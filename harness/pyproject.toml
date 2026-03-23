@@ -6,10 +6,17 @@ dependencies = [
     "cerebras-cloud-sdk>=1.67.0",
     "iterative-context",   # 👈 local workspace dep
     "jcodemunch-mcp",
+    "openai>=2.29.0",
     "pydantic>=2",
     "rich",                # nice CLI/logging
+    "pytest>=8.3.0",
+    "pytest-timeout>=2.3.1",
+    "python-dotenv>=1.0.0",
 ]
 
 [tool.uv.sources]
 jcodemunch-mcp = { workspace = true }
 iterative-context = { workspace = true }
+
+[tool.basedpyright]
+extraPaths = [".."]

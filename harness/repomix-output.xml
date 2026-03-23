@@ -40,6 +40,40 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
+pipeline/
+  __init__.py
+  pipeline.py
+  steps.py
+  types.py
+tests_harness/
+  __init__.py
+  conftest.py
+  test_filesystem_guard.py
+  test_policy_sandbox.py
+  test_pytest_scope.py
+  test_subprocess_guard.py
+  test_test_integrity.py
+tools/
+  ic/
+    __init__.py
+    registry.py
+  jc/
+    __init__.py
+    registry.py
+  __init__.py
+  normalize.py
+  parser.py
+  registry.py
+  schema.py
+utils/
+  __init__.py
+  cmd.py
+  diff.py
+  env.py
+  repo_root.py
+  test_loader.py
+  type_loader.py
+__init__.py
 loop.py
 policy_loader.py
 policy.py
@@ -52,44 +86,1366 @@ writer.py
 <files>
 This section contains the contents of the repository's files.
 
+<file path="pipeline/__init__.py">
+from __future__ import annotations
+
+from .pipeline import (
+    Pipeline,
+    default_pipeline,
+    summarize_results,
+    classify_results,
+    format_structured_feedback,
+    infer_action_hint,
+)
+from .steps import BasedPyrightStep, PytestStep, RuffFixStep
+from .types import StepResult
+
+__all__ = [
+    "Pipeline",
+    "default_pipeline",
+    "summarize_results",
+    "classify_results",
+    "format_structured_feedback",
+    "infer_action_hint",
+    "StepResult",
+    "RuffFixStep",
+    "BasedPyrightStep",
+    "PytestStep",
+]
+</file>
+
+<file path="pipeline/pipeline.py">
+from __future__ import annotations
+
+from typing import Iterable, List, Dict
+from pathlib import Path
+
+from .steps import BasedPyrightStep, PytestStep, RuffFixStep
+from .types import Step, StepResult
+
+
+class Pipeline:
+    def __init__(self, steps: Iterable[Step], fail_fast: bool = True) -> None:
+        self.steps: List[Step] = list(steps)
+        self.fail_fast: bool = fail_fast
+
+    def run(self, repo_root: Path) -> List[StepResult]:
+        results: List[StepResult] = []
+        for step in self.steps:
+            result = step.run(repo_root)
+            results.append(result)
+            if self.fail_fast and not result.success:
+                break
+        return results
+
+
+def default_pipeline() -> Pipeline:
+    return Pipeline([RuffFixStep(), BasedPyrightStep(), PytestStep()])
+
+
+def summarize_results(results: List[StepResult]) -> str:
+    lines: list[str] = []
+    for result in results:
+        status = "passed" if result.success else "FAILED"
+        lines.append(f"[{result.name}] {status}")
+        if not result.success and result.stderr:
+            lines.append(result.stderr.strip())
+            lines.append("")
+    summary = "\n".join(lines).strip()
+    if len(summary) > 2000:
+        summary = summary[:2000] + "\n... (truncated)"
+    return summary
+
+
+def classify_results(results: List[StepResult]) -> Dict[str, object]:
+    out: Dict[str, object] = {
+        "type_errors": "",
+        "lint_errors": "",
+        "test_failures": "",
+        "passed": [],
+    }
+    for r in results:
+        if r.success:
+            passed_list = out["passed"]
+            if isinstance(passed_list, list):
+                passed_list.append(r.name)
+            continue
+
+        stderr = (r.stderr or "").strip()
+        if r.name == "basedpyright":
+            out["type_errors"] = stderr
+        elif r.name == "ruff_fix":
+            out["lint_errors"] = stderr
+        elif "pytest" in r.name:
+            out["test_failures"] = stderr
+    return out
+
+
+def format_structured_feedback(classified: Dict[str, object], max_chars: int = 4000) -> str:
+    parts: list[str] = []
+
+    type_err = classified.get("type_errors")
+    lint_err = classified.get("lint_errors")
+    test_err = classified.get("test_failures")
+    passed = classified.get("passed")
+
+    if isinstance(type_err, str) and type_err:
+        parts.append("## TYPE ERRORS (must fix first)\n" + type_err)
+    if isinstance(lint_err, str) and lint_err:
+        parts.append("## LINT ERRORS\n" + lint_err)
+    if isinstance(test_err, str) and test_err:
+        parts.append("## TEST FAILURES\n" + test_err)
+    if isinstance(passed, list) and passed:
+        parts.append("## PASSED STEPS\n" + ", ".join(passed))
+
+    joined = "\n\n".join(parts)
+    if len(joined) > max_chars:
+        return joined[:max_chars] + "\n\n... truncated"
+    return joined
+
+
+def infer_action_hint(classified: Dict[str, object]) -> str:
+    if isinstance(classified.get("type_errors"), str) and classified.get("type_errors"):
+        return "Fix type errors first. Do not attempt logic changes until types pass."
+    if isinstance(classified.get("lint_errors"), str) and classified.get("lint_errors"):
+        return "Fix lint/style issues. Ensure valid Python syntax."
+    if isinstance(classified.get("test_failures"), str) and classified.get("test_failures"):
+        return "Tests are failing. Adjust scoring logic to satisfy invariants."
+    return "All checks passed. Improve score."
+</file>
+
+<file path="pipeline/steps.py">
+from __future__ import annotations
+
+from pathlib import Path
+
+from .types import ExecutionBackend, StepResult
+
+
+class _BaseStep:
+    name: str = ""
+
+    def __init__(self, backend: ExecutionBackend | None = None) -> None:
+        self.backend: ExecutionBackend = backend or ExecutionBackend()
+
+
+class RuffFixStep(_BaseStep):
+    name = "ruff_fix"
+
+    def run(self, repo_root: Path) -> StepResult:
+        return self.backend.run(
+            ["uv", "run", "ruff", "check", "--fix"],
+            cwd=repo_root,
+            name=self.name,
+        )
+
+
+class BasedPyrightStep(_BaseStep):
+    name = "basedpyright"
+
+    def run(self, repo_root: Path) -> StepResult:
+        return self.backend.run(
+            ["uv", "run", "basedpyright"],
+            cwd=repo_root,
+            name=self.name,
+        )
+
+
+class PytestStep(_BaseStep):
+    name = "pytest_iterative_context"
+
+    def run(self, repo_root: Path) -> StepResult:
+        return self.backend.run(
+            ["uv", "run", "pytest", "iterative-context", "-q", "--disable-warnings", "--maxfail=1"],
+            cwd=repo_root,
+            name=self.name,
+        )
+</file>
+
+<file path="pipeline/types.py">
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
+
+
+@dataclass
+class StepResult:
+    name: str
+    success: bool
+    stdout: str
+    stderr: str
+    exit_code: int
+
+
+class Step(Protocol):
+    name: str
+
+    def run(self, repo_root: Path) -> StepResult:
+        ...
+
+
+class ExecutionBackend:
+    def run(self, cmd: list[str], cwd: Path, name: str | None = None) -> StepResult:
+        import subprocess
+        from ..utils.repo_root import find_repo_root
+
+        allowed = {
+            ("uv", "run", "ruff", "check", "--fix"),
+            ("uv", "run", "basedpyright"),
+            ("uv", "run", "pytest", "iterative-context"),
+            ("uv", "run", "pytest", "iterative-context", "-q", "--disable-warnings", "--maxfail=1"),
+        }
+
+        repo_root = find_repo_root()
+        if cwd != repo_root:
+            return StepResult(
+                name=" ".join(cmd),
+                success=False,
+                stdout="",
+                stderr="Execution not allowed outside repo root",
+                exit_code=1,
+            )
+
+        if tuple(cmd) not in allowed:
+            return StepResult(
+                name=" ".join(cmd),
+                success=False,
+                stdout="",
+                stderr="Command not permitted",
+                exit_code=1,
+            )
+
+        completed = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        result = StepResult(
+            name=" ".join(cmd),
+            success=completed.returncode == 0,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            exit_code=completed.returncode,
+        )
+        if name:
+            result.name = name
+        return result
+</file>
+
+<file path="tests_harness/conftest.py">
+import sys
+from pathlib import Path
+
+
+def _bootstrap_repo_root() -> Path:
+    """
+    Locate the monorepo root before importing harness utilities.
+    """
+    start = Path(__file__).resolve()
+    for path in [start, *start.parents]:
+        if path.name == "searchbench":
+            return path
+        if (path / "pyproject.toml").exists() and (path / "uv.lock").exists():
+            return path
+    raise FileNotFoundError("Repository root not found for tests")
+
+
+ROOT = _bootstrap_repo_root()
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Import after sys.path is set to reuse the shared helper elsewhere.
+from harness.utils.repo_root import find_repo_root  # noqa: E402
+</file>
+
+<file path="tests_harness/test_filesystem_guard.py">
+from pathlib import Path
+
+import pytest
+
+from harness.loop import _write_policy
+
+
+def test_only_policy_file_can_be_written(tmp_path: Path):
+    with pytest.raises(RuntimeError):
+        _write_policy("hi", tmp_path / "other.py")
+</file>
+
+<file path="tests_harness/test_policy_sandbox.py">
+from pathlib import Path
+
+import pytest
+
+from harness.policy_loader import load_policy
+from harness.loop import _write_policy, _read_policy
+
+
+@pytest.fixture(autouse=True)
+def restore_policy():
+    policy_path = Path(__file__).resolve().parents[2] / "harness" / "policy.py"
+    original = _read_policy(policy_path)
+    yield
+    _write_policy(original, policy_path)
+
+
+def test_policy_cannot_import_os():
+    policy_path = Path(__file__).resolve().parents[2] / "harness" / "policy.py"
+    malicious = "import os\n\ndef score(node, state):\n    return 1.0\n"
+    _write_policy(malicious, policy_path)
+    with pytest.raises(ImportError):
+        load_policy()
+
+
+def test_policy_cannot_use_open():
+    policy_path = Path(__file__).resolve().parents[2] / "harness" / "policy.py"
+    malicious = "def score(node, state):\n    open('x', 'w')\n    return 1.0\n"
+    _write_policy(malicious, policy_path)
+    scorer = load_policy()
+    with pytest.raises(Exception):
+        scorer(None, {})
+
+
+def test_policy_timeout():
+    policy_path = Path(__file__).resolve().parents[1] / "policy.py"
+    malicious = "def score(node, state):\n    while True:\n        pass\n"
+    _write_policy(malicious, policy_path)
+    scorer = load_policy()
+    with pytest.raises(TimeoutError):
+        scorer(None, {})
+</file>
+
+<file path="tests_harness/test_pytest_scope.py">
+from pathlib import Path
+
+from harness.pipeline.steps import PytestStep
+from harness.pipeline.types import StepResult, ExecutionBackend
+
+
+class FakeBackend(ExecutionBackend):
+    def __init__(self):
+        self.last_cmd: list[str] | None = None
+
+    def run(self, cmd: list[str], cwd: Path, name: str | None = None) -> StepResult:
+        self.last_cmd = cmd
+        return StepResult(
+            name=name or "pytest",
+            success=True,
+            stdout="",
+            stderr="",
+            exit_code=0,
+        )
+
+
+def test_pytest_scope_limited():
+    backend = FakeBackend()
+    step = PytestStep(backend=backend)
+    repo_root = Path(__file__).resolve().parents[2]
+    step.run(repo_root)
+    assert backend.last_cmd == ["uv", "run", "pytest", "iterative-context", "-q", "--disable-warnings", "--maxfail=1"]
+</file>
+
+<file path="tests_harness/test_subprocess_guard.py">
+from pathlib import Path
+
+from harness.pipeline.types import ExecutionBackend
+
+
+def test_disallowed_command_rejected():
+    backend = ExecutionBackend()
+    repo_root = Path(__file__).resolve().parents[2]
+    result = backend.run(["echo", "not-allowed"], cwd=repo_root)
+    assert not result.success
+    assert result.exit_code != 0
+</file>
+
+<file path="tests_harness/test_test_integrity.py">
+from pathlib import Path
+
+from harness.loop import _hash_tests_dir, _write_policy, _read_policy
+
+
+def test_test_directory_integrity(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[2]
+    tests_dir = repo_root / "iterative-context" / "tests"
+    marker = tests_dir / "tmp_integrity_marker.py"
+    before = _hash_tests_dir(repo_root)
+    try:
+        marker.write_text("# marker\n", encoding="utf-8")
+        after = _hash_tests_dir(repo_root)
+        assert before != after
+    finally:
+        if marker.exists():
+            marker.unlink()
+        # ensure policy restored to avoid side effects
+        policy_path = repo_root / "harness" / "policy.py"
+        _write_policy(_read_policy(policy_path), policy_path)
+</file>
+
+<file path="tools/ic/__init__.py">
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from iterative_context import exploration
+
+
+def resolve(symbol: str) -> Optional[Dict[str, Any]]:
+    exploration.ensure_graph_loaded()
+    node: Any = exploration.resolve(symbol)
+    if node is None:
+        return None
+
+    graph = exploration.get_active_graph()
+    extras: Dict[str, Any] = {}
+    node_id = getattr(node, "id", None)
+    if graph is not None and node_id in getattr(graph, "nodes", {}):
+        raw = graph.nodes[node_id]
+        extras = {k: v for k, v in raw.items() if k != "data"}
+
+    return {
+        "id": node_id,
+        "type": getattr(node, "type", None),
+        "data": getattr(node, "data", None),
+        "extras": extras,
+    }
+
+
+def expand(node_id: str, depth: int, score_fn):
+    exploration.ensure_graph_loaded()
+    return exploration.expand(node_id=node_id, depth=depth, score_fn=score_fn)
+
+
+def resolve_and_expand(symbol: str, depth: int, score_fn):
+    node = resolve(symbol)
+    if node is None:
+        return {"nodes": [], "edges": [], "metadata": {}}
+    return expand(node["id"], depth, score_fn)
+</file>
+
+<file path="tools/ic/registry.py">
+from __future__ import annotations
+
+from . import resolve, expand, resolve_and_expand
+from ..schema import Tool
+
+IC_TOOLS = [
+    Tool(
+        name="resolve",
+        func=resolve,
+        description="Resolve a symbol into a graph node",
+        parameters={
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+        },
+    ),
+    Tool(
+        name="expand",
+        func=expand,
+        description="Expand a node in the graph",
+        parameters={
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string"},
+                "depth": {"type": "integer"},
+            },
+            "required": ["node_id", "depth"],
+        },
+    ),
+    Tool(
+        name="resolve_and_expand",
+        func=resolve_and_expand,
+        description="Resolve a symbol and expand its graph",
+        parameters={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "depth": {"type": "integer"},
+            },
+            "required": ["symbol", "depth"],
+        },
+    ),
+]
+</file>
+
+<file path="tools/jc/__init__.py">
+from __future__ import annotations
+
+from typing import Any
+
+# Core indexing
+from jcodemunch_mcp.tools.index_repo import index_repo
+from jcodemunch_mcp.tools.index_folder import index_folder
+from jcodemunch_mcp.tools.index_file import index_file
+from jcodemunch_mcp.tools.list_repos import list_repos
+
+# File + symbol access
+from jcodemunch_mcp.tools.get_file_tree import get_file_tree
+from jcodemunch_mcp.tools.get_file_outline import get_file_outline
+from jcodemunch_mcp.tools.get_file_content import get_file_content
+from jcodemunch_mcp.tools.get_symbol import get_symbol, get_symbols
+
+# Search
+from jcodemunch_mcp.tools.search_symbols import search_symbols
+from jcodemunch_mcp.tools.search_text import search_text
+from jcodemunch_mcp.tools.search_columns import search_columns
+
+# Repo overview
+from jcodemunch_mcp.tools.get_repo_outline import get_repo_outline
+
+# Dependency + references
+from jcodemunch_mcp.tools.find_importers import find_importers
+from jcodemunch_mcp.tools.find_references import find_references
+from jcodemunch_mcp.tools.check_references import check_references
+from jcodemunch_mcp.tools.get_dependency_graph import get_dependency_graph
+from jcodemunch_mcp.tools.get_blast_radius import get_blast_radius
+
+# Diff / structure
+from jcodemunch_mcp.tools.get_symbol_diff import get_symbol_diff
+from jcodemunch_mcp.tools.get_class_hierarchy import get_class_hierarchy
+from jcodemunch_mcp.tools.get_related_symbols import get_related_symbols
+
+# Misc
+from jcodemunch_mcp.tools.suggest_queries import suggest_queries
+from jcodemunch_mcp.tools.get_session_stats import get_session_stats
+from jcodemunch_mcp.tools.invalidate_cache import invalidate_cache
+
+# Core bundle
+from jcodemunch_mcp.tools.get_context_bundle import get_context_bundle
+
+__all__ = [
+    "index_repo",
+    "index_folder",
+    "index_file",
+    "list_repos",
+    "get_file_tree",
+    "get_file_outline",
+    "get_file_content",
+    "get_symbol",
+    "get_symbols",
+    "search_symbols",
+    "search_text",
+    "search_columns",
+    "get_repo_outline",
+    "find_importers",
+    "find_references",
+    "check_references",
+    "get_dependency_graph",
+    "get_blast_radius",
+    "get_symbol_diff",
+    "get_class_hierarchy",
+    "get_related_symbols",
+    "suggest_queries",
+    "get_session_stats",
+    "invalidate_cache",
+    "get_context_bundle",
+]
+</file>
+
+<file path="tools/jc/registry.py">
+from __future__ import annotations
+
+from ..schema import Tool
+from . import (
+    check_references,
+    find_importers,
+    find_references,
+    get_blast_radius,
+    get_class_hierarchy,
+    get_context_bundle,
+    get_dependency_graph,
+    get_file_content,
+    get_file_outline,
+    get_file_tree,
+    get_related_symbols,
+    get_repo_outline,
+    get_session_stats,
+    get_symbol,
+    get_symbol_diff,
+    get_symbols,
+    index_file,
+    index_folder,
+    index_repo,
+    invalidate_cache,
+    list_repos,
+    search_columns,
+    search_symbols,
+    search_text,
+    suggest_queries,
+)
+
+JC_TOOLS = [
+    Tool(
+        "index_repo",
+        index_repo,
+        "Index a GitHub repository",
+        {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+    ),
+    Tool(
+        "index_folder",
+        index_folder,
+        "Index a local folder",
+        {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    ),
+    Tool(
+        "index_file",
+        index_file,
+        "Index a single file",
+        {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    ),
+    Tool(
+        "list_repos",
+        list_repos,
+        "List indexed repositories",
+        {"type": "object", "properties": {}},
+    ),
+    Tool(
+        "get_file_tree",
+        get_file_tree,
+        "Get repository file tree",
+        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+    ),
+    Tool(
+        "get_file_outline",
+        get_file_outline,
+        "Get symbols in a file",
+        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+    ),
+    Tool(
+        "get_file_content",
+        get_file_content,
+        "Get file contents",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "file_path": {"type": "string"}},
+            "required": ["repo", "file_path"],
+        },
+    ),
+    Tool(
+        "get_symbol",
+        get_symbol,
+        "Get symbol source",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "symbol_id": {"type": "string"}},
+            "required": ["repo", "symbol_id"],
+        },
+    ),
+    Tool(
+        "get_symbols",
+        get_symbols,
+        "Get multiple symbols",
+        {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string"},
+                "symbol_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["repo", "symbol_ids"],
+        },
+    ),
+    Tool(
+        "search_symbols",
+        search_symbols,
+        "Search symbols",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "query": {"type": "string"}},
+            "required": ["repo", "query"],
+        },
+    ),
+    Tool(
+        "search_text",
+        search_text,
+        "Search text",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "query": {"type": "string"}},
+            "required": ["repo", "query"],
+        },
+    ),
+    Tool(
+        "search_columns",
+        search_columns,
+        "Search columns",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "query": {"type": "string"}},
+            "required": ["repo", "query"],
+        },
+    ),
+    Tool(
+        "get_repo_outline",
+        get_repo_outline,
+        "Get repo overview",
+        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+    ),
+    Tool(
+        "find_importers",
+        find_importers,
+        "Find file importers",
+        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+    ),
+    Tool(
+        "find_references",
+        find_references,
+        "Find references",
+        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+    ),
+    Tool(
+        "check_references",
+        check_references,
+        "Check references",
+        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+    ),
+    Tool(
+        "get_dependency_graph",
+        get_dependency_graph,
+        "Get dependency graph",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "file": {"type": "string"}},
+            "required": ["repo", "file"],
+        },
+    ),
+    Tool(
+        "get_blast_radius",
+        get_blast_radius,
+        "Get blast radius",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "symbol": {"type": "string"}},
+            "required": ["repo", "symbol"],
+        },
+    ),
+    Tool(
+        "get_symbol_diff",
+        get_symbol_diff,
+        "Diff symbols",
+        {
+            "type": "object",
+            "properties": {"repo_a": {"type": "string"}, "repo_b": {"type": "string"}},
+            "required": ["repo_a", "repo_b"],
+        },
+    ),
+    Tool(
+        "get_class_hierarchy",
+        get_class_hierarchy,
+        "Get class hierarchy",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "class_name": {"type": "string"}},
+            "required": ["repo", "class_name"],
+        },
+    ),
+    Tool(
+        "get_related_symbols",
+        get_related_symbols,
+        "Find related symbols",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "symbol_id": {"type": "string"}},
+            "required": ["repo", "symbol_id"],
+        },
+    ),
+    Tool(
+        "suggest_queries",
+        suggest_queries,
+        "Suggest queries",
+        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+    ),
+    Tool(
+        "get_session_stats",
+        get_session_stats,
+        "Get session stats",
+        {"type": "object", "properties": {}},
+    ),
+    Tool(
+        "invalidate_cache",
+        invalidate_cache,
+        "Invalidate cache",
+        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
+    ),
+    Tool(
+        "get_context_bundle",
+        get_context_bundle,
+        "Get context bundle",
+        {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "symbol_id": {"type": "string"}},
+            "required": ["repo", "symbol_id"],
+        },
+    ),
+]
+</file>
+
+<file path="tools/__init__.py">
+from __future__ import annotations
+
+from . import schema, ic, jc, registry, parser, normalize
+
+__all__ = ["schema", "ic", "jc", "registry", "parser", "normalize"]
+</file>
+
+<file path="tools/normalize.py">
+from __future__ import annotations
+
+from typing import Any, Dict
+
+
+def _obs_nodes(result: Dict[str, Any]) -> list[Any]:
+    observations = result.get("observations")
+    if isinstance(observations, list):
+        return observations
+    return []
+
+
+def extract_nodes_from_observation(obs: Dict[str, Any]) -> list[Any]:
+    result = obs.get("result")
+    if not isinstance(result, dict):
+        return []
+
+    if "nodes" in result and isinstance(result["nodes"], list):
+        return result["nodes"]
+
+    if "symbols" in result and isinstance(result["symbols"], list):
+        return result["symbols"]
+
+    if "id" in result:
+        return [result]
+
+    return []
+
+
+def project_observations(observations: list[Dict[str, Any]]) -> Dict[str, Any]:
+    nodes: list[Any] = []
+    seen_ids: set[str] = set()
+
+    for obs in observations:
+        extracted = extract_nodes_from_observation(obs)
+        for node in extracted:
+            node_id = None
+            if isinstance(node, dict):
+                node_id = str(node.get("id") or node.get("symbol_id") or "")
+            if node_id:
+                if node_id in seen_ids:
+                    continue
+                seen_ids.add(node_id)
+            nodes.append(node)
+
+    return {
+        "nodes": nodes,
+        "edges": [],
+        "node_count": len(nodes),
+        "edge_count": 0,
+    }
+
+
+def normalize_iterative_context(result: Dict[str, Any]) -> Dict[str, Any]:
+    if "observations" in result:
+        obs = _obs_nodes(result)
+        projected = project_observations(obs)
+        return {**projected, "raw": result}
+
+    graph = result.get("graph", result)
+    nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
+    edges = graph.get("edges", []) if isinstance(graph, dict) else []
+    node_count = len(nodes) if isinstance(nodes, list) else 0
+    edge_count = len(edges) if isinstance(edges, list) else 0
+    return {
+        "nodes": nodes if isinstance(nodes, list) else [],
+        "edges": edges if isinstance(edges, list) else [],
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "raw": result,
+    }
+
+
+def normalize_jcodemunch(result: Dict[str, Any]) -> Dict[str, Any]:
+    if "observations" in result:
+        obs = _obs_nodes(result)
+        projected = project_observations(obs)
+        return {**projected, "raw": result}
+
+    bundle = result.get("bundle", result)
+    symbols = bundle.get("symbols", []) if isinstance(bundle, dict) else []
+    node_count = len(symbols) if isinstance(symbols, list) else 0
+    return {
+        "nodes": symbols if isinstance(symbols, list) else [],
+        "edges": [],
+        "node_count": node_count,
+        "edge_count": 0,
+        "raw": result,
+    }
+</file>
+
+<file path="tools/parser.py">
+from __future__ import annotations
+
+import json
+from typing import Any, Dict
+
+from .registry import TOOL_MAP
+
+
+def parse_tool_call(text: str) -> Dict[str, Any]:
+    """
+    Expected JSON format:
+    {"tool": "<name>", "arguments": {...}}
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON: {exc}") from exc
+
+    tool_name = data.get("tool")
+    args = data.get("arguments", {})
+
+    if tool_name not in TOOL_MAP:
+        raise ValueError(f"Unknown tool: {tool_name}")
+
+    return {"tool": tool_name, "arguments": args}
+
+
+def execute_tool_call(call: Dict[str, Any], score_fn: Any | None = None):
+    tool = TOOL_MAP[call["tool"]]
+    func = tool.func
+
+    if "score_fn" in func.__code__.co_varnames:
+        return func(**call["arguments"], score_fn=score_fn)
+
+    return func(**call["arguments"])
+</file>
+
+<file path="tools/registry.py">
+from __future__ import annotations
+
+from typing import Dict, List
+
+from .ic.registry import IC_TOOLS
+from .jc.registry import JC_TOOLS
+from .schema import Tool, ToolSpec
+
+ALL_TOOLS: List[Tool] = IC_TOOLS + JC_TOOLS
+TOOL_MAP: Dict[str, Tool] = {tool.name: tool for tool in ALL_TOOLS}
+
+
+def get_tool_specs() -> List[ToolSpec]:
+    return [tool.to_spec() for tool in ALL_TOOLS]
+</file>
+
+<file path="tools/schema.py">
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, TypedDict
+
+
+class ToolSpec(TypedDict):
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+
+
+class Tool:
+    name: str
+    func: Callable[..., Any]
+    description: str
+    parameters: Dict[str, Any]
+
+    def __init__(
+        self,
+        name: str,
+        func: Callable[..., Any],
+        description: str,
+        parameters: Dict[str, Any],
+    ) -> None:
+        self.name = name
+        self.func = func
+        self.description = description
+        self.parameters = parameters
+
+    def to_spec(self) -> ToolSpec:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        }
+</file>
+
+<file path="utils/__init__.py">
+from __future__ import annotations
+
+from . import repo_root, cmd, test_loader, type_loader, diff
+
+__all__ = ["repo_root", "cmd", "test_loader", "type_loader", "diff"]
+</file>
+
+<file path="utils/cmd.py">
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from typing import List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..pipeline.types import StepResult
+
+
+def run_cmd(cmd: List[str], cwd: Path) -> "StepResult":
+    completed = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    from ..pipeline.types import StepResult
+
+    return StepResult(
+        name=" ".join(cmd),
+        success=completed.returncode == 0,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        exit_code=completed.returncode,
+    )
+</file>
+
+<file path="utils/diff.py">
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Set
+
+
+@dataclass
+class DiffSummary:
+    score_delta: float
+    fixed_failures: Set[str]
+    new_failures: Set[str]
+    regression: bool
+
+
+def extract_failure_keys(classified: Dict[str, object]) -> Set[str]:
+    keys: Set[str] = set()
+    if isinstance(classified.get("type_errors"), str) and classified["type_errors"]:
+        keys.add("type")
+    if isinstance(classified.get("lint_errors"), str) and classified["lint_errors"]:
+        keys.add("lint")
+    if isinstance(classified.get("test_failures"), str) and classified["test_failures"]:
+        keys.add("tests")
+    return keys
+
+
+def compute_diff(
+    prev_score: float,
+    curr_score: float,
+    prev_classified: Dict[str, object],
+    curr_classified: Dict[str, object],
+) -> DiffSummary:
+    prev_keys = extract_failure_keys(prev_classified)
+    curr_keys = extract_failure_keys(curr_classified)
+
+    fixed = prev_keys - curr_keys
+    new = curr_keys - prev_keys
+
+    return DiffSummary(
+        score_delta=curr_score - prev_score,
+        fixed_failures=fixed,
+        new_failures=new,
+        regression=bool(new),
+    )
+
+
+def format_diff(diff: DiffSummary) -> str:
+    parts: list[str] = []
+    parts.append("## CHANGE IMPACT (last iteration)")
+    parts.append(f"Score delta: {diff.score_delta:+.4f}")
+
+    if diff.fixed_failures:
+        parts.append("Fixed:")
+        for item in sorted(diff.fixed_failures):
+            parts.append(f"- {item}")
+
+    if diff.new_failures:
+        parts.append("New failures introduced:")
+        for item in sorted(diff.new_failures):
+            parts.append(f"- {item}")
+
+    parts.append(f"Regression: {'yes' if diff.regression else 'no'}")
+    return "\n".join(parts)
+
+
+def interpret_diff(diff: DiffSummary) -> str:
+    if diff.new_failures:
+        return "Your last change introduced regressions. Be more conservative."
+    if diff.fixed_failures and not diff.new_failures:
+        return "Good progress. Continue in this direction."
+    if diff.score_delta < 0:
+        return "Score decreased. Reconsider your heuristic."
+    return "No meaningful improvement. Try a different approach."
+</file>
+
+<file path="utils/env.py">
+from __future__ import annotations
+
+import os
+
+from dotenv import load_dotenv
+
+_loaded = False
+
+
+def load_env() -> None:
+    global _loaded  # noqa: PLW0603
+    if not _loaded:
+        load_dotenv()
+        _loaded = True
+</file>
+
+<file path="utils/repo_root.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+
+def find_repo_root(start: Optional[Path] = None) -> Path:
+    """
+    Walk upward until the monorepo root is found.
+
+    Preference order:
+    1) A directory named "searchbench"
+    2) A directory containing both pyproject.toml and uv.lock
+    """
+    current = start or Path.cwd()
+    current = current.resolve()
+
+    for path in [current, *current.parents]:
+        if path.name == "searchbench":
+            return path
+        if (path / "pyproject.toml").exists() and (path / "uv.lock").exists():
+            return path
+    raise FileNotFoundError("Repository root not found (missing searchbench dir or pyproject.toml and uv.lock)")
+</file>
+
+<file path="utils/test_loader.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Tuple
+
+
+def load_tests(repo_root: Path) -> List[Tuple[str, str]]:
+    """
+    Return a list of (relative_path, file_contents) for iterative-context tests.
+    """
+    tests_dir = repo_root / "iterative-context" / "tests"
+    if not tests_dir.exists():
+        return []
+
+    files = sorted(tests_dir.rglob("*.py"))
+    results: List[Tuple[str, str]] = []
+    for file_path in files:
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        rel_path = file_path.relative_to(repo_root)
+        results.append((str(rel_path), content))
+
+    return results
+
+
+def format_tests_for_prompt(tests: List[Tuple[str, str]], max_chars: int = 12000) -> str:
+    """
+    Concatenate tests into a prompt-friendly string, truncating if necessary.
+    """
+    parts: list[str] = [f"# FILE: {path}\n{content}" for path, content in tests]
+    joined = "\n\n".join(parts)
+    if len(joined) > max_chars:
+        return joined[:max_chars] + "\n\n# ... truncated"
+    return joined
+</file>
+
+<file path="utils/type_loader.py">
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def load_scoring_types(repo_root: Path) -> str:
+    """
+    Load canonical scoring type definitions from iterative-context.
+    """
+    types_path = repo_root / "iterative-context" / "src" / "iterative_context" / "types.py"
+    if not types_path.exists():
+        return ""
+    try:
+        return types_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def load_scoring_examples(repo_root: Path) -> str:
+    scoring_path = repo_root / "iterative-context" / "src" / "iterative_context" / "scoring.py"
+    if not scoring_path.exists():
+        return ""
+    try:
+        return scoring_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def format_scoring_context(types: str, examples: str, max_chars: int = 8000) -> str:
+    """
+    Concatenate type definitions and reference implementations for prompt use.
+    """
+    parts: list[str] = []
+    if types:
+        parts.append(f"# TYPES (source of truth)\n{types}")
+    if examples:
+        parts.append(f"# EXAMPLES (reference implementations)\n{examples}")
+
+    joined = "\n\n".join(parts)
+    if len(joined) > max_chars:
+        return joined[:max_chars] + "\n\n# ... truncated"
+    return joined
+</file>
+
+<file path="__init__.py">
+# Treat harness as a package for imports and type checking.
+</file>
+
 <file path="loop.py">
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
+from typing import Any
 from pathlib import Path
 
 from .policy_loader import load_policy
 from .runner import run_both
 from .scorer import score
 from .writer import generate_policy
+from .utils.repo_root import find_repo_root
+from .utils.test_loader import format_tests_for_prompt, load_tests
+from .utils.type_loader import (
+    format_scoring_context,
+    load_scoring_examples,
+    load_scoring_types,
+)
+from .pipeline import (
+    default_pipeline,
+    classify_results,
+    format_structured_feedback,
+    infer_action_hint,
+)
+from .utils.diff import compute_diff, format_diff, interpret_diff
 
 _POLICY_PATH = Path(__file__).with_name("policy.py")
 
 
-def _read_policy() -> str:
-    return _POLICY_PATH.read_text(encoding="utf-8")
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def _write_policy(code: str) -> None:
-    _ = _POLICY_PATH.write_text(code, encoding="utf-8")
+def _read_policy(path: Path = _POLICY_PATH) -> str:
+    return path.read_text(encoding="utf-8")
 
 
-def run_loop(task: Mapping[str, object], iterations: int = 5) -> list[dict[str, float | int]]:
+def _write_policy(code: str, path: Path = _POLICY_PATH) -> None:
+    if path.name != "policy.py":
+        raise RuntimeError("Unauthorized write attempt")
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(code, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _hash_tests_dir(repo_root: Path) -> str:
+    tests_path = repo_root / "iterative-context" / "tests"
+    hasher = hashlib.sha256()
+    if not tests_path.exists():
+        return hasher.hexdigest()
+    for file in sorted(tests_path.rglob("*.py")):
+        hasher.update(str(file.relative_to(repo_root)).encode())
+        hasher.update(file.read_bytes())
+    return hasher.hexdigest()
+
+
+def run_loop(task: Mapping[str, object], iterations: int = 5) -> list[dict[str, object]]:
     """
     Closed-loop optimizer: execute, score, rewrite policy, repeat.
     """
-    history: list[dict[str, float | int]] = []
+    history: list[dict[str, object]] = []
+    prev_score: float | None = None
+    prev_classified: dict[str, object] | None = None
 
     for _ in range(iterations):
         score_fn = load_policy()
         result = run_both(dict(task), score_fn)
-        metrics = score(result)
+        metrics_map: dict[str, object] = dict(score(result))
+
+        repo_root = find_repo_root()
+        tests = load_tests(repo_root)
+        tests_str = format_tests_for_prompt(tests)
+        types_str = load_scoring_types(repo_root)
+        examples_str = load_scoring_examples(repo_root)
+        scoring_ctx = format_scoring_context(types_str, examples_str)
+        tests_hash_before = _hash_tests_dir(repo_root)
 
         current_code = _read_policy()
-        new_code = generate_policy(metrics, current_code)
-        _write_policy(new_code)
+        try:
+            new_code = generate_policy(
+                feedback=metrics_map,
+                current_policy=current_code,
+                tests=tests_str,
+                scoring_context=scoring_ctx,
+                feedback_str="",
+                guidance_hint="",
+                diff_str="",
+                diff_hint="",
+            )
+            _write_policy(new_code)
+        except Exception:
+            history.append(metrics_map)
+            continue
 
-        history.append(metrics)
+        tests_hash_after = _hash_tests_dir(repo_root)
+        if tests_hash_after != tests_hash_before:
+            _write_policy(current_code)
+            history.append({"error": "test_integrity_modified"})
+            continue
+
+        pipeline = default_pipeline()
+        results = pipeline.run(repo_root)
+        if any(not r.success for r in results):
+            classified = classify_results(results)
+            feedback_str = format_structured_feedback(classified)
+            guidance_hint = infer_action_hint(classified)
+            current_score = _as_float(metrics_map.get("score", 0.0))
+            diff_str = ""
+            diff_hint = ""
+            if prev_score is not None and prev_classified is not None:
+                diff = compute_diff(prev_score, current_score, prev_classified, classified)
+                diff_str = format_diff(diff)
+                diff_hint = interpret_diff(diff)
+            prev_score = current_score
+            prev_classified = classified
+            try:
+                updated_code = generate_policy(
+                    feedback={**metrics_map, "pipeline_feedback": classified},
+                    current_policy=_read_policy(),
+                    tests=tests_str,
+                    scoring_context=scoring_ctx,
+                    feedback_str=feedback_str,
+                    guidance_hint=guidance_hint,
+                    diff_str=diff_str,
+                    diff_hint=diff_hint,
+                )
+                _write_policy(updated_code)
+            except Exception:
+                pass
+            continue
+
+        history.append(metrics_map)
+        prev_score = _as_float(metrics_map.get("score", 0.0))
+        prev_classified = {"type_errors": "", "lint_errors": "", "test_failures": "", "passed": []}
 
     return history
 </file>
@@ -97,37 +1453,95 @@ def run_loop(task: Mapping[str, object], iterations: int = 5) -> list[dict[str, 
 <file path="policy_loader.py">
 from __future__ import annotations
 
-import importlib.util
-import sys
-import uuid
+import builtins
+import math
+import signal
 from pathlib import Path
 from typing import Callable, cast
+
+_BANNED_IMPORTS = {"os", "sys", "subprocess", "socket", "shutil", "pathlib"}
+_ALLOWED_IMPORTS = {"math"}
+_ALLOWED_BUILTINS: dict[str, object] = {
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "sum": sum,
+    "len": len,
+    "float": float,
+    "int": int,
+    "bool": bool,
+    "range": range,
+    "enumerate": enumerate,
+    "zip": zip,
+    "list": list,
+    "dict": dict,
+    "set": set,
+    "tuple": tuple,
+    "str": str,
+    "ValueError": ValueError,
+    "TypeError": TypeError,
+    "RuntimeError": RuntimeError,
+    "__build_class__": builtins.__build_class__,
+    "__name__": "policy",
+}
+
+
+def _safe_import(
+    name: str,
+    globals: dict[str, object] | None = None,
+    locals: dict[str, object] | None = None,
+    fromlist: tuple[str, ...] | list[str] = (),
+    level: int = 0,
+) -> object:
+    root = name.split(".")[0]
+    if root in _BANNED_IMPORTS or (root not in _ALLOWED_IMPORTS and root != ""):
+        raise ImportError(f"Import of '{name}' is not allowed")
+    return builtins.__import__(name, globals, locals, fromlist, level)
+
+
+def _build_safe_globals() -> dict[str, object]:
+    safe_builtins: dict[str, object] = dict(_ALLOWED_BUILTINS)
+    safe_builtins["__import__"] = _safe_import  # type: ignore[assignment]
+    safe_globals: dict[str, object] = {"__builtins__": safe_builtins, "math": math}
+    return safe_globals
+
+
+def _enforce_timeout(func: Callable[[object, object], float], seconds: int = 2) -> Callable[[object, object], float]:
+    def wrapped(node: object, state: object) -> float:
+        def handler(signum, frame):  # noqa: ANN001, ARG001
+            raise TimeoutError("Policy execution timed out")
+
+        previous = signal.signal(signal.SIGALRM, handler)
+        signal.alarm(seconds)
+        try:
+            return float(func(node, state))
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+
+    return wrapped
 
 
 def load_policy() -> Callable[[object, object], float]:
     """
-    Load the current policy module fresh and return its score callable.
-
-    A unique module name is used per load to avoid reusing cached modules.
+    Load the current policy module with restricted execution and return its score callable.
     """
     policy_path = Path(__file__).with_name("policy.py")
     if not policy_path.exists():
         raise FileNotFoundError(f"Policy file not found at {policy_path}")
 
-    module_name = f"harness_policy_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(module_name, policy_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load policy module from {policy_path}")
+    safe_globals = _build_safe_globals()
+    code = policy_path.read_text(encoding="utf-8")
 
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    compiled = compile(code, str(policy_path), "exec")
+    exec(compiled, safe_globals, safe_globals)  # noqa: S102
 
-    score_fn = getattr(module, "score", None)
-    if not callable(score_fn):
+    score_fn_obj = safe_globals.get("score")
+    if not callable(score_fn_obj):
         raise AttributeError("Policy module must define a callable 'score(node, state)'")
 
-    return cast(Callable[[object, object], float], score_fn)
+    score_fn_typed: Callable[[object, object], float] = cast(Callable[[object, object], float], score_fn_obj)
+    return _enforce_timeout(score_fn_typed)
 </file>
 
 <file path="policy.py">
@@ -144,32 +1558,34 @@ dependencies = [
     "cerebras-cloud-sdk>=1.67.0",
     "iterative-context",   # 👈 local workspace dep
     "jcodemunch-mcp",
+    "openai>=2.29.0",
     "pydantic>=2",
     "rich",                # nice CLI/logging
+    "pytest>=8.3.0",
+    "pytest-timeout>=2.3.1",
+    "python-dotenv>=1.0.0",
 ]
 
 [tool.uv.sources]
 jcodemunch-mcp = { workspace = true }
 iterative-context = { workspace = true }
+
+[tool.basedpyright]
+extraPaths = [".."]
 </file>
 
 <file path="runner.py">
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import json
-from typing import Any, Callable
+import os
+from typing import Any, Callable, cast
 
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamable_http_client
-from mcp.types import CallToolResult, TextContent
+from openai import OpenAI
 
-from iterative_context import exploration
-from iterative_context.graph_models import Graph, GraphNode
-from iterative_context.server import create_mcp_server
-from iterative_context.types import SelectionCallable
-from jcodemunch_mcp.server import run_streamable_http_server
+from .utils.env import load_env
+from .tools.normalize import normalize_iterative_context, normalize_jcodemunch
+from .tools.parser import execute_tool_call
+from .tools.registry import get_tool_specs
 
 
 def _require_str(mapping: dict[str, Any], key: str) -> str:
@@ -179,207 +1595,267 @@ def _require_str(mapping: dict[str, Any], key: str) -> str:
     return value
 
 
-async def _jc_via_server(repo: str, symbol_id: str, host: str, port: int) -> dict[str, Any]:
-    server_task = asyncio.create_task(run_streamable_http_server(host, port))
-    try:
-        await asyncio.sleep(0.2)  # brief startup delay
-        async with streamable_http_client(f"http://{host}:{port}/mcp") as (read_stream, write_stream, _):
-            session = ClientSession(read_stream, write_stream)
-            await session.initialize()
-            result: CallToolResult = await session.call_tool(
-                "get_context_bundle",
-                {"repo": repo, "symbol_id": symbol_id, "output_format": "json"},
-            )
-            if not result.content:
-                return {"error": "empty response"}
-            first = result.content[0]
-            if isinstance(first, TextContent):
-                try:
-                    return json.loads(first.text)
-                except json.JSONDecodeError:
-                    return {"raw": first.text}
-            if isinstance(first, dict):
-                payload = first.get("text")
-                if isinstance(payload, str):
-                    try:
-                        return json.loads(payload)
-                    except json.JSONDecodeError:
-                        return {"raw": payload}
-            return {"raw": result.model_dump()}
-    finally:
-        server_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await server_task
+def _make_client() -> OpenAI:
+    load_env()
+    api_key = os.environ.get("CEREBRAS_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing CEREBRAS_API_KEY in environment")
+    client = OpenAI(
+        base_url="https://api.cerebras.ai/v1",
+        api_key=api_key,
+    )
+    print("[LLM] Using model: gpt-oss-120b")
+    return client
 
 
-def _call_jcodemunch(repo: str, symbol_id: str) -> dict[str, Any]:
-    return asyncio.run(_jc_via_server(repo, symbol_id, host="127.0.0.1", port=8901))
+def run_agent(task: dict[str, object], score_fn: Any = None, steps: int = 5) -> dict[str, object]:
+    """
+    Run a simple tool-using agent for a fixed number of steps.
+    """
+    client = _make_client()
+    tool_specs = get_tool_specs()
+
+    messages: list[Any] = [
+        {
+            "role": "system",
+            "content": "You are a code exploration agent. Use tools to gather information.",
+        },
+        {
+            "role": "user",
+            "content": f"Task:\n{task}\n\nUse tools to explore.",
+        },
+    ]
+
+    observations: list[dict[str, object]] = []
+
+    for _ in range(steps):
+        response = client.chat.completions.create(
+            model="gpt-oss-120b",
+            messages=cast(Any, messages),
+            tools=cast(Any, tool_specs),
+        )
+
+        msg = response.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            break
+
+        for call in tool_calls:
+            parsed: dict[str, Any] | None = None
+            try:
+                parsed = {
+                    "tool": call.function.name,
+                    "arguments": call.function.arguments or {},
+                }
+                result = execute_tool_call(parsed, score_fn=score_fn)
+                observations.append({"tool": parsed["tool"], "result": result})
+                messages.append({"role": "tool", "content": str(result)})
+            except Exception as exc:  # noqa: BLE001
+                tool_name = parsed["tool"] if parsed else "unknown"
+                observations.append({"tool": tool_name, "error": str(exc)})
+                messages.append({"role": "tool", "content": f"ERROR: {exc}"})
+
+    return {"observations": observations}
+
+
+def run_ic_agent(task: dict[str, object], score_fn: Any, steps: int = 5) -> dict[str, object]:
+    return run_agent(task, score_fn=score_fn, steps=steps)
+
+
+def run_jc_agent(task: dict[str, object], steps: int = 5) -> dict[str, object]:
+    return run_agent(task, score_fn=None, steps=steps)
 
 
 def run_both(task: dict[str, object], score_fn: Callable[[object, object], float]):
-    """
-    Run both iterative-context and jcodemunch MCP servers against the same symbol.
-
-    The injected score_fn is wired into iterative-context via the MCP server
-    creation to influence traversal.
-    """
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
-    depth_raw = task.get("depth", 2)
-    if isinstance(depth_raw, (int, str)):
-        try:
-            depth = int(depth_raw)
-        except (TypeError, ValueError):
-            depth = 2
-    else:
-        depth = 2
+    symbol_id = str(task.get("symbol_id", symbol))
+    agent_task: dict[str, object] = {"symbol": symbol, "repo": repo, "symbol_id": symbol_id}
 
-    # Adapt the policy to the traversal signature.
-    def ic_score(node: GraphNode, graph: Graph, step: int) -> float:
-        state: dict[str, object] = {"graph": graph, "step": step}
-        return float(score_fn(node, state))
+    ic_raw = run_ic_agent(agent_task, score_fn=score_fn)
+    jc_raw = run_jc_agent(agent_task)
 
-    traversal_score: SelectionCallable = ic_score
-
-    # Instantiate MCP servers to mirror how agents will use them.
-    create_mcp_server(score_fn=traversal_score)
-    exploration.ensure_graph_loaded()
-    ic_graph = exploration.resolve_and_expand(symbol, depth=depth, score_fn=traversal_score)
-
-    symbol_id = str(task.get("symbol_id") or symbol)
-    jc_result = _call_jcodemunch(repo, symbol_id)
+    ic = normalize_iterative_context(ic_raw)
+    jc = normalize_jcodemunch(jc_raw)
 
     return {
-        "iterative_context": {"graph": ic_graph, "symbol": symbol, "depth": depth},
-        "jcodemunch": {"bundle": jc_result, "symbol": symbol_id, "repo": repo},
+        "iterative_context": ic,
+        "jcodemunch": jc,
     }
 </file>
 
 <file path="scorer.py">
 from __future__ import annotations
 
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping
+from typing import Any, Dict, Iterable
 
 
-def _ic_node_count(result: Mapping[str, object]) -> int:
-    graph_obj = result.get("iterative_context")
-    graph = graph_obj.get("graph") if isinstance(graph_obj, MutableMapping) else {}
-    nodes = graph.get("nodes") if isinstance(graph, MutableMapping) else None
-    return len(nodes) if isinstance(nodes, list) else 0
+def _safe_get_nodes(bucket: object) -> list[Any]:
+    if not isinstance(bucket, Mapping):
+        return []
+    nodes = bucket.get("nodes")
+    return nodes if isinstance(nodes, list) else []
 
 
-def _jc_node_count(result: Mapping[str, object]) -> int:
-    jc_obj = result.get("jcodemunch")
-    bundle = jc_obj.get("bundle") if isinstance(jc_obj, MutableMapping) else {}
-    if not isinstance(bundle, MutableMapping):
-        return 0
-    if "symbols" in bundle and isinstance(bundle["symbols"], list):
-        return len(bundle["symbols"])
-    # Single-symbol responses still count as one if no error is present.
-    if "error" in bundle:
-        return 0
-    return 1 if bundle else 0
+def _normalize_nodes(result: Mapping[str, object], key: str) -> list[Any]:
+    bucket = result.get(key)
+    if not isinstance(bucket, Mapping):
+        return []
+    if "nodes" in bucket:
+        return _safe_get_nodes(bucket)
+    if "graph" in bucket and isinstance(bucket["graph"], Mapping):
+        return _safe_get_nodes(bucket["graph"])
+    if "bundle" in bucket and isinstance(bucket["bundle"], Mapping):
+        symbols = bucket["bundle"].get("symbols")
+        return symbols if isinstance(symbols, list) else []
+    return []
 
 
-def score(result: Mapping[str, object]) -> dict[str, float | int]:
+def _node_identifier(node: Any) -> str | None:
+    if isinstance(node, Mapping):
+        for key in ("id", "symbol_id", "symbol", "name"):
+            val = node.get(key)
+            if isinstance(val, (str, int)):
+                return str(val)
+    return None
+
+
+def _unique_count(nodes: Iterable[Any]) -> int:
+    seen: set[str] = set()
+    unique = 0
+    for idx, node in enumerate(nodes):
+        ident = _node_identifier(node)
+        if ident is None:
+            ident = f"_anon_{idx}"
+        if ident in seen:
+            continue
+        seen.add(ident)
+        unique += 1
+    return unique
+
+
+def score(result: Mapping[str, object]) -> Dict[str, object]:
     """
-    Compute deterministic metrics comparing iterative-context and jcodemunch outputs.
-
-    Coverage is approximated by node counts; the score rewards greater coverage
-    while gently penalizing overly large graphs.
+    Deterministic scoring that rewards unique, efficient exploration.
     """
-    ic_nodes = _ic_node_count(result)
-    jc_nodes = _jc_node_count(result)
+    ic_nodes_list = _normalize_nodes(result, "iterative_context")
+    jc_nodes_list = _normalize_nodes(result, "jcodemunch")
 
-    coverage_delta = ic_nodes - jc_nodes
-    efficiency_penalty = 0.05 * ic_nodes
-    total_score = float(coverage_delta - efficiency_penalty)
+    ic_total = len(ic_nodes_list)
+    jc_total = len(jc_nodes_list)
+
+    ic_unique = _unique_count(ic_nodes_list)
+    jc_unique = _unique_count(jc_nodes_list)
+
+    # Advantage of iterative-context over jcodemunch in unique discoveries.
+    coverage_delta = ic_unique - jc_unique
+
+    # Efficiency: unique nodes per explored node (higher is better).
+    efficiency_ic = ic_unique / max(ic_total, 1)
+
+    # Redundancy: proportion of duplicate exploration (higher is worse).
+    redundancy_ic = 1.0 - efficiency_ic if ic_total else 0.0
+
+    score_val = (
+        coverage_delta * 1.0
+        + efficiency_ic * 0.5
+        - redundancy_ic * 0.25
+    )
 
     return {
-        "ic_nodes": int(ic_nodes),
-        "jc_nodes": int(jc_nodes),
-        "coverage_delta": int(coverage_delta),
-        "score": total_score,
+        "ic_nodes": ic_total,
+        "jc_nodes": jc_total,
+        "unique_ic_nodes": ic_unique,
+        "unique_jc_nodes": jc_unique,
+        "coverage_delta": coverage_delta,
+        "efficiency_ic": efficiency_ic,
+        "redundancy_ic": redundancy_ic,
+        "score": float(score_val),
     }
 </file>
 
 <file path="writer.py">
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable, cast
+import os
+from typing import Any
 
-from cerebras.cloud.sdk import Cerebras
+from openai import OpenAI
 
-_client: Cerebras | None = None
+from .utils.env import load_env
+
+_client: OpenAI | None = None
 
 
-def _get_client() -> Cerebras:
+def _get_client() -> OpenAI:
     global _client  # noqa: PLW0603
     if _client is None:
-        _client = Cerebras()
+        load_env()
+        api_key = os.environ.get("CEREBRAS_API_KEY")
+        if not api_key:
+            raise RuntimeError("Missing CEREBRAS_API_KEY in environment")
+        _client = OpenAI(
+            base_url="https://api.cerebras.ai/v1",
+            api_key=api_key,
+        )
+        print("[LLM] Using model: gpt-oss-120b")
     return _client
 
 
-def _coerce_content(raw: Any) -> str:
-    if isinstance(raw, str):
-        return raw
-    if isinstance(raw, list):
-        return "".join(part if isinstance(part, str) else str(part) for part in raw)
-    return str(raw)
-
-
-def generate_policy(feedback: dict[str, Any], current_policy: str) -> str:
+def generate_policy(
+    feedback: dict[str, Any],
+    current_policy: str,
+    tests: str,
+    scoring_context: str,
+    feedback_str: str,
+    guidance_hint: str,
+    diff_str: str,
+    diff_hint: str,
+) -> str:
     """
-    Request an updated policy from Cerebras given feedback metrics and current code.
+    Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
     client = _get_client()
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You write Python code for harness/policy.py. "
-                "Only return valid Python that defines `def score(node, state) -> float:`. "
-                "Keep behavior deterministic and side-effect free."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Current policy code:\n"
-                f"```python\n{current_policy}\n```\n\n"
-                "Feedback metrics:\n"
-                f"{feedback}\n\n"
-                "Update the policy to improve the score."
-            ),
-        },
-    ]
+    response = client.chat.completions.create(
+        model="gpt-oss-120b",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are optimizing a scoring function for a graph search system. Output ONLY valid Python.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Current policy:\n{current_policy}\n\n"
+                    f"Structured feedback:\n{feedback_str or feedback}\n\n"
+                    f"Guidance:\n{guidance_hint}\n\n"
+                    f"{diff_str}\n\n"
+                    f"Diff guidance:\n{diff_hint}\n\n"
+                    f"Tests (source of truth, do not modify):\n{tests}\n\n"
+                    f"Scoring interface + examples (STRICT CONTRACT):\n{scoring_context}\n\n"
+                    "Instructions:\n"
+                    "- Fix errors in order of priority:\n"
+                    "  1. TYPE ERRORS\n"
+                    "  2. LINT ERRORS\n"
+                    "  3. TEST FAILURES\n\n"
+                    "- Do NOT attempt to optimize until all tests pass\n"
+                    "- MUST define: def score(node, state) -> float\n"
+                    "- MUST be deterministic\n"
+                    "- MUST NOT import external libraries\n"
+                    "- MUST operate only on provided node/state data\n\n"
+                    "Return ONLY valid Python code implementing the score function.\n"
+                ),
+            },
+        ],
+    )
 
-    create = cast(Callable[..., Any], client.chat.completions.create)
-    response = create(model="llama3.1-8b", messages=messages)
-    choices = getattr(response, "choices", None)
-    if not choices:
-        raise ValueError("Cerebras response contained no choices")
+    code = response.choices[0].message.content
+    if code is None or "def score" not in code:
+        raise ValueError("Invalid policy: missing score function")
 
-    first = choices[0]
-    message = getattr(first, "message", None)
-    if message is None and isinstance(first, dict):
-        message = first.get("message")
-
-    content = None
-    if message is not None:
-        content = getattr(message, "content", None)
-        if content is None and isinstance(message, dict):
-            content = message.get("content")
-
-    if content is None and hasattr(first, "text"):
-        content = getattr(first, "text")
-    if content is None and isinstance(first, dict):
-        content = first.get("text")
-
-    if content is None:
-        raise ValueError("Cerebras response missing message content")
-
-    return _coerce_content(content)
+    compile(code, "<policy>", "exec")
+    return code
 </file>
 
 </files>

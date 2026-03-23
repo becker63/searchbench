@@ -1,76 +1,82 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable, cast
+import os
+from typing import Any
 
-from cerebras.cloud.sdk import Cerebras
+from openai import OpenAI
 
-_client: Cerebras | None = None
+from .utils.env import load_env
+
+_client: OpenAI | None = None
 
 
-def _get_client() -> Cerebras:
+def _get_client() -> OpenAI:
     global _client  # noqa: PLW0603
     if _client is None:
-        _client = Cerebras()
+        load_env()
+        api_key = os.environ.get("CEREBRAS_API_KEY")
+        if not api_key:
+            raise RuntimeError("Missing CEREBRAS_API_KEY in environment")
+        _client = OpenAI(
+            base_url="https://api.cerebras.ai/v1",
+            api_key=api_key,
+        )
+        model = os.environ.get("WRITER_MODEL", "gpt-oss-120b")
+        print(f"[LLM] Writer model: {model}")
     return _client
 
 
-def _coerce_content(raw: Any) -> str:
-    if isinstance(raw, str):
-        return raw
-    if isinstance(raw, list):
-        return "".join(part if isinstance(part, str) else str(part) for part in raw)
-    return str(raw)
-
-
-def generate_policy(feedback: dict[str, Any], current_policy: str) -> str:
+def generate_policy(
+    feedback: dict[str, Any],
+    current_policy: str,
+    tests: str,
+    scoring_context: str,
+    feedback_str: str,
+    guidance_hint: str,
+    diff_str: str,
+    diff_hint: str,
+) -> str:
     """
-    Request an updated policy from Cerebras given feedback metrics and current code.
+    Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
     client = _get_client()
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You write Python code for harness/policy.py. "
-                "Only return valid Python that defines `def score(node, state) -> float:`. "
-                "Keep behavior deterministic and side-effect free."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Current policy code:\n"
-                f"```python\n{current_policy}\n```\n\n"
-                "Feedback metrics:\n"
-                f"{feedback}\n\n"
-                "Update the policy to improve the score."
-            ),
-        },
-    ]
+    model = os.environ.get("WRITER_MODEL", "gpt-oss-120b")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are optimizing a scoring function for a graph search system. Output ONLY valid Python.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Current policy:\n{current_policy}\n\n"
+                    f"Structured feedback:\n{feedback_str or feedback}\n\n"
+                    f"Guidance:\n{guidance_hint}\n\n"
+                    f"{diff_str}\n\n"
+                    f"Diff guidance:\n{diff_hint}\n\n"
+                    f"Tests (source of truth, do not modify):\n{tests}\n\n"
+                    f"Scoring interface + examples (STRICT CONTRACT):\n{scoring_context}\n\n"
+                    "Instructions:\n"
+                    "- Fix errors in order of priority:\n"
+                    "  1. TYPE ERRORS\n"
+                    "  2. LINT ERRORS\n"
+                    "  3. TEST FAILURES\n\n"
+                    "- Do NOT attempt to optimize until all tests pass\n"
+                    "- MUST define: def score(node, state) -> float\n"
+                    "- MUST be deterministic\n"
+                    "- MUST NOT import external libraries\n"
+                    "- MUST operate only on provided node/state data\n\n"
+                    "Return ONLY valid Python code implementing the score function.\n"
+                ),
+            },
+        ],
+    )
 
-    create = cast(Callable[..., Any], client.chat.completions.create)
-    response = create(model="llama3.1-8b", messages=messages)
-    choices = getattr(response, "choices", None)
-    if not choices:
-        raise ValueError("Cerebras response contained no choices")
+    code = response.choices[0].message.content
+    if code is None or "def score" not in code:
+        raise ValueError("Invalid policy: missing score function")
 
-    first = choices[0]
-    message = getattr(first, "message", None)
-    if message is None and isinstance(first, dict):
-        message = first.get("message")
-
-    content = None
-    if message is not None:
-        content = getattr(message, "content", None)
-        if content is None and isinstance(message, dict):
-            content = message.get("content")
-
-    if content is None and hasattr(first, "text"):
-        content = getattr(first, "text")
-    if content is None and isinstance(first, dict):
-        content = first.get("text")
-
-    if content is None:
-        raise ValueError("Cerebras response missing message content")
-
-    return _coerce_content(content)
+    compile(code, "<policy>", "exec")
+    return code
