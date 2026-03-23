@@ -1,0 +1,385 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+loop.py
+policy_loader.py
+policy.py
+pyproject.toml
+runner.py
+scorer.py
+writer.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="loop.py">
+from __future__ import annotations
+
+from collections.abc import Mapping
+from pathlib import Path
+
+from .policy_loader import load_policy
+from .runner import run_both
+from .scorer import score
+from .writer import generate_policy
+
+_POLICY_PATH = Path(__file__).with_name("policy.py")
+
+
+def _read_policy() -> str:
+    return _POLICY_PATH.read_text(encoding="utf-8")
+
+
+def _write_policy(code: str) -> None:
+    _ = _POLICY_PATH.write_text(code, encoding="utf-8")
+
+
+def run_loop(task: Mapping[str, object], iterations: int = 5) -> list[dict[str, float | int]]:
+    """
+    Closed-loop optimizer: execute, score, rewrite policy, repeat.
+    """
+    history: list[dict[str, float | int]] = []
+
+    for _ in range(iterations):
+        score_fn = load_policy()
+        result = run_both(dict(task), score_fn)
+        metrics = score(result)
+
+        current_code = _read_policy()
+        new_code = generate_policy(metrics, current_code)
+        _write_policy(new_code)
+
+        history.append(metrics)
+
+    return history
+</file>
+
+<file path="policy_loader.py">
+from __future__ import annotations
+
+import importlib.util
+import sys
+import uuid
+from pathlib import Path
+from typing import Callable, cast
+
+
+def load_policy() -> Callable[[object, object], float]:
+    """
+    Load the current policy module fresh and return its score callable.
+
+    A unique module name is used per load to avoid reusing cached modules.
+    """
+    policy_path = Path(__file__).with_name("policy.py")
+    if not policy_path.exists():
+        raise FileNotFoundError(f"Policy file not found at {policy_path}")
+
+    module_name = f"harness_policy_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, policy_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load policy module from {policy_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+    score_fn = getattr(module, "score", None)
+    if not callable(score_fn):
+        raise AttributeError("Policy module must define a callable 'score(node, state)'")
+
+    return cast(Callable[[object, object], float], score_fn)
+</file>
+
+<file path="policy.py">
+def score(node: object, state: object) -> float:
+    return 0.0
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "harness"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "cerebras-cloud-sdk>=1.67.0",
+    "iterative-context",   # 👈 local workspace dep
+    "jcodemunch-mcp",
+    "pydantic>=2",
+    "rich",                # nice CLI/logging
+]
+
+[tool.uv.sources]
+jcodemunch-mcp = { workspace = true }
+iterative-context = { workspace = true }
+</file>
+
+<file path="runner.py">
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+from typing import Any, Callable
+
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.types import CallToolResult, TextContent
+
+from iterative_context import exploration
+from iterative_context.graph_models import Graph, GraphNode
+from iterative_context.server import create_mcp_server
+from iterative_context.types import SelectionCallable
+from jcodemunch_mcp.server import run_streamable_http_server
+
+
+def _require_str(mapping: dict[str, Any], key: str) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"task must include a non-empty string for '{key}'")
+    return value
+
+
+async def _jc_via_server(repo: str, symbol_id: str, host: str, port: int) -> dict[str, Any]:
+    server_task = asyncio.create_task(run_streamable_http_server(host, port))
+    try:
+        await asyncio.sleep(0.2)  # brief startup delay
+        async with streamable_http_client(f"http://{host}:{port}/mcp") as (read_stream, write_stream, _):
+            session = ClientSession(read_stream, write_stream)
+            await session.initialize()
+            result: CallToolResult = await session.call_tool(
+                "get_context_bundle",
+                {"repo": repo, "symbol_id": symbol_id, "output_format": "json"},
+            )
+            if not result.content:
+                return {"error": "empty response"}
+            first = result.content[0]
+            if isinstance(first, TextContent):
+                try:
+                    return json.loads(first.text)
+                except json.JSONDecodeError:
+                    return {"raw": first.text}
+            if isinstance(first, dict):
+                payload = first.get("text")
+                if isinstance(payload, str):
+                    try:
+                        return json.loads(payload)
+                    except json.JSONDecodeError:
+                        return {"raw": payload}
+            return {"raw": result.model_dump()}
+    finally:
+        server_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await server_task
+
+
+def _call_jcodemunch(repo: str, symbol_id: str) -> dict[str, Any]:
+    return asyncio.run(_jc_via_server(repo, symbol_id, host="127.0.0.1", port=8901))
+
+
+def run_both(task: dict[str, object], score_fn: Callable[[object, object], float]):
+    """
+    Run both iterative-context and jcodemunch MCP servers against the same symbol.
+
+    The injected score_fn is wired into iterative-context via the MCP server
+    creation to influence traversal.
+    """
+    symbol = _require_str(task, "symbol")
+    repo = _require_str(task, "repo")
+    depth_raw = task.get("depth", 2)
+    if isinstance(depth_raw, (int, str)):
+        try:
+            depth = int(depth_raw)
+        except (TypeError, ValueError):
+            depth = 2
+    else:
+        depth = 2
+
+    # Adapt the policy to the traversal signature.
+    def ic_score(node: GraphNode, graph: Graph, step: int) -> float:
+        state: dict[str, object] = {"graph": graph, "step": step}
+        return float(score_fn(node, state))
+
+    traversal_score: SelectionCallable = ic_score
+
+    # Instantiate MCP servers to mirror how agents will use them.
+    create_mcp_server(score_fn=traversal_score)
+    exploration.ensure_graph_loaded()
+    ic_graph = exploration.resolve_and_expand(symbol, depth=depth, score_fn=traversal_score)
+
+    symbol_id = str(task.get("symbol_id") or symbol)
+    jc_result = _call_jcodemunch(repo, symbol_id)
+
+    return {
+        "iterative_context": {"graph": ic_graph, "symbol": symbol, "depth": depth},
+        "jcodemunch": {"bundle": jc_result, "symbol": symbol_id, "repo": repo},
+    }
+</file>
+
+<file path="scorer.py">
+from __future__ import annotations
+
+from collections.abc import Mapping, MutableMapping
+
+
+def _ic_node_count(result: Mapping[str, object]) -> int:
+    graph_obj = result.get("iterative_context")
+    graph = graph_obj.get("graph") if isinstance(graph_obj, MutableMapping) else {}
+    nodes = graph.get("nodes") if isinstance(graph, MutableMapping) else None
+    return len(nodes) if isinstance(nodes, list) else 0
+
+
+def _jc_node_count(result: Mapping[str, object]) -> int:
+    jc_obj = result.get("jcodemunch")
+    bundle = jc_obj.get("bundle") if isinstance(jc_obj, MutableMapping) else {}
+    if not isinstance(bundle, MutableMapping):
+        return 0
+    if "symbols" in bundle and isinstance(bundle["symbols"], list):
+        return len(bundle["symbols"])
+    # Single-symbol responses still count as one if no error is present.
+    if "error" in bundle:
+        return 0
+    return 1 if bundle else 0
+
+
+def score(result: Mapping[str, object]) -> dict[str, float | int]:
+    """
+    Compute deterministic metrics comparing iterative-context and jcodemunch outputs.
+
+    Coverage is approximated by node counts; the score rewards greater coverage
+    while gently penalizing overly large graphs.
+    """
+    ic_nodes = _ic_node_count(result)
+    jc_nodes = _jc_node_count(result)
+
+    coverage_delta = ic_nodes - jc_nodes
+    efficiency_penalty = 0.05 * ic_nodes
+    total_score = float(coverage_delta - efficiency_penalty)
+
+    return {
+        "ic_nodes": int(ic_nodes),
+        "jc_nodes": int(jc_nodes),
+        "coverage_delta": int(coverage_delta),
+        "score": total_score,
+    }
+</file>
+
+<file path="writer.py">
+from __future__ import annotations
+
+from typing import Any, Callable, Iterable, cast
+
+from cerebras.cloud.sdk import Cerebras
+
+_client: Cerebras | None = None
+
+
+def _get_client() -> Cerebras:
+    global _client  # noqa: PLW0603
+    if _client is None:
+        _client = Cerebras()
+    return _client
+
+
+def _coerce_content(raw: Any) -> str:
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        return "".join(part if isinstance(part, str) else str(part) for part in raw)
+    return str(raw)
+
+
+def generate_policy(feedback: dict[str, Any], current_policy: str) -> str:
+    """
+    Request an updated policy from Cerebras given feedback metrics and current code.
+    """
+    client = _get_client()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You write Python code for harness/policy.py. "
+                "Only return valid Python that defines `def score(node, state) -> float:`. "
+                "Keep behavior deterministic and side-effect free."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Current policy code:\n"
+                f"```python\n{current_policy}\n```\n\n"
+                "Feedback metrics:\n"
+                f"{feedback}\n\n"
+                "Update the policy to improve the score."
+            ),
+        },
+    ]
+
+    create = cast(Callable[..., Any], client.chat.completions.create)
+    response = create(model="llama3.1-8b", messages=messages)
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise ValueError("Cerebras response contained no choices")
+
+    first = choices[0]
+    message = getattr(first, "message", None)
+    if message is None and isinstance(first, dict):
+        message = first.get("message")
+
+    content = None
+    if message is not None:
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+
+    if content is None and hasattr(first, "text"):
+        content = getattr(first, "text")
+    if content is None and isinstance(first, dict):
+        content = first.get("text")
+
+    if content is None:
+        raise ValueError("Cerebras response missing message content")
+
+    return _coerce_content(content)
+</file>
+
+</files>

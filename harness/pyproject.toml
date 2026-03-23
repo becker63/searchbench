@@ -3,6 +3,7 @@ name = "harness"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "cerebras-cloud-sdk>=1.67.0",
     "iterative-context",   # 👈 local workspace dep
     "jcodemunch-mcp",
     "pydantic>=2",
@@ -10,5 +11,5 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-iterative-context = { workspace = true }
 jcodemunch-mcp = { workspace = true }
+iterative-context = { workspace = true }
