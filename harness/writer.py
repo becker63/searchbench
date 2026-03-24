@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from openai import OpenAI
@@ -41,40 +42,61 @@ def generate_policy(
     """
     client = _get_client()
     model = os.environ.get("WRITER_MODEL", "gpt-oss-120b")
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are optimizing a scoring function for a graph search system. Output ONLY valid Python.",
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Current policy:\n{current_policy}\n\n"
-                    f"Structured feedback:\n{feedback_str or feedback}\n\n"
-                    f"Guidance:\n{guidance_hint}\n\n"
-                    f"{diff_str}\n\n"
-                    f"Diff guidance:\n{diff_hint}\n\n"
-                    f"Tests (source of truth, do not modify):\n{tests}\n\n"
-                    f"Scoring interface + examples (STRICT CONTRACT):\n{scoring_context}\n\n"
-                    "Instructions:\n"
-                    "- Fix errors in order of priority:\n"
-                    "  1. TYPE ERRORS\n"
-                    "  2. LINT ERRORS\n"
-                    "  3. TEST FAILURES\n\n"
-                    "- Do NOT attempt to optimize until all tests pass\n"
-                    "- MUST define: def score(node, state) -> float\n"
-                    "- MUST be deterministic\n"
-                    "- MUST NOT import external libraries\n"
-                    "- MUST operate only on provided node/state data\n\n"
-                    "Return ONLY valid Python code implementing the score function.\n"
-                ),
-            },
-        ],
-    )
+    response = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are optimizing a scoring function for a graph search system. "
+                            "Output ONLY raw Python. No markdown. No backticks."
+                            "\nSTRICT RULES:\n"
+                            "- You MUST NOT use import statements\n"
+                            "- You MUST NOT reference external modules\n"
+                            "- You MUST NOT access the filesystem\n"
+                            "- Only use built-in Python operations\n"
+                            "Any violation will cause immediate failure."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Current policy:\n{current_policy}\n\n"
+                            f"Structured feedback:\n{feedback_str or feedback}\n\n"
+                            f"Guidance:\n{guidance_hint}\n\n"
+                            f"{diff_str}\n\n"
+                            f"Diff guidance:\n{diff_hint}\n\n"
+                            f"Tests (source of truth, do not modify):\n{tests}\n\n"
+                            f"Scoring interface + examples (STRICT CONTRACT):\n{scoring_context}\n\n"
+                            "Instructions:\n"
+                            "- Fix errors in order of priority:\n"
+                            "  1. TYPE ERRORS\n"
+                            "  2. LINT ERRORS\n"
+                            "  3. TEST FAILURES\n\n"
+                            "- Do NOT attempt to optimize until all tests pass\n"
+                            "- MUST define: def score(node, state) -> float\n"
+                            "- MUST be deterministic\n"
+                            "- MUST NOT import external libraries\n"
+                            "- MUST operate only on provided node/state data\n\n"
+                            "Return ONLY valid Python code implementing the score function.\n"
+                        ),
+                    },
+                ],
+            )
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"[WRITER RETRY] attempt={attempt} error={e}")
+            time.sleep(2 * (attempt + 1))
+    else:
+        raise RuntimeError("Writer failed after retries")
 
     code = response.choices[0].message.content
+    print("\n[WRITER RAW OUTPUT]\n")
+    print(code)
+    print("\n[END WRITER OUTPUT]\n")
     if code is None or "def score" not in code:
         raise ValueError("Invalid policy: missing score function")
 

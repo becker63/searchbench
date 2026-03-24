@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import builtins
+import inspect
 import math
 import signal
 from pathlib import Path
 from typing import Callable, cast
 
 _BANNED_IMPORTS = {"os", "sys", "subprocess", "socket", "shutil", "pathlib"}
-_ALLOWED_IMPORTS = {"math"}
+_ALLOWED_IMPORTS = {"math", "__future__", "typing"}
 _ALLOWED_BUILTINS: dict[str, object] = {
     "abs": abs,
     "min": min,
@@ -25,6 +26,7 @@ _ALLOWED_BUILTINS: dict[str, object] = {
     "set": set,
     "tuple": tuple,
     "str": str,
+    "Exception": Exception,
     "ValueError": ValueError,
     "TypeError": TypeError,
     "RuntimeError": RuntimeError,
@@ -53,15 +55,32 @@ def _build_safe_globals() -> dict[str, object]:
     return safe_globals
 
 
+def adapt_score_fn(score_fn: Callable[..., float]) -> Callable[[object, object, object], float]:
+    sig = inspect.signature(score_fn)
+    arity = len(sig.parameters)
+
+    def wrapped(*call_args: object, **call_kwargs: object) -> float:
+        node, state, context = (list(call_args) + [None, None, None])[:3]
+        if arity == 3:
+            return float(score_fn(node, state, context))
+        if arity == 2:
+            return float(score_fn(node, state))
+        if arity == 1:
+            return float(score_fn(node))
+        return 0.0
+
+    return wrapped
+
+
 def _enforce_timeout(func: Callable[[object, object], float], seconds: int = 2) -> Callable[[object, object], float]:
-    def wrapped(node: object, state: object) -> float:
+    def wrapped(*args: object, **kwargs: object) -> float:
         def handler(signum, frame):  # noqa: ANN001, ARG001
             raise TimeoutError("Policy execution timed out")
 
         previous = signal.signal(signal.SIGALRM, handler)
         signal.alarm(seconds)
         try:
-            return float(func(node, state))
+            return float(func(*args, **kwargs))
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, previous)
@@ -87,5 +106,6 @@ def load_policy() -> Callable[[object, object], float]:
     if not callable(score_fn_obj):
         raise AttributeError("Policy module must define a callable 'score(node, state)'")
 
-    score_fn_typed: Callable[[object, object], float] = cast(Callable[[object, object], float], score_fn_obj)
-    return _enforce_timeout(score_fn_typed)
+    score_fn_typed: Callable[..., float] = cast(Callable[..., float], score_fn_obj)
+    adapted = adapt_score_fn(score_fn_typed)
+    return _enforce_timeout(adapted)

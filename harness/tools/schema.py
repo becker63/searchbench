@@ -27,9 +27,12 @@ class Tool:
         self.description = description
         self.parameters = parameters
 
-    def to_spec(self) -> ToolSpec:
+    def to_spec(self) -> dict[str, Any]:
         return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
         }

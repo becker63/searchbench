@@ -20,4 +20,3 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # Import after sys.path is set to reuse the shared helper elsewhere.
-from harness.utils.repo_root import find_repo_root  # noqa: E402

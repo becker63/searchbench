@@ -7,9 +7,17 @@ from iterative_context import exploration
 
 def resolve(symbol: str) -> Optional[Dict[str, Any]]:
     exploration.ensure_graph_loaded()
+    graph = exploration.get_active_graph()
+    if graph is None or not getattr(graph, "nodes", {}):
+        raise RuntimeError("[IC ERROR] Graph is not loaded or empty")
+
+    if ":" not in symbol:
+        print(f"[IC WARNING] Symbol may be ambiguous: '{symbol}' (no file qualifier)")
+
     node: Any = exploration.resolve(symbol)
+    print(f"[IC] resolve(symbol={symbol}) -> {getattr(node, 'id', None)}")
     if node is None:
-        return None
+        raise RuntimeError(f"[IC ERROR] Failed to resolve symbol: {symbol}")
 
     graph = exploration.get_active_graph()
     extras: Dict[str, Any] = {}
@@ -28,6 +36,12 @@ def resolve(symbol: str) -> Optional[Dict[str, Any]]:
 
 def expand(node_id: str, depth: int, score_fn):
     exploration.ensure_graph_loaded()
+    graph = exploration.get_active_graph()
+    if graph is None or not getattr(graph, "nodes", {}):
+        raise RuntimeError("[IC ERROR] Graph is not loaded or empty")
+    if not node_id:
+        raise ValueError("[IC ERROR] expand called with empty node_id")
+    print(f"[IC] expand(node_id={node_id}, depth={depth})")
     return exploration.expand(node_id=node_id, depth=depth, score_fn=score_fn)
 
 

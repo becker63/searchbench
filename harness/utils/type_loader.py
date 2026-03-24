@@ -30,7 +30,8 @@ def format_scoring_context(types: str, examples: str, max_chars: int = 8000) -> 
     """
     Concatenate type definitions and reference implementations for prompt use.
     """
-    parts: list[str] = []
+    canonical = "def score(node: object, state: object, context: object) -> float: ..."
+    parts: list[str] = [f"# CANONICAL SIGNATURE\n{canonical}"]
     if types:
         parts.append(f"# TYPES (source of truth)\n{types}")
     if examples:
