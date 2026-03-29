@@ -1,30 +1,22 @@
 from __future__ import annotations
 
-import os
 import time
 from typing import Any
 
-from openai import OpenAI
+from .observability.langfuse import get_tracing_openai_client, record_score, start_span
+from .utils.env import get_cerebras_api_key, get_writer_model
 
-from .utils.env import load_env
-
-_client: OpenAI | None = None
+_client: Any | None = None
 
 
-def _get_client() -> OpenAI:
+def _get_client():
     global _client  # noqa: PLW0603
     if _client is None:
-        load_env()
-        api_key = os.environ.get("CEREBRAS_API_KEY")
+        api_key = get_cerebras_api_key()
         if not api_key:
             raise RuntimeError("Missing CEREBRAS_API_KEY in environment")
-        _client = OpenAI(
-            base_url="https://api.cerebras.ai/v1",
-            api_key=api_key,
-        )
-        model = os.environ.get("WRITER_MODEL", "gpt-oss-120b")
-        print(f"[LLM] Writer model: {model}")
-    return _client
+        _client = get_tracing_openai_client(base_url="https://api.cerebras.ai/v1", api_key=api_key)
+    return _client, get_writer_model()
 
 
 def generate_policy(
@@ -36,14 +28,21 @@ def generate_policy(
     guidance_hint: str,
     diff_str: str,
     diff_hint: str,
+    comparison_summary: str | None = None,
+    parent_trace=None,
 ) -> str:
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
-    client = _get_client()
-    model = os.environ.get("WRITER_MODEL", "gpt-oss-120b")
+    client, model = _get_client()
+    if client is None or not hasattr(client, "chat"):
+        raise RuntimeError("Writer client is not available")
+    writer_obs = start_span(parent_trace, "policy_writer", metadata={"model": model})
     response = None
+    record_score(writer_obs, "writer.policy_generated", False)
+    record_score(writer_obs, "writer.policy_compiled", False)
     for attempt in range(3):
+        attempt_obs = start_span(writer_obs, f"writer_attempt_{attempt}", metadata={"attempt": attempt, "model": model})
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -66,6 +65,7 @@ def generate_policy(
                         "content": (
                             f"Current policy:\n{current_policy}\n\n"
                             f"Structured feedback:\n{feedback_str or feedback}\n\n"
+                            f"Baseline comparison:\n{comparison_summary or 'N/A'}\n\n"
                             f"Guidance:\n{guidance_hint}\n\n"
                             f"{diff_str}\n\n"
                             f"Diff guidance:\n{diff_hint}\n\n"
@@ -86,19 +86,50 @@ def generate_policy(
                     },
                 ],
             )
+            if attempt_obs and hasattr(attempt_obs, "end"):
+                try:
+                    attempt_obs.end(metadata={"model": model})
+                except Exception:
+                    pass
             break
         except Exception as e:  # noqa: BLE001
-            print(f"[WRITER RETRY] attempt={attempt} error={e}")
+            if attempt_obs and hasattr(attempt_obs, "end"):
+                try:
+                    attempt_obs.end(error=e)
+                except Exception:
+                    pass
             time.sleep(2 * (attempt + 1))
     else:
+        if writer_obs and hasattr(writer_obs, "end"):
+            try:
+                writer_obs.end(error="writer_failed")
+            except Exception:
+                pass
         raise RuntimeError("Writer failed after retries")
 
     code = response.choices[0].message.content
-    print("\n[WRITER RAW OUTPUT]\n")
-    print(code)
-    print("\n[END WRITER OUTPUT]\n")
     if code is None or "def score" not in code:
+        if writer_obs and hasattr(writer_obs, "end"):
+            try:
+                writer_obs.end(error="missing_score_function")
+            except Exception:
+                pass
         raise ValueError("Invalid policy: missing score function")
 
-    compile(code, "<policy>", "exec")
+    try:
+        compile(code, "<policy>", "exec")
+        record_score(writer_obs, "writer.policy_compiled", True, metadata={"model": model})
+    except Exception as exc:  # noqa: BLE001
+        if writer_obs and hasattr(writer_obs, "end"):
+            try:
+                writer_obs.end(error=exc, metadata={"model": model})
+            except Exception:
+                pass
+        raise
+    record_score(writer_obs, "writer.policy_generated", True, metadata={"model": model})
+    if writer_obs and hasattr(writer_obs, "end"):
+        try:
+            writer_obs.end(metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
+        except Exception:
+            pass
     return code

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 
 class OpenAIToolFunction(TypedDict):
     name: str
     description: str
-    parameters: dict
+    parameters: dict[str, Any]
 
 
 class OpenAITool(TypedDict):
@@ -18,7 +18,7 @@ class OpenAITool(TypedDict):
 class ToolCall(TypedDict):
     id: str
     name: str
-    arguments: dict
+    arguments: dict[str, Any]
 
 
 def build_tool_response(call_id: str, content: str) -> dict[str, str]:
@@ -29,7 +29,7 @@ def build_tool_response(call_id: str, content: str) -> dict[str, str]:
     }
 
 
-def parse_arguments(raw: str | dict) -> dict:
+def parse_arguments(raw: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw, str):
         return json.loads(raw)
     return raw

@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from typing import Any, Coroutine, Iterable, TypeVar
+from collections.abc import Awaitable, Iterable
+from typing import Any, TypeVar
 
 from mcp.types import TextContent, Tool as MCPTool
 
@@ -44,7 +45,7 @@ def parse_text_content_payload(blocks: Iterable[TextContent] | None) -> Any:
     return None
 
 
-def run_async(coro: asyncio.Future[T] | Coroutine[Any, Any, T]) -> T:
+def run_async(coro: Awaitable[T]) -> T:
     """
     Run an async coroutine from sync code safely.
 
@@ -52,10 +53,13 @@ def run_async(coro: asyncio.Future[T] | Coroutine[Any, Any, T]) -> T:
     - If a loop is already running on this thread: execute the coroutine inside a
       fresh event loop on a dedicated background thread to avoid deadlocks.
     """
+    async def _awaitable() -> T:
+        return await coro
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(_awaitable())
 
     result: list[T] = []
     error: list[BaseException] = []
@@ -64,7 +68,7 @@ def run_async(coro: asyncio.Future[T] | Coroutine[Any, Any, T]) -> T:
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
-            result.append(loop.run_until_complete(coro))
+            result.append(loop.run_until_complete(_awaitable()))
         except BaseException as exc:  # pragma: no cover - exercised in tests
             error.append(exc)
         finally:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Dict
+from typing import Dict, cast
 
 
 def _obs_count(bucket: Mapping[str, object] | None) -> int:
@@ -12,8 +12,10 @@ def _obs_count(bucket: Mapping[str, object] | None) -> int:
 
 
 def score(result: Mapping[str, object]) -> Dict[str, object]:
-    ic_obs = _obs_count(result.get("iterative_context"))
-    jc_obs = _obs_count(result.get("jcodemunch"))
+    ic_bucket = cast(Mapping[str, object] | None, result.get("iterative_context"))
+    jc_bucket = cast(Mapping[str, object] | None, result.get("jcodemunch"))
+    ic_obs = _obs_count(ic_bucket)
+    jc_obs = _obs_count(jc_bucket)
     coverage_delta = ic_obs - jc_obs
     score_val = float(coverage_delta)
     return {

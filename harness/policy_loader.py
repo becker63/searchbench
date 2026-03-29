@@ -1,58 +1,9 @@
 from __future__ import annotations
 
-import builtins
+import importlib.util
 import inspect
-import math
-import signal
 from pathlib import Path
 from typing import Callable, cast
-
-_BANNED_IMPORTS = {"os", "sys", "subprocess", "socket", "shutil", "pathlib"}
-_ALLOWED_IMPORTS = {"math", "__future__", "typing"}
-_ALLOWED_BUILTINS: dict[str, object] = {
-    "abs": abs,
-    "min": min,
-    "max": max,
-    "sum": sum,
-    "len": len,
-    "float": float,
-    "int": int,
-    "bool": bool,
-    "range": range,
-    "enumerate": enumerate,
-    "zip": zip,
-    "list": list,
-    "dict": dict,
-    "set": set,
-    "tuple": tuple,
-    "str": str,
-    "Exception": Exception,
-    "ValueError": ValueError,
-    "TypeError": TypeError,
-    "RuntimeError": RuntimeError,
-    "__build_class__": builtins.__build_class__,
-    "__name__": "policy",
-}
-
-
-def _safe_import(
-    name: str,
-    globals: dict[str, object] | None = None,
-    locals: dict[str, object] | None = None,
-    fromlist: tuple[str, ...] | list[str] = (),
-    level: int = 0,
-) -> object:
-    root = name.split(".")[0]
-    if root in _BANNED_IMPORTS or (root not in _ALLOWED_IMPORTS and root != ""):
-        raise ImportError(f"Import of '{name}' is not allowed")
-    return builtins.__import__(name, globals, locals, fromlist, level)
-
-
-def _build_safe_globals() -> dict[str, object]:
-    safe_builtins: dict[str, object] = dict(_ALLOWED_BUILTINS)
-    safe_builtins["__import__"] = _safe_import  # type: ignore[assignment]
-    safe_globals: dict[str, object] = {"__builtins__": safe_builtins, "math": math}
-    return safe_globals
 
 
 def adapt_score_fn(score_fn: Callable[..., float]) -> Callable[[object, object, object], float]:
@@ -72,40 +23,24 @@ def adapt_score_fn(score_fn: Callable[..., float]) -> Callable[[object, object, 
     return wrapped
 
 
-def _enforce_timeout(func: Callable[[object, object], float], seconds: int = 2) -> Callable[[object, object], float]:
-    def wrapped(*args: object, **kwargs: object) -> float:
-        def handler(signum, frame):  # noqa: ANN001, ARG001
-            raise TimeoutError("Policy execution timed out")
-
-        previous = signal.signal(signal.SIGALRM, handler)
-        signal.alarm(seconds)
-        try:
-            return float(func(*args, **kwargs))
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous)
-
-    return wrapped
-
-
-def load_policy() -> Callable[[object, object], float]:
+def load_policy() -> Callable[[object, object, object], float]:
     """
-    Load the current policy module with restricted execution and return its score callable.
+    Load the current policy module and return its score callable (adapted to node, state, context).
     """
     policy_path = Path(__file__).with_name("policy.py")
     if not policy_path.exists():
         raise FileNotFoundError(f"Policy file not found at {policy_path}")
 
-    safe_globals = _build_safe_globals()
-    code = policy_path.read_text(encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("policy", policy_path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Unable to load policy module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[arg-type]
 
-    compiled = compile(code, str(policy_path), "exec")
-    exec(compiled, safe_globals, safe_globals)  # noqa: S102
-
-    score_fn_obj = safe_globals.get("score")
+    score_fn_obj = getattr(module, "score", None)
     if not callable(score_fn_obj):
-        raise AttributeError("Policy module must define a callable 'score(node, state)'")
+        raise AttributeError("Policy module must define a callable 'score'")
 
     score_fn_typed: Callable[..., float] = cast(Callable[..., float], score_fn_obj)
-    adapted = adapt_score_fn(score_fn_typed)
-    return _enforce_timeout(adapted)
+    adapted: Callable[[object, object, object], float] = adapt_score_fn(score_fn_typed)
+    return adapted

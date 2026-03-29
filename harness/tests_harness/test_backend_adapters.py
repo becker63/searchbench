@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from mcp.types import TextContent, Tool
@@ -16,6 +17,7 @@ from harness.tools.mcp_adapter import (
     run_async,
     serialize_tool_result_for_model,
 )
+from harness.utils.openai_schema import OpenAITool
 
 
 async def _sample_coroutine(loop_ids: list[int] | None = None) -> str:
@@ -66,8 +68,10 @@ def test_ic_backend_uses_server_surfaces(monkeypatch):
     monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
 
-    score_fn = lambda a, b: 1.0
-    backend = IterativeContextBackend(score_fn=score_fn)
+    def score_fn(a, b):
+        return 1.0
+
+    backend = IterativeContextBackend(repo="/tmp", score_fn=score_fn)
 
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
     assert runtime_score_args == [score_fn]
@@ -77,7 +81,7 @@ def test_ic_backend_uses_server_surfaces(monkeypatch):
     assert calls == [("resolve", {"symbol": "foo"})]
 
 
-def test_jc_backend_uses_server_surfaces(monkeypatch):
+def test_jc_backend_uses_server_surfaces(monkeypatch, tmp_path):
     dummy_tool = Tool(
         name="search_symbols",
         description="search",
@@ -95,13 +99,13 @@ def test_jc_backend_uses_server_surfaces(monkeypatch):
     monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
 
-    backend = JCodeMunchBackend()
+    backend = JCodeMunchBackend(repo=str(tmp_path))
 
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
 
     result = backend.dispatch("search_symbols", {"query": "foo"})
     assert result == {"result": "ok", "args": {"query": "foo"}}
-    assert call_args == [("search_symbols", {"query": "foo"})]
+    assert ("search_symbols", {"query": "foo"}) in call_args
 
 
 def test_parse_text_content_payload_handles_json_and_text():
@@ -175,10 +179,10 @@ def _dummy_client(tool_name: str, args: dict[str, Any]):
         def __init__(self):
             self.chat = DummyChat()
 
-    return DummyClient()
+    return DummyClient(), "dummy-model"
 
 
-def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch):
+def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp_path):
     dummy_tool = Tool(
         name="resolve",
         description="resolve",
@@ -205,14 +209,16 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch):
     monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve", {"symbol": "foo"}))
 
-    result = runner.run_ic_iteration({"symbol": "s", "repo": "r"}, score_fn=lambda n, s: 1.0, steps=1)
+    result = cast(dict[str, Any], runner.run_ic_iteration({"symbol": "s", "repo": str(tmp_path)}, score_fn=lambda n, s: 1.0, steps=1))
     assert result["node_count"] == 2
-    assert result["observations"][0]["result"]["full_graph"] == {"nodes": [1, 2]}
-    assert result["observations"][0]["result"]["score_source"] == "injected"
-    assert result["observations"][0]["result"]["node"] == {"id": "n1"}
+    first_obs = cast(dict[str, Any], result["observations"][0])
+    payload = cast(dict[str, Any], first_obs["result"])
+    assert payload["full_graph"] == {"nodes": [1, 2]}
+    assert payload["score_source"] == "injected"
+    assert payload["node"] == {"id": "n1"}
 
 
-def test_run_jc_iteration_uses_call_tool(monkeypatch):
+def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
     dummy_tool = Tool(
         name="search_symbols",
         description="search",
@@ -229,16 +235,112 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch):
     monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_symbols", {"query": "foo"}))
 
-    result = runner.run_jc_iteration({"symbol": "s", "repo": "r"}, steps=1)
+    result = cast(dict[str, Any], runner.run_jc_iteration({"symbol": "s", "repo": str(tmp_path)}, steps=1))
     assert result["node_count"] == 0
-    assert result["observations"][0]["result"] == {"called": "search_symbols", "args": {"query": "foo"}}
+    first_obs = cast(dict[str, Any], result["observations"][0])
+    assert first_obs["result"] == {"called": "search_symbols", "args": {"query": "foo"}}
 
 
 def test_jc_prompt_uses_canonical_tool_names():
-    specs = [
+    specs: list[OpenAITool] = [
         {"type": "function", "function": {"name": "alpha", "description": "", "parameters": {}}},
         {"type": "function", "function": {"name": "beta", "description": "", "parameters": {}}},
     ]
     prompt = runner._build_jc_system_prompt(specs)  # type: ignore[attr-defined]
     assert "- alpha" in prompt
     assert "- beta" in prompt
+
+
+def test_jc_backend_initializes_github_url(monkeypatch, tmp_path):
+    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    called: dict[str, int] = {"index_repo": 0}
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    async def fake_call_tool(name: str, arguments: dict[str, Any]):
+        if name == "index_repo":
+            called["index_repo"] += 1
+            assert arguments["url"] == "https://github.com/owner/repo"
+            return [TextContent(type="text", text=json.dumps({"repo": "id"}))]
+        return []
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+
+    JCodeMunchBackend(repo="https://github.com/owner/repo")
+    assert called["index_repo"] == 1
+
+
+def test_jc_backend_owner_repo_init(monkeypatch):
+    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    called: dict[str, int] = {"index_repo": 0}
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    async def fake_call_tool(name: str, arguments: dict[str, Any]):
+        if name == "index_repo":
+            called["index_repo"] += 1
+            assert arguments["url"] == "owner/repo"
+            return [TextContent(type="text", text=json.dumps({"repo": "id"}))]
+        return []
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+
+    JCodeMunchBackend(repo="owner/repo")
+    assert called["index_repo"] == 1
+
+
+def test_jc_backend_rejects_ambiguous_repo(monkeypatch):
+    async def fake_list_tools():
+        return []
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", lambda *args, **kwargs: [])
+
+    with pytest.raises(RuntimeError):
+        JCodeMunchBackend(repo="owner/repo/extra")
+
+
+def test_jc_backend_initializes_local_repo(monkeypatch, tmp_path):
+    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    called: dict[str, int] = {"resolve": 0, "index": 0}
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    async def fake_call_tool(name: str, arguments: dict[str, Any]):
+        if name == "resolve_repo":
+            called["resolve"] += 1
+            return [TextContent(type="text", text=json.dumps({"error": "missing"}))]
+        if name == "index_folder":
+            called["index"] += 1
+            return [TextContent(type="text", text=json.dumps({"repo": "repo-id"}))]
+        return []
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+
+    backend = JCodeMunchBackend(repo=str(tmp_path))
+    assert called["resolve"] == 1
+    assert called["index"] == 1
+    assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
+
+
+def test_ic_backend_initializes_repo(monkeypatch, tmp_path):
+    dummy_tool = Tool(name="resolve", description="", inputSchema={})
+    cwd_seen: list[str] = []
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    def fake_ensure_graph_loaded():
+        cwd_seen.append(str(Path.cwd()))
+
+    monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.ic_backend.exploration.ensure_graph_loaded", fake_ensure_graph_loaded)
+
+    IterativeContextBackend(repo=str(tmp_path), score_fn=None)
+    assert cwd_seen == [str(tmp_path)]

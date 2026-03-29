@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterable, List, Dict
 from pathlib import Path
 
+from ..observability.langfuse import start_span, record_score
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
 from .types import Step, StepResult
 
@@ -12,12 +13,28 @@ class Pipeline:
         self.steps: List[Step] = list(steps)
         self.fail_fast: bool = fail_fast
 
-    def run(self, repo_root: Path) -> List[StepResult]:
+    def run(self, repo_root: Path, observation=None) -> List[StepResult]:
         results: List[StepResult] = []
         for step in self.steps:
+            step_obs = start_span(observation, name=step.name, metadata={"cwd": str(repo_root)})
             result = step.run(repo_root)
             results.append(result)
-            if self.fail_fast and not result.success:
+            record_score(step_obs, "exit_code", result.exit_code, metadata={"step": step.name})
+            record_score(step_obs, "pipeline_pass", result.success, metadata={"step": step.name})
+            terminated = self.fail_fast and not result.success
+            if step_obs and hasattr(step_obs, "end"):
+                step_obs.end(
+                    metadata={
+                        "step": step.name,
+                        "success": result.success,
+                        "exit_code": result.exit_code,
+                        "stdout_excerpt": (result.stdout or "")[:400],
+                        "stderr_excerpt": (result.stderr or "")[:400],
+                        "fail_fast": self.fail_fast,
+                        "terminated_pipeline": terminated,
+                    }
+                )
+            if terminated:
                 break
         return results
 

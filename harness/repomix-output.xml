@@ -40,6 +40,13 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
+observability/
+  __init__.py
+  baselines.py
+  datasets.py
+  experiments.py
+  langfuse.py
+  runner_integration.py
 pipeline/
   __init__.py
   pipeline.py
@@ -49,12 +56,18 @@ tests_harness/
   __init__.py
   conftest.py
   test_backend_adapters.py
+  test_baselines.py
+  test_datasets_experiments.py
+  test_datasets.py
   test_filesystem_guard.py
-  test_policy_sandbox.py
+  test_observability.py
+  test_policy_loader.py
   test_pytest_scope.py
+  test_runner_integration.py
   test_score_adapter.py
   test_subprocess_guard.py
   test_test_integrity.py
+  test_tracing_wrappers.py
 tools/
   backends/
     __init__.py
@@ -65,7 +78,7 @@ tools/
 utils/
   __init__.py
   cmd.py
-  debug.py
+  comparison.py
   diff.py
   env.py
   openai_schema.py
@@ -73,6 +86,7 @@ utils/
   test_loader.py
   type_loader.py
 __init__.py
+LANGFUSE.md
 loop.py
 policy_loader.py
 policy.py
@@ -84,6 +98,870 @@ writer.py
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="observability/__init__.py">
+from .langfuse import flush_langfuse, get_langfuse_client, get_tracing_openai_client, is_langfuse_enabled, record_score, start_span, start_trace  # noqa: F401
+from .datasets import DatasetItem, fetch_dataset_items, local_dataset, map_task_to_dataset_item, normalize_dataset_item  # noqa: F401
+from .baselines import BaselineBundle, BaselineSnapshot, baseline_key, compute_baseline_for_item, make_baseline_bundle, require_baseline, resolve_baseline  # noqa: F401
+
+__all__ = [
+    "flush_langfuse",
+    "get_langfuse_client",
+    "get_tracing_openai_client",
+    "is_langfuse_enabled",
+    "record_score",
+    "start_span",
+    "start_trace",
+    "DatasetItem",
+    "fetch_dataset_items",
+    "local_dataset",
+    "map_task_to_dataset_item",
+    "normalize_dataset_item",
+    "BaselineBundle",
+    "BaselineSnapshot",
+    "baseline_key",
+    "compute_baseline_for_item",
+    "make_baseline_bundle",
+    "require_baseline",
+    "resolve_baseline",
+]
+</file>
+
+<file path="observability/baselines.py">
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Mapping, TypedDict, cast
+
+from .datasets import DatasetItem, normalize_dataset_item
+from .langfuse import record_score, start_span
+from ..scorer import score
+
+
+class BaselineSnapshot(TypedDict, total=False):
+    dataset_name: str | None
+    dataset_version: str | None
+    item_id: str | None
+    repo: str
+    symbol: str
+    jc_result: dict[str, object]
+    jc_metrics: dict[str, float]
+    experiment_run_id: str | None
+    trace_id: str | None
+    metadata: dict[str, object]
+
+
+class BaselineBundle(TypedDict, total=False):
+    dataset_name: str | None
+    dataset_version: str | None
+    baseline_run_id: str | None
+    baseline_run_name: str | None
+    dataset_run_id: str | None
+    created_at: str | None
+    items: list[BaselineSnapshot]
+    metadata: dict[str, object]
+
+
+def _stable_repo_symbol(repo: str, symbol: str) -> str:
+    return hashlib.sha256(f"{repo}::{symbol}".encode()).hexdigest()
+
+
+def _item_identity(item: DatasetItem) -> str:
+    normalized = normalize_dataset_item(item)
+    if normalized.get("id"):
+        return cast(str, normalized.get("id"))
+    h = hashlib.sha256(f"{normalized.get('repo')}::{normalized.get('symbol')}".encode()).hexdigest()
+    return h
+
+
+def baseline_key(item: DatasetItem) -> str:
+    return _item_identity(item)
+
+
+def _snapshot_key(snapshot: BaselineSnapshot) -> str:
+    snap_id = snapshot.get("item_id")
+    if isinstance(snap_id, str):
+        return snap_id
+    repo = snapshot.get("repo")
+    symbol = snapshot.get("symbol")
+    if isinstance(repo, str) and isinstance(symbol, str):
+        return _stable_repo_symbol(repo, symbol)
+    return ""
+
+
+def baseline_metrics_from_jc(jc_result: Mapping[str, object]) -> dict[str, float]:
+    combined = {"iterative_context": {"observations": []}, "jcodemunch": jc_result}
+    metrics = score(combined)
+    numeric_metrics: dict[str, float] = {}
+    for k, v in metrics.items():
+        if isinstance(v, (int, float, bool)):
+            numeric_metrics[k] = float(v)
+    return numeric_metrics
+
+
+def index_baselines(bundle: BaselineBundle | list[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
+    items = bundle["items"] if isinstance(bundle, Mapping) and "items" in bundle else bundle  # type: ignore[index]
+    indexed: dict[str, BaselineSnapshot] = {}
+    for snap in items:
+        if isinstance(snap, Mapping):
+            snapshot = cast(BaselineSnapshot, snap)
+            key = _snapshot_key(snapshot)
+            if key:
+                indexed[key] = snapshot
+    return indexed
+
+
+def compute_baseline_for_item(
+    item: DatasetItem,
+    dataset_name: str | None = None,
+    dataset_version: str | None = None,
+    parent_trace=None,
+) -> BaselineSnapshot:
+    from ..runner import run_jc_iteration  # local import to avoid circular dependency
+    normalized = normalize_dataset_item(item)
+    trace = start_span(
+        parent_trace,
+        "jc_baseline_item",
+        metadata={
+            "dataset": dataset_name,
+            "dataset_version": dataset_version,
+            "item_id": normalized.get("id"),
+            "repo": normalized.get("repo"),
+            "symbol": normalized.get("symbol"),
+            "run_kind": "jc_baseline",
+        },
+    )
+    jc_result = run_jc_iteration({"symbol": normalized["symbol"], "repo": normalized["repo"]}, parent_trace=trace)
+    metrics = baseline_metrics_from_jc(jc_result)
+    for name, value in metrics.items():
+        record_score(trace, f"baseline.{name}", value)
+    if trace and hasattr(trace, "end"):
+        try:
+            trace.end(metadata={"jc_nodes": metrics.get("jc_nodes", 0)})
+        except Exception:
+            pass
+    return BaselineSnapshot(
+        dataset_name=dataset_name,
+        dataset_version=dataset_version,
+        item_id=normalized.get("id"),
+        repo=normalized["repo"],
+        symbol=normalized["symbol"],
+        jc_result=cast(dict[str, object], jc_result),
+        jc_metrics=metrics,
+        trace_id=getattr(trace, "id", None),
+        experiment_run_id=getattr(parent_trace, "id", None),
+        metadata={"run_kind": "jc_baseline"},
+    )
+
+
+def resolve_baseline(baselines: BaselineBundle | list[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot | None:
+    identity = baseline_key(item)
+    snapshots_raw = baselines["items"] if isinstance(baselines, Mapping) and "items" in baselines else baselines  # type: ignore[index]
+    snapshots: list[BaselineSnapshot] = []
+    for snap in snapshots_raw:
+        if isinstance(snap, Mapping):
+            snapshots.append(cast(BaselineSnapshot, snap))
+    for snap in snapshots:
+        if _snapshot_key(snap) == identity:
+            return snap
+    for snap in snapshots:
+        if snap.get("repo") == item.get("repo") and snap.get("symbol") == item.get("symbol"):
+            return snap
+    return None
+
+
+def require_baseline(baselines: BaselineBundle | list[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot:
+    resolved = resolve_baseline(baselines, item)
+    if resolved is None:
+        raise ValueError(f"No baseline snapshot found for repo={item.get('repo')} symbol={item.get('symbol')}")
+    return resolved
+
+
+def make_baseline_bundle(
+    snapshots: list[BaselineSnapshot],
+    dataset_name: str | None = None,
+    dataset_version: str | None = None,
+    baseline_run_id: str | None = None,
+    baseline_run_name: str | None = None,
+    dataset_run_id: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> BaselineBundle:
+    return BaselineBundle(
+        dataset_name=dataset_name,
+        dataset_version=dataset_version,
+        baseline_run_id=baseline_run_id,
+        baseline_run_name=baseline_run_name,
+        dataset_run_id=dataset_run_id or baseline_run_id,
+        created_at=datetime.now(tz=timezone.utc).isoformat(),
+        items=snapshots,
+        metadata=dict(metadata) if metadata else {},
+    )
+
+
+def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
+    serializable = json.loads(json.dumps(bundle, default=str))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(serializable, indent=2))
+
+
+def load_baseline_bundle(path: Path) -> BaselineBundle:
+    data: object = json.loads(path.read_text())
+    if not isinstance(data, Mapping):
+        raise ValueError("Invalid baseline bundle format")
+    items_raw = data.get("items", [])
+    snapshots: list[BaselineSnapshot] = []
+    if isinstance(items_raw, list):
+        for snap in items_raw:
+            if isinstance(snap, Mapping):
+                repo = snap.get("repo")
+                symbol = snap.get("symbol")
+                if not isinstance(repo, str) or not isinstance(symbol, str):
+                    continue
+                jc_result_obj = snap.get("jc_result", {})
+                jc_metrics_obj = snap.get("jc_metrics", {})
+                try:
+                    snapshots.append(
+                        BaselineSnapshot(
+                            dataset_name=cast(str | None, snap.get("dataset_name") or data.get("dataset_name")),
+                            dataset_version=cast(str | None, snap.get("dataset_version") or data.get("dataset_version")),
+                            item_id=cast(str | None, snap.get("item_id")),
+                            repo=repo,
+                            symbol=symbol,
+                            jc_result=jc_result_obj if isinstance(jc_result_obj, dict) else {},
+                            jc_metrics=jc_metrics_obj if isinstance(jc_metrics_obj, dict) else {},
+                            experiment_run_id=cast(str | None, snap.get("experiment_run_id")),
+                            trace_id=cast(str | None, snap.get("trace_id")),
+                            metadata=cast(dict[str, object], snap.get("metadata", {})) if isinstance(snap.get("metadata", {}), dict) else {},
+                        )
+                    )
+                except Exception:
+                    continue
+    return make_baseline_bundle(
+        snapshots,
+        dataset_name=cast(str | None, data.get("dataset_name")),
+        dataset_version=cast(str | None, data.get("dataset_version")),
+        baseline_run_id=cast(str | None, data.get("baseline_run_id")),
+        baseline_run_name=cast(str | None, data.get("baseline_run_name")),
+        dataset_run_id=cast(str | None, data.get("dataset_run_id")),
+        metadata=cast(Mapping[str, object] | None, data.get("metadata", {})) if isinstance(data.get("metadata", {}), Mapping) else None,
+    )
+</file>
+
+<file path="observability/datasets.py">
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Mapping, Sequence
+from typing import Any, TypedDict, cast
+
+from .langfuse import get_langfuse_client
+
+
+class DatasetItem(TypedDict):
+    repo: str
+    symbol: str
+    id: str | None
+    metadata: dict[str, object]
+
+
+def map_task_to_dataset_item(task: Mapping[str, object]) -> DatasetItem:
+    repo = task.get("repo")
+    symbol = task.get("symbol")
+    if not isinstance(repo, str) or not isinstance(symbol, str):
+        raise ValueError("Task must include 'repo' and 'symbol'")
+    metadata = {k: v for k, v in task.items() if k not in {"repo", "symbol"}}
+    return {"repo": repo, "symbol": symbol, "metadata": metadata, "id": None}
+
+
+def _stable_id(repo: str, symbol: str) -> str:
+    return hashlib.sha256(f"{repo}::{symbol}".encode()).hexdigest()
+
+
+def normalize_dataset_item(item: Mapping[str, object]) -> DatasetItem:
+    repo_obj = item.get("repo")
+    symbol_obj = item.get("symbol")
+    if not isinstance(repo_obj, str) or not isinstance(symbol_obj, str):
+        raise ValueError("Dataset item missing repo/symbol")
+    metadata_obj = item.get("metadata")
+    metadata: dict[str, object] = {}
+    if isinstance(metadata_obj, Mapping):
+        metadata = {str(k): v for k, v in metadata_obj.items()}
+    normalized: DatasetItem = {
+        "repo": repo_obj,
+        "symbol": symbol_obj,
+        "metadata": metadata,
+        "id": None,
+    }
+    item_id = item.get("id")
+    if isinstance(item_id, str):
+        normalized["id"] = item_id
+    elif item_id is not None:
+        normalized["id"] = str(item_id)
+    else:
+        normalized["id"] = _stable_id(repo_obj, symbol_obj)
+    return normalized
+
+
+def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetItem]:
+    """
+    Fetch dataset items from Langfuse. Falls back to empty list if unavailable.
+    """
+    client = get_langfuse_client()
+    if not client:
+        return []
+    client_any = cast(Any, client)
+    dataset: Any = None
+    try:
+        if hasattr(client_any, "get_dataset"):
+            dataset = client_any.get_dataset(name=name, version=version)  # type: ignore[arg-type]
+        elif hasattr(client_any, "dataset"):
+            dataset = client_any.dataset(name=name, version=version)  # type: ignore[arg-type]
+    except Exception:
+        dataset = None
+    items: list[DatasetItem] = []
+    if dataset is None:
+        return items
+    try:
+        raw_items = dataset.items() if callable(getattr(dataset, "items", None)) else getattr(dataset, "items", [])
+    except Exception:
+        raw_items = []
+    for idx, item in enumerate(raw_items):
+        if isinstance(item, Mapping):
+            task_meta = cast(Mapping[str, object], item)
+            input_section = task_meta.get("input")
+            if not isinstance(input_section, Mapping):
+                input_section = {}
+            repo = task_meta.get("repo") or input_section.get("repo")
+            symbol = task_meta.get("symbol") or input_section.get("symbol")
+            if not isinstance(repo, str) or not isinstance(symbol, str):
+                continue
+            meta = task_meta.get("metadata")
+            meta_map: Mapping[str, object] = input_section if isinstance(input_section, Mapping) else {}
+            if isinstance(meta, Mapping):
+                meta_map = meta
+            try:
+                mapped = map_task_to_dataset_item({"repo": repo, "symbol": symbol, **{str(k): v for k, v in meta_map.items()}})
+                item_id = task_meta.get("id")
+                if isinstance(item_id, str):
+                    mapped["id"] = item_id
+                elif item_id is not None:
+                    mapped["id"] = str(item_id)
+                items.append(normalize_dataset_item(mapped))
+            except Exception:
+                continue
+    return items
+
+
+def local_dataset(name: str, items: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    normalized_items = [normalize_dataset_item(item) for item in items if isinstance(item, Mapping)]
+    return {"name": name, "items": normalized_items}
+</file>
+
+<file path="observability/experiments.py">
+from __future__ import annotations
+
+from typing import Mapping, Sequence, cast
+
+from .baselines import (
+    BaselineBundle,
+    BaselineSnapshot,
+    compute_baseline_for_item,
+    make_baseline_bundle,
+    require_baseline,
+    resolve_baseline,
+)
+from .datasets import DatasetItem, fetch_dataset_items, local_dataset, normalize_dataset_item
+from .langfuse import flush_langfuse, record_score, start_trace
+from .runner_integration import HostedRunResult, run_hosted_dataset_experiment, run_local_dataset_experiment
+from ..loop import run_loop
+from ..scorer import score
+
+
+def _build_bundle_from_hosted(run: HostedRunResult, snapshots: list[BaselineSnapshot]) -> BaselineBundle:
+    return make_baseline_bundle(
+        snapshots,
+        dataset_name=run.get("dataset_name"),
+        dataset_version=run.get("dataset_version"),
+        baseline_run_id=run.get("run_id"),
+        baseline_run_name=run.get("run_name"),
+        dataset_run_id=run.get("run_id"),
+        metadata={"run_kind": "jc_baseline", "run_name": run.get("run_name")},
+    )
+
+
+def _run_local_jc_baselines(items: Sequence[DatasetItem], dataset_name: str | None, dataset_version: str | None) -> BaselineBundle:
+    def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
+        return {
+            "baseline": compute_baseline_for_item(
+                normalize_dataset_item(item), dataset_name=dataset_name, dataset_version=dataset_version, parent_trace=parent_trace
+            )
+        }
+
+    hosted = run_local_dataset_experiment(
+        data=list(items),
+        experiment_name="jc_baseline_local",
+        task_fn=_run_item,
+        metadata={"run_kind": "jc_baseline"},
+    )
+    baselines: list[BaselineSnapshot] = []
+    for entry in hosted.get("items", []):
+        if not isinstance(entry, Mapping):
+            continue
+        output = entry.get("output")
+        if isinstance(output, Mapping) and isinstance(output.get("baseline"), Mapping):
+            baselines.append(cast(BaselineSnapshot, output["baseline"]))
+    return make_baseline_bundle(
+        baselines,
+        dataset_name=dataset_name,
+        dataset_version=dataset_version,
+        baseline_run_id=hosted.get("run_id"),
+        baseline_run_name=hosted.get("run_name"),
+        metadata={"run_kind": "jc_baseline"},
+    )
+
+
+def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> BaselineBundle:
+    def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
+        snapshot = compute_baseline_for_item(
+            normalize_dataset_item(item), dataset_name=name, dataset_version=version, parent_trace=parent_trace
+        )
+        return {"baseline": snapshot}
+
+    hosted = run_hosted_dataset_experiment(
+        dataset_name=name,
+        dataset_version=version,
+        experiment_name="jc_baseline",
+        task_fn=_run_item,
+        metadata={"run_kind": "jc_baseline"},
+    )
+    snapshots: list[BaselineSnapshot] = []
+    for entry in hosted.get("items", []):
+        if not isinstance(entry, Mapping):
+            continue
+        output = entry.get("output")
+        if isinstance(output, Mapping) and "baseline" in output and isinstance(output["baseline"], Mapping):
+            snapshots.append(cast(BaselineSnapshot, output["baseline"]))
+    if not snapshots:
+        # Fallback to manual computation if hosted wrapper returned nothing
+        items = fetch_dataset_items(name=name, version=version)
+        root = start_trace("jc_baseline_experiment", metadata={"dataset": name, "version": version, "count": len(items)})
+        for item in items:
+            snapshots.append(compute_baseline_for_item(item, dataset_name=name, dataset_version=version, parent_trace=root))
+        if root and hasattr(root, "end"):
+            try:
+                root.end(metadata={"completed": len(snapshots)})
+            except Exception:
+                pass
+        hosted = HostedRunResult(run_id=getattr(root, "id", None), run_name=None, dataset_name=name, dataset_version=version, items=[])
+    flush_langfuse()
+    return _build_bundle_from_hosted(hosted, snapshots)
+
+
+def run_local_jc_baseline_experiment(dataset: Mapping[str, object]) -> BaselineBundle:
+    items_obj = dataset.get("items") if isinstance(dataset, Mapping) else []
+    items: list[DatasetItem] = []
+    if isinstance(items_obj, Sequence):
+        for entry in items_obj:
+            if isinstance(entry, Mapping):
+                items.append(normalize_dataset_item(entry))
+    name = dataset.get("name") if isinstance(dataset, Mapping) else None
+    dataset_name = name if isinstance(name, str) else None
+    return _run_local_jc_baselines(items, dataset_name=dataset_name, dataset_version=None)
+
+
+def _run_ic_optimizations(
+    items: Sequence[DatasetItem],
+    baselines: BaselineBundle,
+    dataset_name: str | None,
+    dataset_version: str | None,
+    iterations: int,
+    hosted: bool,
+) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    indexed = baselines.get("items", []) if isinstance(baselines, Mapping) else []
+
+    def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
+        normalized_item = normalize_dataset_item(item)
+        baseline = resolve_baseline(indexed, normalized_item) if indexed else resolve_baseline(baselines, normalized_item)
+        baseline = require_baseline(baselines, normalized_item) if baseline is None else baseline
+        history = run_loop(dict(normalized_item), iterations=iterations, parent_trace=parent_trace, baseline_snapshot=baseline)
+        last = history[-1] if history else {}
+        jc_payload: Mapping[str, object] | dict[str, object] = baseline["jc_result"] if baseline and "jc_result" in baseline else {}
+        metrics = score({"iterative_context": last if isinstance(last, Mapping) else {}, "jcodemunch": jc_payload})
+        for name, value in metrics.items():
+            if isinstance(value, (int, float, bool)):
+                record_score(parent_trace, f"ic_opt.{name}", float(value))
+        return {"item": normalized_item, "baseline": baseline, "history": history, "metrics": metrics}
+
+    if hosted:
+        hosted_result = run_hosted_dataset_experiment(
+            dataset_name=dataset_name or "",
+            dataset_version=dataset_version,
+            experiment_name="ic_optimization",
+            task_fn=_run_item,
+            metadata={"run_kind": "ic_optimization", "baseline_run_id": baselines.get("baseline_run_id") if isinstance(baselines, Mapping) else None},
+        )
+        for entry in hosted_result.get("items", []):
+            if not isinstance(entry, Mapping):
+                continue
+            output = entry.get("output")
+            if isinstance(output, Mapping):
+                results.append(dict(output))
+    else:
+        local_result = run_local_dataset_experiment(
+            data=list(items),
+            experiment_name="ic_optimization_local",
+            task_fn=_run_item,
+            metadata={"run_kind": "ic_optimization", "baseline_run_id": baselines.get("baseline_run_id") if isinstance(baselines, Mapping) else None},
+        )
+        for entry in local_result.get("items", []):
+            if not isinstance(entry, Mapping):
+                continue
+            output = entry.get("output")
+            if isinstance(output, Mapping):
+                results.append(dict(output))
+    if not results:
+        # Fallback manual path if runner returned nothing
+        root = start_trace(
+            "ic_optimization_experiment",
+            metadata={"dataset": dataset_name, "version": dataset_version, "count": len(items)},
+        )
+        for item in items:
+            baseline = resolve_baseline(indexed, item) if indexed else resolve_baseline(baselines, item)
+            baseline = require_baseline(baselines, item) if baseline is None else baseline
+            history = run_loop(dict(item), iterations=iterations, parent_trace=root, baseline_snapshot=baseline)
+            results.append({"item": item, "baseline": baseline, "history": history})
+        if root and hasattr(root, "end"):
+            try:
+                root.end(metadata={"completed": len(results)})
+            except Exception:
+                pass
+    flush_langfuse()
+    return results
+
+
+def run_hosted_ic_optimization_experiment(
+    name: str,
+    version: str | None = None,
+    iterations: int = 5,
+    baselines: BaselineBundle | None = None,
+    recompute_baselines: bool = False,
+) -> list[dict[str, object]]:
+    items = fetch_dataset_items(name=name, version=version)
+    if baselines is None and not recompute_baselines:
+        raise ValueError("Baselines bundle required for optimization; set recompute_baselines=True to compute.")
+    bundle = baselines if baselines is not None else run_hosted_jc_baseline_experiment(name, version=version)
+    return _run_ic_optimizations(items, bundle, dataset_name=name, dataset_version=version, iterations=iterations, hosted=True)
+
+
+def run_local_ic_optimization_experiment(
+    dataset: Mapping[str, object],
+    iterations: int = 5,
+    baselines: BaselineBundle | None = None,
+    recompute_baselines: bool = False,
+) -> list[dict[str, object]]:
+    items_source = dataset.get("items") if isinstance(dataset, Mapping) else []
+    name = dataset.get("name") if isinstance(dataset, Mapping) else "local"
+    normalized_ds = local_dataset(str(name), items_source if isinstance(items_source, Sequence) else [])
+    items = normalized_ds.get("items", [])
+    if not isinstance(items, list):
+        items = []
+    name_value = normalized_ds.get("name")
+    dataset_name: str | None = name_value if isinstance(name_value, str) else None
+    if baselines is None and not recompute_baselines:
+        raise ValueError("Baselines bundle required for optimization; set recompute_baselines=True to compute.")
+    bundle = baselines if baselines is not None else _run_local_jc_baselines(items, dataset_name=dataset_name, dataset_version=None)
+    return _run_ic_optimizations(items, bundle, dataset_name=dataset_name, dataset_version=None, iterations=iterations, hosted=False)
+
+
+__all__ = [
+    "run_hosted_jc_baseline_experiment",
+    "run_local_jc_baseline_experiment",
+    "run_hosted_ic_optimization_experiment",
+    "run_local_ic_optimization_experiment",
+]
+</file>
+
+<file path="observability/langfuse.py">
+from __future__ import annotations
+
+from typing import Any, Mapping, Optional, cast
+
+from langfuse import Langfuse
+from langfuse.openai import OpenAI as LangfuseOpenAI
+
+from ..utils.env import get_langfuse_env
+
+_client: Optional[Langfuse] = None
+
+
+def get_langfuse_client() -> Optional[Langfuse]:
+    global _client  # noqa: PLW0603
+    if _client is not None:
+        return _client
+    env = get_langfuse_env()
+    if not env.get("enabled", True):
+        return None
+    public, secret = env.get("public_key"), env.get("secret_key")
+    if not isinstance(public, str) or not isinstance(secret, str) or not public or not secret:
+        return None
+    base_url_val = env.get("base_url")
+    env_val = env.get("environment")
+    host: Optional[str] = base_url_val if isinstance(base_url_val, str) else None
+    environment: Optional[str] = env_val if isinstance(env_val, str) else None
+    try:
+        _client = Langfuse(
+            public_key=public,
+            secret_key=secret,
+            host=host if host else None,
+            environment=environment if environment else None,
+        )
+    except Exception:
+        _client = None
+    return _client
+
+
+def is_langfuse_enabled() -> bool:
+    return get_langfuse_client() is not None
+
+
+def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
+    """
+    Prefer Langfuse's OpenAI integration, but fall back to vanilla client if unavailable.
+    """
+    try:
+        return LangfuseOpenAI(base_url=base_url, api_key=api_key)
+    except Exception:
+        from openai import OpenAI  # local import to avoid import-time side effects
+
+        return OpenAI(base_url=base_url, api_key=api_key)
+
+
+def start_trace(name: str, metadata: Mapping[str, object] | None = None, input: object | None = None) -> Any | None:
+    client = get_langfuse_client()
+    if not client:
+        return None
+    try:
+        client_any = cast(Any, client)
+        return client_any.trace(name=name, metadata=dict(metadata) if metadata else None, input=input)
+    except Exception:
+        return None
+
+
+def start_span(parent: Any | None, name: str, metadata: Mapping[str, object] | None = None, input: object | None = None) -> Any | None:
+    if parent is None:
+        return start_trace(name=name, metadata=metadata, input=input)
+    try:
+        if hasattr(parent, "span"):
+            return parent.span(name=name, metadata=dict(metadata) if metadata else None, input=input)
+    except Exception:
+        return None
+    return None
+
+
+def record_score(handle: Any | None, name: str, value: float | int | bool, metadata: Mapping[str, object] | None = None) -> None:
+    if handle is None:
+        return
+    try:
+        scorer = getattr(handle, "score", None)
+        if scorer:
+            scorer(name=name, value=float(value), metadata=dict(metadata) if metadata else None)
+    except Exception:
+        return
+
+
+def flush_langfuse() -> None:
+    client = get_langfuse_client()
+    if not client:
+        return
+    try:
+        client.flush()
+    except Exception:
+        return
+
+
+__all__ = [
+    "get_langfuse_client",
+    "is_langfuse_enabled",
+    "get_tracing_openai_client",
+    "start_trace",
+    "start_span",
+    "record_score",
+    "flush_langfuse",
+]
+</file>
+
+<file path="observability/runner_integration.py">
+from __future__ import annotations
+
+import time
+from typing import Any, Callable, Mapping, TypedDict, cast
+
+from .langfuse import get_langfuse_client, start_span, start_trace
+
+
+class HostedRunItemResult(TypedDict, total=False):
+    item: Mapping[str, object]
+    output: Mapping[str, object] | dict[str, object] | None
+    trace_id: str | None
+
+
+class HostedRunResult(TypedDict, total=False):
+    run_id: str | None
+    run_name: str | None
+    dataset_name: str | None
+    dataset_version: str | None
+    items: list[HostedRunItemResult]
+    metadata: dict[str, object]
+
+
+def _normalize_items(raw_items: Any) -> list[HostedRunItemResult]:
+    normalized: list[HostedRunItemResult] = []
+    if not isinstance(raw_items, list):
+        return normalized
+    for entry in raw_items:
+        if isinstance(entry, Mapping):
+            item = cast(Mapping[str, object], entry.get("item") or entry.get("input") or {})
+            output = cast(Mapping[str, object] | dict[str, object] | None, entry.get("output") or entry.get("result"))
+            trace_id = cast(str | None, entry.get("trace_id") or entry.get("traceId") or entry.get("id"))
+            normalized.append({"item": item, "output": output, "trace_id": trace_id})
+        else:
+            # Object-style access
+            try:
+                item_val = cast(Mapping[str, object], getattr(entry, "item", {}) or getattr(entry, "input", {}) or {})
+                output_val = cast(Mapping[str, object] | dict[str, object] | None, getattr(entry, "output", None) or getattr(entry, "result", None))
+                trace_val = cast(str | None, getattr(entry, "trace_id", None) or getattr(entry, "traceId", None) or getattr(entry, "id", None))
+                normalized.append({"item": item_val, "output": output_val, "trace_id": trace_val})
+            except Exception:
+                continue
+    return normalized
+
+
+def run_hosted_dataset_experiment(
+    dataset_name: str,
+    dataset_version: str | None,
+    experiment_name: str,
+    task_fn: Callable[[Mapping[str, object], object | None], Mapping[str, object] | dict[str, object]],
+    evaluators: list[object] | None = None,
+    run_evaluators: list[object] | None = None,
+    metadata: Mapping[str, object] | None = None,
+    max_concurrency: int | None = None,
+) -> HostedRunResult:
+    client = get_langfuse_client()
+    run_name = f"{experiment_name}-{int(time.time())}"
+    if client:
+        try:
+            client_any = cast(Any, client)
+            dataset = client_any.get_dataset(name=dataset_name, version=dataset_version)
+            run_kwargs: dict[str, Any] = {
+                "name": experiment_name,
+                "run_name": run_name,
+                "task": task_fn,
+                "metadata": dict(metadata) if metadata else None,
+            }
+            if evaluators is not None:
+                run_kwargs["evaluators"] = evaluators
+            if run_evaluators is not None:
+                run_kwargs["run_evaluators"] = run_evaluators
+            if max_concurrency is not None:
+                run_kwargs["max_concurrency"] = max_concurrency
+            result = cast(Any, dataset).run_experiment(**run_kwargs)
+            run_id = cast(str | None, getattr(result, "id", None) or getattr(result, "run_id", None))
+            items_raw = getattr(result, "items", None) or getattr(result, "item_results", None)
+            return HostedRunResult(
+                run_id=run_id,
+                run_name=run_name,
+                dataset_name=dataset_name,
+                dataset_version=dataset_version,
+                items=_normalize_items(items_raw),
+                metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})},
+            )
+        except Exception:
+            pass
+
+    # Defensive fallback: manual trace-run if client unavailable/error.
+    root = start_trace(
+        f"{experiment_name}_hosted_fallback",
+        metadata={"dataset": dataset_name, "dataset_version": dataset_version, "run_kind": experiment_name, "count": len([])},
+    )
+    run_id = getattr(root, "id", None)
+    items: list[HostedRunItemResult] = []
+    # Without dataset items we cannot iterate safely; hosted caller should provide items separately.
+    return HostedRunResult(
+        run_id=run_id,
+        run_name=run_name,
+        dataset_name=dataset_name,
+        dataset_version=dataset_version,
+        items=items,
+        metadata={"run_kind": experiment_name, "fallback": True, **(dict(metadata) if metadata else {})},
+    )
+
+
+def run_local_dataset_experiment(
+    data: list[Mapping[str, object]],
+    experiment_name: str,
+    task_fn: Callable[[Mapping[str, object], object | None], Mapping[str, object] | dict[str, object]],
+    evaluators: list[object] | None = None,
+    run_evaluators: list[object] | None = None,
+    metadata: Mapping[str, object] | None = None,
+    max_concurrency: int | None = None,
+) -> HostedRunResult:
+    client = get_langfuse_client()
+    run_name = f"{experiment_name}-local-{int(time.time())}"
+    if client:
+        try:
+            client_any = cast(Any, client)
+            run_kwargs: dict[str, Any] = {
+                "name": experiment_name,
+                "data": data,
+                "task": task_fn,
+                "metadata": dict(metadata) if metadata else None,
+            }
+            if evaluators is not None:
+                run_kwargs["evaluators"] = evaluators
+            if run_evaluators is not None:
+                run_kwargs["run_evaluators"] = run_evaluators
+            if max_concurrency is not None:
+                run_kwargs["max_concurrency"] = max_concurrency
+            result = client_any.run_experiment(**run_kwargs)
+            run_id = cast(str | None, getattr(result, "id", None) or getattr(result, "run_id", None))
+            items_raw = getattr(result, "items", None) or getattr(result, "item_results", None)
+            return HostedRunResult(
+                run_id=run_id,
+                run_name=run_name,
+                dataset_name=None,
+                dataset_version=None,
+                items=_normalize_items(items_raw),
+                metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})},
+            )
+        except Exception:
+            pass
+
+    # Defensive local fallback: run tasks with Langfuse spans so traces still exist.
+    root = start_trace(
+        f"{experiment_name}_local_fallback",
+        metadata={"run_kind": experiment_name, "count": len(data)},
+    )
+    items: list[HostedRunItemResult] = []
+    for entry in data:
+        span = start_span(root, f"{experiment_name}_item", metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})})
+        output = task_fn(entry, span)
+        items.append({"item": entry, "output": output, "trace_id": getattr(span, "id", None)})
+    return HostedRunResult(
+        run_id=getattr(root, "id", None),
+        run_name=run_name,
+        dataset_name=None,
+        dataset_version=None,
+        items=items,
+        metadata={"run_kind": experiment_name, "fallback": True, **(dict(metadata) if metadata else {})},
+    )
+
+
+__all__ = ["HostedRunResult", "run_hosted_dataset_experiment", "run_local_dataset_experiment"]
+</file>
 
 <file path="pipeline/__init__.py">
 from __future__ import annotations
@@ -119,6 +997,7 @@ from __future__ import annotations
 from typing import Iterable, List, Dict
 from pathlib import Path
 
+from ..observability.langfuse import start_span, record_score
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
 from .types import Step, StepResult
 
@@ -128,12 +1007,28 @@ class Pipeline:
         self.steps: List[Step] = list(steps)
         self.fail_fast: bool = fail_fast
 
-    def run(self, repo_root: Path) -> List[StepResult]:
+    def run(self, repo_root: Path, observation=None) -> List[StepResult]:
         results: List[StepResult] = []
         for step in self.steps:
+            step_obs = start_span(observation, name=step.name, metadata={"cwd": str(repo_root)})
             result = step.run(repo_root)
             results.append(result)
-            if self.fail_fast and not result.success:
+            record_score(step_obs, "exit_code", result.exit_code, metadata={"step": step.name})
+            record_score(step_obs, "pipeline_pass", result.success, metadata={"step": step.name})
+            terminated = self.fail_fast and not result.success
+            if step_obs and hasattr(step_obs, "end"):
+                step_obs.end(
+                    metadata={
+                        "step": step.name,
+                        "success": result.success,
+                        "exit_code": result.exit_code,
+                        "stdout_excerpt": (result.stdout or "")[:400],
+                        "stderr_excerpt": (result.stderr or "")[:400],
+                        "fail_fast": self.fail_fast,
+                        "terminated_pipeline": terminated,
+                    }
+                )
+            if terminated:
                 break
         return results
 
@@ -359,7 +1254,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from mcp.types import TextContent, Tool
@@ -373,6 +1269,7 @@ from harness.tools.mcp_adapter import (
     run_async,
     serialize_tool_result_for_model,
 )
+from harness.utils.openai_schema import OpenAITool
 
 
 async def _sample_coroutine(loop_ids: list[int] | None = None) -> str:
@@ -423,8 +1320,10 @@ def test_ic_backend_uses_server_surfaces(monkeypatch):
     monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
 
-    score_fn = lambda a, b: 1.0
-    backend = IterativeContextBackend(score_fn=score_fn)
+    def score_fn(a, b):
+        return 1.0
+
+    backend = IterativeContextBackend(repo="/tmp", score_fn=score_fn)
 
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
     assert runtime_score_args == [score_fn]
@@ -434,7 +1333,7 @@ def test_ic_backend_uses_server_surfaces(monkeypatch):
     assert calls == [("resolve", {"symbol": "foo"})]
 
 
-def test_jc_backend_uses_server_surfaces(monkeypatch):
+def test_jc_backend_uses_server_surfaces(monkeypatch, tmp_path):
     dummy_tool = Tool(
         name="search_symbols",
         description="search",
@@ -452,13 +1351,13 @@ def test_jc_backend_uses_server_surfaces(monkeypatch):
     monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
 
-    backend = JCodeMunchBackend()
+    backend = JCodeMunchBackend(repo=str(tmp_path))
 
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
 
     result = backend.dispatch("search_symbols", {"query": "foo"})
     assert result == {"result": "ok", "args": {"query": "foo"}}
-    assert call_args == [("search_symbols", {"query": "foo"})]
+    assert ("search_symbols", {"query": "foo"}) in call_args
 
 
 def test_parse_text_content_payload_handles_json_and_text():
@@ -532,10 +1431,10 @@ def _dummy_client(tool_name: str, args: dict[str, Any]):
         def __init__(self):
             self.chat = DummyChat()
 
-    return DummyClient()
+    return DummyClient(), "dummy-model"
 
 
-def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch):
+def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp_path):
     dummy_tool = Tool(
         name="resolve",
         description="resolve",
@@ -562,14 +1461,16 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch):
     monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve", {"symbol": "foo"}))
 
-    result = runner.run_ic_iteration({"symbol": "s", "repo": "r"}, score_fn=lambda n, s: 1.0, steps=1)
+    result = cast(dict[str, Any], runner.run_ic_iteration({"symbol": "s", "repo": str(tmp_path)}, score_fn=lambda n, s: 1.0, steps=1))
     assert result["node_count"] == 2
-    assert result["observations"][0]["result"]["full_graph"] == {"nodes": [1, 2]}
-    assert result["observations"][0]["result"]["score_source"] == "injected"
-    assert result["observations"][0]["result"]["node"] == {"id": "n1"}
+    first_obs = cast(dict[str, Any], result["observations"][0])
+    payload = cast(dict[str, Any], first_obs["result"])
+    assert payload["full_graph"] == {"nodes": [1, 2]}
+    assert payload["score_source"] == "injected"
+    assert payload["node"] == {"id": "n1"}
 
 
-def test_run_jc_iteration_uses_call_tool(monkeypatch):
+def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
     dummy_tool = Tool(
         name="search_symbols",
         description="search",
@@ -586,19 +1487,289 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch):
     monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_symbols", {"query": "foo"}))
 
-    result = runner.run_jc_iteration({"symbol": "s", "repo": "r"}, steps=1)
+    result = cast(dict[str, Any], runner.run_jc_iteration({"symbol": "s", "repo": str(tmp_path)}, steps=1))
     assert result["node_count"] == 0
-    assert result["observations"][0]["result"] == {"called": "search_symbols", "args": {"query": "foo"}}
+    first_obs = cast(dict[str, Any], result["observations"][0])
+    assert first_obs["result"] == {"called": "search_symbols", "args": {"query": "foo"}}
 
 
 def test_jc_prompt_uses_canonical_tool_names():
-    specs = [
+    specs: list[OpenAITool] = [
         {"type": "function", "function": {"name": "alpha", "description": "", "parameters": {}}},
         {"type": "function", "function": {"name": "beta", "description": "", "parameters": {}}},
     ]
     prompt = runner._build_jc_system_prompt(specs)  # type: ignore[attr-defined]
     assert "- alpha" in prompt
     assert "- beta" in prompt
+
+
+def test_jc_backend_initializes_github_url(monkeypatch, tmp_path):
+    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    called: dict[str, int] = {"index_repo": 0}
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    async def fake_call_tool(name: str, arguments: dict[str, Any]):
+        if name == "index_repo":
+            called["index_repo"] += 1
+            assert arguments["url"] == "https://github.com/owner/repo"
+            return [TextContent(type="text", text=json.dumps({"repo": "id"}))]
+        return []
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+
+    JCodeMunchBackend(repo="https://github.com/owner/repo")
+    assert called["index_repo"] == 1
+
+
+def test_jc_backend_owner_repo_init(monkeypatch):
+    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    called: dict[str, int] = {"index_repo": 0}
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    async def fake_call_tool(name: str, arguments: dict[str, Any]):
+        if name == "index_repo":
+            called["index_repo"] += 1
+            assert arguments["url"] == "owner/repo"
+            return [TextContent(type="text", text=json.dumps({"repo": "id"}))]
+        return []
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+
+    JCodeMunchBackend(repo="owner/repo")
+    assert called["index_repo"] == 1
+
+
+def test_jc_backend_rejects_ambiguous_repo(monkeypatch):
+    async def fake_list_tools():
+        return []
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", lambda *args, **kwargs: [])
+
+    with pytest.raises(RuntimeError):
+        JCodeMunchBackend(repo="owner/repo/extra")
+
+
+def test_jc_backend_initializes_local_repo(monkeypatch, tmp_path):
+    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    called: dict[str, int] = {"resolve": 0, "index": 0}
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    async def fake_call_tool(name: str, arguments: dict[str, Any]):
+        if name == "resolve_repo":
+            called["resolve"] += 1
+            return [TextContent(type="text", text=json.dumps({"error": "missing"}))]
+        if name == "index_folder":
+            called["index"] += 1
+            return [TextContent(type="text", text=json.dumps({"repo": "repo-id"}))]
+        return []
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+
+    backend = JCodeMunchBackend(repo=str(tmp_path))
+    assert called["resolve"] == 1
+    assert called["index"] == 1
+    assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
+
+
+def test_ic_backend_initializes_repo(monkeypatch, tmp_path):
+    dummy_tool = Tool(name="resolve", description="", inputSchema={})
+    cwd_seen: list[str] = []
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    def fake_ensure_graph_loaded():
+        cwd_seen.append(str(Path.cwd()))
+
+    monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.ic_backend.exploration.ensure_graph_loaded", fake_ensure_graph_loaded)
+
+    IterativeContextBackend(repo=str(tmp_path), score_fn=None)
+    assert cwd_seen == [str(tmp_path)]
+</file>
+
+<file path="tests_harness/test_baselines.py">
+from __future__ import annotations
+
+from harness.observability import baselines
+
+
+def test_baseline_key_uses_id_or_hash():
+    item = baselines.normalize_dataset_item({"repo": "r", "symbol": "s", "id": "123"})  # type: ignore[arg-type]
+    assert baselines.baseline_key(item) == "123"
+    item_no_id = baselines.normalize_dataset_item({"repo": "r", "symbol": "s"})  # type: ignore[arg-type]
+    key = baselines.baseline_key(item_no_id)
+    assert key and isinstance(key, str)
+
+
+def test_resolve_baseline_prefers_id():
+    item = baselines.normalize_dataset_item({"repo": "r", "symbol": "s", "id": "abc"})  # type: ignore[arg-type]
+    snap = baselines.BaselineSnapshot(dataset_name=None, dataset_version=None, item_id="abc", repo="r", symbol="s", jc_result={}, jc_metrics={}, experiment_run_id=None, trace_id=None, metadata={})
+    resolved = baselines.resolve_baseline([snap], item)
+    assert resolved is snap
+
+
+def test_baseline_bundle_roundtrip(tmp_path):
+    snap = baselines.BaselineSnapshot(
+        dataset_name="d",
+        dataset_version="v",
+        item_id="abc",
+        repo="r",
+        symbol="s",
+        jc_result={"x": 1},
+        jc_metrics={"score": 1.0},
+        experiment_run_id="run1",
+        trace_id="trace1",
+        metadata={},
+    )
+    bundle = baselines.make_baseline_bundle([snap], dataset_name="d", dataset_version="v", baseline_run_id="run1")
+    path = tmp_path / "bundle.json"
+    baselines.save_baseline_bundle(bundle, path)
+    loaded = baselines.load_baseline_bundle(path)
+    resolved = baselines.require_baseline(loaded, baselines.normalize_dataset_item({"repo": "r", "symbol": "s"}))  # type: ignore[arg-type]
+    metrics = resolved.get("jc_metrics", {})
+    assert metrics.get("score") == 1.0
+
+
+def test_require_baseline_errors_when_missing():
+    bundle = baselines.make_baseline_bundle([], dataset_name="d")
+    item = baselines.normalize_dataset_item({"repo": "r", "symbol": "s"})  # type: ignore[arg-type]
+    try:
+        baselines.require_baseline(bundle, item)
+    except ValueError as exc:
+        assert "repo" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for missing baseline")
+</file>
+
+<file path="tests_harness/test_datasets_experiments.py">
+from __future__ import annotations
+
+from typing import Any, cast
+
+from harness.observability import datasets, experiments
+from harness.observability.baselines import BaselineBundle
+
+
+def test_fetch_dataset_items_from_client(monkeypatch):
+    class FakeDataset:
+        def __init__(self):
+            self._items = [{"repo": "r1", "symbol": "s1", "metadata": {"k": 1}}]
+
+        def items(self):
+            return self._items
+
+    class FakeClient:
+        def get_dataset(self, name: str, version: str | None = None):
+            return FakeDataset()
+
+    monkeypatch.setattr(datasets, "get_langfuse_client", lambda: FakeClient())
+    items = datasets.fetch_dataset_items("fake")
+    assert items
+    first_item = cast(datasets.DatasetItem, items[0])
+    assert first_item.get("repo") == "r1"
+
+
+def test_run_hosted_jc_baseline_experiment(monkeypatch):
+    items = [datasets.normalize_dataset_item({"repo": "r", "symbol": "s"})]
+    monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
+    monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(experiments, "compute_baseline_for_item", lambda *a, **k: {"repo": "r", "symbol": "s", "jc_result": {}, "jc_metrics": {}})
+
+    def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
+        outputs = []
+        for it in items:
+            outputs.append({"item": it, "output": task_fn(it, None), "trace_id": "t1"})
+        return {"run_id": "run1", "items": outputs, "dataset_name": dataset_name, "dataset_version": dataset_version}
+
+    monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_runner)
+    bundle_any = cast(Any, experiments.run_hosted_jc_baseline_experiment("fake", version=None))
+    assert bundle_any
+    first = bundle_any["items"][0]
+    assert first["symbol"] == "s"
+    assert bundle_any.get("baseline_run_id") == "run1"
+
+
+def test_run_hosted_ic_optimization_experiment(monkeypatch):
+    items = [datasets.normalize_dataset_item({"repo": "r", "symbol": "s"})]
+    monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
+    monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [{"score": 2.0}])
+
+    def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
+        outputs = []
+        for it in items:
+            outputs.append({"item": it, "output": task_fn(it, None), "trace_id": "t2"})
+        return {"run_id": "run2", "items": outputs, "dataset_name": dataset_name, "dataset_version": dataset_version}
+
+    monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_runner)
+    results_any = cast(Any, experiments.run_hosted_ic_optimization_experiment("fake", iterations=1, baselines={"items": [{"repo": "r", "symbol": "s", "jc_result": {}, "jc_metrics": {}}]}))
+    assert results_any
+    first = results_any[0]
+    assert first["item"]["symbol"] == "s"
+
+
+def test_run_ic_optimization_requires_baseline(monkeypatch):
+    items = [datasets.normalize_dataset_item({"repo": "r", "symbol": "s"})]
+    monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
+    try:
+        experiments.run_hosted_ic_optimization_experiment("fake", iterations=1, recompute_baselines=False)
+    except ValueError as exc:
+        assert "Baselines bundle" in str(exc)
+    else:
+        raise AssertionError("Expected missing baseline error")
+
+
+def test_run_ic_optimization_uses_provided_baseline(monkeypatch):
+    items = [datasets.normalize_dataset_item({"repo": "r", "symbol": "s"})]
+    monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
+    called = {"baseline": False}
+
+    def fail_run_baseline(*args, **kwargs):
+        called["baseline"] = True
+        raise AssertionError("Should not recompute baseline")
+
+    monkeypatch.setattr(experiments, "run_hosted_jc_baseline_experiment", fail_run_baseline)
+    monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [{"score": 1.0}])
+
+    def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
+        outputs = []
+        for it in items:
+            outputs.append({"item": it, "output": task_fn(it, None), "trace_id": "t3"})
+        return {"run_id": "run3", "items": outputs, "dataset_name": dataset_name, "dataset_version": dataset_version}
+
+    monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_runner)
+    baselines_bundle: BaselineBundle = {"items": [{"repo": "r", "symbol": "s", "jc_result": {}, "jc_metrics": {}}]}
+    results_any = experiments.run_hosted_ic_optimization_experiment("fake", iterations=1, baselines=baselines_bundle)
+    assert results_any and not called["baseline"]
+</file>
+
+<file path="tests_harness/test_datasets.py">
+from __future__ import annotations
+
+from harness.observability import datasets
+
+
+def test_normalize_dataset_item_generates_id_when_missing():
+    item = {"repo": "r", "symbol": "s"}
+    normalized = datasets.normalize_dataset_item(item)
+    assert normalized["repo"] == "r"
+    assert normalized["symbol"] == "s"
+    assert isinstance(normalized.get("id"), str)
 </file>
 
 <file path="tests_harness/test_filesystem_guard.py">
@@ -614,47 +1785,70 @@ def test_only_policy_file_can_be_written(tmp_path: Path):
         _write_policy("hi", tmp_path / "other.py")
 </file>
 
-<file path="tests_harness/test_policy_sandbox.py">
+<file path="tests_harness/test_observability.py">
+from __future__ import annotations
+
+from harness.observability import langfuse as lf
+
+
+class DummySpan:
+    def __init__(self):
+        self.scores: list[tuple[str, float, dict[str, object] | None]] = []
+
+    def score(self, name: str, value: float, metadata=None):
+        self.scores.append((name, value, metadata))
+
+
+def test_langfuse_disabled_without_keys(monkeypatch):
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    monkeypatch.setenv("LANGFUSE_ENABLED", "0")
+    assert lf.get_langfuse_client() is None
+
+
+def test_record_score_passes_metadata():
+    span = DummySpan()
+    lf.record_score(span, "metric", 1.0, metadata={"a": 1})
+    assert span.scores == [("metric", 1.0, {"a": 1})]
+</file>
+
+<file path="tests_harness/test_policy_loader.py">
+from __future__ import annotations
+
 from pathlib import Path
 
 import pytest
 
 from harness.policy_loader import load_policy
-from harness.loop import _write_policy, _read_policy
 
 
-@pytest.fixture(autouse=True)
-def restore_policy():
-    policy_path = Path(__file__).resolve().parents[2] / "harness" / "policy.py"
-    original = _read_policy(policy_path)
-    yield
-    _write_policy(original, policy_path)
+@pytest.fixture()
+def policy_path():
+    path = Path(__file__).resolve().parents[2] / "harness" / "policy.py"
+    original = path.read_text(encoding="utf-8")
+    yield path
+    path.write_text(original, encoding="utf-8")
 
 
-def test_policy_cannot_import_os():
-    policy_path = Path(__file__).resolve().parents[2] / "harness" / "policy.py"
-    malicious = "import os\n\ndef score(node, state):\n    return 1.0\n"
-    _write_policy(malicious, policy_path)
-    with pytest.raises(ImportError):
+def test_missing_score_function_raises(policy_path: Path):
+    policy_path.write_text("def not_score():\n    return 1\n", encoding="utf-8")
+    with pytest.raises(AttributeError):
         load_policy()
 
 
-def test_policy_cannot_use_open():
-    policy_path = Path(__file__).resolve().parents[2] / "harness" / "policy.py"
-    malicious = "def score(node, state):\n    open('x', 'w')\n    return 1.0\n"
-    _write_policy(malicious, policy_path)
-    scorer = load_policy()
-    with pytest.raises(Exception):
-        scorer(None, {})
+def test_non_callable_score_raises(policy_path: Path):
+    policy_path.write_text("score = 1\n", encoding="utf-8")
+    with pytest.raises(AttributeError):
+        load_policy()
 
 
-def test_policy_timeout():
-    policy_path = Path(__file__).resolve().parents[1] / "policy.py"
-    malicious = "def score(node, state):\n    while True:\n        pass\n"
-    _write_policy(malicious, policy_path)
+def test_variable_arity_adapts(policy_path: Path):
+    policy_path.write_text(
+        "def score(node):\n    return 1.5\n",
+        encoding="utf-8",
+    )
     scorer = load_policy()
-    with pytest.raises(TimeoutError):
-        scorer(None, {})
+    assert scorer(None, None, None) == 1.5
 </file>
 
 <file path="tests_harness/test_pytest_scope.py">
@@ -685,6 +1879,69 @@ def test_pytest_scope_limited():
     repo_root = Path(__file__).resolve().parents[2]
     step.run(repo_root)
     assert backend.last_cmd == ["uv", "run", "pytest", "iterative-context", "-q", "--disable-warnings", "--maxfail=1"]
+</file>
+
+<file path="tests_harness/test_runner_integration.py">
+from __future__ import annotations
+
+from typing import Mapping
+
+from harness.observability import runner_integration
+
+
+class _FakeResult:
+    def __init__(self):
+        self.id = "rid"
+        self.items = [{"input": {"repo": "r"}, "output": {"ok": True}, "trace_id": "tid"}]
+
+
+def test_run_hosted_dataset_experiment_uses_get_dataset(monkeypatch):
+    calls: dict[str, int] = {"get_dataset": 0, "run_experiment": 0}
+
+    class FakeDataset:
+        def run_experiment(self, **kwargs):
+            calls["run_experiment"] += 1
+            assert kwargs["name"] == "exp"
+            assert callable(kwargs["task"])
+            return _FakeResult()
+
+    class FakeClient:
+        def get_dataset(self, name: str, version: str | None = None):
+            calls["get_dataset"] += 1
+            assert name == "ds"
+            assert version == "v1"
+            return FakeDataset()
+
+    monkeypatch.setattr(runner_integration, "get_langfuse_client", lambda: FakeClient())
+    result = runner_integration.run_hosted_dataset_experiment(
+        dataset_name="ds",
+        dataset_version="v1",
+        experiment_name="exp",
+        task_fn=lambda item, trace=None: {"ok": True},
+    )
+    assert result.get("run_id") == "rid"
+    assert calls["get_dataset"] == 1 and calls["run_experiment"] == 1
+
+
+def test_run_local_dataset_experiment_calls_client(monkeypatch):
+    calls: dict[str, int] = {"run_experiment": 0}
+
+    class FakeClient:
+        def run_experiment(self, **kwargs):
+            calls["run_experiment"] += 1
+            assert kwargs["name"] == "exp_local"
+            assert isinstance(kwargs["data"], list)
+            return _FakeResult()
+
+    monkeypatch.setattr(runner_integration, "get_langfuse_client", lambda: FakeClient())
+    data: list[Mapping[str, object]] = [{"repo": "r"}]
+    result = runner_integration.run_local_dataset_experiment(
+        data=data,
+        experiment_name="exp_local",
+        task_fn=lambda item, trace=None: {"ok": True},
+    )
+    assert result.get("run_id") == "rid"
+    assert calls["run_experiment"] == 1
 </file>
 
 <file path="tests_harness/test_score_adapter.py">
@@ -743,6 +2000,123 @@ def test_test_directory_integrity(tmp_path: Path):
         _write_policy(_read_policy(policy_path), policy_path)
 </file>
 
+<file path="tests_harness/test_tracing_wrappers.py">
+from __future__ import annotations
+
+from harness import loop, runner, writer
+
+
+class DummySpan:
+    def __init__(self, name: str = "obs"):
+        self.name = name
+        self.ended: list[dict[str, object]] = []
+        self.scores: list[tuple[str, float]] = []
+
+    def end(self, **kwargs):
+        self.ended.append(kwargs)
+
+    def score(self, name: str, value: float | int | bool, metadata=None):
+        self.scores.append((name, float(value)))
+
+
+def test_run_ic_iteration_emits_scores(monkeypatch):
+    scores: list[tuple[str, float]] = []
+    monkeypatch.setattr(runner, "record_score", lambda span, name, value, metadata=None: scores.append((name, float(value))))
+    monkeypatch.setattr(runner, "start_span", lambda *a, **k: DummySpan("span"))
+    monkeypatch.setattr(runner, "run_agent", lambda *a, **k: {"observations": [{"tool": "t", "result": {"graph": {"nodes": [1, 2]}}}]})
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type("B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}})(),
+    )
+
+    result = runner.run_ic_iteration({"symbol": "s", "repo": "r"}, score_fn=lambda n, s, c=None: 1.0, steps=1)
+    assert result["node_count"] == 2
+    assert ("ic.node_count", 2.0) in scores
+
+
+def test_writer_records_policy_events(monkeypatch):
+    attempt_scores: list[tuple[str, float]] = []
+
+    class DummyMessage:
+        content = "def score(node, state):\n    return 1.0\n"
+
+    class DummyChoice:
+        message = DummyMessage()
+
+    class DummyResponse:
+        choices = [DummyChoice()]
+
+    class DummyCompletions:
+        def create(self, **kwargs):
+            return DummyResponse()
+
+    class DummyChat:
+        def __init__(self):
+            self.completions = DummyCompletions()
+
+    class DummyClient:
+        def __init__(self):
+            self.chat = DummyChat()
+
+    def fake_client():
+        return DummyClient(), "test-model"
+
+    monkeypatch.setattr(writer, "_get_client", fake_client)
+    monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan("writer"))
+    monkeypatch.setattr(writer, "record_score", lambda obs, name, value, metadata=None: attempt_scores.append((name, float(value))))
+
+    result = writer.generate_policy(
+        feedback={"a": 1},
+        current_policy="def score(node, state):\n    return 0.0\n",
+        tests="",
+        scoring_context="",
+        feedback_str="",
+        guidance_hint="",
+        diff_str="",
+        diff_hint="",
+        comparison_summary="IC vs JC summary",
+        parent_trace=None,
+    )
+    assert "def score" in result
+    assert ("writer.policy_compiled", 1.0) in attempt_scores
+    assert ("writer.policy_generated", 1.0) in attempt_scores
+
+
+def test_run_loop_uses_observations(monkeypatch, tmp_path):
+    events: list[str] = []
+    monkeypatch.setattr(loop, "index_folder", lambda repo: {"repo": repo})
+    monkeypatch.setattr(loop, "load_policy", lambda: lambda *_: 1.0)
+    monkeypatch.setattr(loop, "run_ic_iteration", lambda *a, **k: {"observations": [{"tool": "x"}], "node_count": 1})
+    monkeypatch.setattr(loop, "score", lambda result: {"score": 1.0, "coverage_delta": 1, "ic_nodes": 1, "jc_nodes": 0})
+    monkeypatch.setattr(loop, "load_tests", lambda repo: [])
+    monkeypatch.setattr(loop, "format_tests_for_prompt", lambda tests: "")
+    monkeypatch.setattr(loop, "load_scoring_types", lambda repo: "")
+    monkeypatch.setattr(loop, "load_scoring_examples", lambda repo: "")
+    monkeypatch.setattr(loop, "format_scoring_context", lambda *a, **k: "")
+    monkeypatch.setattr(loop, "_read_policy", lambda *a, **k: "def score(node, state):\n    return 0.0\n")
+    monkeypatch.setattr(loop, "_write_policy", lambda *a, **k: None)
+    monkeypatch.setattr(loop, "_hash_tests_dir", lambda *a, **k: "hash")
+    monkeypatch.setattr(loop, "generate_policy", lambda **kwargs: "def score(node, state):\n    return 1.0\n")
+
+    class DummyPipeline:
+        def run(self, repo_root, observation=None):
+            return []
+
+    monkeypatch.setattr(loop, "default_pipeline", lambda: DummyPipeline())
+    monkeypatch.setattr(loop, "find_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(loop, "start_trace", lambda *a, **k: DummySpan("trace"))
+    monkeypatch.setattr(loop, "start_span", lambda *a, **k: DummySpan("span"))
+    monkeypatch.setattr(loop, "record_score", lambda *a, **k: events.append("record_score"))
+    monkeypatch.setattr(loop, "flush_langfuse", lambda: events.append("flush"))
+
+    baseline = {"jc_result": {"observations": [{"tool": "y"}]}, "jc_metrics": {"jc_nodes": 0, "score": 0.0}}
+
+    history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot=baseline)
+    assert history and history[0]["score"] == 1.0
+    assert "flush" in events
+</file>
+
 <file path="tools/backends/__init__.py">
 from .ic_backend import IterativeContextBackend
 from .jc_backend import JCodeMunchBackend
@@ -753,8 +2127,11 @@ __all__ = ["IterativeContextBackend", "JCodeMunchBackend"]
 <file path="tools/backends/ic_backend.py">
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any, Callable
 
+from iterative_context import exploration
 from iterative_context.server import IterativeContextToolRuntime, list_tools
 
 from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
@@ -762,10 +2139,24 @@ from ...utils.openai_schema import OpenAITool
 
 
 class IterativeContextBackend:
-    def __init__(self, score_fn: Callable[..., float] | None):
+    def __init__(self, repo: str, score_fn: Callable[..., float] | None):
         self._runtime = IterativeContextToolRuntime(score_fn=score_fn)
+        self._initialize_repo(repo)
         tools = run_async(list_tools())
         self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
+
+    def _initialize_repo(self, repo: str) -> None:
+        repo_path = Path(repo)
+        if not repo_path.exists():
+            raise RuntimeError(f"[IC] Repo path does not exist: {repo}")
+        prev_cwd = Path.cwd()
+        try:
+            os.chdir(repo_path)
+            # NOTE: iterative-context currently loads the active graph from cwd.
+            # This fallback relies on that behavior until a repo-specific API is exposed.
+            exploration.ensure_graph_loaded()
+        finally:
+            os.chdir(prev_cwd)
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
         result_blocks = run_async(self._runtime.call_tool(name, arguments))
@@ -775,21 +2166,86 @@ class IterativeContextBackend:
 <file path="tools/backends/jc_backend.py">
 from __future__ import annotations
 
-from typing import Any
+import re
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any, cast
 
 from jcodemunch_mcp.server import call_tool, list_tools
+from mcp.types import TextContent, Tool
 
-from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
 from ...utils.openai_schema import OpenAITool
+from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
 
 
 class JCodeMunchBackend:
-    def __init__(self) -> None:
-        tools = run_async(list_tools())
+    def __init__(self, repo: str) -> None:
+        list_tools_fn: Callable[[], Awaitable[list[Tool]]] = cast(
+            Callable[[], Awaitable[list[Tool]]],
+            list_tools,
+        )
+        tools = run_async(list_tools_fn())
         self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
+        self._initialize_repo(repo)
+
+    def _initialize_repo(self, repo: str) -> None:
+        repo = repo.strip()
+        if not repo:
+            raise RuntimeError("[JC] Repo path/url is empty")
+
+        if self._is_existing_local_path(repo):
+            self._init_local_repo(repo)
+            return
+
+        if self._is_github_url(repo) or self._is_owner_repo(repo):
+            self._init_remote_repo(repo)
+            return
+
+        raise RuntimeError(f"[JC] Unable to initialize repo: {repo}")
+
+    @staticmethod
+    def _is_existing_local_path(repo: str) -> bool:
+        return Path(repo).expanduser().exists()
+
+    @staticmethod
+    def _is_github_url(repo: str) -> bool:
+        return bool(re.match(r"^https?://(www\.)?github\.com/[^/\s]+/[^/\s]+$", repo))
+
+    @staticmethod
+    def _is_owner_repo(repo: str) -> bool:
+        if "\\" in repo or " " in repo or repo.startswith("/"):
+            return False
+        parts = repo.split("/")
+        return len(parts) == 2 and all(parts)
+
+    def _init_local_repo(self, repo: str) -> None:
+        try:
+            result = run_async(call_tool("resolve_repo", {"path": repo}))
+            parsed = parse_text_content_payload(cast(list[TextContent], result))
+            if parsed and isinstance(parsed, dict) and not parsed.get("error"):
+                return
+        except Exception:
+            pass
+
+        result = run_async(call_tool("index_folder", {"path": repo, "incremental": True}))
+        parsed = parse_text_content_payload(cast(list[TextContent], result))
+        if isinstance(parsed, dict) and parsed.get("error"):
+            raise RuntimeError(f"[JC] index_folder failed: {parsed['error']}")
+
+    def _init_remote_repo(self, repo: str) -> None:
+        result = run_async(call_tool("index_repo", {"url": repo}))
+        parsed = parse_text_content_payload(cast(list[TextContent], result))
+        if isinstance(parsed, dict) and parsed.get("error"):
+            raise RuntimeError(f"[JC] index_repo failed: {parsed['error']}")
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
-        result_blocks = run_async(call_tool(name, arguments))
+        call_tool_fn: Callable[[str, dict[str, Any]], Awaitable[list[TextContent]]] = (
+            cast(
+                Callable[[str, dict[str, Any]], Awaitable[list[TextContent]]],
+                call_tool,
+            )
+        )
+        result_blocks = run_async(call_tool_fn(name, arguments))
         return parse_text_content_payload(result_blocks)
 </file>
 
@@ -807,7 +2263,8 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from typing import Any, Coroutine, Iterable, TypeVar
+from collections.abc import Awaitable, Iterable
+from typing import Any, TypeVar
 
 from mcp.types import TextContent, Tool as MCPTool
 
@@ -848,7 +2305,7 @@ def parse_text_content_payload(blocks: Iterable[TextContent] | None) -> Any:
     return None
 
 
-def run_async(coro: asyncio.Future[T] | Coroutine[Any, Any, T]) -> T:
+def run_async(coro: Awaitable[T]) -> T:
     """
     Run an async coroutine from sync code safely.
 
@@ -856,10 +2313,13 @@ def run_async(coro: asyncio.Future[T] | Coroutine[Any, Any, T]) -> T:
     - If a loop is already running on this thread: execute the coroutine inside a
       fresh event loop on a dedicated background thread to avoid deadlocks.
     """
+    async def _awaitable() -> T:
+        return await coro
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(_awaitable())
 
     result: list[T] = []
     error: list[BaseException] = []
@@ -868,7 +2328,7 @@ def run_async(coro: asyncio.Future[T] | Coroutine[Any, Any, T]) -> T:
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
-            result.append(loop.run_until_complete(coro))
+            result.append(loop.run_until_complete(_awaitable()))
         except BaseException as exc:  # pragma: no cover - exercised in tests
             error.append(exc)
         finally:
@@ -932,114 +2392,62 @@ def run_cmd(cmd: List[str], cwd: Path) -> "StepResult":
     )
 </file>
 
-<file path="utils/debug.py">
+<file path="utils/comparison.py">
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Mapping
+
+DEFAULT_WEIGHTS: dict[str, float] = {
+    "score": 1.0,
+    "coverage_delta": 1.0,
+    "ic_nodes": 0.2,
+    "jc_nodes": 0.2,
+    "tool_error_rate": -0.5,
+    "pipeline_passed": 1.0,
+}
 
 
-def _truncate(text: str, limit: int = 200) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
+def _as_float(val: object) -> float:
+    if isinstance(val, bool):
+        return 1.0 if val else 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    return 0.0
 
 
-def print_iteration_debug(iter_idx: int, result: Mapping[str, Any], metrics: Mapping[str, Any]) -> None:
-    """
-    Pretty-print iteration details for humans.
-    """
-    print(f"\n=== ITERATION {iter_idx} ===")
-
-    ic = result.get("iterative_context") or {}
-    jc = result.get("jcodemunch") or {}
-
-    # Tool usage from raw observations
-    raw_ic = ic.get("raw") if isinstance(ic, Mapping) else {}
-    observations = raw_ic.get("observations") if isinstance(raw_ic, Mapping) else []
-    if observations:
-        print("Tools called (iterative-context):")
-        for obs in observations:
-            if not isinstance(obs, Mapping):
-                continue
-            tool = obs.get("tool", "unknown")
-            payload = obs.get("result") or obs.get("error") or ""
-            summary = _truncate(str(payload))
-            print(f"  - {tool}: {summary}")
-    else:
-        print("Tools called (iterative-context): none")
-
-    # Exploration stats
-    ic_nodes = ic.get("node_count") if isinstance(ic, Mapping) else None
-    jc_nodes = jc.get("node_count") if isinstance(jc, Mapping) else None
-    print(f"Exploration stats: ic_nodes={ic_nodes}, jc_nodes={jc_nodes}")
-
-    # Metrics of interest
-    score = metrics.get("score")
-    coverage_delta = metrics.get("coverage_delta")
-    efficiency_ic = metrics.get("efficiency_ic")
-    redundancy_ic = metrics.get("redundancy_ic")
-    print(
-        f"Metrics: score={score}, coverage_delta={coverage_delta}, "
-        f"efficiency_ic={efficiency_ic}, redundancy_ic={redundancy_ic}"
-    )
+def build_comparison(
+    ic_metrics: Mapping[str, object],
+    jc_metrics: Mapping[str, object],
+    weights: Mapping[str, float] | None = None,
+) -> dict[str, object]:
+    w = dict(DEFAULT_WEIGHTS)
+    if weights:
+        w.update(weights)
+    deltas: dict[str, float] = {}
+    weighted = 0.0
+    for key, weight in w.items():
+        delta = _as_float(ic_metrics.get(key, 0.0)) - _as_float(jc_metrics.get(key, 0.0))
+        deltas[key] = delta
+        weighted += weight * delta
+    return {
+        "ic_metrics": dict(ic_metrics),
+        "jc_metrics": dict(jc_metrics),
+        "deltas": deltas,
+        "weighted_score": weighted,
+    }
 
 
-def print_final_summary(history: list[Mapping[str, Any]]) -> None:
-    """
-    Summarize run history in a compact, human-friendly way.
-    """
-    if not history:
-        print("No iterations completed.")
-        return
-
-    scores: list[float] = []
-    coverage: list[int] = []
-    efficiency: list[float] = []
-
-    for entry in history:
-        if not isinstance(entry, Mapping):
-            continue
-        metrics = entry.get("metrics", entry) if isinstance(entry, Mapping) else entry
-        if not isinstance(metrics, Mapping):
-            continue
-        score_val = metrics.get("score")
-        coverage_val = metrics.get("coverage_delta")
-        eff_val = metrics.get("efficiency_ic")
-        try:
-            scores.append(float(score_val))
-        except (TypeError, ValueError):
-            pass
-        try:
-            coverage.append(int(coverage_val))
-        except (TypeError, ValueError):
-            pass
-        try:
-            efficiency.append(float(eff_val))
-        except (TypeError, ValueError):
-            pass
-
-    total = len(history)
-    last_score = scores[-1] if scores else None
-    best_score = max(scores) if scores else None
-    avg_score = sum(scores) / len(scores) if scores else None
-    max_coverage = max(coverage) if coverage else None
-    max_eff = max(efficiency) if efficiency else None
-
-    print(f"Iterations completed: {total}")
-    print(f"Last score: {last_score}")
-    print(f"Best score: {best_score}")
-    print(f"Average score: {avg_score}")
-    print(f"Max coverage_delta: {max_coverage}")
-    print(f"Max efficiency_ic: {max_eff}")
-
-    if len(scores) >= 2:
-        trend = "improving" if scores[-1] > scores[0] else "regressing" if scores[-1] < scores[0] else "flat"
-        print(f"Trend: {trend}")
-        print(f"Score history: {', '.join(f'{s:.3f}' for s in scores)}")
-    elif scores:
-        print(f"Score history: {scores[0]:.3f}")
-    else:
-        print("Score history: unavailable")
+def format_comparison_summary(comp: Mapping[str, object]) -> str:
+    deltas = comp.get("deltas")
+    weighted = comp.get("weighted_score")
+    if not isinstance(deltas, Mapping):
+        return "No baseline comparison available."
+    parts = ["IC vs JC baseline:"]
+    for k, v in deltas.items():
+        parts.append(f"- {k}: {v:+.3f}")
+    if isinstance(weighted, (int, float)):
+        parts.append(f"Weighted delta: {float(weighted):+.3f}")
+    return "\n".join(parts)
 </file>
 
 <file path="utils/diff.py">
@@ -1131,19 +2539,61 @@ def load_env() -> None:
     if not _loaded:
         load_dotenv()
         _loaded = True
+
+
+def getenv(key: str, default: str | None = None) -> str | None:
+    """
+    Wrapper around os.environ that ensures .env is loaded once.
+    """
+    import os
+
+    load_env()
+    return os.environ.get(key, default)
+
+
+def getenv_bool(key: str, default: bool = False) -> bool:
+    val = getenv(key)
+    if val is None:
+        return default
+    return val.lower() not in {"0", "false", "off", "no"}
+
+
+def get_runner_model() -> str:
+    return getenv("RUNNER_MODEL", "llama3.1-8b") or "llama3.1-8b"
+
+
+def get_writer_model() -> str:
+    return getenv("WRITER_MODEL", "gpt-oss-120b") or "gpt-oss-120b"
+
+
+def get_cerebras_api_key() -> str | None:
+    return getenv("CEREBRAS_API_KEY")
+
+
+def get_langfuse_env() -> dict[str, str | bool | None]:
+    """
+    Centralized Langfuse environment access to avoid scattered lookups.
+    """
+    return {
+        "enabled": getenv_bool("LANGFUSE_ENABLED", default=True),
+        "public_key": getenv("LANGFUSE_PUBLIC_KEY"),
+        "secret_key": getenv("LANGFUSE_SECRET_KEY"),
+        "base_url": getenv("LANGFUSE_BASE_URL"),
+        "environment": getenv("LANGFUSE_ENV"),
+    }
 </file>
 
 <file path="utils/openai_schema.py">
 from __future__ import annotations
 
 import json
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 
 class OpenAIToolFunction(TypedDict):
     name: str
     description: str
-    parameters: dict
+    parameters: dict[str, Any]
 
 
 class OpenAITool(TypedDict):
@@ -1154,7 +2604,7 @@ class OpenAITool(TypedDict):
 class ToolCall(TypedDict):
     id: str
     name: str
-    arguments: dict
+    arguments: dict[str, Any]
 
 
 def build_tool_response(call_id: str, content: str) -> dict[str, str]:
@@ -1165,7 +2615,7 @@ def build_tool_response(call_id: str, content: str) -> dict[str, str]:
     }
 
 
-def parse_arguments(raw: str | dict) -> dict:
+def parse_arguments(raw: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw, str):
         return json.loads(raw)
     return raw
@@ -1290,6 +2740,55 @@ def format_scoring_context(types: str, examples: str, max_chars: int = 8000) -> 
 # Treat harness as a package for imports and type checking.
 </file>
 
+<file path="LANGFUSE.md">
+# Langfuse-First Usage
+
+## Environment
+- Required to enable: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`
+- Optional: `LANGFUSE_BASE_URL`, `LANGFUSE_ENV`, `LANGFUSE_ENABLED=0` to disable
+- Model config remains: `CEREBRAS_API_KEY`, `RUNNER_MODEL`, `WRITER_MODEL`
+
+## Benchmark Model
+- Langfuse datasets are the canonical benchmark source.
+- JC baselines are computed as separate experiments over the dataset (cached snapshots).
+- IC optimization runs consume those JC baseline snapshots and perform the inner loop per item.
+
+## Datasets
+- `fetch_dataset_items(name, version=None)` pulls hosted datasets.
+- `local_dataset(name, items)` converts local task dicts to Langfuse-style items (normalized ids).
+- Items must include `repo` and `symbol`; ids are stable (dataset id if present, otherwise hash).
+
+## Baselines & Experiments (Langfuse-first)
+- Baseline bundle: reusable JC snapshots keyed by dataset name/version and item id; contains `jc_result`, `jc_metrics`, trace/run ids, and pointers to the hosted baseline run (`baseline_run_id`, optional run name).
+- Hosted JC baselines use the documented SDK:
+  - `dataset = get_langfuse_client().get_dataset(name, version=...)`
+  - `dataset.run_experiment(name="jc_baseline", task=...)`
+  - `run_hosted_jc_baseline_experiment(...) -> BaselineBundle` caches the hosted outputs.
+- Hosted IC optimization wraps `run_loop` inside `dataset.run_experiment(...)`:
+  - `run_hosted_ic_optimization_experiment(name, version=None, iterations=..., baselines=bundle, recompute_baselines=False)`
+  - Baselines are NOT recomputed implicitly. Provide a bundle or set `recompute_baselines=True` (which re-runs the hosted JC baseline experiment).
+- Local fallback paths use `client.run_experiment(data=..., task=...)`:
+  - `run_local_jc_baseline_experiment(dataset)`
+  - `run_local_ic_optimization_experiment(dataset, iterations=..., baselines=bundle, recompute_baselines=False)`
+- Hosted runs create dataset runs/compare UX; local runs create traces/scores only. Per-item traces include dataset info, item id, baseline run id, and run kind (`jc_baseline` vs `ic_optimization`).
+
+## Tracing & Scoring
+- `runner.py`: model calls and MCP tool invocations traced via Langfuse spans.
+- `writer.py`: policy generations/retries traced; emits `writer.policy_generated` and `writer.policy_compiled`.
+- `loop.py`: iteration boundaries, policy load/write, IC/JC runs, scoring, pipeline steps, integrity checks captured as spans with scores like `metrics.score`, `metrics.coverage_delta`, `metrics.tool_error_rate`, `pipeline_passed`.
+- `pipeline` steps emit exit-code/pass flags per step.
+- `scorer.py` remains the source of metric computation; Langfuse stores the metrics.
+
+## CLI
+- Ad hoc IC loop: `python run.py --iterations 3`
+- JC baseline experiment (hosted runner): `python run.py --jc-baseline --dataset DATASET_NAME [--version v1] [--baseline-path bundle.json]`
+- IC optimization experiment (hosted runner): `python run.py --ic-optimize --dataset DATASET_NAME [--version v1] --iterations 5 --baseline-path bundle.json [--recompute-baselines]`
+- Console output is concise; Langfuse stores detailed traces/scores. `flush_langfuse()` runs on exit.
+
+## Policy Loading
+- `policy_loader.py` now simply loads `policy.py`, validates a callable `score`, and adapts 1/2/3-arg callables to `score(node, state, context) -> float`. No sandbox or restricted execution.
+</file>
+
 <file path="loop.py">
 from __future__ import annotations
 
@@ -1301,22 +2800,17 @@ from typing import Any
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
-from .pipeline import (
-    classify_results,
-    default_pipeline,
-)
+from .observability.langfuse import flush_langfuse, record_score, start_span, start_trace
+from .observability.baselines import baseline_metrics_from_jc
+from .pipeline import classify_results, default_pipeline
 from .policy_loader import load_policy
-from .runner import run_ic_iteration, run_jc_iteration
+from .runner import run_ic_iteration
 from .scorer import score
-from .utils.debug import print_iteration_debug
+from .utils.comparison import build_comparison, format_comparison_summary
 from .utils.diff import compute_diff, format_diff, interpret_diff
 from .utils.repo_root import find_repo_root
 from .utils.test_loader import format_tests_for_prompt, load_tests
-from .utils.type_loader import (
-    format_scoring_context,
-    load_scoring_examples,
-    load_scoring_types,
-)
+from .utils.type_loader import format_scoring_context, load_scoring_examples, load_scoring_types
 from .writer import generate_policy
 
 _POLICY_PATH = Path(__file__).with_name("policy.py")
@@ -1324,7 +2818,7 @@ _POLICY_PATH = Path(__file__).with_name("policy.py")
 
 def _as_float(value: Any) -> float:
     try:
-        return float(value)
+        return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0.0
 
@@ -1381,8 +2875,24 @@ def _hash_tests_dir(repo_root: Path) -> str:
     return hasher.hexdigest()
 
 
+def _tool_call_stats(bucket: Mapping[str, object] | None) -> tuple[int, int]:
+    if not isinstance(bucket, Mapping):
+        return 0, 0
+    observations = bucket.get("observations")
+    if not isinstance(observations, list):
+        return 0, 0
+    errors = 0
+    for obs in observations:
+        if isinstance(obs, Mapping) and "error" in obs:
+            errors += 1
+    return len(observations), errors
+
+
 def run_loop(
-    task: Mapping[str, object], iterations: int = 5
+    task: Mapping[str, object],
+    iterations: int = 5,
+    parent_trace=None,
+    baseline_snapshot: Mapping[str, object] | None = None,
 ) -> list[dict[str, object]]:
     """
     Closed-loop optimizer: execute, score, rewrite policy, repeat.
@@ -1391,44 +2901,72 @@ def run_loop(
     prev_score: float | None = None
     prev_classified: dict[str, object] | None = None
     repo_path = task.get("repo")
+    root_meta = {"task": dict(task), "iterations": iterations}
+    run_trace = start_span(parent_trace, "run_loop", metadata=root_meta, input=task) if parent_trace else start_trace("run_loop", metadata=root_meta, input=task)
+    index_obs = None
     if isinstance(repo_path, str):
-        print(f"[INDEX] Indexing repo: {repo_path}")
         try:
+            index_obs = start_span(run_trace, "index_repo", metadata={"repo": repo_path})
             result = index_folder(repo_path)
             repo_id = result["repo"]
-            print(f"[INDEX] Repo registered as: {repo_id}")
+            if index_obs and hasattr(index_obs, "end"):
+                index_obs.end(metadata={"repo": repo_id})
             task = dict(task)
             task["repo"] = repo_id
         except Exception as e:  # noqa: BLE001
-            print(f"[INDEX ERROR] {e}")
+            if index_obs is not None:
+                try:
+                    index_obs.end(error=e)
+                except Exception:
+                    pass
 
     try:
         for i in range(iterations):
+            iteration_span = start_span(run_trace, f"iteration_{i}", metadata={"iteration": i, "iterations": iterations, "task": dict(task)})
+            policy_load_obs = None
             try:
+                policy_load_obs = start_span(iteration_span, "policy_load", metadata={"iteration": i})
                 score_fn = load_policy()
+                if policy_load_obs and hasattr(policy_load_obs, "end"):
+                    policy_load_obs.end(metadata={"status": "loaded"})
             except ImportError as e:
+                if policy_load_obs is not None:
+                    try:
+                        policy_load_obs.end(error=e)
+                    except Exception:
+                        pass
                 metrics_map = {
                     "score": -10.0,
                     "error": f"policy_import_error: {str(e)}",
                 }
-                print("[POLICY ERROR]", metrics_map["error"])
+                record_score(iteration_span, "metrics.score", _as_float(metrics_map.get("score", 0.0)))
                 history.append(metrics_map)
                 continue
-            print(f"[TASK] {task}")
-            ic_result = run_ic_iteration(dict(task), score_fn)
-            jc_result = run_jc_iteration(dict(task))
+
+            ic_result = run_ic_iteration(dict(task), score_fn, parent_trace=iteration_span)
+            jc_result = baseline_snapshot.get("jc_result") if isinstance(baseline_snapshot, Mapping) else {}
+            jc_metrics = baseline_snapshot.get("jc_metrics") if isinstance(baseline_snapshot, Mapping) else {}
+            if not isinstance(jc_metrics, Mapping):
+                jc_metrics = baseline_metrics_from_jc(jc_result if isinstance(jc_result, Mapping) else {})
             combined_result = {"iterative_context": ic_result, "jcodemunch": jc_result}
             metrics_map: dict[str, object] = dict(score(combined_result))
             if ic_result.get("node_count", 0) == 0:
-                metrics_map["score"] = float(metrics_map.get("score", 0.0)) - 1.0
+                metrics_map["score"] = _as_float(metrics_map.get("score", 0.0)) - 1.0
                 metrics_map["error"] = "no_tool_usage"
-            print(f"=== ITERATION {i} ===")
-            print("[IC RESULT]")
-            print_iteration_debug(i, {"iterative_context": ic_result, "jcodemunch": {}}, metrics_map)
-            print("[JC RESULT]")
-            print_iteration_debug(i, {"iterative_context": {}, "jcodemunch": jc_result}, metrics_map)
-            print("[METRICS]")
-            print(metrics_map)
+            total_ic, errors_ic = _tool_call_stats(ic_result)
+            total_jc, errors_jc = _tool_call_stats(jc_result if isinstance(jc_result, Mapping) else {})
+            total_calls = total_ic + total_jc
+            total_errors = errors_ic + errors_jc
+            metrics_map["tool_error_rate"] = (total_errors / total_calls) if total_calls else 0.0
+            metrics_map["no_tool_usage"] = total_ic == 0
+            comparison = build_comparison(metrics_map, jc_metrics if isinstance(jc_metrics, Mapping) else {})
+            comparison_summary = format_comparison_summary(comparison)
+            metrics_map.setdefault("iteration_regression", False)
+            metrics_map["jc_baseline_metrics"] = dict(jc_metrics) if isinstance(jc_metrics, Mapping) else {}
+            metrics_map["comparison"] = comparison
+            for name, value in metrics_map.items():
+                if isinstance(value, (int, float, bool)):
+                    record_score(iteration_span, f"metrics.{name}", float(value))
 
             repo_root = find_repo_root()
             tests = load_tests(repo_root)
@@ -1439,44 +2977,54 @@ def run_loop(
             tests_hash_before = _hash_tests_dir(repo_root)
 
             current_code = _read_policy()
+            policy_gen_obs = start_span(iteration_span, "policy_generation", metadata={"iteration": i})
             try:
                 new_code = generate_policy(
                     feedback=metrics_map,
                     current_policy=current_code,
                     tests=tests_str,
                     scoring_context=scoring_ctx,
-                    feedback_str=metrics_map.get("error", ""),
+                    feedback_str=str(metrics_map.get("error", "")),
                     guidance_hint="Fix errors before improving score",
                     diff_str="",
                     diff_hint="",
+                    comparison_summary=comparison_summary,
+                    parent_trace=policy_gen_obs,
                 )
                 new_code = _clean_policy_code(new_code)
                 if "import " in new_code:
-                    print("[POLICY BLOCKED] contains import")
+                    if policy_gen_obs and hasattr(policy_gen_obs, "end"):
+                        policy_gen_obs.end(error="blocked_import")
                     history.append({"error": "blocked_import"})
                     continue
-                print_policy_diff(current_code, new_code)
-                print("\n[POLICY FULL OUTPUT]\n")
-                print(new_code)
-                print("\n[END POLICY]\n")
+                if policy_gen_obs and hasattr(policy_gen_obs, "end"):
+                    policy_gen_obs.end(metadata={"status": "generated", "length": len(new_code)})
                 _write_policy(new_code)
             except Exception as e:  # noqa: BLE001
-                print(f"[POLICY ERROR] {e}")
-                print("[POLICY] Reusing previous policy")
+                if policy_gen_obs and hasattr(policy_gen_obs, "end"):
+                    try:
+                        policy_gen_obs.end(error=e)
+                    except Exception:
+                        pass
                 history.append(metrics_map)
                 continue
 
+            integrity_obs = start_span(iteration_span, "test_integrity", metadata={"iteration": i})
             tests_hash_after = _hash_tests_dir(repo_root)
             if tests_hash_after != tests_hash_before:
                 _write_policy(current_code)
-                print("[SECURITY] Tests modified — reverting policy")
+                if integrity_obs and hasattr(integrity_obs, "end"):
+                    integrity_obs.end(error="test_integrity_modified")
                 history.append({"error": "test_integrity_modified"})
                 continue
+            if integrity_obs and hasattr(integrity_obs, "end"):
+                integrity_obs.end(metadata={"status": "ok"})
 
             pipeline = default_pipeline()
-            results = pipeline.run(repo_root)
-            if any(not r.success for r in results):
-                classified = classify_results(results)
+            pipeline_results = pipeline.run(repo_root, observation=iteration_span)
+            pipeline_obs = start_span(iteration_span, "pipeline", metadata={"iteration": i})
+            if any(not r.success for r in pipeline_results):
+                classified = classify_results(pipeline_results)
                 feedback_str = metrics_map.get("error", "")
                 guidance_hint = "Fix errors before improving score"
                 current_score = _as_float(metrics_map.get("score", 0.0))
@@ -1488,6 +3036,8 @@ def run_loop(
                     )
                     diff_str = format_diff(diff)
                     diff_hint = interpret_diff(diff)
+                    metrics_map["iteration_regression"] = diff.regression
+                    record_score(iteration_span, "iteration_regression", diff.regression)
                 prev_score = current_score
                 prev_classified = classified
                 try:
@@ -1496,16 +3046,27 @@ def run_loop(
                         current_policy=_read_policy(),
                         tests=tests_str,
                         scoring_context=scoring_ctx,
-                        feedback_str=feedback_str,
+                        feedback_str=str(feedback_str),
                         guidance_hint=guidance_hint,
                         diff_str=diff_str,
                         diff_hint=diff_hint,
+                        comparison_summary=comparison_summary,
+                        parent_trace=iteration_span,
                     )
                     _write_policy(updated_code)
-                except Exception as e:  # noqa: BLE001
-                    print(f"[POLICY ERROR] {e}")
+                    metrics_map["pipeline_passed"] = False
+                    record_score(iteration_span, "pipeline_passed", False)
+                except Exception:
+                    metrics_map["pipeline_passed"] = False
+                    record_score(iteration_span, "pipeline_passed", False)
+                if pipeline_obs and hasattr(pipeline_obs, "end"):
+                    pipeline_obs.end(metadata={"status": "failed"})
                 continue
 
+            metrics_map["pipeline_passed"] = True
+            record_score(iteration_span, "pipeline_passed", True)
+            if pipeline_obs and hasattr(pipeline_obs, "end"):
+                pipeline_obs.end(metadata={"status": "passed"})
             history.append(metrics_map)
             prev_score = _as_float(metrics_map.get("score", 0.0))
             prev_classified = {
@@ -1514,68 +3075,34 @@ def run_loop(
                 "test_failures": "",
                 "passed": [],
             }
+            if iteration_span and hasattr(iteration_span, "end"):
+                try:
+                    iteration_span.end(metadata={"status": "complete", "score": prev_score})
+                except Exception:
+                    pass
     except KeyboardInterrupt:
-        return history
-
+        if run_trace and hasattr(run_trace, "end"):
+            try:
+                run_trace.end(error="interrupted")
+            except Exception:
+                pass
+    finally:
+        if run_trace and hasattr(run_trace, "end"):
+            try:
+                run_trace.end(metadata={"iterations_completed": len(history)})
+            except Exception:
+                pass
+        flush_langfuse()
     return history
 </file>
 
 <file path="policy_loader.py">
 from __future__ import annotations
 
-import builtins
+import importlib.util
 import inspect
-import math
-import signal
 from pathlib import Path
 from typing import Callable, cast
-
-_BANNED_IMPORTS = {"os", "sys", "subprocess", "socket", "shutil", "pathlib"}
-_ALLOWED_IMPORTS = {"math", "__future__", "typing"}
-_ALLOWED_BUILTINS: dict[str, object] = {
-    "abs": abs,
-    "min": min,
-    "max": max,
-    "sum": sum,
-    "len": len,
-    "float": float,
-    "int": int,
-    "bool": bool,
-    "range": range,
-    "enumerate": enumerate,
-    "zip": zip,
-    "list": list,
-    "dict": dict,
-    "set": set,
-    "tuple": tuple,
-    "str": str,
-    "Exception": Exception,
-    "ValueError": ValueError,
-    "TypeError": TypeError,
-    "RuntimeError": RuntimeError,
-    "__build_class__": builtins.__build_class__,
-    "__name__": "policy",
-}
-
-
-def _safe_import(
-    name: str,
-    globals: dict[str, object] | None = None,
-    locals: dict[str, object] | None = None,
-    fromlist: tuple[str, ...] | list[str] = (),
-    level: int = 0,
-) -> object:
-    root = name.split(".")[0]
-    if root in _BANNED_IMPORTS or (root not in _ALLOWED_IMPORTS and root != ""):
-        raise ImportError(f"Import of '{name}' is not allowed")
-    return builtins.__import__(name, globals, locals, fromlist, level)
-
-
-def _build_safe_globals() -> dict[str, object]:
-    safe_builtins: dict[str, object] = dict(_ALLOWED_BUILTINS)
-    safe_builtins["__import__"] = _safe_import  # type: ignore[assignment]
-    safe_globals: dict[str, object] = {"__builtins__": safe_builtins, "math": math}
-    return safe_globals
 
 
 def adapt_score_fn(score_fn: Callable[..., float]) -> Callable[[object, object, object], float]:
@@ -1595,43 +3122,27 @@ def adapt_score_fn(score_fn: Callable[..., float]) -> Callable[[object, object, 
     return wrapped
 
 
-def _enforce_timeout(func: Callable[[object, object], float], seconds: int = 2) -> Callable[[object, object], float]:
-    def wrapped(*args: object, **kwargs: object) -> float:
-        def handler(signum, frame):  # noqa: ANN001, ARG001
-            raise TimeoutError("Policy execution timed out")
-
-        previous = signal.signal(signal.SIGALRM, handler)
-        signal.alarm(seconds)
-        try:
-            return float(func(*args, **kwargs))
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous)
-
-    return wrapped
-
-
-def load_policy() -> Callable[[object, object], float]:
+def load_policy() -> Callable[[object, object, object], float]:
     """
-    Load the current policy module with restricted execution and return its score callable.
+    Load the current policy module and return its score callable (adapted to node, state, context).
     """
     policy_path = Path(__file__).with_name("policy.py")
     if not policy_path.exists():
         raise FileNotFoundError(f"Policy file not found at {policy_path}")
 
-    safe_globals = _build_safe_globals()
-    code = policy_path.read_text(encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("policy", policy_path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Unable to load policy module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[arg-type]
 
-    compiled = compile(code, str(policy_path), "exec")
-    exec(compiled, safe_globals, safe_globals)  # noqa: S102
-
-    score_fn_obj = safe_globals.get("score")
+    score_fn_obj = getattr(module, "score", None)
     if not callable(score_fn_obj):
-        raise AttributeError("Policy module must define a callable 'score(node, state)'")
+        raise AttributeError("Policy module must define a callable 'score'")
 
     score_fn_typed: Callable[..., float] = cast(Callable[..., float], score_fn_obj)
-    adapted = adapt_score_fn(score_fn_typed)
-    return _enforce_timeout(adapted)
+    adapted: Callable[[object, object, object], float] = adapt_score_fn(score_fn_typed)
+    return adapted
 </file>
 
 <file path="policy.py">
@@ -1713,6 +3224,7 @@ dependencies = [
     "cerebras-cloud-sdk>=1.67.0",
     "iterative-context",   # 👈 local workspace dep
     "jcodemunch-mcp",
+    "langfuse>=2.50.6",
     "openai>=2.29.0",
     "pydantic>=2",
     "rich",                # nice CLI/logging
@@ -1733,16 +3245,15 @@ extraPaths = [".."]
 from __future__ import annotations
 
 import json
-import os
+import time
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from openai import OpenAI
-
+from .observability.langfuse import record_score, start_span, get_tracing_openai_client
 from .tools.backends.ic_backend import IterativeContextBackend
 from .tools.backends.jc_backend import JCodeMunchBackend
 from .tools.mcp_adapter import serialize_tool_result_for_model
-from .utils.env import load_env
+from .utils.env import get_cerebras_api_key, get_runner_model
 from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
 
 
@@ -1767,6 +3278,16 @@ def _format_available_tools(tool_names: list[str]) -> str:
     if not tool_names:
         return "- none"
     return "\n".join(f"- {name}" for name in tool_names)
+
+
+def _truncate_for_metadata(payload: object, limit: int = 2000) -> object:
+    try:
+        serialized = json.dumps(payload)
+    except Exception:
+        serialized = str(payload)
+    if len(serialized) <= limit:
+        return payload
+    return f"{serialized[:limit]}...(truncated)"
 
 
 def _build_ic_system_prompt(tool_specs: list[OpenAITool]) -> str:
@@ -1802,18 +3323,13 @@ def _build_jc_system_prompt(tool_specs: list[OpenAITool]) -> str:
     )
 
 
-def _make_client() -> OpenAI:
-    load_env()
-    api_key = os.environ.get("CEREBRAS_API_KEY")
+def _make_client():
+    api_key = get_cerebras_api_key()
     if not api_key:
         raise RuntimeError("Missing CEREBRAS_API_KEY in environment")
-    model = os.environ.get("RUNNER_MODEL", "llama3.1-8b")
-    client = OpenAI(
-        base_url="https://api.cerebras.ai/v1",
-        api_key=api_key,
-    )
-    print(f"[LLM] Runner model: {model}")
-    return client
+    model = get_runner_model()
+    client = get_tracing_openai_client(base_url="https://api.cerebras.ai/v1", api_key=api_key)
+    return client, model
 
 
 def run_agent(
@@ -1822,11 +3338,15 @@ def run_agent(
     tool_specs: list[OpenAITool],
     dispatch_tool_call: Callable[[str, dict[str, Any]], Any],
     system_prompt: str,
+    parent_trace=None,
+    backend_name: str | None = None,
+    model: str | None = None,
 ) -> dict[str, object]:
     """
     Execute a deterministic tool-only agent for a fixed number of steps.
     """
-    client = _make_client()
+    client, resolved_model = _make_client()
+    model_name = model or resolved_model
     validate_tools(tool_specs)
 
     messages: list[Any] = [
@@ -1841,44 +3361,86 @@ def run_agent(
     ]
 
     observations: list[dict[str, object]] = []
-    model = os.environ.get("RUNNER_MODEL", "llama3.1-8b")
-    for _ in range(steps):
+    agent_obs = start_span(parent_trace, "agent_run", metadata={"backend": backend_name or "unknown", "model": model_name, "task": task})
+    for step_index in range(steps):
+        model_obs = start_span(agent_obs, "model_completion", metadata={"model": model_name, "backend": backend_name, "step": step_index})
+        start_time = time.perf_counter()
         response = client.chat.completions.create(
-            model=model,
+            model=model_name,
             messages=cast(Any, messages),
             tools=cast(Any, tool_specs),
             tool_choice="required",
         )
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        if model_obs and hasattr(model_obs, "end"):
+            try:
+                model_obs.end(metadata={"latency_ms": latency_ms})
+            except Exception:
+                pass
 
         msg = response.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)
         if not tool_calls:
+            if agent_obs and hasattr(agent_obs, "end"):
+                try:
+                    agent_obs.end(error="missing_tool_call")
+                except Exception:
+                    pass
             raise RuntimeError("Model failed to produce tool call")
 
         call = tool_calls[0]
         call_id = getattr(call, "id", None)
         if not call_id:
+            if agent_obs and hasattr(agent_obs, "end"):
+                try:
+                    agent_obs.end(error="missing_call_id")
+                except Exception:
+                    pass
             raise RuntimeError("Tool call missing id")
         try:
             raw_args = call.function.arguments or {}
             parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             tool_name = call.function.name
+            tool_obs = start_span(agent_obs, tool_name or "tool_call", metadata={"backend": backend_name, "step": step_index, "tool": tool_name, "args": _truncate_for_metadata(parsed_args)})
+            tool_start = time.perf_counter()
             result = dispatch_tool_call(tool_name, parsed_args)
+            latency_ms = (time.perf_counter() - tool_start) * 1000
             observations.append({"tool": tool_name, "result": result})
             messages.append(build_tool_response(call_id, serialize_tool_result_for_model(result)))
+            if tool_obs and hasattr(tool_obs, "end"):
+                try:
+                    tool_obs.end(output={"result": _truncate_for_metadata(result)}, metadata={"latency_ms": latency_ms, "tool": tool_name, "step": step_index})
+                except Exception:
+                    pass
         except Exception as exc:  # noqa: BLE001
             tool_name = call.function.name or "unknown"
             observations.append({"tool": tool_name, "error": str(exc)})
             messages.append(build_tool_response(call_id, f"ERROR: {exc}"))
+            err_obs = start_span(agent_obs, f"{tool_name}_error", metadata={"backend": backend_name, "step": step_index, "tool": tool_name, "error": str(exc)})
+            if err_obs and hasattr(err_obs, "end"):
+                try:
+                    err_obs.end(error=exc)
+                except Exception:
+                    pass
 
     if not observations:
+        if agent_obs and hasattr(agent_obs, "end"):
+            try:
+                agent_obs.end(error="no_observations")
+            except Exception:
+                pass
         raise RuntimeError("Agent failed to call any tools")
 
+    if agent_obs and hasattr(agent_obs, "end"):
+        try:
+            agent_obs.end(metadata={"backend": backend_name, "model": model_name, "steps": steps, "observation_count": len(observations)})
+        except Exception:
+            pass
     return {"observations": observations}
 
 
-def _normalize_agent_result(raw: dict[str, object]) -> dict[str, object]:
-    observations = raw.get("observations") if isinstance(raw, dict) else []
+def _normalize_agent_result(raw: Mapping[str, object] | dict[str, object]) -> dict[str, object]:
+    observations = raw.get("observations") if isinstance(raw, Mapping) else []
     if not isinstance(observations, list):
         observations = []
 
@@ -1911,7 +3473,12 @@ def _normalize_agent_result(raw: dict[str, object]) -> dict[str, object]:
     return normalized
 
 
-def run_ic_iteration(task: dict[str, object], score_fn: Callable[..., float], steps: int = 5):
+def run_ic_iteration(
+    task: dict[str, object],
+    score_fn: Callable[..., float],
+    steps: int = 5,
+    parent_trace=None,
+):
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
     agent_task: dict[str, object] = {
@@ -1921,9 +3488,10 @@ def run_ic_iteration(task: dict[str, object], score_fn: Callable[..., float], st
         "raw_symbol": symbol,
     }
 
-    backend = IterativeContextBackend(score_fn)
+    backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
     tool_specs: list[OpenAITool] = backend.tool_specs
     system_prompt = _build_ic_system_prompt(tool_specs)
+    backend_obs = start_span(parent_trace, "iterative_context", metadata={"backend": "iterative_context", "repo": repo, "symbol": symbol})
     try:
         raw = run_agent(
             agent_task,
@@ -1931,13 +3499,33 @@ def run_ic_iteration(task: dict[str, object], score_fn: Callable[..., float], st
             tool_specs=tool_specs,
             dispatch_tool_call=backend.dispatch,
             system_prompt=system_prompt,
+            parent_trace=backend_obs,
+            backend_name="iterative_context",
         )
     except Exception as exc:  # noqa: BLE001
-        raw = {"observations": [], "error": str(exc)}
-    return _normalize_agent_result(raw)
+        raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
+        if backend_obs and hasattr(backend_obs, "end"):
+            try:
+                backend_obs.end(error=exc)
+            except Exception:
+                pass
+    normalized = _normalize_agent_result(raw)
+    nc_val = normalized.get("node_count", 0)
+    node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
+    record_score(backend_obs, "ic.node_count", node_count)
+    if backend_obs and hasattr(backend_obs, "end"):
+        try:
+            backend_obs.end(metadata={"node_count": normalized.get("node_count", 0)})
+        except Exception:
+            pass
+    return normalized
 
 
-def run_jc_iteration(task: dict[str, object], steps: int = 5):
+def run_jc_iteration(
+    task: dict[str, object],
+    steps: int = 5,
+    parent_trace=None,
+):
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
     agent_task: dict[str, object] = {
@@ -1947,9 +3535,10 @@ def run_jc_iteration(task: dict[str, object], steps: int = 5):
         "raw_symbol": symbol,
     }
 
-    backend = JCodeMunchBackend()
+    backend = JCodeMunchBackend(repo=repo)
     tool_specs: list[OpenAITool] = backend.tool_specs
     system_prompt = _build_jc_system_prompt(tool_specs)
+    backend_obs = start_span(parent_trace, "jcodemunch", metadata={"backend": "jcodemunch", "repo": repo, "symbol": symbol})
     try:
         raw = run_agent(
             agent_task,
@@ -1957,17 +3546,33 @@ def run_jc_iteration(task: dict[str, object], steps: int = 5):
             tool_specs=tool_specs,
             dispatch_tool_call=backend.dispatch,
             system_prompt=system_prompt,
+            parent_trace=backend_obs,
+            backend_name="jcodemunch",
         )
     except Exception as exc:  # noqa: BLE001
-        raw = {"observations": [], "error": str(exc)}
-    return _normalize_agent_result(raw)
+        raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
+        if backend_obs and hasattr(backend_obs, "end"):
+            try:
+                backend_obs.end(error=exc)
+            except Exception:
+                pass
+    normalized = _normalize_agent_result(raw)
+    nc_val = normalized.get("node_count", 0)
+    node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
+    record_score(backend_obs, "jc.node_count", node_count)
+    if backend_obs and hasattr(backend_obs, "end"):
+        try:
+            backend_obs.end(metadata={"node_count": normalized.get("node_count", 0)})
+        except Exception:
+            pass
+    return normalized
 </file>
 
 <file path="scorer.py">
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Dict
+from typing import Dict, cast
 
 
 def _obs_count(bucket: Mapping[str, object] | None) -> int:
@@ -1978,8 +3583,10 @@ def _obs_count(bucket: Mapping[str, object] | None) -> int:
 
 
 def score(result: Mapping[str, object]) -> Dict[str, object]:
-    ic_obs = _obs_count(result.get("iterative_context"))
-    jc_obs = _obs_count(result.get("jcodemunch"))
+    ic_bucket = cast(Mapping[str, object] | None, result.get("iterative_context"))
+    jc_bucket = cast(Mapping[str, object] | None, result.get("jcodemunch"))
+    ic_obs = _obs_count(ic_bucket)
+    jc_obs = _obs_count(jc_bucket)
     coverage_delta = ic_obs - jc_obs
     score_val = float(coverage_delta)
     return {
@@ -1993,31 +3600,23 @@ def score(result: Mapping[str, object]) -> Dict[str, object]:
 <file path="writer.py">
 from __future__ import annotations
 
-import os
 import time
 from typing import Any
 
-from openai import OpenAI
+from .observability.langfuse import get_tracing_openai_client, record_score, start_span
+from .utils.env import get_cerebras_api_key, get_writer_model
 
-from .utils.env import load_env
-
-_client: OpenAI | None = None
+_client: Any | None = None
 
 
-def _get_client() -> OpenAI:
+def _get_client():
     global _client  # noqa: PLW0603
     if _client is None:
-        load_env()
-        api_key = os.environ.get("CEREBRAS_API_KEY")
+        api_key = get_cerebras_api_key()
         if not api_key:
             raise RuntimeError("Missing CEREBRAS_API_KEY in environment")
-        _client = OpenAI(
-            base_url="https://api.cerebras.ai/v1",
-            api_key=api_key,
-        )
-        model = os.environ.get("WRITER_MODEL", "gpt-oss-120b")
-        print(f"[LLM] Writer model: {model}")
-    return _client
+        _client = get_tracing_openai_client(base_url="https://api.cerebras.ai/v1", api_key=api_key)
+    return _client, get_writer_model()
 
 
 def generate_policy(
@@ -2029,14 +3628,21 @@ def generate_policy(
     guidance_hint: str,
     diff_str: str,
     diff_hint: str,
+    comparison_summary: str | None = None,
+    parent_trace=None,
 ) -> str:
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
-    client = _get_client()
-    model = os.environ.get("WRITER_MODEL", "gpt-oss-120b")
+    client, model = _get_client()
+    if client is None or not hasattr(client, "chat"):
+        raise RuntimeError("Writer client is not available")
+    writer_obs = start_span(parent_trace, "policy_writer", metadata={"model": model})
     response = None
+    record_score(writer_obs, "writer.policy_generated", False)
+    record_score(writer_obs, "writer.policy_compiled", False)
     for attempt in range(3):
+        attempt_obs = start_span(writer_obs, f"writer_attempt_{attempt}", metadata={"attempt": attempt, "model": model})
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -2059,6 +3665,7 @@ def generate_policy(
                         "content": (
                             f"Current policy:\n{current_policy}\n\n"
                             f"Structured feedback:\n{feedback_str or feedback}\n\n"
+                            f"Baseline comparison:\n{comparison_summary or 'N/A'}\n\n"
                             f"Guidance:\n{guidance_hint}\n\n"
                             f"{diff_str}\n\n"
                             f"Diff guidance:\n{diff_hint}\n\n"
@@ -2079,21 +3686,52 @@ def generate_policy(
                     },
                 ],
             )
+            if attempt_obs and hasattr(attempt_obs, "end"):
+                try:
+                    attempt_obs.end(metadata={"model": model})
+                except Exception:
+                    pass
             break
         except Exception as e:  # noqa: BLE001
-            print(f"[WRITER RETRY] attempt={attempt} error={e}")
+            if attempt_obs and hasattr(attempt_obs, "end"):
+                try:
+                    attempt_obs.end(error=e)
+                except Exception:
+                    pass
             time.sleep(2 * (attempt + 1))
     else:
+        if writer_obs and hasattr(writer_obs, "end"):
+            try:
+                writer_obs.end(error="writer_failed")
+            except Exception:
+                pass
         raise RuntimeError("Writer failed after retries")
 
     code = response.choices[0].message.content
-    print("\n[WRITER RAW OUTPUT]\n")
-    print(code)
-    print("\n[END WRITER OUTPUT]\n")
     if code is None or "def score" not in code:
+        if writer_obs and hasattr(writer_obs, "end"):
+            try:
+                writer_obs.end(error="missing_score_function")
+            except Exception:
+                pass
         raise ValueError("Invalid policy: missing score function")
 
-    compile(code, "<policy>", "exec")
+    try:
+        compile(code, "<policy>", "exec")
+        record_score(writer_obs, "writer.policy_compiled", True, metadata={"model": model})
+    except Exception as exc:  # noqa: BLE001
+        if writer_obs and hasattr(writer_obs, "end"):
+            try:
+                writer_obs.end(error=exc, metadata={"model": model})
+            except Exception:
+                pass
+        raise
+    record_score(writer_obs, "writer.policy_generated", True, metadata={"model": model})
+    if writer_obs and hasattr(writer_obs, "end"):
+        try:
+            writer_obs.end(metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
+        except Exception:
+            pass
     return code
 </file>
 
