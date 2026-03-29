@@ -36,13 +36,16 @@ def test_writer_records_policy_events(monkeypatch):
     attempt_scores: list[tuple[str, float]] = []
 
     class DummyMessage:
-        content = "def score(node, state):\n    return 1.0\n"
+        def __init__(self):
+            self.content = '{"code": "def score(node, state):\\n    return 1.0\\n"}'
 
     class DummyChoice:
-        message = DummyMessage()
+        def __init__(self):
+            self.message = DummyMessage()
 
     class DummyResponse:
-        choices = [DummyChoice()]
+        def __init__(self):
+            self.choices = [DummyChoice()]
 
     class DummyCompletions:
         def create(self, **kwargs):
@@ -106,9 +109,116 @@ def test_run_loop_uses_observations(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "start_span", lambda *a, **k: DummySpan("span"))
     monkeypatch.setattr(loop, "record_score", lambda *a, **k: events.append("record_score"))
     monkeypatch.setattr(loop, "flush_langfuse", lambda: events.append("flush"))
+    synth_calls: list[dict[str, object]] = []
+
+    def fake_synthesize_valid_policy(**kwargs):
+        synth_calls.append(kwargs)
+        return (
+            "def score(node: object, state: object, context: object | None = None) -> float:\n    return 1.0\n",
+            [],
+            True,
+            0,
+            {"pipeline_passed": True, "repair_attempts": 0, "max_policy_repairs": 3},
+        )
+
+    monkeypatch.setattr(loop, "synthesize_valid_policy", fake_synthesize_valid_policy)
 
     baseline = {"jc_result": {"observations": [{"tool": "y"}]}, "jc_metrics": {"jc_nodes": 0, "score": 0.0}}
 
     history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot=baseline)
     assert history and history[0]["score"] == 1.0
     assert "flush" in events
+    assert synth_calls
+
+
+def test_run_agent_truncates_tool_content(monkeypatch):
+    class DummyResponse:
+        class Choice:
+            class Msg:
+                def __init__(self):
+                    self.tool_calls = [
+                        type("Call", (), {"id": "1", "function": type("F", (), {"name": "tool", "arguments": "{}"})()})()
+                    ]
+
+            message = Msg()
+
+        choices = [Choice()]
+
+    class DummyCompletions:
+        def __init__(self):
+            self.calls: list[list[dict[str, object]]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs["messages"])
+            return DummyResponse()
+
+    completions = DummyCompletions()
+
+    class DummyClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": completions})()
+
+    monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
+    long_result = "X" * (runner._MAX_TOOL_CONTENT_CHARS * 2)
+    observations = runner.run_agent(
+        {"symbol": "s", "repo": "r"},
+        steps=2,
+        tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
+        dispatch_tool_call=lambda *a, **k: long_result,
+        system_prompt="sys",
+        parent_trace=None,
+        backend_name="test",
+    )
+    assert observations["observations"]
+    assert len(completions.calls) == 2
+    second_call_msgs = completions.calls[1]
+    tool_msg = next(msg for msg in second_call_msgs if msg.get("role") == "tool")
+    assert len(str(tool_msg.get("content", ""))) <= runner._MAX_TOOL_CONTENT_CHARS
+
+
+def test_run_agent_retries_on_context_error(monkeypatch):
+    class ContextError(Exception):
+        status_code = 400
+
+    class DummyResponse:
+        class Choice:
+            class Msg:
+                def __init__(self):
+                    self.tool_calls = [
+                        type("Call", (), {"id": "1", "function": type("F", (), {"name": "tool", "arguments": "{}"})()})()
+                    ]
+
+            message = Msg()
+
+        choices = [Choice()]
+
+    class DummyCompletions:
+        def __init__(self):
+            self.calls: list[list[dict[str, object]]] = []
+            self.failed = False
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs["messages"])
+            if not self.failed:
+                self.failed = True
+                raise ContextError("Please reduce the length")
+            return DummyResponse()
+
+    completions = DummyCompletions()
+
+    class DummyClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": completions})()
+
+    monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
+    result = runner.run_agent(
+        {"symbol": "s", "repo": "r"},
+        steps=1,
+        tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
+        dispatch_tool_call=lambda *a, **k: {},
+        system_prompt="sys",
+        parent_trace=None,
+        backend_name="test",
+    )
+    assert len(completions.calls) == 2
+    assert result["observations"]

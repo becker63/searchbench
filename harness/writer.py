@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+import json
+from typing import Any, Mapping
 
 from .observability.langfuse import get_tracing_openai_client, record_score, start_span
 from .utils.env import get_cerebras_api_key, get_writer_model
+from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
 
 _client: Any | None = None
 
@@ -19,6 +21,69 @@ def _get_client():
     return _client, get_writer_model()
 
 
+def _extract_policy_code(response: Any) -> str:
+    """
+    Extract structured code from a model response.
+
+    Supports:
+    - response.choices[0].message.content as JSON string (primary)
+    - response.choices[0].message.content as mapping
+    - response.choices[0].message.parsed (mapping with "code") as compatibility fallback
+    """
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise ValueError("Writer response missing choices")
+    msg = getattr(choices[0], "message", None)
+    if msg is None:
+        raise ValueError("Writer response missing message")
+
+    def _mapping_code(obj: Mapping[str, object] | None) -> str | None:
+        if obj is None:
+            return None
+        code_val = obj.get("code")
+        return code_val if isinstance(code_val, str) else None
+
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        try:
+            loaded = json.loads(content)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("Writer response content is not valid JSON") from exc
+        if not isinstance(loaded, Mapping):
+            raise ValueError("Writer response content is not a JSON object")
+        code_val = _mapping_code(loaded)
+        if code_val is not None:
+            return code_val
+        raise ValueError("Writer response missing code field")
+    if isinstance(content, Mapping):
+        code_val = _mapping_code(content)
+        if code_val is not None:
+            return code_val
+        raise ValueError("Writer response missing code field")
+    if content is not None:
+        raise ValueError("Writer response content is not supported")
+
+    parsed = getattr(msg, "parsed", None)
+    if isinstance(parsed, Mapping):
+        code_val = _mapping_code(parsed)
+        if code_val is not None:
+            return code_val
+
+    raise ValueError("Writer response missing content")
+
+
+def _ensure_valid_policy_code(code: str) -> str:
+    cleaned = code if isinstance(code, str) else ""
+    if not cleaned or not cleaned.strip():
+        raise ValueError("Writer returned empty code")
+    if "```" in cleaned:
+        raise ValueError("Writer returned fenced code")
+    if "def score" not in cleaned:
+        raise ValueError("Writer missing score function")
+    compile(cleaned, "<generated-policy>", "exec")
+    return cleaned
+
+
 def generate_policy(
     feedback: dict[str, Any],
     current_policy: str,
@@ -30,6 +95,8 @@ def generate_policy(
     diff_hint: str,
     comparison_summary: str | None = None,
     parent_trace=None,
+    failure_context: str | None = None,
+    repair_attempt: int = 0,
 ) -> str:
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
@@ -37,6 +104,12 @@ def generate_policy(
     client, model = _get_client()
     if client is None or not hasattr(client, "chat"):
         raise RuntimeError("Writer client is not available")
+    model_budget = get_model_budget(model)
+    failure_context_budget = compute_prompt_char_budget(model, repair_attempt=repair_attempt)
+    failure_context = failure_context or ""
+    if failure_context:
+        failure_context = failure_context[:failure_context_budget]
+    completion_tokens = model_budget.completion_reserve
     writer_obs = start_span(parent_trace, "policy_writer", metadata={"model": model})
     response = None
     record_score(writer_obs, "writer.policy_generated", False)
@@ -46,43 +119,65 @@ def generate_policy(
         try:
             response = client.chat.completions.create(
                 model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are optimizing a scoring function for a graph search system. "
-                            "Output ONLY raw Python. No markdown. No backticks."
-                            "\nSTRICT RULES:\n"
-                            "- You MUST NOT use import statements\n"
-                            "- You MUST NOT reference external modules\n"
-                            "- You MUST NOT access the filesystem\n"
-                            "- Only use built-in Python operations\n"
+                response_format={
+                    "type": "json_schema",
+                "json_schema": {
+                    "name": "policy_code",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                        "required": ["code"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                },
+            },
+            max_completion_tokens=completion_tokens,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are optimizing a scoring function for a graph search system. "
+                        "Respond ONLY with JSON matching the provided schema. "
+                        "The 'code' field must contain pure Python defining a typed score function with signature "
+                        "def score(node: object, state: object, context: object | None = None) -> float.\n"
+                        "STRICT RULES:\n"
+                        "- You MUST NOT use import statements\n"
+                        "- You MUST NOT reference external modules\n"
+                        "- You MUST NOT access the filesystem\n"
+                        "- Only use built-in Python operations\n"
+                            "- Do NOT wrap the code in Markdown\n"
                             "Any violation will cause immediate failure."
                         ),
                     },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Current policy:\n{current_policy}\n\n"
-                            f"Structured feedback:\n{feedback_str or feedback}\n\n"
-                            f"Baseline comparison:\n{comparison_summary or 'N/A'}\n\n"
-                            f"Guidance:\n{guidance_hint}\n\n"
-                            f"{diff_str}\n\n"
-                            f"Diff guidance:\n{diff_hint}\n\n"
-                            f"Tests (source of truth, do not modify):\n{tests}\n\n"
-                            f"Scoring interface + examples (STRICT CONTRACT):\n{scoring_context}\n\n"
-                            "Instructions:\n"
-                            "- Fix errors in order of priority:\n"
-                            "  1. TYPE ERRORS\n"
-                            "  2. LINT ERRORS\n"
-                            "  3. TEST FAILURES\n\n"
-                            "- Do NOT attempt to optimize until all tests pass\n"
-                            "- MUST define: def score(node, state) -> float\n"
-                            "- MUST be deterministic\n"
-                            "- MUST NOT import external libraries\n"
-                            "- MUST operate only on provided node/state data\n\n"
-                            "Return ONLY valid Python code implementing the score function.\n"
-                        ),
+                {
+                    "role": "user",
+                    "content": (
+                        f"Current policy:\n{current_policy}\n\n"
+                        f"Validation context:\n{failure_context}\n\n"
+                        f"Structured feedback:\n{feedback_str or feedback}\n\n"
+                        f"Baseline comparison:\n{comparison_summary or 'N/A'}\n\n"
+                        f"Guidance:\n{guidance_hint}\n\n"
+                        f"{diff_str}\n\n"
+                        f"Diff guidance:\n{diff_hint}\n\n"
+                        f"Tests (source of truth, do not modify):\n{tests}\n\n"
+                        f"Scoring interface + examples (STRICT CONTRACT):\n{scoring_context}\n\n"
+                        "Validation requirements:\n"
+                        "- score MUST have type annotations on all parameters and return float\n"
+                        "- Target signature: def score(node: object, state: object, context: object | None = None) -> float\n"
+                        "- Code MUST be valid under BasedPyright\n\n"
+                        "Instructions:\n"
+                        "- Fix errors in order of priority:\n"
+                        "  1. TYPE ERRORS\n"
+                        "  2. LINT ERRORS\n"
+                        "  3. TEST FAILURES\n\n"
+                        "- Do NOT attempt to optimize until all tests pass\n"
+                        "- MUST define a typed score function used by the harness that returns a float\n"
+                        "- MUST be deterministic\n"
+                        "- MUST NOT import external libraries\n"
+                        "- MUST operate only on provided node/state data\n\n"
+                        "Return ONLY the JSON object specified by the schema.\n"
+                    ),
                     },
                 ],
             )
@@ -107,17 +202,9 @@ def generate_policy(
                 pass
         raise RuntimeError("Writer failed after retries")
 
-    code = response.choices[0].message.content
-    if code is None or "def score" not in code:
-        if writer_obs and hasattr(writer_obs, "end"):
-            try:
-                writer_obs.end(error="missing_score_function")
-            except Exception:
-                pass
-        raise ValueError("Invalid policy: missing score function")
-
     try:
-        compile(code, "<policy>", "exec")
+        raw_code = _extract_policy_code(response)
+        code = _ensure_valid_policy_code(raw_code)
         record_score(writer_obs, "writer.policy_compiled", True, metadata={"model": model})
     except Exception as exc:  # noqa: BLE001
         if writer_obs and hasattr(writer_obs, "end"):

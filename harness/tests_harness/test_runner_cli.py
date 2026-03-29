@@ -35,6 +35,29 @@ def test_ad_hoc_runner_resolves_repo(monkeypatch, tmp_path, capsys):
     assert "expand_node" in out or "symbol" in out
 
 
+def test_ad_hoc_runner_prints_failed_step(monkeypatch, tmp_path, capsys):
+    harness_run = importlib.import_module("harness.run")
+    repo_dir = tmp_path / "small_repo"
+    repo_dir.mkdir()
+    monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
+
+    history = [
+        {
+            "score": 0.0,
+            "pipeline_passed": False,
+            "failed_step": "basedpyright",
+            "failed_exit_code": 1,
+            "failed_summary": "type errors here",
+        }
+    ]
+    monkeypatch.setattr("harness.run.run_loop", lambda task, iterations=3: history, raising=False)
+    harness_run.main([])
+    out = capsys.readouterr().out
+    assert "Last failed step: basedpyright" in out
+    assert "Exit code: 1" in out
+    assert "Failure summary: type errors here" in out
+
+
 def test_hosted_baseline_flow_calls_experiment(monkeypatch, tmp_path, capsys):
     harness_run = importlib.import_module("harness.run")
     called = {"jc": False}

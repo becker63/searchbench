@@ -26,7 +26,7 @@ class ExecutionBackend:
         import subprocess
         from ..utils.repo_root import find_repo_root
 
-        allowed = {
+        allowed_prefixes = {
             ("uv", "run", "ruff", "check", "--fix"),
             ("uv", "run", "basedpyright"),
             ("uv", "run", "pytest", "iterative-context"),
@@ -43,7 +43,13 @@ class ExecutionBackend:
                 exit_code=1,
             )
 
-        if tuple(cmd) not in allowed:
+        def _is_allowed(command: list[str]) -> bool:
+            for prefix in allowed_prefixes:
+                if tuple(command[: len(prefix)]) == prefix:
+                    return True
+            return False
+
+        if not _is_allowed(cmd):
             return StepResult(
                 name=" ".join(cmd),
                 success=False,

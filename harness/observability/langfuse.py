@@ -12,11 +12,12 @@ _client: Optional[Langfuse] = None
 
 def get_langfuse_client() -> Optional[Langfuse]:
     global _client  # noqa: PLW0603
-    if _client is not None:
-        return _client
     env = get_langfuse_env()
     if not env.get("enabled", True):
+        _client = None
         return None
+    if _client is not None:
+        return _client
     public, secret = env.get("public_key"), env.get("secret_key")
     if not isinstance(public, str) or not isinstance(secret, str) or not public or not secret:
         return None

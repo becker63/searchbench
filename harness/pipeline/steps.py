@@ -5,6 +5,10 @@ from pathlib import Path
 from .types import ExecutionBackend, StepResult
 
 
+# Only validate the generated policy surface during optimization.
+_TARGET_PATHS = ["harness/policy.py"]
+
+
 class _BaseStep:
     name: str = ""
 
@@ -17,7 +21,7 @@ class RuffFixStep(_BaseStep):
 
     def run(self, repo_root: Path) -> StepResult:
         return self.backend.run(
-            ["uv", "run", "ruff", "check", "--fix"],
+            ["uv", "run", "ruff", "check", "--fix", *_TARGET_PATHS],
             cwd=repo_root,
             name=self.name,
         )
@@ -28,7 +32,7 @@ class BasedPyrightStep(_BaseStep):
 
     def run(self, repo_root: Path) -> StepResult:
         return self.backend.run(
-            ["uv", "run", "basedpyright"],
+            ["uv", "run", "basedpyright", *_TARGET_PATHS],
             cwd=repo_root,
             name=self.name,
         )

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from harness.observability import baselines, experiments
-from harness import runner
+from harness import loop, runner
 
 
 def test_baseline_resolves_repo(monkeypatch, tmp_path):
@@ -44,3 +44,50 @@ def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
         hosted=False,
     )
     assert calls and calls[0] == str(repo_dir)
+
+
+def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
+    ic_repos: list[object] = []
+
+    class DummySpan:
+        def __init__(self, name: str = "obs"):
+            self.name = name
+
+        def end(self, **kwargs):
+            pass
+
+    repo_dir = tmp_path / "ic_repo"
+    repo_dir.mkdir()
+
+    monkeypatch.setattr(loop, "index_folder", lambda repo: {"repo": "local/fake-repo-id"})
+    monkeypatch.setattr(loop, "load_policy", lambda: lambda *_: 1.0)
+
+    def fake_run_ic_iteration(task: Mapping[str, object], *args, **kwargs):
+        ic_repos.append(task.get("repo"))
+        return {"observations": [{"tool": "x"}], "node_count": 1}
+
+    monkeypatch.setattr(loop, "run_ic_iteration", fake_run_ic_iteration)
+    monkeypatch.setattr(loop, "score", lambda result: {"score": 1.0, "ic_nodes": 1, "jc_nodes": 0})
+    monkeypatch.setattr(loop, "load_tests", lambda repo: [])
+    monkeypatch.setattr(loop, "format_tests_for_prompt", lambda tests: "")
+    monkeypatch.setattr(loop, "load_scoring_types", lambda repo: "")
+    monkeypatch.setattr(loop, "load_scoring_examples", lambda repo: "")
+    monkeypatch.setattr(loop, "format_scoring_context", lambda *a, **k: "")
+    monkeypatch.setattr(loop, "_read_policy", lambda *a, **k: "def score(node, state):\n    return 0.0\n")
+    monkeypatch.setattr(loop, "_write_policy", lambda *a, **k: None)
+    monkeypatch.setattr(loop, "_hash_tests_dir", lambda *a, **k: "hash")
+    monkeypatch.setattr(loop, "generate_policy", lambda **kwargs: "def score(node, state):\n    return 1.0\n")
+
+    class DummyPipeline:
+        def run(self, repo_root, observation=None):
+            return []
+
+    monkeypatch.setattr(loop, "default_pipeline", lambda: DummyPipeline())
+    monkeypatch.setattr(loop, "find_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(loop, "start_trace", lambda *a, **k: DummySpan("trace"))
+    monkeypatch.setattr(loop, "start_span", lambda *a, **k: DummySpan("span"))
+    monkeypatch.setattr(loop, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(loop, "flush_langfuse", lambda: None)
+
+    loop.run_loop({"symbol": "s", "repo": str(repo_dir)}, iterations=1)
+    assert ic_repos == [str(repo_dir)]

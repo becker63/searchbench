@@ -66,6 +66,19 @@ def main(argv: list[str] | None = None) -> None:
             last = history[-1] if history else {}
             last_score: Any = last.get("score") if isinstance(last, Mapping) else None
             print(f"[RUN] Completed {len(history)} iterations. Last score: {last_score}")
+            if isinstance(last, Mapping):
+                failed_step = last.get("failed_step")
+                failed_exit = last.get("failed_exit_code")
+                failed_summary = last.get("failed_summary")
+                last_error = last.get("error") or last.get("writer_error")
+                if failed_step:
+                    print(f"[RUN] Last failed step: {failed_step}")
+                    if failed_exit is not None:
+                        print(f"[RUN] Exit code: {failed_exit}")
+                    if failed_summary:
+                        print(f"[RUN] Failure summary: {failed_summary}")
+                elif last_error:
+                    print(f"[RUN] Last error: {last_error}")
     finally:
         flush_langfuse()
 

@@ -12,6 +12,16 @@ from .tools.mcp_adapter import serialize_tool_result_for_model
 from .utils.env import get_cerebras_api_key, get_runner_model
 from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
 
+_MAX_TOTAL_MESSAGE_CHARS = 24000
+_MAX_TOOL_CONTENT_CHARS = 4000
+_MAX_SYSTEM_CHARS = 4000
+_MAX_USER_CHARS = 4000
+_HISTORY_LIMIT = 3
+_AGGRESSIVE_TOTAL_CHARS = 12000
+_AGGRESSIVE_TOOL_CONTENT_CHARS = 1200
+_AGGRESSIVE_SYSTEM_CHARS = 1500
+_AGGRESSIVE_USER_CHARS = 1500
+
 
 def _require_str(mapping: dict[str, Any], key: str) -> str:
     value = mapping.get(key)
@@ -35,6 +45,112 @@ def _format_available_tools(tool_names: list[str]) -> str:
         return "- none"
     return "\n".join(f"- {name}" for name in tool_names)
 
+
+def _truncate_text(text: str, max_length: int, keep_tail: int = 400) -> str:
+    if max_length <= 0:
+        return ""
+    if len(text) <= max_length:
+        return text
+    tail = min(keep_tail, max_length // 4)
+    head = max_length - tail - 24  # padding for marker
+    if head < 0:
+        head = max_length
+        tail = 0
+    truncated = text[:head]
+    suffix = text[-tail:] if tail > 0 else ""
+    removed = len(text) - len(truncated) - len(suffix)
+    marker = f"...[truncated {removed} chars]..."
+    return f"{truncated}{marker}{suffix}"[:max_length]
+
+
+def _compact_tool_content(result: Any, limit: int = _MAX_TOOL_CONTENT_CHARS) -> str:
+    serialized = serialize_tool_result_for_model(result)
+    if not isinstance(serialized, str):
+        serialized = str(serialized)
+    return _truncate_text(serialized, limit)
+
+
+def _message_content_length(msg: Mapping[str, object]) -> int:
+    content = msg.get("content")
+    try:
+        if isinstance(content, str):
+            return len(content)
+        return len(json.dumps(content))
+    except Exception:
+        return len(str(content))
+
+
+def _enforce_message_budget(
+    messages: list[dict[str, object]],
+    max_total_chars: int = _MAX_TOTAL_MESSAGE_CHARS,
+    max_tool_content: int = _MAX_TOOL_CONTENT_CHARS,
+    max_system_chars: int = _MAX_SYSTEM_CHARS,
+    max_user_chars: int = _MAX_USER_CHARS,
+    keep_last_n_tools: int = _HISTORY_LIMIT,
+) -> list[dict[str, object]]:
+    trimmed: list[dict[str, object]] = []
+    for idx, msg in enumerate(messages):
+        role = msg.get("role")
+        content = msg.get("content")
+        new_msg = dict(msg)
+        if isinstance(content, str):
+            if role == "system":
+                new_msg["content"] = _truncate_text(content, max_system_chars)
+            elif role == "user":
+                new_msg["content"] = _truncate_text(content, max_user_chars)
+            elif role == "tool":
+                new_msg["content"] = _truncate_text(content, max_tool_content)
+        trimmed.append(new_msg)
+
+    if len(trimmed) <= 2:
+        return trimmed
+
+    system_msg = trimmed[0]
+    user_msg = trimmed[1]
+    tool_msgs = trimmed[2:]
+    total_len = _message_content_length(system_msg) + _message_content_length(user_msg)
+
+    kept_tools: list[dict[str, object]] = []
+    for msg in reversed(tool_msgs):
+        if len(kept_tools) >= keep_last_n_tools:
+            break
+        kept_tools.append(msg)
+        total_len += _message_content_length(msg)
+        if total_len >= max_total_chars:
+            break
+
+    kept_tools.reverse()
+    compacted = [system_msg, user_msg] + kept_tools
+
+    total_len = sum(_message_content_length(m) for m in compacted)
+    if total_len > max_total_chars:
+        compacted[0]["content"] = _truncate_text(str(compacted[0].get("content", "")), max_system_chars // 2)
+        compacted[1]["content"] = _truncate_text(str(compacted[1].get("content", "")), max_user_chars // 2)
+        for idx, msg in enumerate(compacted[2:], start=2):
+            msg_content = str(msg.get("content", ""))
+            compacted[idx]["content"] = _truncate_text(msg_content, max_tool_content // 2)
+    return compacted
+
+
+def _aggressive_compact_messages(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+    return _enforce_message_budget(
+        messages,
+        max_total_chars=_AGGRESSIVE_TOTAL_CHARS,
+        max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS,
+        max_system_chars=_AGGRESSIVE_SYSTEM_CHARS,
+        max_user_chars=_AGGRESSIVE_USER_CHARS,
+        keep_last_n_tools=1,
+    )
+
+
+def _is_context_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if "context" in msg and "length" in msg:
+        return True
+    if "reduce the length" in msg or "too long" in msg:
+        return True
+    status = getattr(exc, "status_code", None)
+    return status == 400 and ("length" in msg or "context" in msg)
 
 def _truncate_for_metadata(payload: object, limit: int = 2000) -> object:
     try:
@@ -121,12 +237,28 @@ def run_agent(
     for step_index in range(steps):
         model_obs = start_span(agent_obs, "model_completion", metadata={"model": model_name, "backend": backend_name, "step": step_index})
         start_time = time.perf_counter()
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=cast(Any, messages),
-            tools=cast(Any, tool_specs),
-            tool_choice="required",
-        )
+        response = None
+        attempt = 0
+        while True:
+            try:
+                budgeted = _aggressive_compact_messages(messages) if attempt else _enforce_message_budget(messages)
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=cast(Any, budgeted),
+                    tools=cast(Any, tool_specs),
+                    tool_choice="required",
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                if not _is_context_error(exc) or attempt:
+                    if model_obs and hasattr(model_obs, "end") and response is None:
+                        try:
+                            model_obs.end(error=str(exc))
+                        except Exception:
+                            pass
+                    raise
+                attempt += 1
+                continue
         latency_ms = (time.perf_counter() - start_time) * 1000
         if model_obs and hasattr(model_obs, "end"):
             try:
@@ -162,7 +294,7 @@ def run_agent(
             result = dispatch_tool_call(tool_name, parsed_args)
             latency_ms = (time.perf_counter() - tool_start) * 1000
             observations.append({"tool": tool_name, "result": result})
-            messages.append(build_tool_response(call_id, serialize_tool_result_for_model(result)))
+            messages.append(build_tool_response(call_id, _compact_tool_content(result)))
             if tool_obs and hasattr(tool_obs, "end"):
                 try:
                     tool_obs.end(output={"result": _truncate_for_metadata(result)}, metadata={"latency_ms": latency_ms, "tool": tool_name, "step": step_index})
@@ -178,6 +310,7 @@ def run_agent(
                     err_obs.end(error=exc)
                 except Exception:
                     pass
+        messages = _enforce_message_budget(messages)
 
     if not observations:
         if agent_obs and hasattr(agent_obs, "end"):

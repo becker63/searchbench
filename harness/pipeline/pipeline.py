@@ -18,10 +18,12 @@ class Pipeline:
         for step in self.steps:
             step_obs = start_span(observation, name=step.name, metadata={"cwd": str(repo_root)})
             result = step.run(repo_root)
+            # Enforce success semantics based solely on exit status.
+            result.success = result.exit_code == 0
             results.append(result)
             record_score(step_obs, "exit_code", result.exit_code, metadata={"step": step.name})
             record_score(step_obs, "pipeline_pass", result.success, metadata={"step": step.name})
-            terminated = self.fail_fast and not result.success
+            terminated = self.fail_fast and result.exit_code != 0
             if step_obs and hasattr(step_obs, "end"):
                 step_obs.end(
                     metadata={
@@ -65,7 +67,8 @@ def classify_results(results: List[StepResult]) -> Dict[str, object]:
         "passed": [],
     }
     for r in results:
-        if r.success:
+        failed = r.exit_code != 0
+        if not failed:
             passed_list = out["passed"]
             if isinstance(passed_list, list):
                 passed_list.append(r.name)
