@@ -63,6 +63,9 @@ tests_harness/
   test_observability.py
   test_policy_loader.py
   test_pytest_scope.py
+  test_repo_resolution_execution.py
+  test_repo_targets.py
+  test_runner_cli.py
   test_runner_integration.py
   test_score_adapter.py
   test_subprocess_guard.py
@@ -83,6 +86,7 @@ utils/
   env.py
   openai_schema.py
   repo_root.py
+  repo_targets.py
   test_loader.py
   type_loader.py
 __init__.py
@@ -91,6 +95,7 @@ loop.py
 policy_loader.py
 policy.py
 pyproject.toml
+run.py
 runner.py
 scorer.py
 writer.py
@@ -139,6 +144,7 @@ from typing import Mapping, TypedDict, cast
 from .datasets import DatasetItem, normalize_dataset_item
 from .langfuse import record_score, start_span
 from ..scorer import score
+from ..utils.repo_targets import resolve_repo_target
 
 
 class BaselineSnapshot(TypedDict, total=False):
@@ -222,6 +228,8 @@ def compute_baseline_for_item(
 ) -> BaselineSnapshot:
     from ..runner import run_jc_iteration  # local import to avoid circular dependency
     normalized = normalize_dataset_item(item)
+    repo_ref = normalized["repo"]
+    resolved_repo = resolve_repo_target(repo_ref)
     trace = start_span(
         parent_trace,
         "jc_baseline_item",
@@ -232,9 +240,11 @@ def compute_baseline_for_item(
             "repo": normalized.get("repo"),
             "symbol": normalized.get("symbol"),
             "run_kind": "jc_baseline",
+            "repo_ref": repo_ref,
+            "resolved_repo": resolved_repo,
         },
     )
-    jc_result = run_jc_iteration({"symbol": normalized["symbol"], "repo": normalized["repo"]}, parent_trace=trace)
+    jc_result = run_jc_iteration({"symbol": normalized["symbol"], "repo": resolved_repo}, parent_trace=trace)
     metrics = baseline_metrics_from_jc(jc_result)
     for name, value in metrics.items():
         record_score(trace, f"baseline.{name}", value)
@@ -476,6 +486,7 @@ from .baselines import (
 from .datasets import DatasetItem, fetch_dataset_items, local_dataset, normalize_dataset_item
 from .langfuse import flush_langfuse, record_score, start_trace
 from .runner_integration import HostedRunResult, run_hosted_dataset_experiment, run_local_dataset_experiment
+from ..utils.repo_targets import resolve_repo_target
 from ..loop import run_loop
 from ..scorer import score
 
@@ -585,9 +596,13 @@ def _run_ic_optimizations(
 
     def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
         normalized_item = normalize_dataset_item(item)
+        repo_ref = normalized_item.get("repo", "")
+        resolved_repo = resolve_repo_target(str(repo_ref))
         baseline = resolve_baseline(indexed, normalized_item) if indexed else resolve_baseline(baselines, normalized_item)
         baseline = require_baseline(baselines, normalized_item) if baseline is None else baseline
-        history = run_loop(dict(normalized_item), iterations=iterations, parent_trace=parent_trace, baseline_snapshot=baseline)
+        task = dict(normalized_item)
+        task["repo"] = resolved_repo
+        history = run_loop(task, iterations=iterations, parent_trace=parent_trace, baseline_snapshot=baseline)
         last = history[-1] if history else {}
         jc_payload: Mapping[str, object] | dict[str, object] = baseline["jc_result"] if baseline and "jc_result" in baseline else {}
         metrics = score({"iterative_context": last if isinstance(last, Mapping) else {}, "jcodemunch": jc_payload})
@@ -630,9 +645,13 @@ def _run_ic_optimizations(
             metadata={"dataset": dataset_name, "version": dataset_version, "count": len(items)},
         )
         for item in items:
+            repo_ref = item.get("repo")
+            resolved_repo = resolve_repo_target(str(repo_ref))
             baseline = resolve_baseline(indexed, item) if indexed else resolve_baseline(baselines, item)
             baseline = require_baseline(baselines, item) if baseline is None else baseline
-            history = run_loop(dict(item), iterations=iterations, parent_trace=root, baseline_snapshot=baseline)
+            task = dict(item)
+            task["repo"] = resolved_repo
+            history = run_loop(task, iterations=iterations, parent_trace=root, baseline_snapshot=baseline)
             results.append({"item": item, "baseline": baseline, "history": history})
         if root and hasattr(root, "end"):
             try:
@@ -1297,21 +1316,21 @@ def test_run_async_with_running_loop_uses_separate_loop():
     assert loop_ids[0] != outer_loop_id
 
 
-def test_ic_backend_uses_server_surfaces(monkeypatch):
+def test_ic_backend_uses_server_surfaces(monkeypatch, tmp_path):
     dummy_tool = Tool(
         name="resolve",
         description="resolve",
         inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}}},
     )
     calls: list[tuple[str, dict[str, Any]]] = []
-    runtime_score_args: list[Any] = []
+    runtime_args: list[dict[str, Any]] = []
 
     async def fake_list_tools():
         return [dummy_tool]
 
     class FakeRuntime:
-        def __init__(self, score_fn=None):
-            runtime_score_args.append(score_fn)
+        def __init__(self, score_fn=None, repo_root=None):
+            runtime_args.append({"score_fn": score_fn, "repo_root": repo_root})
 
         async def call_tool(self, name: str, arguments: dict[str, Any]):
             calls.append((name, arguments))
@@ -1323,10 +1342,15 @@ def test_ic_backend_uses_server_surfaces(monkeypatch):
     def score_fn(a, b):
         return 1.0
 
-    backend = IterativeContextBackend(repo="/tmp", score_fn=score_fn)
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    cwd_before = Path.cwd()
+
+    backend = IterativeContextBackend(repo=str(repo_path), score_fn=score_fn)
 
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
-    assert runtime_score_args == [score_fn]
+    assert runtime_args == [{"score_fn": score_fn, "repo_root": repo_path.resolve()}]
+    assert Path.cwd() == cwd_before
 
     result = backend.dispatch("resolve", {"symbol": "foo"})
     assert result == {"ok": True, "name": "resolve"}
@@ -1445,8 +1469,9 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
         return [dummy_tool]
 
     class FakeRuntime:
-        def __init__(self, score_fn=None):
+        def __init__(self, score_fn=None, repo_root=None):
             self.score_fn = score_fn
+            self.repo_root = repo_root
 
         async def call_tool(self, name: str, arguments: dict[str, Any]):
             payload = {
@@ -1579,23 +1604,6 @@ def test_jc_backend_initializes_local_repo(monkeypatch, tmp_path):
     assert called["resolve"] == 1
     assert called["index"] == 1
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
-
-
-def test_ic_backend_initializes_repo(monkeypatch, tmp_path):
-    dummy_tool = Tool(name="resolve", description="", inputSchema={})
-    cwd_seen: list[str] = []
-
-    async def fake_list_tools():
-        return [dummy_tool]
-
-    def fake_ensure_graph_loaded():
-        cwd_seen.append(str(Path.cwd()))
-
-    monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.ic_backend.exploration.ensure_graph_loaded", fake_ensure_graph_loaded)
-
-    IterativeContextBackend(repo=str(tmp_path), score_fn=None)
-    assert cwd_seen == [str(tmp_path)]
 </file>
 
 <file path="tests_harness/test_baselines.py">
@@ -1707,6 +1715,7 @@ def test_run_hosted_ic_optimization_experiment(monkeypatch):
     monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [{"score": 2.0}])
+    monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "resolved-path")
 
     def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
         outputs = []
@@ -1745,6 +1754,7 @@ def test_run_ic_optimization_uses_provided_baseline(monkeypatch):
     monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [{"score": 1.0}])
+    monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "/tmp/resolved-r")
 
     def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
         outputs = []
@@ -1879,6 +1889,152 @@ def test_pytest_scope_limited():
     repo_root = Path(__file__).resolve().parents[2]
     step.run(repo_root)
     assert backend.last_cmd == ["uv", "run", "pytest", "iterative-context", "-q", "--disable-warnings", "--maxfail=1"]
+</file>
+
+<file path="tests_harness/test_repo_resolution_execution.py">
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+from harness.observability import baselines, experiments
+from harness import runner
+
+
+def test_baseline_resolves_repo(monkeypatch, tmp_path):
+    called = {"repo": None}
+
+    def fake_run_jc_iteration(task: Mapping[str, object], parent_trace=None):
+        called["repo"] = task.get("repo")
+        return {"observations": []}
+
+    repo_dir = tmp_path / "small_repo"
+    repo_dir.mkdir()
+    monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
+    monkeypatch.setattr(runner, "run_jc_iteration", fake_run_jc_iteration)
+    snap = baselines.compute_baseline_for_item({"repo": "small", "symbol": "s"})  # type: ignore[arg-type]
+    assert called["repo"] == str(repo_dir)
+    # logical repo ref preserved
+    assert snap["repo"] == "small"
+
+
+def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
+    calls: list[str] = []
+
+    def fake_run_loop(task: Mapping[str, object], iterations: int, parent_trace=None, baseline_snapshot=None):
+        calls.append(task.get("repo", ""))
+        return [{"score": 1.0}]
+
+    repo_dir = tmp_path / "medium_repo"
+    repo_dir.mkdir()
+    monkeypatch.setenv("TEST_REPO_MEDIUM", str(repo_dir))
+    monkeypatch.setattr(experiments, "run_loop", fake_run_loop)
+    baselines_bundle: Any = {"items": [{"repo": "medium", "symbol": "s", "jc_result": {}, "jc_metrics": {}}]}
+    experiments._run_ic_optimizations(  # type: ignore[attr-defined]
+        [{"repo": "medium", "symbol": "s"}],
+        baselines_bundle,
+        dataset_name=None,
+        dataset_version=None,
+        iterations=1,
+        hosted=False,
+    )
+    assert calls and calls[0] == str(repo_dir)
+</file>
+
+<file path="tests_harness/test_repo_targets.py">
+from __future__ import annotations
+
+import pytest
+
+from harness.utils import repo_targets
+
+
+def test_resolve_alias_small(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "small_repo"
+    repo_dir.mkdir()
+    monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
+    assert repo_targets.resolve_repo_target("small") == str(repo_dir)
+
+
+def test_resolve_alias_medium(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "medium_repo"
+    repo_dir.mkdir()
+    monkeypatch.setenv("TEST_REPO_MEDIUM", str(repo_dir))
+    assert repo_targets.resolve_repo_target("medium") == str(repo_dir)
+
+
+def test_resolve_alias_missing_env(monkeypatch):
+    monkeypatch.delenv("TEST_REPO_SMALL", raising=False)
+    with pytest.raises(ValueError):
+        repo_targets.resolve_repo_target("small")
+
+
+def test_resolve_path_passthrough(tmp_path):
+    repo_dir = tmp_path / "path_repo"
+    repo_dir.mkdir()
+    assert repo_targets.resolve_repo_target(str(repo_dir)) == str(repo_dir)
+
+
+def test_resolve_invalid_path_raises(tmp_path):
+    missing = tmp_path / "missing"
+    with pytest.raises(FileNotFoundError):
+        repo_targets.resolve_repo_target(str(missing))
+
+
+def test_unknown_target():
+    with pytest.raises(ValueError):
+        repo_targets.resolve_repo_target("unknown_target")
+</file>
+
+<file path="tests_harness/test_runner_cli.py">
+from __future__ import annotations
+
+import importlib
+from importlib import util as importlib_util
+
+
+def test_root_shim_invokes_harness_main(monkeypatch):
+    harness_run = importlib.import_module("harness.run")
+    called = {"main": False}
+
+    def fake_main(argv=None):
+        called["main"] = True
+
+    monkeypatch.setattr(harness_run, "main", fake_main)
+    from pathlib import Path
+
+    root_path = Path(__file__).resolve().parents[2] / "run.py"
+    spec = importlib_util.spec_from_file_location("root_run", root_path)
+    assert spec and spec.loader
+    module = importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[arg-type]
+    module.main()
+    assert called["main"]
+
+
+def test_ad_hoc_runner_resolves_repo(monkeypatch, tmp_path, capsys):
+    harness_run = importlib.import_module("harness.run")
+    repo_dir = tmp_path / "small_repo"
+    repo_dir.mkdir()
+    monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
+    monkeypatch.setattr("harness.run.run_loop", lambda task, iterations=3: [{"score": 1.0}], raising=False)
+    harness_run.main([])
+    out = capsys.readouterr().out
+    assert "small_repo" in out
+    assert "expand_node" in out or "symbol" in out
+
+
+def test_hosted_baseline_flow_calls_experiment(monkeypatch, tmp_path, capsys):
+    harness_run = importlib.import_module("harness.run")
+    called = {"jc": False}
+
+    def fake_run_hosted_jc_baseline_experiment(name, version=None):
+        called["jc"] = True
+        return {"items": []}
+
+    monkeypatch.setattr(harness_run, "run_hosted_jc_baseline_experiment", fake_run_hosted_jc_baseline_experiment)
+    argv = ["--dataset", "ds", "--jc-baseline"]
+    harness_run.main(argv)
+    assert called["jc"]
 </file>
 
 <file path="tests_harness/test_runner_integration.py">
@@ -2127,11 +2283,9 @@ __all__ = ["IterativeContextBackend", "JCodeMunchBackend"]
 <file path="tools/backends/ic_backend.py">
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Callable
 
-from iterative_context import exploration
 from iterative_context.server import IterativeContextToolRuntime, list_tools
 
 from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
@@ -2140,23 +2294,13 @@ from ...utils.openai_schema import OpenAITool
 
 class IterativeContextBackend:
     def __init__(self, repo: str, score_fn: Callable[..., float] | None):
-        self._runtime = IterativeContextToolRuntime(score_fn=score_fn)
-        self._initialize_repo(repo)
-        tools = run_async(list_tools())
-        self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
-
-    def _initialize_repo(self, repo: str) -> None:
-        repo_path = Path(repo)
+        repo_path = Path(repo).expanduser().resolve(strict=False)
         if not repo_path.exists():
             raise RuntimeError(f"[IC] Repo path does not exist: {repo}")
-        prev_cwd = Path.cwd()
-        try:
-            os.chdir(repo_path)
-            # NOTE: iterative-context currently loads the active graph from cwd.
-            # This fallback relies on that behavior until a repo-specific API is exposed.
-            exploration.ensure_graph_loaded()
-        finally:
-            os.chdir(prev_cwd)
+
+        self._runtime = IterativeContextToolRuntime(score_fn=score_fn, repo_root=repo_path)
+        tools = run_async(list_tools())
+        self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
         result_blocks = run_async(self._runtime.call_tool(name, arguments))
@@ -2649,6 +2793,60 @@ def find_repo_root(start: Optional[Path] = None) -> Path:
         if (path / "pyproject.toml").exists() and (path / "uv.lock").exists():
             return path
     raise FileNotFoundError("Repository root not found (missing searchbench dir or pyproject.toml and uv.lock)")
+</file>
+
+<file path="utils/repo_targets.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict
+
+from .env import getenv
+
+
+_ALIASES = {
+    "small": "TEST_REPO_SMALL",
+    "medium": "TEST_REPO_MEDIUM",
+    "itsdangerous": "TEST_REPO_SMALL",
+    "click": "TEST_REPO_MEDIUM",
+}
+
+
+def list_repo_targets() -> Dict[str, str]:
+    return {alias: var for alias, var in _ALIASES.items()}
+
+
+def is_known_repo_target(repo_ref: str) -> bool:
+    return repo_ref in _ALIASES
+
+
+def _resolve_env_var(var: str) -> str:
+    val = getenv(var)
+    if not val:
+        raise ValueError(f"Environment variable {var} not set for repo target")
+    return val
+
+
+def resolve_repo_target(repo_ref: str) -> str:
+    # Alias -> env var
+    if repo_ref in _ALIASES:
+        path = _resolve_env_var(_ALIASES[repo_ref])
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Resolved repo path does not exist for {repo_ref}: {path}")
+        return path
+
+    candidate = Path(repo_ref)
+    if candidate.exists():
+        return str(candidate)
+
+    # Looks like a path but missing
+    if any(sep in repo_ref for sep in ("/", "\\")) or repo_ref.startswith("."):
+        raise FileNotFoundError(f"Repo path does not exist: {repo_ref}")
+
+    raise ValueError(f"Unknown repo target: {repo_ref}")
+
+
+__all__ = ["resolve_repo_target", "list_repo_targets", "is_known_repo_target"]
 </file>
 
 <file path="utils/test_loader.py">
@@ -3234,11 +3432,88 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-jcodemunch-mcp = { workspace = true }
 iterative-context = { workspace = true }
+jcodemunch-mcp = { workspace = true }
 
 [tool.basedpyright]
 extraPaths = [".."]
+</file>
+
+<file path="run.py">
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any, Mapping
+
+from harness.loop import run_loop
+from harness.observability.baselines import BaselineBundle, load_baseline_bundle, save_baseline_bundle
+from harness.observability.experiments import (
+    run_hosted_ic_optimization_experiment,
+    run_hosted_jc_baseline_experiment,
+)
+from harness.observability.langfuse import flush_langfuse
+from harness.utils.repo_targets import resolve_repo_target
+
+
+def _load_baseline(path: str | None) -> BaselineBundle | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Baseline bundle not found at {path}")
+    return load_baseline_bundle(p)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Searchbench Langfuse-first runner")
+    parser.add_argument("--dataset", help="Langfuse dataset name")
+    parser.add_argument("--version", help="Langfuse dataset version")
+    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--jc-baseline", action="store_true", help="Run JC baseline experiment (hosted dataset)")
+    parser.add_argument("--ic-optimize", action="store_true", help="Run IC optimization experiment (hosted dataset)")
+    parser.add_argument("--baseline-path", help="Path to load/save baseline bundle JSON")
+    parser.add_argument("--recompute-baselines", action="store_true", help="Recompute baselines if none provided")
+    parser.add_argument("--repo", help="Repo target ref or path for ad hoc run (e.g., small, medium)", default="small")
+    parser.add_argument("--symbol", help="Symbol/function name for ad hoc run", default="expand_node")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.dataset and args.jc_baseline:
+            print(f"[RUN] Hosted JC baseline experiment: {args.dataset}")
+            bundle = run_hosted_jc_baseline_experiment(args.dataset, version=args.version)
+            if args.baseline_path:
+                save_baseline_bundle(bundle, Path(args.baseline_path))
+                print(f"[RUN] Baseline bundle saved to {args.baseline_path}")
+            print(f"[RUN] Baselines computed: {len(bundle.get('items', []))}")
+        elif args.dataset and args.ic_optimize:
+            print(f"[RUN] Hosted IC optimization experiment: {args.dataset}")
+            bundle = _load_baseline(args.baseline_path)
+            if bundle:
+                print("[RUN] Loaded baseline bundle")
+            results = run_hosted_ic_optimization_experiment(
+                args.dataset,
+                version=args.version,
+                iterations=args.iterations,
+                baselines=bundle,
+                recompute_baselines=args.recompute_baselines,
+            )
+            print(f"[RUN] Optimization items completed: {len(results)}")
+        else:
+            repo_ref = args.repo or "small"
+            resolved_repo = resolve_repo_target(repo_ref)
+            task: Mapping[str, object] = {"symbol": args.symbol, "repo": resolved_repo}
+            print(f"[RUN] Ad hoc run for repo '{repo_ref}' -> {resolved_repo}, symbol='{args.symbol}'")
+            history = run_loop(task, iterations=args.iterations)
+            last = history[-1] if history else {}
+            last_score: Any = last.get("score") if isinstance(last, Mapping) else None
+            print(f"[RUN] Completed {len(history)} iterations. Last score: {last_score}")
+    finally:
+        flush_langfuse()
+
+
+if __name__ == "__main__":
+    main()
 </file>
 
 <file path="runner.py">

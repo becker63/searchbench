@@ -9,6 +9,7 @@ from typing import Mapping, TypedDict, cast
 from .datasets import DatasetItem, normalize_dataset_item
 from .langfuse import record_score, start_span
 from ..scorer import score
+from ..utils.repo_targets import resolve_repo_target
 
 
 class BaselineSnapshot(TypedDict, total=False):
@@ -92,6 +93,8 @@ def compute_baseline_for_item(
 ) -> BaselineSnapshot:
     from ..runner import run_jc_iteration  # local import to avoid circular dependency
     normalized = normalize_dataset_item(item)
+    repo_ref = normalized["repo"]
+    resolved_repo = resolve_repo_target(repo_ref)
     trace = start_span(
         parent_trace,
         "jc_baseline_item",
@@ -102,9 +105,11 @@ def compute_baseline_for_item(
             "repo": normalized.get("repo"),
             "symbol": normalized.get("symbol"),
             "run_kind": "jc_baseline",
+            "repo_ref": repo_ref,
+            "resolved_repo": resolved_repo,
         },
     )
-    jc_result = run_jc_iteration({"symbol": normalized["symbol"], "repo": normalized["repo"]}, parent_trace=trace)
+    jc_result = run_jc_iteration({"symbol": normalized["symbol"], "repo": resolved_repo}, parent_trace=trace)
     metrics = baseline_metrics_from_jc(jc_result)
     for name, value in metrics.items():
         record_score(trace, f"baseline.{name}", value)

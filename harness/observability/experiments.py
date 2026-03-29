@@ -13,6 +13,7 @@ from .baselines import (
 from .datasets import DatasetItem, fetch_dataset_items, local_dataset, normalize_dataset_item
 from .langfuse import flush_langfuse, record_score, start_trace
 from .runner_integration import HostedRunResult, run_hosted_dataset_experiment, run_local_dataset_experiment
+from ..utils.repo_targets import resolve_repo_target
 from ..loop import run_loop
 from ..scorer import score
 
@@ -122,9 +123,13 @@ def _run_ic_optimizations(
 
     def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
         normalized_item = normalize_dataset_item(item)
+        repo_ref = normalized_item.get("repo", "")
+        resolved_repo = resolve_repo_target(str(repo_ref))
         baseline = resolve_baseline(indexed, normalized_item) if indexed else resolve_baseline(baselines, normalized_item)
         baseline = require_baseline(baselines, normalized_item) if baseline is None else baseline
-        history = run_loop(dict(normalized_item), iterations=iterations, parent_trace=parent_trace, baseline_snapshot=baseline)
+        task = dict(normalized_item)
+        task["repo"] = resolved_repo
+        history = run_loop(task, iterations=iterations, parent_trace=parent_trace, baseline_snapshot=baseline)
         last = history[-1] if history else {}
         jc_payload: Mapping[str, object] | dict[str, object] = baseline["jc_result"] if baseline and "jc_result" in baseline else {}
         metrics = score({"iterative_context": last if isinstance(last, Mapping) else {}, "jcodemunch": jc_payload})
@@ -167,9 +172,13 @@ def _run_ic_optimizations(
             metadata={"dataset": dataset_name, "version": dataset_version, "count": len(items)},
         )
         for item in items:
+            repo_ref = item.get("repo")
+            resolved_repo = resolve_repo_target(str(repo_ref))
             baseline = resolve_baseline(indexed, item) if indexed else resolve_baseline(baselines, item)
             baseline = require_baseline(baselines, item) if baseline is None else baseline
-            history = run_loop(dict(item), iterations=iterations, parent_trace=root, baseline_snapshot=baseline)
+            task = dict(item)
+            task["repo"] = resolved_repo
+            history = run_loop(task, iterations=iterations, parent_trace=root, baseline_snapshot=baseline)
             results.append({"item": item, "baseline": baseline, "history": history})
         if root and hasattr(root, "end"):
             try:

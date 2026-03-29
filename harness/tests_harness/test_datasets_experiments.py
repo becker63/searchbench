@@ -52,6 +52,7 @@ def test_run_hosted_ic_optimization_experiment(monkeypatch):
     monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [{"score": 2.0}])
+    monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "resolved-path")
 
     def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
         outputs = []
@@ -90,6 +91,7 @@ def test_run_ic_optimization_uses_provided_baseline(monkeypatch):
     monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [{"score": 1.0}])
+    monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "/tmp/resolved-r")
 
     def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
         outputs = []

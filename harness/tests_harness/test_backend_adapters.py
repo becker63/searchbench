@@ -45,21 +45,21 @@ def test_run_async_with_running_loop_uses_separate_loop():
     assert loop_ids[0] != outer_loop_id
 
 
-def test_ic_backend_uses_server_surfaces(monkeypatch):
+def test_ic_backend_uses_server_surfaces(monkeypatch, tmp_path):
     dummy_tool = Tool(
         name="resolve",
         description="resolve",
         inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}}},
     )
     calls: list[tuple[str, dict[str, Any]]] = []
-    runtime_score_args: list[Any] = []
+    runtime_args: list[dict[str, Any]] = []
 
     async def fake_list_tools():
         return [dummy_tool]
 
     class FakeRuntime:
-        def __init__(self, score_fn=None):
-            runtime_score_args.append(score_fn)
+        def __init__(self, score_fn=None, repo_root=None):
+            runtime_args.append({"score_fn": score_fn, "repo_root": repo_root})
 
         async def call_tool(self, name: str, arguments: dict[str, Any]):
             calls.append((name, arguments))
@@ -71,10 +71,15 @@ def test_ic_backend_uses_server_surfaces(monkeypatch):
     def score_fn(a, b):
         return 1.0
 
-    backend = IterativeContextBackend(repo="/tmp", score_fn=score_fn)
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    cwd_before = Path.cwd()
+
+    backend = IterativeContextBackend(repo=str(repo_path), score_fn=score_fn)
 
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
-    assert runtime_score_args == [score_fn]
+    assert runtime_args == [{"score_fn": score_fn, "repo_root": repo_path.resolve()}]
+    assert Path.cwd() == cwd_before
 
     result = backend.dispatch("resolve", {"symbol": "foo"})
     assert result == {"ok": True, "name": "resolve"}
@@ -193,8 +198,9 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
         return [dummy_tool]
 
     class FakeRuntime:
-        def __init__(self, score_fn=None):
+        def __init__(self, score_fn=None, repo_root=None):
             self.score_fn = score_fn
+            self.repo_root = repo_root
 
         async def call_tool(self, name: str, arguments: dict[str, Any]):
             payload = {
@@ -327,20 +333,3 @@ def test_jc_backend_initializes_local_repo(monkeypatch, tmp_path):
     assert called["resolve"] == 1
     assert called["index"] == 1
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
-
-
-def test_ic_backend_initializes_repo(monkeypatch, tmp_path):
-    dummy_tool = Tool(name="resolve", description="", inputSchema={})
-    cwd_seen: list[str] = []
-
-    async def fake_list_tools():
-        return [dummy_tool]
-
-    def fake_ensure_graph_loaded():
-        cwd_seen.append(str(Path.cwd()))
-
-    monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.ic_backend.exploration.ensure_graph_loaded", fake_ensure_graph_loaded)
-
-    IterativeContextBackend(repo=str(tmp_path), score_fn=None)
-    assert cwd_seen == [str(tmp_path)]

@@ -16,8 +16,8 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-jcodemunch-mcp = { workspace = true }
 iterative-context = { workspace = true }
+jcodemunch-mcp = { workspace = true }
 
 [tool.basedpyright]
 extraPaths = [".."]
