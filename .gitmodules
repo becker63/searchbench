@@ -1,9 +1,9 @@
 [submodule "jcodemunch"]
 	path = jcodemunch
 	url = https://github.com/jgravelle/jcodemunch-mcp
-[submodule "jcodemunch-mcp"]
-	path = jcodemunch-mcp
-	url = https://github.com/jgravelle/jcodemunch-mcp
 [submodule "iterative-context"]
 	path = iterative-context
 	url = https://github.com/becker63/iterative-context
+[submodule "jcodemunch-mcp"]
+	path = jcodemunch-mcp
+	url = https://github.com/jgravelle/jcodemunch-mcp

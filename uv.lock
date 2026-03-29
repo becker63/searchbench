@@ -867,7 +867,7 @@ dev = [{ name = "iterative-context" }]
 
 [[package]]
 name = "jcodemunch-mcp"
-version = "1.10.1"
+version = "1.12.7"
 source = { editable = "jcodemunch-mcp" }
 dependencies = [
     { name = "httpx" },
@@ -882,7 +882,9 @@ all = [
     { name = "anthropic" },
     { name = "anyio" },
     { name = "google-generativeai" },
+    { name = "openai" },
     { name = "pyyaml" },
+    { name = "sentence-transformers" },
     { name = "starlette" },
     { name = "uvicorn" },
     { name = "watchfiles" },
@@ -901,8 +903,20 @@ http = [
     { name = "starlette" },
     { name = "uvicorn" },
 ]
+minimax = [
+    { name = "openai" },
+]
+openai = [
+    { name = "openai" },
+]
+semantic = [
+    { name = "sentence-transformers" },
+]
 watch = [
     { name = "watchfiles" },
+]
+zhipu = [
+    { name = "openai" },
 ]
 
 [package.dev-dependencies]
@@ -922,10 +936,16 @@ requires-dist = [
     { name = "google-generativeai", marker = "extra == 'gemini'", specifier = ">=0.8.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "mcp", specifier = ">=1.10.0,<2.0.0" },
+    { name = "openai", marker = "extra == 'all'", specifier = ">=1.0.0" },
+    { name = "openai", marker = "extra == 'minimax'", specifier = ">=1.0.0" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.0.0" },
+    { name = "openai", marker = "extra == 'zhipu'", specifier = ">=1.0.0" },
     { name = "pathspec", specifier = ">=0.12.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "pyyaml", marker = "extra == 'all'", specifier = ">=6.0" },
     { name = "pyyaml", marker = "extra == 'dbt'", specifier = ">=6.0" },
+    { name = "sentence-transformers", marker = "extra == 'all'", specifier = ">=2.2.0" },
+    { name = "sentence-transformers", marker = "extra == 'semantic'", specifier = ">=2.2.0" },
     { name = "starlette", marker = "extra == 'all'", specifier = ">=0.27.0" },
     { name = "starlette", marker = "extra == 'http'", specifier = ">=0.27.0" },
     { name = "tree-sitter-language-pack", specifier = ">=0.7.0,<1.0.0" },
@@ -934,7 +954,7 @@ requires-dist = [
     { name = "watchfiles", marker = "extra == 'all'", specifier = ">=1.0.0" },
     { name = "watchfiles", marker = "extra == 'watch'", specifier = ">=1.0.0" },
 ]
-provides-extras = ["anthropic", "gemini", "dbt", "http", "watch", "all"]
+provides-extras = ["anthropic", "gemini", "openai", "minimax", "zhipu", "dbt", "http", "watch", "semantic", "all"]
 
 [package.metadata.requires-dev]
 dev = [

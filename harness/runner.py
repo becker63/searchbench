@@ -2,18 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from typing import Any, Callable, cast
 
 from openai import OpenAI
 
-from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
-from .tools.registry import (
-    get_ic_tool_specs,
-    get_jc_tool_specs,
-    IC_TOOL_MAP,
-    JC_TOOL_MAP,
-)
+from .tools.backends.ic_backend import IterativeContextBackend
+from .tools.backends.jc_backend import JCodeMunchBackend
+from .tools.mcp_adapter import serialize_tool_result_for_model
 from .utils.env import load_env
+from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
 
 
 def _require_str(mapping: dict[str, Any], key: str) -> str:
@@ -23,29 +21,53 @@ def _require_str(mapping: dict[str, Any], key: str) -> str:
     return value
 
 
-def _dispatch_tool_call(
-    tool_name: str,
-    arguments: dict[str, Any],
-    tool_map: dict[str, Any],
-    score_fn: Any,
-) -> Any:
-    if tool_name not in tool_map:
-        raise ValueError(f"Unknown tool: {tool_name}")
-    tool = tool_map[tool_name]
-    func = tool.func
+def _tool_names_from_specs(tool_specs: list[OpenAITool]) -> list[str]:
+    names: list[str] = []
+    for spec in tool_specs:
+        func = spec.get("function") if isinstance(spec, Mapping) else None
+        name = func.get("name") if isinstance(func, Mapping) else None
+        if isinstance(name, str):
+            names.append(name)
+    return names
 
-    args = dict(arguments)
-    if "depth" in args:
-        try:
-            args["depth"] = int(args["depth"])
-        except Exception:
-            args["depth"] = 1
-    if score_fn is not None:
-        try:
-            return func(**args, score_fn=score_fn)
-        except TypeError:
-            pass
-    return func(**args)
+
+def _format_available_tools(tool_names: list[str]) -> str:
+    if not tool_names:
+        return "- none"
+    return "\n".join(f"- {name}" for name in tool_names)
+
+
+def _build_ic_system_prompt(tool_specs: list[OpenAITool]) -> str:
+    tool_names = _tool_names_from_specs(tool_specs)
+    return (
+        "You are exploring a codebase using a graph-based system.\n"
+        "Available tools:\n"
+        f"{_format_available_tools(tool_names)}\n\n"
+        "Guidelines:\n"
+        "- Always expand after resolving\n"
+        "- Prefer expand over repeated resolve\n"
+        "- Do not attempt file-level inspection unless necessary\n"
+        "- Focus on graph traversal\n"
+        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
+        "- Always start by calling a tool. Never respond with text.\n"
+        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
+    )
+
+
+def _build_jc_system_prompt(tool_specs: list[OpenAITool]) -> str:
+    tool_names = _tool_names_from_specs(tool_specs)
+    tools_section = _format_available_tools(tool_names)
+    return (
+        "You are exploring a codebase using tool calls.\n"
+        "Available tools:\n"
+        f"{tools_section}\n\n"
+        "Guidelines:\n"
+        "- Use the available tools to locate and inspect symbols and files\n"
+        "- Avoid redundant calls\n"
+        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
+        "- Always start by calling a tool. Never respond with text.\n"
+        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
+    )
 
 
 def _make_client() -> OpenAI:
@@ -64,10 +86,9 @@ def _make_client() -> OpenAI:
 
 def run_agent(
     task: dict[str, object],
-    score_fn: Any,
     steps: int,
     tool_specs: list[OpenAITool],
-    tool_map: dict[str, Any],
+    dispatch_tool_call: Callable[[str, dict[str, Any]], Any],
     system_prompt: str,
 ) -> dict[str, object]:
     """
@@ -110,14 +131,9 @@ def run_agent(
             raw_args = call.function.arguments or {}
             parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             tool_name = call.function.name
-            result = _dispatch_tool_call(
-                tool_name=tool_name,
-                arguments=parsed_args,
-                tool_map=tool_map,
-                score_fn=score_fn,
-            )
+            result = dispatch_tool_call(tool_name, parsed_args)
             observations.append({"tool": tool_name, "result": result})
-            messages.append(build_tool_response(call_id, str(result)))
+            messages.append(build_tool_response(call_id, serialize_tool_result_for_model(result)))
         except Exception as exc:  # noqa: BLE001
             tool_name = call.function.name or "unknown"
             observations.append({"tool": tool_name, "error": str(exc)})
@@ -129,7 +145,41 @@ def run_agent(
     return {"observations": observations}
 
 
-def run_ic_iteration(task: dict[str, object], score_fn: Callable[[object, object], float], steps: int = 5):
+def _normalize_agent_result(raw: dict[str, object]) -> dict[str, object]:
+    observations = raw.get("observations") if isinstance(raw, dict) else []
+    if not isinstance(observations, list):
+        observations = []
+
+    def _latest_graph_node_count() -> int:
+        if not observations:
+            return 0
+        latest = observations[-1]
+        result = latest.get("result") if isinstance(latest, Mapping) else None
+        if not isinstance(result, Mapping):
+            return 0
+        full_graph = result.get("full_graph")
+        if isinstance(full_graph, Mapping):
+            nodes = full_graph.get("nodes")
+            if isinstance(nodes, list):
+                return len(nodes)
+        graph = result.get("graph")
+        if isinstance(graph, Mapping):
+            nodes = graph.get("nodes")
+            if isinstance(nodes, list):
+                return len(nodes)
+        return 0
+
+    normalized: dict[str, object] = {
+        "observations": observations,
+        "node_count": _latest_graph_node_count(),
+        "raw": raw,
+    }
+    if isinstance(raw, dict) and "error" in raw:
+        normalized["error"] = raw["error"]
+    return normalized
+
+
+def run_ic_iteration(task: dict[str, object], score_fn: Callable[..., float], steps: int = 5):
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
     agent_task: dict[str, object] = {
@@ -139,32 +189,20 @@ def run_ic_iteration(task: dict[str, object], score_fn: Callable[[object, object
         "raw_symbol": symbol,
     }
 
-    tool_specs: list[OpenAITool] = get_ic_tool_specs()
-    system_prompt = (
-        "You are exploring a codebase using a graph-based system.\n"
-        "Available tools:\n"
-        "- resolve\n- expand\n- resolve_and_expand\n\n"
-        "Guidelines:\n"
-        "- Always expand after resolving\n"
-        "- Prefer expand over repeated resolve\n"
-        "- Do not attempt file-level inspection unless necessary\n"
-        "- Focus on graph traversal\n"
-        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
-        "- Always start by calling a tool. Never respond with text.\n"
-        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
-    )
+    backend = IterativeContextBackend(score_fn)
+    tool_specs: list[OpenAITool] = backend.tool_specs
+    system_prompt = _build_ic_system_prompt(tool_specs)
     try:
         raw = run_agent(
             agent_task,
-            score_fn=score_fn,
             steps=steps,
             tool_specs=tool_specs,
-            tool_map=IC_TOOL_MAP,
+            dispatch_tool_call=backend.dispatch,
             system_prompt=system_prompt,
         )
     except Exception as exc:  # noqa: BLE001
         raw = {"observations": [], "error": str(exc)}
-    return normalize_iterative_context(raw)
+    return _normalize_agent_result(raw)
 
 
 def run_jc_iteration(task: dict[str, object], steps: int = 5):
@@ -177,25 +215,17 @@ def run_jc_iteration(task: dict[str, object], steps: int = 5):
         "raw_symbol": symbol,
     }
 
-    tool_specs: list[OpenAITool] = get_jc_tool_specs()
-    system_prompt = (
-        "You are exploring a codebase using tool calls.\n"
-        "Available tools:\n"
-        "- search_symbols\n- get_symbol\n- get_file_outline\n- find_references\n- get_file_tree\n\n"
-        "Guidelines:\n"
-        "- Use search to locate symbols\n"
-        "- Inspect files to understand structure\n"
-        "- Use references/imports to navigate\n"
-        "- Avoid redundant calls\n"
-        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
-        "- Always start by calling a tool. Never respond with text.\n"
-        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
-    )
-    return run_agent(
-        agent_task,
-        score_fn=None,
-        steps=steps,
-        tool_specs=tool_specs,
-        tool_map=JC_TOOL_MAP,
-        system_prompt=system_prompt,
-    )
+    backend = JCodeMunchBackend()
+    tool_specs: list[OpenAITool] = backend.tool_specs
+    system_prompt = _build_jc_system_prompt(tool_specs)
+    try:
+        raw = run_agent(
+            agent_task,
+            steps=steps,
+            tool_specs=tool_specs,
+            dispatch_tool_call=backend.dispatch,
+            system_prompt=system_prompt,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raw = {"observations": [], "error": str(exc)}
+    return _normalize_agent_result(raw)

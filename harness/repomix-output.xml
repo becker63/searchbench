@@ -48,6 +48,7 @@ pipeline/
 tests_harness/
   __init__.py
   conftest.py
+  test_backend_adapters.py
   test_filesystem_guard.py
   test_policy_sandbox.py
   test_pytest_scope.py
@@ -55,15 +56,12 @@ tests_harness/
   test_subprocess_guard.py
   test_test_integrity.py
 tools/
-  ic/
+  backends/
     __init__.py
-    registry.py
-  jc/
-    __init__.py
-    registry.py
+    ic_backend.py
+    jc_backend.py
   __init__.py
-  registry.py
-  schema.py
+  mcp_adapter.py
 utils/
   __init__.py
   cmd.py
@@ -356,6 +354,253 @@ if str(ROOT) not in sys.path:
 # Import after sys.path is set to reuse the shared helper elsewhere.
 </file>
 
+<file path="tests_harness/test_backend_adapters.py">
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+import pytest
+from mcp.types import TextContent, Tool
+
+from harness import runner
+from harness.tools.backends.ic_backend import IterativeContextBackend
+from harness.tools.backends.jc_backend import JCodeMunchBackend
+from harness.tools.mcp_adapter import (
+    mcp_tool_to_openai_tool,
+    parse_text_content_payload,
+    run_async,
+    serialize_tool_result_for_model,
+)
+
+
+async def _sample_coroutine(loop_ids: list[int] | None = None) -> str:
+    if loop_ids is not None:
+        loop_ids.append(id(asyncio.get_running_loop()))
+    await asyncio.sleep(0)
+    return "ok"
+
+
+def test_run_async_without_running_loop():
+    assert run_async(_sample_coroutine()) == "ok"
+
+
+def test_run_async_with_running_loop_uses_separate_loop():
+    loop_ids: list[int] = []
+
+    async def _inner():
+        outer_loop_id = id(asyncio.get_running_loop())
+        result = run_async(_sample_coroutine(loop_ids))
+        return outer_loop_id, result
+
+    outer_loop_id, result = asyncio.run(_inner())
+    assert result == "ok"
+    assert loop_ids  # captured inner loop id
+    assert loop_ids[0] != outer_loop_id
+
+
+def test_ic_backend_uses_server_surfaces(monkeypatch):
+    dummy_tool = Tool(
+        name="resolve",
+        description="resolve",
+        inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}}},
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+    runtime_score_args: list[Any] = []
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    class FakeRuntime:
+        def __init__(self, score_fn=None):
+            runtime_score_args.append(score_fn)
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]):
+            calls.append((name, arguments))
+            return [TextContent(type="text", text=json.dumps({"ok": True, "name": name}))]
+
+    monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
+
+    score_fn = lambda a, b: 1.0
+    backend = IterativeContextBackend(score_fn=score_fn)
+
+    assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
+    assert runtime_score_args == [score_fn]
+
+    result = backend.dispatch("resolve", {"symbol": "foo"})
+    assert result == {"ok": True, "name": "resolve"}
+    assert calls == [("resolve", {"symbol": "foo"})]
+
+
+def test_jc_backend_uses_server_surfaces(monkeypatch):
+    dummy_tool = Tool(
+        name="search_symbols",
+        description="search",
+        inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+    call_args: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    async def fake_call_tool(name: str, arguments: dict[str, Any]):
+        call_args.append((name, arguments))
+        return [TextContent(type="text", text=json.dumps({"result": "ok", "args": arguments}))]  # type: ignore[return-value]
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+
+    backend = JCodeMunchBackend()
+
+    assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
+
+    result = backend.dispatch("search_symbols", {"query": "foo"})
+    assert result == {"result": "ok", "args": {"query": "foo"}}
+    assert call_args == [("search_symbols", {"query": "foo"})]
+
+
+def test_parse_text_content_payload_handles_json_and_text():
+    payload = {"a": 1}
+    blocks = [TextContent(type="text", text=json.dumps(payload))]
+    assert parse_text_content_payload(blocks) == payload
+
+    plain = [TextContent(type="text", text="not-json")]
+    assert parse_text_content_payload(plain) == "not-json"
+
+
+def test_serialize_tool_result_for_model_json_and_string():
+    payload = {"b": 2, "a": 1}
+    serialized = serialize_tool_result_for_model(payload)
+    assert serialized == json.dumps(payload, sort_keys=True)
+
+    assert serialize_tool_result_for_model("already") == "already"
+
+
+def test_normalize_agent_result_prefers_full_graph_then_graph():
+    raw = {
+        "observations": [
+            {"tool": "resolve", "result": {"graph": {"nodes": [1]}}},
+            {"tool": "expand", "result": {"graph": {"nodes": [4, 5]}, "full_graph": {"nodes": [1, 2, 3]}}},
+        ]
+    }
+    normalized = runner._normalize_agent_result(raw)  # type: ignore[attr-defined]
+    assert normalized["node_count"] == 3
+
+    raw_graph_only = {"observations": [{"tool": "expand", "result": {"graph": {"nodes": [1, 2]}}}]}
+    normalized_graph_only = runner._normalize_agent_result(raw_graph_only)  # type: ignore[attr-defined]
+    assert normalized_graph_only["node_count"] == 2
+
+    raw_empty = {"observations": [{"tool": "expand", "result": {"graph": {}}}]}
+    normalized_empty = runner._normalize_agent_result(raw_empty)  # type: ignore[attr-defined]
+    assert normalized_empty["node_count"] == 0
+
+
+def _dummy_client(tool_name: str, args: dict[str, Any]):
+    class DummyFunction:
+        def __init__(self):
+            self.arguments = json.dumps(args)
+            self.name = tool_name
+
+    class DummyToolCall:
+        def __init__(self):
+            self.function = DummyFunction()
+            self.id = "call-1"
+
+    class DummyMessage:
+        def __init__(self):
+            self.tool_calls = [DummyToolCall()]
+
+    class DummyChoice:
+        def __init__(self):
+            self.message = DummyMessage()
+
+    class DummyResponse:
+        def __init__(self):
+            self.choices = [DummyChoice()]
+
+    class DummyCompletions:
+        def create(self, **kwargs):
+            return DummyResponse()
+
+    class DummyChat:
+        def __init__(self):
+            self.completions = DummyCompletions()
+
+    class DummyClient:
+        def __init__(self):
+            self.chat = DummyChat()
+
+    return DummyClient()
+
+
+def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch):
+    dummy_tool = Tool(
+        name="resolve",
+        description="resolve",
+        inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}}},
+    )
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    class FakeRuntime:
+        def __init__(self, score_fn=None):
+            self.score_fn = score_fn
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]):
+            payload = {
+                "graph": {"nodes": [1]},
+                "full_graph": {"nodes": [1, 2]},
+                "score_source": "injected",
+                "node": {"id": "n1"},
+            }
+            return [TextContent(type="text", text=json.dumps(payload))]
+
+    monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
+    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve", {"symbol": "foo"}))
+
+    result = runner.run_ic_iteration({"symbol": "s", "repo": "r"}, score_fn=lambda n, s: 1.0, steps=1)
+    assert result["node_count"] == 2
+    assert result["observations"][0]["result"]["full_graph"] == {"nodes": [1, 2]}
+    assert result["observations"][0]["result"]["score_source"] == "injected"
+    assert result["observations"][0]["result"]["node"] == {"id": "n1"}
+
+
+def test_run_jc_iteration_uses_call_tool(monkeypatch):
+    dummy_tool = Tool(
+        name="search_symbols",
+        description="search",
+        inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    async def fake_call_tool(name: str, arguments: dict[str, Any]):
+        return [TextContent(type="text", text=json.dumps({"called": name, "args": arguments}))]  # type: ignore[return-value]
+
+    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_symbols", {"query": "foo"}))
+
+    result = runner.run_jc_iteration({"symbol": "s", "repo": "r"}, steps=1)
+    assert result["node_count"] == 0
+    assert result["observations"][0]["result"] == {"called": "search_symbols", "args": {"query": "foo"}}
+
+
+def test_jc_prompt_uses_canonical_tool_names():
+    specs = [
+        {"type": "function", "function": {"name": "alpha", "description": "", "parameters": {}}},
+        {"type": "function", "function": {"name": "beta", "description": "", "parameters": {}}},
+    ]
+    prompt = runner._build_jc_system_prompt(specs)  # type: ignore[attr-defined]
+    assert "- alpha" in prompt
+    assert "- beta" in prompt
+</file>
+
 <file path="tests_harness/test_filesystem_guard.py">
 from pathlib import Path
 
@@ -498,492 +743,161 @@ def test_test_directory_integrity(tmp_path: Path):
         _write_policy(_read_policy(policy_path), policy_path)
 </file>
 
-<file path="tools/ic/__init__.py">
-from __future__ import annotations
+<file path="tools/backends/__init__.py">
+from .ic_backend import IterativeContextBackend
+from .jc_backend import JCodeMunchBackend
 
-from typing import Any, Dict, Optional
-
-from iterative_context import exploration
-
-
-def resolve(symbol: str) -> Optional[Dict[str, Any]]:
-    exploration.ensure_graph_loaded()
-    graph = exploration.get_active_graph()
-    if graph is None or not getattr(graph, "nodes", {}):
-        raise RuntimeError("[IC ERROR] Graph is not loaded or empty")
-
-    if ":" not in symbol:
-        print(f"[IC WARNING] Symbol may be ambiguous: '{symbol}' (no file qualifier)")
-
-    node: Any = exploration.resolve(symbol)
-    print(f"[IC] resolve(symbol={symbol}) -> {getattr(node, 'id', None)}")
-    if node is None:
-        raise RuntimeError(f"[IC ERROR] Failed to resolve symbol: {symbol}")
-
-    graph = exploration.get_active_graph()
-    extras: Dict[str, Any] = {}
-    node_id = getattr(node, "id", None)
-    if graph is not None and node_id in getattr(graph, "nodes", {}):
-        raw = graph.nodes[node_id]
-        extras = {k: v for k, v in raw.items() if k != "data"}
-
-    return {
-        "id": node_id,
-        "type": getattr(node, "type", None),
-        "data": getattr(node, "data", None),
-        "extras": extras,
-    }
-
-
-def expand(node_id: str, depth: int, score_fn):
-    exploration.ensure_graph_loaded()
-    graph = exploration.get_active_graph()
-    if graph is None or not getattr(graph, "nodes", {}):
-        raise RuntimeError("[IC ERROR] Graph is not loaded or empty")
-    if not node_id:
-        raise ValueError("[IC ERROR] expand called with empty node_id")
-    print(f"[IC] expand(node_id={node_id}, depth={depth})")
-    return exploration.expand(node_id=node_id, depth=depth, score_fn=score_fn)
-
-
-def resolve_and_expand(symbol: str, depth: int, score_fn):
-    node = resolve(symbol)
-    if node is None:
-        return {"nodes": [], "edges": [], "metadata": {}}
-    return expand(node["id"], depth, score_fn)
+__all__ = ["IterativeContextBackend", "JCodeMunchBackend"]
 </file>
 
-<file path="tools/ic/registry.py">
+<file path="tools/backends/ic_backend.py">
 from __future__ import annotations
 
-from . import resolve, expand, resolve_and_expand
-from ..schema import Tool
+from typing import Any, Callable
 
-IC_TOOLS = [
-    Tool(
-        name="resolve",
-        func=resolve,
-        description="Resolve a symbol into a graph node",
-        parameters={
-            "type": "object",
-            "properties": {"symbol": {"type": "string"}},
-            "required": ["symbol"],
-        },
-    ),
-    Tool(
-        name="expand",
-        func=expand,
-        description="Expand a node in the graph",
-        parameters={
-            "type": "object",
-            "properties": {
-                "node_id": {"type": "string"},
-                "depth": {"type": "integer"},
-            },
-            "required": ["node_id", "depth"],
-        },
-    ),
-    Tool(
-        name="resolve_and_expand",
-        func=resolve_and_expand,
-        description="Resolve a symbol and expand its graph",
-        parameters={
-            "type": "object",
-            "properties": {
-                "symbol": {"type": "string"},
-                "depth": {"type": "integer"},
-            },
-            "required": ["symbol", "depth"],
-        },
-    ),
-]
+from iterative_context.server import IterativeContextToolRuntime, list_tools
+
+from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
+from ...utils.openai_schema import OpenAITool
+
+
+class IterativeContextBackend:
+    def __init__(self, score_fn: Callable[..., float] | None):
+        self._runtime = IterativeContextToolRuntime(score_fn=score_fn)
+        tools = run_async(list_tools())
+        self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
+
+    def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
+        result_blocks = run_async(self._runtime.call_tool(name, arguments))
+        return parse_text_content_payload(result_blocks)
 </file>
 
-<file path="tools/jc/__init__.py">
+<file path="tools/backends/jc_backend.py">
 from __future__ import annotations
 
 from typing import Any
 
-# Core indexing
-from jcodemunch_mcp.tools.index_repo import index_repo
-from jcodemunch_mcp.tools.index_folder import index_folder
-from jcodemunch_mcp.tools.index_file import index_file
-from jcodemunch_mcp.tools.list_repos import list_repos
+from jcodemunch_mcp.server import call_tool, list_tools
 
-# File + symbol access
-from jcodemunch_mcp.tools.get_file_tree import get_file_tree
-from jcodemunch_mcp.tools.get_file_outline import get_file_outline
-from jcodemunch_mcp.tools.get_file_content import get_file_content
-from jcodemunch_mcp.tools.get_symbol import get_symbol, get_symbols
+from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
+from ...utils.openai_schema import OpenAITool
 
-# Search
-from jcodemunch_mcp.tools.search_symbols import search_symbols
-from jcodemunch_mcp.tools.search_text import search_text
-from jcodemunch_mcp.tools.search_columns import search_columns
 
-# Repo overview
-from jcodemunch_mcp.tools.get_repo_outline import get_repo_outline
+class JCodeMunchBackend:
+    def __init__(self) -> None:
+        tools = run_async(list_tools())
+        self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
 
-# Dependency + references
-from jcodemunch_mcp.tools.find_importers import find_importers
-from jcodemunch_mcp.tools.find_references import find_references
-from jcodemunch_mcp.tools.check_references import check_references
-from jcodemunch_mcp.tools.get_dependency_graph import get_dependency_graph
-from jcodemunch_mcp.tools.get_blast_radius import get_blast_radius
-
-# Diff / structure
-from jcodemunch_mcp.tools.get_symbol_diff import get_symbol_diff
-from jcodemunch_mcp.tools.get_class_hierarchy import get_class_hierarchy
-from jcodemunch_mcp.tools.get_related_symbols import get_related_symbols
-
-# Misc
-from jcodemunch_mcp.tools.suggest_queries import suggest_queries
-from jcodemunch_mcp.tools.get_session_stats import get_session_stats
-from jcodemunch_mcp.tools.invalidate_cache import invalidate_cache
-
-# Core bundle
-from jcodemunch_mcp.tools.get_context_bundle import get_context_bundle
-
-__all__ = [
-    "index_repo",
-    "index_folder",
-    "index_file",
-    "list_repos",
-    "get_file_tree",
-    "get_file_outline",
-    "get_file_content",
-    "get_symbol",
-    "get_symbols",
-    "search_symbols",
-    "search_text",
-    "search_columns",
-    "get_repo_outline",
-    "find_importers",
-    "find_references",
-    "check_references",
-    "get_dependency_graph",
-    "get_blast_radius",
-    "get_symbol_diff",
-    "get_class_hierarchy",
-    "get_related_symbols",
-    "suggest_queries",
-    "get_session_stats",
-    "invalidate_cache",
-    "get_context_bundle",
-]
-</file>
-
-<file path="tools/jc/registry.py">
-from __future__ import annotations
-
-from ..schema import Tool
-from . import (
-    check_references,
-    find_importers,
-    find_references,
-    get_blast_radius,
-    get_class_hierarchy,
-    get_context_bundle,
-    get_dependency_graph,
-    get_file_content,
-    get_file_outline,
-    get_file_tree,
-    get_related_symbols,
-    get_repo_outline,
-    get_session_stats,
-    get_symbol,
-    get_symbol_diff,
-    get_symbols,
-    index_file,
-    index_folder,
-    index_repo,
-    invalidate_cache,
-    list_repos,
-    search_columns,
-    search_symbols,
-    search_text,
-    suggest_queries,
-)
-
-JC_TOOLS = [
-    Tool(
-        "index_repo",
-        index_repo,
-        "Index a GitHub repository",
-        {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
-    ),
-    Tool(
-        "index_folder",
-        index_folder,
-        "Index a local folder",
-        {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
-    ),
-    Tool(
-        "index_file",
-        index_file,
-        "Index a single file",
-        {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
-    ),
-    Tool(
-        "list_repos",
-        list_repos,
-        "List indexed repositories",
-        {"type": "object", "properties": {}},
-    ),
-    Tool(
-        "get_file_tree",
-        get_file_tree,
-        "Get repository file tree",
-        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
-    ),
-    Tool(
-        "get_file_outline",
-        get_file_outline,
-        "Get symbols in a file",
-        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
-    ),
-    Tool(
-        "get_file_content",
-        get_file_content,
-        "Get file contents",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "file_path": {"type": "string"}},
-            "required": ["repo", "file_path"],
-        },
-    ),
-    Tool(
-        "get_symbol",
-        get_symbol,
-        "Get symbol source",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "symbol_id": {"type": "string"}},
-            "required": ["repo", "symbol_id"],
-        },
-    ),
-    Tool(
-        "get_symbols",
-        get_symbols,
-        "Get multiple symbols",
-        {
-            "type": "object",
-            "properties": {
-                "repo": {"type": "string"},
-                "symbol_ids": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["repo", "symbol_ids"],
-        },
-    ),
-    Tool(
-        "search_symbols",
-        search_symbols,
-        "Search symbols",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "query": {"type": "string"}},
-            "required": ["repo", "query"],
-        },
-    ),
-    Tool(
-        "search_text",
-        search_text,
-        "Search text",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "query": {"type": "string"}},
-            "required": ["repo", "query"],
-        },
-    ),
-    Tool(
-        "search_columns",
-        search_columns,
-        "Search columns",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "query": {"type": "string"}},
-            "required": ["repo", "query"],
-        },
-    ),
-    Tool(
-        "get_repo_outline",
-        get_repo_outline,
-        "Get repo overview",
-        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
-    ),
-    Tool(
-        "find_importers",
-        find_importers,
-        "Find file importers",
-        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
-    ),
-    Tool(
-        "find_references",
-        find_references,
-        "Find references",
-        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
-    ),
-    Tool(
-        "check_references",
-        check_references,
-        "Check references",
-        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
-    ),
-    Tool(
-        "get_dependency_graph",
-        get_dependency_graph,
-        "Get dependency graph",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "file": {"type": "string"}},
-            "required": ["repo", "file"],
-        },
-    ),
-    Tool(
-        "get_blast_radius",
-        get_blast_radius,
-        "Get blast radius",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "symbol": {"type": "string"}},
-            "required": ["repo", "symbol"],
-        },
-    ),
-    Tool(
-        "get_symbol_diff",
-        get_symbol_diff,
-        "Diff symbols",
-        {
-            "type": "object",
-            "properties": {"repo_a": {"type": "string"}, "repo_b": {"type": "string"}},
-            "required": ["repo_a", "repo_b"],
-        },
-    ),
-    Tool(
-        "get_class_hierarchy",
-        get_class_hierarchy,
-        "Get class hierarchy",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "class_name": {"type": "string"}},
-            "required": ["repo", "class_name"],
-        },
-    ),
-    Tool(
-        "get_related_symbols",
-        get_related_symbols,
-        "Find related symbols",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "symbol_id": {"type": "string"}},
-            "required": ["repo", "symbol_id"],
-        },
-    ),
-    Tool(
-        "suggest_queries",
-        suggest_queries,
-        "Suggest queries",
-        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
-    ),
-    Tool(
-        "get_session_stats",
-        get_session_stats,
-        "Get session stats",
-        {"type": "object", "properties": {}},
-    ),
-    Tool(
-        "invalidate_cache",
-        invalidate_cache,
-        "Invalidate cache",
-        {"type": "object", "properties": {"repo": {"type": "string"}}, "required": ["repo"]},
-    ),
-    Tool(
-        "get_context_bundle",
-        get_context_bundle,
-        "Get context bundle",
-        {
-            "type": "object",
-            "properties": {"repo": {"type": "string"}, "symbol_id": {"type": "string"}},
-            "required": ["repo", "symbol_id"],
-        },
-    ),
-]
+    def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
+        result_blocks = run_async(call_tool(name, arguments))
+        return parse_text_content_payload(result_blocks)
 </file>
 
 <file path="tools/__init__.py">
 from __future__ import annotations
 
-from . import schema, ic, jc, registry
+from . import backends, mcp_adapter
 
-__all__ = ["schema", "ic", "jc", "registry"]
+__all__ = ["backends", "mcp_adapter"]
 </file>
 
-<file path="tools/registry.py">
+<file path="tools/mcp_adapter.py">
 from __future__ import annotations
 
-from typing import Dict, List
+import asyncio
+import json
+import threading
+from typing import Any, Coroutine, Iterable, TypeVar
 
-from .ic.registry import IC_TOOLS
-from .jc.registry import JC_TOOLS
-from .schema import Tool, ToolSpec
+from mcp.types import TextContent, Tool as MCPTool
 
-ALL_TOOLS: List[Tool] = IC_TOOLS + JC_TOOLS
-TOOL_MAP: Dict[str, Tool] = {tool.name: tool for tool in ALL_TOOLS}
-IC_TOOL_MAP: Dict[str, Tool] = {tool.name: tool for tool in IC_TOOLS}
-JC_TOOL_MAP: Dict[str, Tool] = {tool.name: tool for tool in JC_TOOLS}
+from ..utils.openai_schema import OpenAITool
 
-
-def get_tool_specs() -> List[ToolSpec]:
-    return [tool.to_spec() for tool in ALL_TOOLS]
+T = TypeVar("T")
 
 
-def get_ic_tool_specs() -> List[ToolSpec]:
-    return [tool.to_spec() for tool in IC_TOOLS]
+def mcp_tool_to_openai_tool(tool: MCPTool) -> OpenAITool:
+    """Convert an MCP Tool definition into the OpenAI function tool schema."""
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description or "",
+            "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+        },
+    }
 
 
-def get_jc_tool_specs() -> List[ToolSpec]:
-    return [tool.to_spec() for tool in JC_TOOLS]
-</file>
+def parse_text_content_payload(blocks: Iterable[TextContent] | None) -> Any:
+    """
+    Parse the first text content block as JSON when possible, otherwise return raw text.
 
-<file path="tools/schema.py">
-from __future__ import annotations
+    Tool runtimes return a list[TextContent]; harness wants Python payloads in observations.
+    """
+    if not blocks:
+        return None
 
-from typing import Any, Callable, Dict, TypedDict
+    for block in blocks:
+        text = getattr(block, "text", None)
+        if text is None:
+            continue
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+    return None
 
 
-class ToolSpec(TypedDict):
-    name: str
-    description: str
-    parameters: Dict[str, Any]
+def run_async(coro: asyncio.Future[T] | Coroutine[Any, Any, T]) -> T:
+    """
+    Run an async coroutine from sync code safely.
+
+    - If no event loop is running: run with asyncio.run.
+    - If a loop is already running on this thread: execute the coroutine inside a
+      fresh event loop on a dedicated background thread to avoid deadlocks.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: list[T] = []
+    error: list[BaseException] = []
+
+    def _runner() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            result.append(loop.run_until_complete(coro))
+        except BaseException as exc:  # pragma: no cover - exercised in tests
+            error.append(exc)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if error:
+        raise error[0]
+    return result[0]
 
 
-class Tool:
-    name: str
-    func: Callable[..., Any]
-    description: str
-    parameters: Dict[str, Any]
+def serialize_tool_result_for_model(result: Any) -> str:
+    """
+    Serialize tool output for inclusion in the chat transcript.
 
-    def __init__(
-        self,
-        name: str,
-        func: Callable[..., Any],
-        description: str,
-        parameters: Dict[str, Any],
-    ) -> None:
-        self.name = name
-        self.func = func
-        self.description = description
-        self.parameters = parameters
-
-    def to_spec(self) -> dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
-        }
+    Keeps strings as-is; attempts deterministic JSON for structured data.
+    """
+    if isinstance(result, str):
+        return result
+    try:
+        return json.dumps(result, sort_keys=True)
+    except Exception:
+        return str(result)
 </file>
 
 <file path="utils/__init__.py">
@@ -1820,18 +1734,16 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from typing import Any, Callable, cast
 
 from openai import OpenAI
 
-from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
-from .tools.registry import (
-    get_ic_tool_specs,
-    get_jc_tool_specs,
-    IC_TOOL_MAP,
-    JC_TOOL_MAP,
-)
+from .tools.backends.ic_backend import IterativeContextBackend
+from .tools.backends.jc_backend import JCodeMunchBackend
+from .tools.mcp_adapter import serialize_tool_result_for_model
 from .utils.env import load_env
+from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
 
 
 def _require_str(mapping: dict[str, Any], key: str) -> str:
@@ -1841,29 +1753,53 @@ def _require_str(mapping: dict[str, Any], key: str) -> str:
     return value
 
 
-def _dispatch_tool_call(
-    tool_name: str,
-    arguments: dict[str, Any],
-    tool_map: dict[str, Any],
-    score_fn: Any,
-) -> Any:
-    if tool_name not in tool_map:
-        raise ValueError(f"Unknown tool: {tool_name}")
-    tool = tool_map[tool_name]
-    func = tool.func
+def _tool_names_from_specs(tool_specs: list[OpenAITool]) -> list[str]:
+    names: list[str] = []
+    for spec in tool_specs:
+        func = spec.get("function") if isinstance(spec, Mapping) else None
+        name = func.get("name") if isinstance(func, Mapping) else None
+        if isinstance(name, str):
+            names.append(name)
+    return names
 
-    args = dict(arguments)
-    if "depth" in args:
-        try:
-            args["depth"] = int(args["depth"])
-        except Exception:
-            args["depth"] = 1
-    if score_fn is not None:
-        try:
-            return func(**args, score_fn=score_fn)
-        except TypeError:
-            pass
-    return func(**args)
+
+def _format_available_tools(tool_names: list[str]) -> str:
+    if not tool_names:
+        return "- none"
+    return "\n".join(f"- {name}" for name in tool_names)
+
+
+def _build_ic_system_prompt(tool_specs: list[OpenAITool]) -> str:
+    tool_names = _tool_names_from_specs(tool_specs)
+    return (
+        "You are exploring a codebase using a graph-based system.\n"
+        "Available tools:\n"
+        f"{_format_available_tools(tool_names)}\n\n"
+        "Guidelines:\n"
+        "- Always expand after resolving\n"
+        "- Prefer expand over repeated resolve\n"
+        "- Do not attempt file-level inspection unless necessary\n"
+        "- Focus on graph traversal\n"
+        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
+        "- Always start by calling a tool. Never respond with text.\n"
+        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
+    )
+
+
+def _build_jc_system_prompt(tool_specs: list[OpenAITool]) -> str:
+    tool_names = _tool_names_from_specs(tool_specs)
+    tools_section = _format_available_tools(tool_names)
+    return (
+        "You are exploring a codebase using tool calls.\n"
+        "Available tools:\n"
+        f"{tools_section}\n\n"
+        "Guidelines:\n"
+        "- Use the available tools to locate and inspect symbols and files\n"
+        "- Avoid redundant calls\n"
+        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
+        "- Always start by calling a tool. Never respond with text.\n"
+        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
+    )
 
 
 def _make_client() -> OpenAI:
@@ -1882,10 +1818,9 @@ def _make_client() -> OpenAI:
 
 def run_agent(
     task: dict[str, object],
-    score_fn: Any,
     steps: int,
     tool_specs: list[OpenAITool],
-    tool_map: dict[str, Any],
+    dispatch_tool_call: Callable[[str, dict[str, Any]], Any],
     system_prompt: str,
 ) -> dict[str, object]:
     """
@@ -1928,14 +1863,9 @@ def run_agent(
             raw_args = call.function.arguments or {}
             parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             tool_name = call.function.name
-            result = _dispatch_tool_call(
-                tool_name=tool_name,
-                arguments=parsed_args,
-                tool_map=tool_map,
-                score_fn=score_fn,
-            )
+            result = dispatch_tool_call(tool_name, parsed_args)
             observations.append({"tool": tool_name, "result": result})
-            messages.append(build_tool_response(call_id, str(result)))
+            messages.append(build_tool_response(call_id, serialize_tool_result_for_model(result)))
         except Exception as exc:  # noqa: BLE001
             tool_name = call.function.name or "unknown"
             observations.append({"tool": tool_name, "error": str(exc)})
@@ -1947,7 +1877,41 @@ def run_agent(
     return {"observations": observations}
 
 
-def run_ic_iteration(task: dict[str, object], score_fn: Callable[[object, object], float], steps: int = 5):
+def _normalize_agent_result(raw: dict[str, object]) -> dict[str, object]:
+    observations = raw.get("observations") if isinstance(raw, dict) else []
+    if not isinstance(observations, list):
+        observations = []
+
+    def _latest_graph_node_count() -> int:
+        if not observations:
+            return 0
+        latest = observations[-1]
+        result = latest.get("result") if isinstance(latest, Mapping) else None
+        if not isinstance(result, Mapping):
+            return 0
+        full_graph = result.get("full_graph")
+        if isinstance(full_graph, Mapping):
+            nodes = full_graph.get("nodes")
+            if isinstance(nodes, list):
+                return len(nodes)
+        graph = result.get("graph")
+        if isinstance(graph, Mapping):
+            nodes = graph.get("nodes")
+            if isinstance(nodes, list):
+                return len(nodes)
+        return 0
+
+    normalized: dict[str, object] = {
+        "observations": observations,
+        "node_count": _latest_graph_node_count(),
+        "raw": raw,
+    }
+    if isinstance(raw, dict) and "error" in raw:
+        normalized["error"] = raw["error"]
+    return normalized
+
+
+def run_ic_iteration(task: dict[str, object], score_fn: Callable[..., float], steps: int = 5):
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
     agent_task: dict[str, object] = {
@@ -1957,32 +1921,20 @@ def run_ic_iteration(task: dict[str, object], score_fn: Callable[[object, object
         "raw_symbol": symbol,
     }
 
-    tool_specs: list[OpenAITool] = get_ic_tool_specs()
-    system_prompt = (
-        "You are exploring a codebase using a graph-based system.\n"
-        "Available tools:\n"
-        "- resolve\n- expand\n- resolve_and_expand\n\n"
-        "Guidelines:\n"
-        "- Always expand after resolving\n"
-        "- Prefer expand over repeated resolve\n"
-        "- Do not attempt file-level inspection unless necessary\n"
-        "- Focus on graph traversal\n"
-        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
-        "- Always start by calling a tool. Never respond with text.\n"
-        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
-    )
+    backend = IterativeContextBackend(score_fn)
+    tool_specs: list[OpenAITool] = backend.tool_specs
+    system_prompt = _build_ic_system_prompt(tool_specs)
     try:
         raw = run_agent(
             agent_task,
-            score_fn=score_fn,
             steps=steps,
             tool_specs=tool_specs,
-            tool_map=IC_TOOL_MAP,
+            dispatch_tool_call=backend.dispatch,
             system_prompt=system_prompt,
         )
     except Exception as exc:  # noqa: BLE001
         raw = {"observations": [], "error": str(exc)}
-    return normalize_iterative_context(raw)
+    return _normalize_agent_result(raw)
 
 
 def run_jc_iteration(task: dict[str, object], steps: int = 5):
@@ -1995,28 +1947,20 @@ def run_jc_iteration(task: dict[str, object], steps: int = 5):
         "raw_symbol": symbol,
     }
 
-    tool_specs: list[OpenAITool] = get_jc_tool_specs()
-    system_prompt = (
-        "You are exploring a codebase using tool calls.\n"
-        "Available tools:\n"
-        "- search_symbols\n- get_symbol\n- get_file_outline\n- find_references\n- get_file_tree\n\n"
-        "Guidelines:\n"
-        "- Use search to locate symbols\n"
-        "- Inspect files to understand structure\n"
-        "- Use references/imports to navigate\n"
-        "- Avoid redundant calls\n"
-        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
-        "- Always start by calling a tool. Never respond with text.\n"
-        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
-    )
-    return run_agent(
-        agent_task,
-        score_fn=None,
-        steps=steps,
-        tool_specs=tool_specs,
-        tool_map=JC_TOOL_MAP,
-        system_prompt=system_prompt,
-    )
+    backend = JCodeMunchBackend()
+    tool_specs: list[OpenAITool] = backend.tool_specs
+    system_prompt = _build_jc_system_prompt(tool_specs)
+    try:
+        raw = run_agent(
+            agent_task,
+            steps=steps,
+            tool_specs=tool_specs,
+            dispatch_tool_call=backend.dispatch,
+            system_prompt=system_prompt,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raw = {"observations": [], "error": str(exc)}
+    return _normalize_agent_result(raw)
 </file>
 
 <file path="scorer.py">
