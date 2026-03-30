@@ -6,7 +6,7 @@ from harness.pipeline.types import StepResult, ExecutionBackend
 
 class FakeBackend(ExecutionBackend):
     def __init__(self):
-        self.last_cmd: list[str] | None = None
+        self.last_cmd: list[str] = []
 
     def run(self, cmd: list[str], cwd: Path, name: str | None = None) -> StepResult:
         self.last_cmd = cmd

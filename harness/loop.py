@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -107,7 +107,7 @@ def _step_succeeded(step: Mapping[str, object]) -> bool:
     return bool(success_val)
 
 
-def _first_failed_step(steps: list[object]) -> Mapping[str, object] | None:
+def _first_failed_step(steps: Sequence[Mapping[str, object] | object]) -> Mapping[str, object] | None:
     def _as_mapping(step: object) -> Mapping[str, object] | None:
         if isinstance(step, Mapping):
             return step
@@ -238,7 +238,9 @@ def synthesize_valid_policy(
                     repair_obs.end(error=e)
                 except Exception:
                     pass
-            failure_context_str = _format_pipeline_failure_context([], {}, metadata.get("writer_error"), writer_model, attempts_used)
+            writer_err_val = metadata.get("writer_error")
+            writer_err_str = str(writer_err_val) if writer_err_val is not None else None
+            failure_context_str = _format_pipeline_failure_context([], {}, writer_err_str, writer_model, attempts_used)
             continue
 
         step_results = pipeline.run(repo_root, observation=repair_obs)
@@ -266,7 +268,9 @@ def synthesize_valid_policy(
             metadata["failed_summary"] = _compact_failure(failed_step)
         metadata["pipeline_feedback"] = classified
         metadata["error"] = "pipeline_failed"
-        failure_context_str = _format_pipeline_failure_context(pipeline_results, classified, metadata.get("writer_error"), writer_model, attempts_used)
+        writer_err_val = metadata.get("writer_error")
+        writer_err_str = str(writer_err_val) if writer_err_val is not None else None
+        failure_context_str = _format_pipeline_failure_context(pipeline_results, classified, writer_err_str, writer_model, attempts_used)
         initial_policy = _read_policy()
         if repair_obs and hasattr(repair_obs, "end"):
             repair_obs.end(metadata={"status": "failed", "error": metadata.get("error")})

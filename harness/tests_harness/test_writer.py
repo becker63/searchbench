@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from typing import TypedDict
+
 from harness import writer
 
 
@@ -52,19 +54,34 @@ def _make_client(content, capture, parsed=None):
     return DummyClient()
 
 
-def _base_inputs():
-    return dict(
-        feedback={"a": 1},
-        current_policy="def score(node, state):\n    return 0.0\n",
-        tests="",
-        scoring_context="",
-        feedback_str="",
-        guidance_hint="",
-        diff_str="",
-        diff_hint="",
-        comparison_summary="IC vs JC summary",
-        parent_trace=None,
-    )
+class BaseInputs(TypedDict, total=False):
+    feedback: dict[str, object]
+    current_policy: str
+    tests: str
+    scoring_context: str
+    feedback_str: str
+    guidance_hint: str
+    diff_str: str
+    diff_hint: str
+    comparison_summary: str | None
+    parent_trace: object | None
+    failure_context: str | None
+    repair_attempt: int
+
+
+def _base_inputs() -> BaseInputs:
+    return {
+        "feedback": {"a": 1},
+        "current_policy": "def score(node, state):\n    return 0.0\n",
+        "tests": "",
+        "scoring_context": "",
+        "feedback_str": "",
+        "guidance_hint": "",
+        "diff_str": "",
+        "diff_hint": "",
+        "comparison_summary": "IC vs JC summary",
+        "parent_trace": None,
+    }
 
 
 def test_generate_policy_accepts_structured_code(monkeypatch):
@@ -78,13 +95,21 @@ def test_generate_policy_accepts_structured_code(monkeypatch):
     assert "def score" in code
     assert ("writer.policy_compiled", 1.0) in scores
     assert ("writer.policy_generated", 1.0) in scores
-    assert calls and calls[0]["response_format"]["type"] == "json_schema"
-    schema = calls[0]["response_format"]["json_schema"]["schema"]
+    assert calls
+    assert isinstance(calls[0]["response_format"], dict)
+    response_format = calls[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert isinstance(response_format["json_schema"], dict)
+    json_schema = response_format["json_schema"]
+    assert isinstance(json_schema["schema"], dict)
+    schema = json_schema["schema"]
     assert schema["required"] == ["code"]
     assert schema["properties"] == {"code": {"type": "string"}}
-    assert calls[0]["response_format"]["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["strict"] is True
     assert schema.get("additionalProperties") is False
-    assert calls[0]["max_completion_tokens"] > 0
+    max_tokens = calls[0]["max_completion_tokens"]
+    assert isinstance(max_tokens, int)
+    assert max_tokens > 0
 
 
 @pytest.mark.parametrize(
