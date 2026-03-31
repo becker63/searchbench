@@ -1,0 +1,156 @@
+Yes. For a major refactor, I would stop thinking in terms of “small cuts” and instead make loop_machine.py the only place that owns orchestration state, transitions, and transition-scoped observability. That lines up with the library’s observer pattern and external listeners model.  ￼
+
+Here’s the file-by-file delete checklist I’d use.
+
+1. loop.py — biggest target
+
+This is where I’d expect the most shrinkage.
+
+Delete or collapse:
+	•	synthesize_valid_policy(...) entirely once callers move to RepairStateMachine / RepairOutcome. Right now it is explicitly a compatibility wrapper around the repair machine.  ￼
+	•	_ORIGINAL_SYNTHESIZE
+	•	the repair_override / _compat_repair branch inside run_loop() that exists only to preserve monkeypatch compatibility with the old wrapper. run_loop() is currently still checking whether synthesize_valid_policy is not _ORIGINAL_SYNTHESIZE and dynamically adapting back to the legacy tuple-returning API. That is exactly the kind of transitional code you want gone in a real migration.  ￼
+	•	any remaining span setup in helper/orchestration paths that duplicates machine listeners. Your own repo notes still describe loop.py as carrying iteration boundaries, policy load/write, IC/JC runs, scoring, pipeline steps, and integrity spans. If the machine is now the orchestration core, this file should mostly become dependency wiring plus a thin entrypoint.  ￼
+
+My expected cut here: 350–700 LOC.
+
+2. loop_machine.py — keep, but simplify
+
+This file should become the center of gravity, but it still has cleanup inside it.
+
+What I’d delete or tighten:
+	•	the manual repair-span bootstrap in RepairStateMachine.run(). You already have _RepairTracingListener starting spans on on_enter_generating_candidate, ending them on retry / success / exhaustion, and clearing ctx.repair_observation. But RepairStateMachine.run() still manually initializes ctx.repair_observation before the machine runs. That is split ownership and should be removed so the listener is the sole owner.
+	•	likely the _TransitionTraceListener if you are not actually consuming the transition sink as a first-class debugging artifact. It is useful, but if this trace bucket is not part of your public model or test contract, it is a nice-to-have, not core complexity budget.  ￼
+	•	maybe the BoundEvent.key shim later, but I would treat that as a second-pass cut only after you know the installed version surface is stable. It is a compatibility shim, but it is small and low-risk to keep.  ￼
+
+My expected net cut here is smaller because this file becomes more important: 40–120 LOC.
+
+3. loop_types.py — likely flatten a bit
+
+I would not expect giant deletions here, but once the wrapper path disappears you can usually trim:
+	•	tuple-compat/result-shape translation types that only exist because old loop.py APIs returned tuples while the machine returns structured outcomes
+	•	metadata fields that only preserve old wrapper semantics rather than real machine state
+	•	maybe some duplicated “public dict” conversion helpers if the machine result becomes the canonical external representation
+
+I have less direct evidence here than in loop.py, so I’d call this a probable cleanup zone, not a guaranteed cut.
+
+My expected cut: 30–100 LOC.
+
+4. tests_harness/test_loop_failures.py — big test debt from the old API
+
+This file is still strongly coupled to loop.synthesize_valid_policy(...) and to monkeypatching it back into run_loop(). You have tests asserting the old tuple return shape, pipeline mutation semantics through the wrapper, and propagation of wrapper metadata back into run_loop(). That is all migration drag.
+
+What to delete or rewrite:
+	•	direct synthesize_valid_policy(...) tests
+	•	tests that monkeypatch loop.synthesize_valid_policy and expect run_loop() to adapt
+	•	tests whose purpose is specifically “legacy wrapper still interoperates with machine loop”
+
+Keep only the behavior, rewritten at the machine boundary:
+	•	repair retries
+	•	accepted-policy source metadata
+	•	pipeline-failure metadata
+	•	pipeline mutation behavior
+
+My expected cut here: 150–300 LOC.
+
+5. tests_harness/test_tracing_wrappers.py — likely mostly disposable
+
+This file is probably the clearest candidate for aggressive trimming. Once listeners own transition-scoped tracing, wrapper-level tracing tests become much less valuable than:
+	•	one machine test for repair listener span lifecycle
+	•	one optimization test for iteration span open/close + score recording
+	•	maybe one end-to-end smoke test through run_loop()
+
+So I would expect a lot of this file to either disappear or collapse into a few machine-listener tests.
+
+My expected cut: 100–250 LOC.
+
+6. tests_harness/test_loop_machine.py — keep, maybe expand a little
+
+This is the test file you want to survive the refactor. It is already testing the state machine as the primary abstraction. That is healthy.  ￼
+
+I would not plan a big cut here. I would actually migrate assertions from the old wrapper tests into this file.
+
+Net change: -50 to +80 LOC depending on how much you consolidate.
+
+7. LANGFUSE.md / observability docs
+
+Your own notes still describe loop.py as the place where most tracing lives. After the refactor, that document should say:
+	•	transition/iteration/repair spans are owned by machine listeners
+	•	loop.py is mostly wiring
+	•	lower-level tool/model spans remain in runner.py, writer.py, and pipeline/* as leaf observability
+
+That is not a LOC win, but it prevents the architecture from drifting back.  ￼
+
+⸻
+
+What I would not delete in the major pass
+
+I would keep these unless the refactor uncovers dead code naturally:
+	•	observability/langfuse.py
+	•	runner.py
+	•	writer.py
+	•	pipeline/*
+
+Those are still legitimate leaf-operation boundaries. The major duplication is not “too much tracing exists.” It is that orchestration tracing is split between wrapper code and machine listeners.  ￼
+
+⸻
+
+The architectural end state I’d aim for
+
+After the refactor, the flow should be:
+	•	run_loop() creates context, dependencies, machine model, and run trace
+	•	OptimizationStateMachine owns orchestration
+	•	RepairStateMachine owns repair flow
+	•	listeners own transition-scoped spans and summary metrics
+	•	tests target machine behavior, not wrapper compatibility
+	•	no dynamic fallback to legacy monkeypatch contracts
+
+That would finally make the migration feel real instead of partial. The observer/listener model in the library is designed for exactly this.
+
+⸻
+
+LOC estimate for the major refactor
+
+My earlier estimate was conservative cleanup. For a genuine major pass, I’d use these bands:
+
+Conservative major pass
+	•	delete compat wrapper + compat branch
+	•	remove duplicated span ownership
+	•	trim wrapper-based tests
+
+Expected reduction: 700–1,400 LOC
+
+Strong major pass
+	•	everything above
+	•	aggressively collapse tracing-wrapper tests
+	•	flatten some result/metadata plumbing in loop_types.py
+	•	simplify loop.py into a thin machine bootstrapper
+
+Expected reduction: 1,400–2,600 LOC
+
+Very aggressive pass
+
+Only if you also decide _TransitionTraceListener is not worth keeping and you prune more transitional metadata/helpers than I can prove from the current snapshot.
+
+Expected reduction: 2,600–3,500 LOC
+
+So from ~55,000 LOC, I’d expect you to land around:
+	•	53.6k–54.3k after a strong major pass
+	•	maybe 51.5k–52.4k only if there is additional dead transitional scaffolding elsewhere that we have not fully surfaced yet
+
+My honest guess: ~53k–54k is the realistic target from the migration work you’ve described.
+
+⸻
+
+My recommended order
+	1.	Delete manual repair-span initialization from RepairStateMachine.run()
+	2.	Delete synthesize_valid_policy
+	3.	Delete _ORIGINAL_SYNTHESIZE
+	4.	Delete the run_loop() compat branch
+	5.	Rewrite test_loop_failures.py around machine behavior
+	6.	Collapse test_tracing_wrappers.py
+	7.	Only then do a second pass on loop_types.py
+
+That order keeps the architecture legible the whole time.
+
+If you want, I can next turn this into a surgical codex prompt with exact delete targets and “done when” conditions.

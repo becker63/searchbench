@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from harness import loop, runner, writer
+from harness import runner, writer
 
 
 class DummySpan:
@@ -81,59 +81,6 @@ def test_writer_records_policy_events(monkeypatch):
     assert "def score" in result
     assert ("writer.policy_compiled", 1.0) in attempt_scores
     assert ("writer.policy_generated", 1.0) in attempt_scores
-
-
-def test_run_loop_uses_observations(monkeypatch, tmp_path):
-    events: list[str] = []
-    monkeypatch.setattr(loop, "index_folder", lambda repo: {"repo": repo})
-    monkeypatch.setattr(loop, "load_policy", lambda: lambda *_: 1.0)
-    monkeypatch.setattr(loop, "run_ic_iteration", lambda *a, **k: {"observations": [{"tool": "x"}], "node_count": 1})
-    monkeypatch.setattr(loop, "score", lambda result: {"score": 1.0, "coverage_delta": 1, "ic_nodes": 1, "jc_nodes": 0})
-    monkeypatch.setattr(loop, "load_tests", lambda repo: [])
-    monkeypatch.setattr(loop, "format_tests_for_prompt", lambda tests: "")
-    monkeypatch.setattr(loop, "load_scoring_types", lambda repo: "")
-    monkeypatch.setattr(loop, "load_scoring_examples", lambda repo: "")
-    monkeypatch.setattr(loop, "format_scoring_context", lambda *a, **k: "")
-    monkeypatch.setattr(loop, "_read_policy", lambda *a, **k: "def score(node, state):\n    return 0.0\n")
-    monkeypatch.setattr(loop, "_write_policy", lambda *a, **k: None)
-    monkeypatch.setattr(loop, "_hash_tests_dir", lambda *a, **k: "hash")
-    monkeypatch.setattr(loop, "generate_policy", lambda **kwargs: "def score(node, state):\n    return 1.0\n")
-
-    class DummyPipeline:
-        def run(self, repo_root, observation=None):
-            return []
-
-    monkeypatch.setattr(loop, "default_pipeline", lambda: DummyPipeline())
-    monkeypatch.setattr(loop, "find_repo_root", lambda: tmp_path)
-    monkeypatch.setattr(loop, "start_trace", lambda *a, **k: DummySpan("trace"))
-    monkeypatch.setattr(loop, "start_span", lambda *a, **k: DummySpan("span"))
-    monkeypatch.setattr(loop, "record_score", lambda *a, **k: events.append("record_score"))
-    monkeypatch.setattr(loop, "flush_langfuse", lambda: events.append("flush"))
-    synth_calls: list[dict[str, object]] = []
-
-    def fake_synthesize_valid_policy(**kwargs):
-        synth_calls.append(kwargs)
-        return (
-            "def score(node: object, state: object, context: object | None = None) -> float:\n    return 1.0\n",
-            [],
-            True,
-            0,
-            {"pipeline_passed": True, "repair_attempts": 0, "max_policy_repairs": 3},
-        )
-
-    monkeypatch.setattr(loop, "synthesize_valid_policy", fake_synthesize_valid_policy)
-
-    baseline = loop.BaselineSnapshot(
-        repo="r",
-        symbol="s",
-        jc_result={"observations": [{"tool": "y"}]},
-        jc_metrics={"jc_nodes": 0, "score": 0.0},
-    )
-
-    history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot=baseline)
-    assert history and history[0].metrics["score"] == 1.0
-    assert "flush" in events
-    assert synth_calls
 
 
 def test_run_agent_truncates_tool_content(monkeypatch):

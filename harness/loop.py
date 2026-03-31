@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import difflib
 import hashlib
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
@@ -13,19 +12,16 @@ from .observability.langfuse import flush_langfuse, record_score, start_span, st
 from .observability.baselines import BaselineSnapshot, baseline_metrics_from_jc
 from .pipeline import classify_results, default_pipeline
 from .pipeline.types import StepResult
-from .loop_machine import OptimizationStateMachine, RepairStateMachine
+from .loop_machine import OptimizationStateMachine
 from .loop_types import (
-    FeedbackPackage,
     EvaluationResult,
+    FeedbackPackage,
     IterationRecord,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
     PipelineStepResult,
     PreparedTasks,
-    RepairContext,
-    RepairMachineModel,
-    RepairOutcome,
 )
 from .policy_loader import load_policy
 from .runner import run_ic_iteration
@@ -64,25 +60,6 @@ def _write_policy(code: str, path: Path = _POLICY_PATH) -> None:
     tmp_path = path.with_suffix(".tmp")
     tmp_path.write_text(code, encoding="utf-8")
     tmp_path.replace(path)
-
-
-def print_policy_diff(old: str, new: str) -> None:
-    if old == new:
-        print("[POLICY] No change")
-        return
-
-    print("[POLICY] Updated")
-    diff = difflib.unified_diff(
-        old.splitlines(),
-        new.splitlines(),
-        lineterm="",
-    )
-    lines = list(diff)
-    max_lines = 50
-    for line in lines[:max_lines]:
-        print(line)
-    if len(lines) > max_lines:
-        print("... diff truncated")
 
 
 def _clean_policy_code(code: str) -> str:
@@ -145,32 +122,6 @@ def _first_failed_step(steps: Sequence[Mapping[str, object] | object]) -> Mappin
         if not _step_succeeded(step_mapping):
             return step_mapping
     return None
-
-
-def _compact_failure(step: Mapping[str, object]) -> str:
-    stderr = step.get("stderr")
-    stdout = step.get("stdout")
-    text = ""
-    if isinstance(stderr, str) and stderr.strip():
-        text = stderr.strip()
-    elif isinstance(stdout, str) and stdout.strip():
-        text = stdout.strip()
-    return text[:_MAX_FAILURE_SUMMARY_CHARS]
-
-
-def _map_steps(steps: list[object]) -> list[Mapping[str, object]]:
-    mapped: list[Mapping[str, object]] = []
-    for step in steps:
-        if isinstance(step, Mapping):
-            mapped.append(step)
-            continue
-        data: dict[str, object] = {}
-        for key in ("name", "success", "stdout", "stderr", "exit_code"):
-            if hasattr(step, key):
-                data[key] = getattr(step, key)
-        if data:
-            mapped.append(data)
-    return mapped
 
 
 def _format_pipeline_failure_context(
@@ -362,10 +313,11 @@ def attempt_policy_generation(
 
 def run_policy_pipeline(pipeline, repo_root: Path, repair_obs: object | None = None) -> tuple[list[PipelineStepResult], list[StepResult], bool]:
     step_results = pipeline.run(repo_root, observation=repair_obs)
-    pipeline_results = [PipelineStepResult.from_mapping(r) for r in _map_steps(list(step_results))]
-    normalized_results = pipeline_results or [PipelineStepResult.from_mapping(r) for r in _map_steps(list(step_results))]
+    raw_results = list(step_results)
+    pipeline_results = [PipelineStepResult.from_mapping(r) for r in raw_results]
+    normalized_results = pipeline_results or [PipelineStepResult.from_mapping(r) for r in raw_results]
     pipeline_success = all(_step_succeeded(r.to_mapping()) for r in normalized_results)
-    return pipeline_results, list(step_results), pipeline_success
+    return pipeline_results, raw_results, pipeline_success
 
 
 def finalize_successful_policy(
@@ -397,7 +349,14 @@ def finalize_failed_repair(
     if failed_step:
         metadata["failed_step"] = failed_step.get("name")
         metadata["failed_exit_code"] = failed_step.get("exit_code")
-        metadata["failed_summary"] = _compact_failure(failed_step)
+        stderr = failed_step.get("stderr")
+        stdout = failed_step.get("stdout")
+        text = ""
+        if isinstance(stderr, str) and stderr.strip():
+            text = stderr.strip()
+        elif isinstance(stdout, str) and stdout.strip():
+            text = stdout.strip()
+        metadata["failed_summary"] = text[:_MAX_FAILURE_SUMMARY_CHARS]
     metadata["pipeline_feedback"] = classified
     metadata["error"] = "pipeline_failed"
     writer_err_val = metadata.get("writer_error")
@@ -406,7 +365,7 @@ def finalize_failed_repair(
     return failure_context_str, _read_policy()
 
 
-def _build_dependencies(repair_override=None) -> LoopDependencies:
+def _build_dependencies() -> LoopDependencies:
     return LoopDependencies(
         prepare_iteration_tasks=prepare_iteration_tasks,
         evaluate_policy_on_item=evaluate_policy_on_item,
@@ -424,64 +383,7 @@ def _build_dependencies(repair_override=None) -> LoopDependencies:
         start_span=start_span,
         find_repo_root=find_repo_root,
         default_pipeline=default_pipeline,
-        repair_via_synthesize=repair_override,
     )
-
-
-def synthesize_valid_policy(
-    *,
-    repo_root: Path,
-    initial_policy: str,
-    feedback: dict[str, object],
-    tests: str,
-    scoring_context: str,
-    feedback_str: str,
-    guidance_hint: str,
-    diff_str: str,
-    diff_hint: str,
-    comparison_summary: str | None,
-    parent_trace: object | None = None,
-    max_repair_attempts: int = _MAX_POLICY_REPAIRS,
-) -> tuple[str, list[dict[str, object]], bool, int, dict[str, object]]:
-    """Compatibility wrapper that reuses the repair state machine."""
-    evaluation = EvaluationResult(
-        metrics=dict(feedback),
-        ic_result={},
-        jc_result={},
-        jc_metrics={},
-        comparison_summary=comparison_summary,
-        policy_code=initial_policy,
-    )
-    feedback_pkg = FeedbackPackage(
-        tests=tests,
-        scoring_context=scoring_context,
-        comparison_summary=comparison_summary,
-        feedback=dict(feedback),
-        feedback_str=feedback_str,
-        guidance_hint=guidance_hint,
-        diff_str=diff_str,
-        diff_hint=diff_hint,
-    )
-    repair_ctx = RepairContext(
-        repo_root=repo_root,
-        evaluation=evaluation,
-        feedback=feedback_pkg,
-        max_repair_attempts=max_repair_attempts,
-        parent_trace=parent_trace,
-        writer_model=get_writer_model(),
-        pipeline=default_pipeline(),
-    )
-    repair_model = RepairMachineModel(
-        context=repair_ctx,
-        deps=_build_dependencies(),
-    )
-    repair_machine = RepairStateMachine(repair_model)
-    outcome = repair_machine.run()
-    pipeline_results = [r.to_mapping() for r in outcome.pipeline_results]
-    return outcome.policy, pipeline_results, outcome.success, outcome.attempts_used, outcome.metadata
-
-
-_ORIGINAL_SYNTHESIZE = synthesize_valid_policy
 
 
 def run_loop(
@@ -495,32 +397,6 @@ def run_loop(
     """
     root_meta = {"task": dict(task), "iterations": iterations}
     run_trace = start_span(parent_trace, "run_loop", metadata=root_meta, input=task) if parent_trace else start_trace("run_loop", metadata=root_meta, input=task)
-    repair_override = None
-    if synthesize_valid_policy is not _ORIGINAL_SYNTHESIZE:
-        def _compat_repair(evaluation: EvaluationResult, feedback: FeedbackPackage, repo_root: Path, parent_trace: object | None) -> RepairOutcome:
-            policy, pipeline_results, pipeline_success, attempts, metadata = synthesize_valid_policy(  # type: ignore[call-arg]
-                repo_root=repo_root,
-                initial_policy=evaluation.policy_code,
-                feedback=feedback.feedback,
-                tests=feedback.tests,
-                scoring_context=feedback.scoring_context,
-                feedback_str=feedback.feedback_str,
-                guidance_hint=feedback.guidance_hint,
-                diff_str=feedback.diff_str,
-                diff_hint=feedback.diff_hint,
-                comparison_summary=feedback.comparison_summary,
-                parent_trace=parent_trace,
-                max_repair_attempts=_MAX_POLICY_REPAIRS,
-            )
-            return RepairOutcome(
-                policy=policy,
-                pipeline_results=[PipelineStepResult.from_mapping(r) for r in pipeline_results],
-                success=pipeline_success,
-                attempts_used=attempts,
-                metadata=metadata,
-            )
-
-        repair_override = _compat_repair
     baseline_model = (
         BaselineSnapshot.model_validate(baseline_snapshot)
         if isinstance(baseline_snapshot, Mapping)
@@ -534,7 +410,7 @@ def run_loop(
     )
     opt_model = OptimizationMachineModel(
         context=context,
-        deps=_build_dependencies(repair_override),
+        deps=_build_dependencies(),
         max_policy_repairs=_MAX_POLICY_REPAIRS,
     )
     machine = OptimizationStateMachine(opt_model)

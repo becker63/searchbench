@@ -14,6 +14,7 @@ _BOUND_EVENT = cast(Any, BoundEvent)
 if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
     setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
+from .loop_listeners import OptimizationTracingListener, RepairTracingListener
 from .loop_types import (
     AcceptedPolicy,
     EvaluationResult,
@@ -28,152 +29,6 @@ from .loop_types import (
     RepairMachineModel,
     RepairOutcome,
 )
-
-
-def _safe_end_span(span: object | None, **kwargs) -> None:
-    """Best-effort guard for Langfuse span termination."""
-    if span is None or not hasattr(span, "end"):
-        return
-    try:
-        cast(Any, span).end(**kwargs)
-    except Exception:
-        pass
-
-
-class _TransitionTraceListener:
-    """Lightweight listener to collect transition metadata for observability."""
-
-    def __init__(self, label: str, sink: dict[str, list[str]] | None = None):
-        self.label: str = label
-        self.sink: dict[str, list[str]] = sink if sink is not None else {}
-
-    def on_transition(self, event: object, state: State, event_data, **kwargs) -> None:
-        machine = cast("StateChart", event_data.machine)
-        trace_sink: dict[str, list[str]] = getattr(machine.model, "trace", self.sink)
-        bucket = trace_sink.setdefault(self.label, [])
-        bucket.append(f"{state.id}->{event_data.transition.target.id}")
-
-
-class _RepairTracingListener:
-    """Listener that manages repair attempt span lifecycle."""
-
-    def on_enter_generating_candidate(self, event: object, state: State, event_data, **kwargs) -> None:
-        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
-        model = machine.model
-        if not model.started:
-            return
-        ctx = model.context
-        if ctx.repair_observation is None:
-            ctx.repair_observation = model.deps.start_span(
-                ctx.parent_trace,
-                f"policy_repair_attempt_{ctx.attempts_used}",
-                metadata={"attempt": ctx.attempts_used},
-            )
-
-    def on_enter_retrying(self, event: object, state: State, event_data, **kwargs) -> None:
-        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
-        self._end_attempt(machine, status="retrying")
-
-    def on_enter_candidate_valid(self, event: object, state: State, event_data, **kwargs) -> None:
-        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
-        self._end_attempt(machine, status="passed")
-
-    def on_enter_repair_exhausted(self, event: object, state: State, event_data, **kwargs) -> None:
-        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
-        self._end_attempt(machine, status="failed")
-
-    def _end_attempt(self, machine: "RepairStateMachine", status: str) -> None:
-        ctx = machine.model.context
-        attempt_index = ctx.attempts_used - 1 if ctx.attempts_used > 0 else ctx.attempts_used
-        metadata: dict[str, object] = {"status": status, "attempt": attempt_index}
-        if ctx.pipeline_passed is False:
-            metadata["pipeline_passed"] = False
-        if ctx.metadata.get("error"):
-            metadata["error"] = ctx.metadata["error"]
-        _safe_end_span(ctx.repair_observation, metadata=metadata)
-        ctx.repair_observation = None
-
-
-class _OptimizationTracingListener:
-    """Listener that owns iteration spans and summary metrics."""
-
-    def __init__(self) -> None:
-        self._last_recorded_iteration: int | None = None
-
-    def on_enter_evaluating(self, event: object, state: State, event_data, **kwargs) -> None:
-        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
-        ctx = machine.model.context
-        if ctx.prepared_tasks is None:
-            machine.model.current_iteration_span = None  # noqa: SLF001
-            return
-        ic_task, jc_task = ctx.prepared_tasks.build_iteration_tasks()
-        machine.model.current_iteration_span = machine.model.deps.start_span(  # noqa: SLF001
-            ctx.run_trace,
-            f"iteration_{ctx.current_iteration}",
-            metadata={
-                "iteration": ctx.current_iteration,
-                "iterations": ctx.iterations,
-                "task": dict(ic_task),
-                "jc_repo": jc_task.get("repo"),
-            },
-        )
-
-    def on_exit_accepted_round(self, event: object, state: State, event_data, **kwargs) -> None:
-        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
-        self._finalize_iteration(machine, status="complete")
-
-    def on_enter_completed(self, event: object, state: State, event_data, **kwargs) -> None:
-        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
-        self._finalize_iteration(machine, status="completed")
-
-    def on_enter_failed(self, event: object, state: State, event_data, **kwargs) -> None:
-        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
-        self._finalize_iteration(machine, status="failed")
-
-    def _finalize_iteration(self, machine: "OptimizationStateMachine", status: str) -> None:
-        ctx = machine.model.context
-        span = machine.model.current_iteration_span
-        record = ctx.history[-1] if ctx.history else None
-        if record is not None and self._last_recorded_iteration == record.iteration:
-            machine.model.current_iteration_span = None  # noqa: SLF001
-            return
-
-        handle = span or ctx.run_trace
-        if record is not None:
-            self._record_iteration_scores(machine, handle, record)
-            self._last_recorded_iteration = record.iteration
-
-        if span is not None:
-            status_val = status
-            if record and (record.error or record.writer_error or record.pipeline_passed is False):
-                status_val = "failed"
-            metadata: dict[str, object] = {
-                "status": status_val,
-                "iteration": record.iteration if record else ctx.current_iteration,
-            }
-            if record and record.pipeline_passed is not None:
-                metadata["pipeline_passed"] = record.pipeline_passed
-            failure_val = record.error if record else None
-            failure_val = failure_val or (record.writer_error if record else None)
-            if failure_val:
-                metadata["error"] = failure_val
-            _safe_end_span(span, metadata=metadata)
-        machine.model.current_iteration_span = None  # noqa: SLF001
-
-    def _record_iteration_scores(
-        self,
-        machine: "OptimizationStateMachine",
-        handle: object | None,
-        record: IterationRecord,
-    ) -> None:
-        deps = machine.deps
-        score_meta = {"iteration": record.iteration}
-        if record.pipeline_passed is not None:
-            deps.record_score(handle, "pipeline_passed", bool(record.pipeline_passed), score_meta)
-        for key in ("score", "coverage_delta", "tool_error_rate"):
-            value = record.metrics.get(key)
-            if isinstance(value, (int, float, bool)):
-                deps.record_score(handle, f"metrics.{key}", float(value), score_meta)
 
 
 class RepairStateMachine(StateChart[RepairMachineModel]):
@@ -209,22 +64,13 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         super().__init__(
             model=model,
             listeners=[
-                _TransitionTraceListener("repair", model.trace),
-                _RepairTracingListener(),
+                RepairTracingListener(),
             ],
         )
 
     # Entry point ---------------------------------------------------------
     def run(self) -> RepairOutcome:
         self.model.started = True
-        # Initialize repair-level observation once per machine run.
-        ctx = self.context
-        if ctx.repair_observation is None:
-            ctx.repair_observation = self.deps.start_span(
-                ctx.parent_trace,
-                f"policy_repair_attempt_{ctx.attempts_used}",
-                metadata={"attempt": ctx.attempts_used},
-            )
         self._run_writer()
         attempts_used = self.context.attempts_used
         final_attempts = (
@@ -391,8 +237,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         super().__init__(
             model=model,
             listeners=[
-                _TransitionTraceListener("optimization", model.trace),
-                _OptimizationTracingListener(),
+                OptimizationTracingListener(),
             ],
         )
 
@@ -501,17 +346,6 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         feedback: FeedbackPackage,
         iteration_span: object | None,
     ) -> RepairOutcome:
-        if self.deps.repair_via_synthesize:
-            outcome = self.deps.repair_via_synthesize(
-                evaluation, feedback, repo_root, iteration_span
-            )
-            if outcome.pipeline_results and not isinstance(
-                outcome.pipeline_results[0], PipelineStepResult
-            ):
-                outcome.pipeline_results = [
-                    PipelineStepResult.from_mapping(r) for r in outcome.pipeline_results
-                ]  # type: ignore[arg-type]
-            return outcome
         repair_ctx = RepairContext(
             repo_root=repo_root,
             evaluation=evaluation,
@@ -523,7 +357,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         )
         repair_model = RepairMachineModel(
             context=repair_ctx,
-            deps=self._repair_dependencies(),
+            deps=self.deps,
         )
         repair_machine = RepairStateMachine(repair_model)
         return repair_machine.run()
@@ -608,24 +442,3 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
                 return step
         return None
 
-    def _repair_dependencies(self) -> LoopDependencies:
-        # Reuse the same dependency set for nested repair machine where possible.
-        return LoopDependencies(
-            prepare_iteration_tasks=self.deps.prepare_iteration_tasks,
-            evaluate_policy_on_item=self.deps.evaluate_policy_on_item,
-            build_iteration_feedback=self.deps.build_iteration_feedback,
-            attempt_policy_generation=self.deps.attempt_policy_generation,
-            run_policy_pipeline=self.deps.run_policy_pipeline,
-            finalize_successful_policy=self.deps.finalize_successful_policy,
-            finalize_failed_repair=self.deps.finalize_failed_repair,
-            classify_results=self.deps.classify_results,
-            format_pipeline_failure_context=self.deps.format_pipeline_failure_context,
-            read_policy=self.deps.read_policy,
-            write_policy=self.deps.write_policy,
-            get_writer_model=self.deps.get_writer_model,
-            record_score=self.deps.record_score,
-            start_span=self.deps.start_span,
-            find_repo_root=self.deps.find_repo_root,
-            default_pipeline=self.deps.default_pipeline,
-            repair_via_synthesize=None,
-        )

@@ -15,7 +15,7 @@ from .datasets import Dataset, DatasetItem, fetch_dataset_items, local_dataset, 
 from .langfuse import flush_langfuse, record_score, start_trace
 from .runner_integration import HostedRunResult, run_hosted_dataset_experiment, run_local_dataset_experiment
 from ..loop import run_loop
-from ..loop_types import iteration_record_to_public_dict, iteration_record_to_score_input
+from ..loop_types import iteration_record_to_public_dict
 from ..scorer import score
 from ..utils.repo_targets import resolve_repo_target
 
@@ -136,7 +136,7 @@ def _run_ic_optimizations(
         history = run_loop(task, iterations=iterations, parent_trace=parent_trace, baseline_snapshot=baseline)
         last_record = history[-1] if history else None
         last_dict: Mapping[str, object] = (
-            iteration_record_to_score_input(last_record) if last_record else {}
+            iteration_record_to_public_dict(last_record) if last_record else {}
         )
         metrics = score({"iterative_context": last_dict, "jcodemunch": baseline.jc_result})
         for name, value in metrics.items():

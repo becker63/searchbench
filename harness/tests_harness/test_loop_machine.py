@@ -18,8 +18,8 @@ from harness.loop_types import (
 from harness.pipeline.types import StepResult
 
 
-def test_optimization_machine_success_path():
-    deps = LoopDependencies(
+def _make_deps(**overrides) -> LoopDependencies:
+    defaults = dict(
         prepare_iteration_tasks=lambda task, trace: PreparedTasks(
             base_task=task, resolved_repo_path=None, jc_repo_id=None
         ),
@@ -55,6 +55,37 @@ def test_optimization_machine_success_path():
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),
     )
+    defaults.update(overrides)
+    return LoopDependencies(**defaults)
+
+
+def _make_evaluation(**overrides) -> EvaluationResult:
+    defaults = dict(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="policy")
+    defaults.update(overrides)
+    return EvaluationResult(**defaults)
+
+
+def _make_feedback(**overrides) -> FeedbackPackage:
+    defaults = dict(tests="", scoring_context="", comparison_summary=None, feedback={}, feedback_str="", guidance_hint="", diff_str="", diff_hint="")
+    defaults.update(overrides)
+    return FeedbackPackage(**defaults)
+
+
+def _make_repair_ctx(deps, *, max_repair_attempts=3, **overrides) -> RepairContext:
+    defaults = dict(
+        repo_root=Path("."),
+        evaluation=_make_evaluation(),
+        feedback=_make_feedback(),
+        max_repair_attempts=max_repair_attempts,
+        parent_trace=None,
+        writer_model="model",
+    )
+    defaults.update(overrides)
+    return RepairContext(**defaults)
+
+
+def test_optimization_machine_success_path():
+    deps = _make_deps()
     model = OptimizationMachineModel(
         context=LoopContext(task={"symbol": "s"}, iterations=1, baseline_snapshot=None, run_trace=None),
         deps=deps,
@@ -71,9 +102,6 @@ def test_optimization_machine_success_path():
 def test_repair_machine_retries_until_exhaustion():
     attempts: list[int] = []
 
-    def attempt_policy_generation(**kwargs):
-        return "candidate", None
-
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         attempts.append(1)
         result = StepResult(name="step", success=False, exit_code=1, stdout="", stderr="boom")
@@ -86,36 +114,12 @@ def test_repair_machine_retries_until_exhaustion():
         metadata["failed_summary"] = "boom"
         return ("ctx", "policy")
 
-    deps = LoopDependencies(
-        prepare_iteration_tasks=lambda *a, **k: PreparedTasks(
-            base_task={}, resolved_repo_path=None, jc_repo_id=None
-        ),
-        evaluate_policy_on_item=lambda *a, **k: evaluation,
-        build_iteration_feedback=lambda *a, **k: feedback,
-        attempt_policy_generation=attempt_policy_generation,
+    deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
-        finalize_successful_policy=lambda **kwargs: ("policy", {}),
         finalize_failed_repair=finalize_failed_repair,
         classify_results=lambda results: {"test_failures": "boom"},
-        format_pipeline_failure_context=lambda *a, **k: "",
-        read_policy=lambda: "policy",
-        write_policy=lambda code: None,
-        get_writer_model=lambda: "model",
-        record_score=lambda *a, **k: None,
-        start_span=lambda *a, **k: None,
-        find_repo_root=lambda: Path("."),
-        default_pipeline=lambda: object(),
     )
-    evaluation = EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="policy")
-    feedback = FeedbackPackage(tests="", scoring_context="", comparison_summary=None, feedback={}, feedback_str="", guidance_hint="", diff_str="", diff_hint="")
-    repair_ctx = RepairContext(
-        repo_root=Path("."),
-        evaluation=evaluation,
-        feedback=feedback,
-        max_repair_attempts=2,
-        parent_trace=None,
-        writer_model="model",
-    )
+    repair_ctx = _make_repair_ctx(deps, max_repair_attempts=2)
     repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
     machine = RepairStateMachine(repair_model)
     outcome = machine.run()
@@ -124,3 +128,202 @@ def test_repair_machine_retries_until_exhaustion():
     assert outcome.metadata.get("pipeline_feedback") == {"test_failures": "boom"}
     state = getattr(machine, "current_state")
     assert getattr(state, "id", None) == machine.repair_exhausted.id  # type: ignore[attr-defined]
+
+
+def test_repair_succeeds_on_second_attempt():
+    pipeline_calls: list[int] = []
+
+    def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
+        pipeline_calls.append(1)
+        if len(pipeline_calls) == 1:
+            result = StepResult(name="ruff", success=False, exit_code=1, stdout="", stderr="lint error")
+            return [PipelineStepResult.from_mapping(result)], [result], False
+        result = StepResult(name="ruff", success=True, exit_code=0, stdout="", stderr="")
+        return [PipelineStepResult.from_mapping(result)], [result], True
+
+    deps = _make_deps(
+        run_policy_pipeline=run_policy_pipeline,
+        classify_results=lambda results: {"lint_errors": "bad"},
+        finalize_failed_repair=lambda *, metadata, pipeline_results, classified, **kwargs: ("ctx", "policy"),
+        finalize_successful_policy=lambda **kwargs: (
+            "policy",
+            {
+                "repair_attempts": 1,
+                "max_policy_repairs": 3,
+                "accepted_policy_source": "post_pipeline_disk",
+                "accepted_policy_changed_by_pipeline": False,
+            },
+        ),
+    )
+    repair_ctx = _make_repair_ctx(deps, max_repair_attempts=3)
+    repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
+    machine = RepairStateMachine(repair_model)
+    outcome = machine.run()
+    assert outcome.success is True
+    assert outcome.attempts_used == 2
+    assert outcome.metadata.get("repair_attempts") == 1
+
+
+def test_pipeline_mutation_returns_on_disk_policy():
+    written_code: list[str] = []
+    disk_policy = ["initial"]
+
+    def write_policy(code):
+        written_code.append(code)
+        disk_policy[0] = code
+
+    def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
+        disk_policy[0] = "formatted_policy"
+        result = StepResult(name="ruff_fix", success=True, exit_code=0, stdout="", stderr="")
+        return [PipelineStepResult.from_mapping(result)], [result], True
+
+    deps = _make_deps(
+        write_policy=write_policy,
+        read_policy=lambda: disk_policy[0],
+        run_policy_pipeline=run_policy_pipeline,
+        finalize_successful_policy=lambda **kwargs: (
+            disk_policy[0],
+            {
+                "repair_attempts": 0,
+                "max_policy_repairs": 3,
+                "accepted_policy_source": "post_pipeline_disk",
+                "accepted_policy_changed_by_pipeline": disk_policy[0] != kwargs.get("new_code", ""),
+            },
+        ),
+    )
+    repair_ctx = _make_repair_ctx(deps)
+    repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
+    machine = RepairStateMachine(repair_model)
+    outcome = machine.run()
+    assert outcome.success is True
+    assert outcome.policy == "formatted_policy"
+    assert outcome.metadata.get("accepted_policy_source") == "post_pipeline_disk"
+    assert outcome.metadata.get("accepted_policy_changed_by_pipeline") is True
+
+
+def test_warning_only_steps_do_not_fail():
+    def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
+        results = [
+            StepResult(name="basedpyright", success=False, stdout="warning only", stderr="reportUnusedParameter", exit_code=0),
+            StepResult(name="pytest_iterative_context", success=False, stdout="warning", stderr="", exit_code=0),
+            StepResult(name="ruff_fix", success=False, stdout="notice", stderr="", exit_code=0),
+        ]
+        pipeline_results = [PipelineStepResult.from_mapping(r) for r in results]
+        return pipeline_results, results, True
+
+    deps = _make_deps(
+        run_policy_pipeline=run_policy_pipeline,
+        finalize_successful_policy=lambda **kwargs: (
+            "policy",
+            {
+                "repair_attempts": 0,
+                "max_policy_repairs": 3,
+                "accepted_policy_source": "post_pipeline_disk",
+                "accepted_policy_changed_by_pipeline": False,
+            },
+        ),
+    )
+    repair_ctx = _make_repair_ctx(deps)
+    repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
+    machine = RepairStateMachine(repair_model)
+    outcome = machine.run()
+    assert outcome.success is True
+    assert outcome.attempts_used == 1
+    assert outcome.metadata.get("repair_attempts") == 0
+    assert not outcome.metadata.get("pipeline_feedback")
+    assert outcome.metadata.get("failed_step") is None
+
+
+def test_nonzero_exit_still_fails():
+    def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
+        result = StepResult(name="pytest_iterative_context", success=False, stdout="", stderr="test failed", exit_code=1)
+        return [PipelineStepResult.from_mapping(result)], [result], False
+
+    def finalize_failed_repair(*, metadata, pipeline_results, classified, **kwargs):
+        metadata["pipeline_feedback"] = classified
+        metadata["error"] = "pipeline_failed"
+        return ("ctx", "policy")
+
+    deps = _make_deps(
+        run_policy_pipeline=run_policy_pipeline,
+        classify_results=lambda results: {"test_failures": "boom"},
+        finalize_failed_repair=finalize_failed_repair,
+    )
+    repair_ctx = _make_repair_ctx(deps, max_repair_attempts=2)
+    repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
+    machine = RepairStateMachine(repair_model)
+    outcome = machine.run()
+    assert outcome.success is False
+    assert outcome.attempts_used == 2
+    assert outcome.metadata.get("pipeline_feedback") == {"test_failures": "boom"}
+
+
+def test_failed_candidate_not_marked_accepted():
+    def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
+        result = StepResult(name="ruff_fix", success=False, stdout="", stderr="lint", exit_code=1)
+        return [PipelineStepResult.from_mapping(result)], [result], False
+
+    def finalize_failed_repair(*, metadata, pipeline_results, classified, **kwargs):
+        metadata["pipeline_feedback"] = classified
+        metadata["error"] = "pipeline_failed"
+        return ("ctx", "policy")
+
+    deps = _make_deps(
+        run_policy_pipeline=run_policy_pipeline,
+        classify_results=lambda results: {"lint_errors": "missing"},
+        finalize_failed_repair=finalize_failed_repair,
+    )
+    repair_ctx = _make_repair_ctx(deps, max_repair_attempts=2)
+    repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
+    machine = RepairStateMachine(repair_model)
+    outcome = machine.run()
+    assert outcome.success is False
+    assert "accepted_policy_source" not in outcome.metadata
+    assert "accepted_policy_changed_by_pipeline" not in outcome.metadata
+
+
+def test_score_metrics_propagation_into_iteration_record():
+    deps = _make_deps(
+        evaluate_policy_on_item=lambda ic_task, baseline, iteration_span=None, iteration_index=None: EvaluationResult(
+            metrics={"score": 0.75, "coverage_delta": 0.1, "tool_error_rate": 0.05},
+            ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="policy"
+        ),
+    )
+    model = OptimizationMachineModel(
+        context=LoopContext(task={"symbol": "s"}, iterations=1, baseline_snapshot=None, run_trace=None),
+        deps=deps,
+        max_policy_repairs=1,
+    )
+    machine = OptimizationStateMachine(model)
+    history = machine.run()
+    assert history
+    record = history[0]
+    assert record.metrics["score"] == 0.75
+    assert record.metrics["coverage_delta"] == 0.1
+    assert record.metrics["tool_error_rate"] == 0.05
+
+
+def test_post_pipeline_metadata_propagates_into_accepted_policy():
+    deps = _make_deps(
+        finalize_successful_policy=lambda **kwargs: (
+            "formatted_policy",
+            {
+                "repair_attempts": 0,
+                "max_policy_repairs": 3,
+                "accepted_policy_source": "post_pipeline_disk",
+                "accepted_policy_changed_by_pipeline": True,
+            },
+        ),
+    )
+    model = OptimizationMachineModel(
+        context=LoopContext(task={"symbol": "s"}, iterations=1, baseline_snapshot=None, run_trace=None),
+        deps=deps,
+        max_policy_repairs=3,
+    )
+    machine = OptimizationStateMachine(model)
+    history = machine.run()
+    assert history
+    record = history[0]
+    assert record.accepted_policy is not None
+    assert record.accepted_policy.source == "post_pipeline_disk"
+    assert record.accepted_policy.changed_by_pipeline is True

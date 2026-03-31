@@ -175,7 +175,6 @@ class LoopDependencies(BaseModel):
     start_span: Callable[..., object | None]
     find_repo_root: Callable[[], Path]
     default_pipeline: Callable[[], object]
-    repair_via_synthesize: Callable[[EvaluationResult, FeedbackPackage, Path, object | None], RepairOutcome] | None = None
 
 
 class RepairContext(BaseModel):
@@ -197,18 +196,6 @@ class RepairContext(BaseModel):
     candidate_code: str | None = None
     pipeline: object | None = None
     repair_observation: object | None = None
-
-
-class AggregateScorecard(BaseModel):
-    """Placeholder for dataset-level aggregation."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    aggregate_score: float | None = None
-    mean_score: float | None = None
-    min_score: float | None = None
-    stddev_score: float | None = None
-    item_scores: dict[str, float] = Field(default_factory=dict)
 
 
 def iteration_record_to_public_dict(record: IterationRecord) -> dict[str, object]:
@@ -240,11 +227,6 @@ def iteration_record_to_public_dict(record: IterationRecord) -> dict[str, object
     return data
 
 
-def iteration_record_to_score_input(record: IterationRecord) -> Mapping[str, object]:
-    """Boundary helper for scorers expecting mapping input."""
-    return iteration_record_to_public_dict(record)
-
-
 class RepairMachineModel(BaseModel):
     """Mutable state model for the repair state machine."""
 
@@ -254,7 +236,6 @@ class RepairMachineModel(BaseModel):
     deps: "LoopDependencies"
     state: str | None = None
     started: bool = False
-    trace: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class OptimizationMachineModel(BaseModel):
@@ -270,7 +251,6 @@ class OptimizationMachineModel(BaseModel):
     current_iteration_span: object | None = None
     current_evaluation: EvaluationResult | None = None
     current_repair_outcome: RepairOutcome | None = None
-    trace: dict[str, list[str]] = Field(default_factory=dict)
 
 
 def _rebuild_forward_refs() -> None:
