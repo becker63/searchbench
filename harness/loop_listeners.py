@@ -23,21 +23,6 @@ def _safe_end_span(span: object | None, **kwargs) -> None:
 class RepairTracingListener:
     """Listener that manages repair attempt span lifecycle."""
 
-    def on_enter_generating_candidate(self, event: object, state: State, event_data, **kwargs) -> None:
-        from .loop_machine import RepairStateMachine
-
-        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
-        model = machine.model
-        if not model.started:
-            return
-        ctx = model.context
-        if ctx.repair_observation is None:
-            ctx.repair_observation = model.deps.start_span(
-                ctx.parent_trace,
-                f"policy_repair_attempt_{ctx.attempts_used}",
-                metadata={"attempt": ctx.attempts_used},
-            )
-
     def on_enter_retrying(self, event: object, state: State, event_data, **kwargs) -> None:
         from .loop_machine import RepairStateMachine
 

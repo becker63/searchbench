@@ -235,7 +235,6 @@ class RepairMachineModel(BaseModel):
     context: RepairContext
     deps: "LoopDependencies"
     state: str | None = None
-    started: bool = False
 
 
 class OptimizationMachineModel(BaseModel):

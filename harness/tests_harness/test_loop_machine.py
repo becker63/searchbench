@@ -327,3 +327,96 @@ def test_post_pipeline_metadata_propagates_into_accepted_policy():
     assert record.accepted_policy is not None
     assert record.accepted_policy.source == "post_pipeline_disk"
     assert record.accepted_policy.changed_by_pipeline is True
+
+
+def test_repair_span_opens_before_writer_for_attempt_zero():
+    span_log: list[tuple[str, dict[str, object]]] = []
+    writer_parent_traces: list[object] = []
+
+    class FakeSpan:
+        def __init__(self, name: str, metadata: dict[str, object]):
+            self.name = name
+            self.metadata = metadata
+            self.ended: list[dict[str, object]] = []
+
+        def end(self, **kwargs: object) -> None:
+            self.ended.append(kwargs)
+
+    def tracking_start_span(parent, name, **kwargs):
+        span = FakeSpan(name, kwargs.get("metadata", {}))
+        span_log.append(("open", {"name": name, **kwargs.get("metadata", {})}))
+        return span
+
+    def tracking_attempt_policy_generation(**kwargs):
+        writer_parent_traces.append(kwargs.get("parent_trace"))
+        return ("policy", None)
+
+    deps = _make_deps(
+        start_span=tracking_start_span,
+        attempt_policy_generation=tracking_attempt_policy_generation,
+    )
+    repair_ctx = _make_repair_ctx(deps, max_repair_attempts=1)
+    repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
+    machine = RepairStateMachine(repair_model)
+    outcome = machine.run()
+    assert outcome.success is True
+    assert len(span_log) >= 1
+    assert span_log[0][1]["attempt"] == 0
+    assert writer_parent_traces[0] is not None
+
+
+def test_repair_span_metadata_correct_across_retries():
+    span_events: list[tuple[str, dict[str, object]]] = []
+    pipeline_calls: list[int] = []
+
+    class FakeSpan:
+        def __init__(self, name: str, metadata: dict[str, object]):
+            self.name = name
+            self.metadata = metadata
+
+        def end(self, **kwargs: object) -> None:
+            span_events.append(("close", dict(kwargs.get("metadata", {}))))
+
+    def tracking_start_span(parent, name, **kwargs):
+        meta = kwargs.get("metadata", {})
+        span = FakeSpan(name, meta)
+        span_events.append(("open", {"name": name, **meta}))
+        return span
+
+    def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
+        pipeline_calls.append(1)
+        if len(pipeline_calls) == 1:
+            result = StepResult(name="ruff", success=False, exit_code=1, stdout="", stderr="err")
+            return [PipelineStepResult.from_mapping(result)], [result], False
+        result = StepResult(name="ruff", success=True, exit_code=0, stdout="", stderr="")
+        return [PipelineStepResult.from_mapping(result)], [result], True
+
+    deps = _make_deps(
+        start_span=tracking_start_span,
+        run_policy_pipeline=run_policy_pipeline,
+        classify_results=lambda results: {"lint_errors": "bad"},
+        finalize_failed_repair=lambda *, metadata, pipeline_results, classified, **kwargs: ("ctx", "policy"),
+        finalize_successful_policy=lambda **kwargs: (
+            "policy",
+            {
+                "repair_attempts": 1,
+                "max_policy_repairs": 3,
+                "accepted_policy_source": "post_pipeline_disk",
+                "accepted_policy_changed_by_pipeline": False,
+            },
+        ),
+    )
+    repair_ctx = _make_repair_ctx(deps, max_repair_attempts=3)
+    repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
+    machine = RepairStateMachine(repair_model)
+    outcome = machine.run()
+    assert outcome.success is True
+    assert outcome.attempts_used == 2
+    open_events = [e for e in span_events if e[0] == "open"]
+    close_events = [e for e in span_events if e[0] == "close"]
+    assert len(open_events) >= 2
+    assert open_events[0][1]["attempt"] == 0
+    assert open_events[1][1]["attempt"] == 1
+    assert len(close_events) >= 2
+    assert close_events[0][1].get("status") == "retrying"
+    assert close_events[1][1].get("status") == "passed"

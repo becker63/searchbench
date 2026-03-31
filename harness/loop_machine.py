@@ -24,7 +24,6 @@ from .loop_types import (
     LoopDependencies,
     OptimizationMachineModel,
     PipelineStepResult,
-    PreparedTasks,
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
@@ -34,16 +33,23 @@ from .loop_types import (
 class RepairStateMachine(StateChart[RepairMachineModel]):
     """
     Drives the candidate generation + pipeline repair loop using state-driven callbacks.
+
+    Construction is cold — the machine starts in ``idle``.  Calling ``run()``
+    fires the ``start`` event, which transitions to ``generating_candidate``
+    through the normal state-entry path so listeners own span lifecycle for
+    every attempt including the first.
     """
 
     catch_errors_as_events = True
 
-    generating_candidate = State(initial=True)
+    idle = State(initial=True)
+    generating_candidate = State()
     running_pipeline = State()
     retrying = State()
     candidate_valid = State(final=True)
     repair_exhausted = State(final=True)
 
+    start = idle.to(generating_candidate)
     writer_generated = generating_candidate.to(running_pipeline)
     writer_retryable_failure = generating_candidate.to(retrying)
     writer_exhausted = generating_candidate.to(repair_exhausted)
@@ -70,8 +76,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
 
     # Entry point ---------------------------------------------------------
     def run(self) -> RepairOutcome:
-        self.model.started = True
-        self._run_writer()
+        self.raise_("start")  # type: ignore[call-arg]
         attempts_used = self.context.attempts_used
         final_attempts = (
             self.context.max_repair_attempts
@@ -95,8 +100,13 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
 
     # Writer/pipeline execution ------------------------------------------
     def on_enter_generating_candidate(self, event: object, state: State) -> None:
-        if not self.model.started:
-            return
+        ctx = self.context
+        if ctx.repair_observation is None:
+            ctx.repair_observation = self.deps.start_span(
+                ctx.parent_trace,
+                f"policy_repair_attempt_{ctx.attempts_used}",
+                metadata={"attempt": ctx.attempts_used},
+            )
         self._run_writer()
 
     def on_enter_retrying(self, event: object, state: State) -> None:

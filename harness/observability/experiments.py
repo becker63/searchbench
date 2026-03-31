@@ -11,7 +11,7 @@ from .baselines import (
     require_baseline,
     resolve_baseline,
 )
-from .datasets import Dataset, DatasetItem, fetch_dataset_items, local_dataset, normalize_dataset_item
+from .datasets import Dataset, DatasetItem, fetch_dataset_items, normalize_dataset_item
 from .langfuse import flush_langfuse, record_score, start_trace
 from .runner_integration import HostedRunResult, run_hosted_dataset_experiment, run_local_dataset_experiment
 from ..loop import run_loop

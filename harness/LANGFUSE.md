@@ -30,9 +30,15 @@
 - Hosted runs create dataset runs/compare UX; local runs create traces/scores only. Per-item traces include dataset info, item id, baseline run id, and run kind (`jc_baseline` vs `ic_optimization`).
 
 ## Tracing & Scoring
+
+Orchestration-scoped tracing is owned by the state machines and their listeners:
+- `loop_machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
+- `loop_listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, metric recording). `RepairTracingListener` closes repair attempt spans on `retrying` / `candidate_valid` / `repair_exhausted`. Repair attempt spans are opened by `RepairStateMachine.on_enter_generating_candidate` (before writer/pipeline work) so the span exists for the full attempt lifecycle. Scores like `metrics.score`, `metrics.coverage_delta`, `metrics.tool_error_rate`, and `pipeline_passed` are recorded by the listeners.
+- `loop.py`: thin bootstrap/wiring layer — constructs context, dependencies, and the optimization machine; converts iteration records to public output shape. Not responsible for tracing or orchestration.
+
+Leaf-operation observability remains with:
 - `runner.py`: model calls and MCP tool invocations traced via Langfuse spans.
 - `writer.py`: policy generations/retries traced; emits `writer.policy_generated` and `writer.policy_compiled`.
-- `loop.py`: iteration boundaries, policy load/write, IC/JC runs, scoring, pipeline steps, integrity checks captured as spans with scores like `metrics.score`, `metrics.coverage_delta`, `metrics.tool_error_rate`, `pipeline_passed`.
 - `pipeline` steps emit exit-code/pass flags per step.
 - `scorer.py` remains the source of metric computation; Langfuse stores the metrics.
 

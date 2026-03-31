@@ -1,0 +1,93 @@
+You are refactoring the harness package to FINISH the state-machine migration.
+
+Context:
+- We already split tracing listeners into harness/loop_listeners.py.
+- RepairTracingListener owns repair attempt spans.
+- OptimizationTracingListener owns iteration spans and iteration-level metric recording.
+- But the migration is still incomplete:
+  1. RepairStateMachine.run() still manually kicks off work with _run_writer(), which bypasses the clean state-entry/listener path for the first repair attempt.
+  2. harness/loop.py still preserves the legacy synthesize_valid_policy compatibility wrapper and related monkeypatch compatibility logic.
+  3. Some tests and docs still reflect the old wrapper-centric orchestration model instead of the machine/listener model.
+
+Your goal:
+Make the state machine and listeners the SINGLE source of truth for orchestration and orchestration-scoped tracing.
+
+Hard requirements:
+1. The first repair attempt must go through the state machine's normal state-entry path so listener-owned repair spans are correct for attempt 0 as well.
+2. Delete legacy compatibility code aggressively:
+   - remove synthesize_valid_policy(...)
+   - remove _ORIGINAL_SYNTHESIZE
+   - remove run_loop compatibility logic that adapts monkeypatched synthesize_valid_policy back into RepairOutcome / old tuple behavior
+   - remove any helper plumbing that only exists to support that deprecated path
+3. Keep the public loop behavior intact:
+   - loop still returns iteration history / public dicts as expected
+   - accepted policy metadata still works
+   - pipeline_passed / repair_attempts / max_policy_repairs / failed_step / failed_summary still work
+4. Rewrite tests to target machine behavior, not wrapper compatibility.
+5. Update LANGFUSE.md so it reflects the new architecture accurately.
+
+Implementation guidance:
+
+A. RepairStateMachine
+- Refactor RepairStateMachine.run() so it does NOT directly call _run_writer() as a manual bootstrap.
+- The first repair attempt should happen by entering the machine normally and letting on_enter_generating_candidate plus listeners do their jobs.
+- Keep listener-owned repair span lifecycle coherent:
+  - span opens on entering generating_candidate
+  - span closes on retrying / candidate_valid / repair_exhausted
+- Do not add hacks that special-case the first attempt outside the state model.
+
+B. loop.py
+- Remove the synthesize_valid_policy wrapper entirely.
+- Remove the compatibility detection branch in run_loop that checks whether synthesize_valid_policy was monkeypatched and then adapts behavior.
+- Make run_loop a thin bootstrapper:
+  - construct context/deps/model
+  - run OptimizationStateMachine
+  - convert iteration records to the public output shape only if needed
+- Prefer deletion over transitional shims.
+
+C. Tests
+- Delete or rewrite tests that only exist to preserve synthesize_valid_policy compatibility.
+- Rewrite test_loop_failures / related tests so they validate:
+  - repair retries and exhaustion
+  - successful repair outcome metadata
+  - accepted policy provenance
+  - failure metadata propagation
+  - iteration record correctness
+- Shrink tracing-wrapper style tests into a few focused tests on listeners + machine behavior.
+- The tests should reinforce the new architecture instead of pinning the old one in place.
+
+D. Docs
+- Update harness/LANGFUSE.md:
+  - machine/listeners own orchestration-scoped tracing
+  - loop.py is no longer the primary orchestration/tracing center
+  - runner.py / writer.py / pipeline stay responsible for leaf-operation observability
+
+E. Cleanup
+- Remove dead comments/docstrings referring to the old wrapper architecture.
+- Keep type annotations strong and explicit.
+- Prefer simpler control flow over backward compatibility.
+
+Validation:
+- Run:
+  - uv run ruff check
+  - uv run basedpyright
+  - uv run pytest
+- Fix failures by deleting stale wrapper-era tests rather than reintroducing shims.
+
+Deliverables:
+1. The refactor.
+2. A short summary of:
+   - what legacy code was removed
+   - what tests were rewritten or deleted
+   - whether the first repair attempt now flows through the listener-owned state-entry path
+   - approximate LOC removed
+
+Success criteria:
+- No synthesize_valid_policy remains.
+- No _ORIGINAL_SYNTHESIZE remains.
+- No run_loop monkeypatch compatibility branch remains.
+- First repair attempt is listener-aligned, not manually bootstrapped outside the machine flow.
+- Tests primarily target machine behavior.
+- LANGFUSE.md matches the architecture.
+
+Be aggressive. Delete compatibility code instead of preserving it.

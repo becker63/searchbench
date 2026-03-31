@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Mapping
 
 from harness.loop_types import IterationRecord
 from harness.observability import datasets, experiments

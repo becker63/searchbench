@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from harness import loop
-from harness.pipeline.types import StepResult
 
 
 class DummySpan:
