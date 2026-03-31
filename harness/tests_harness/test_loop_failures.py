@@ -49,15 +49,19 @@ def test_pipeline_failure_appends_history(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loop, "default_pipeline", lambda: DummyPipeline())
 
-    history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot={"jc_result": {}, "jc_metrics": {}})
+    history = loop.run_loop(
+        {"symbol": "s", "repo": "r"},
+        iterations=1,
+        baseline_snapshot=loop.BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={}),
+    )
     assert len(history) == 1
     entry = history[0]
-    assert entry.get("pipeline_passed") is False
-    assert entry.get("pipeline_feedback") == {"lint_errors": "missing"}
-    assert entry.get("failed_step") == "ruff_fail"
-    assert entry.get("failed_exit_code") == 1
-    assert entry.get("failed_summary") == "ruff stderr"
-    assert entry.get("repair_attempts") == loop._MAX_POLICY_REPAIRS
+    assert entry.pipeline_passed is False
+    assert entry.pipeline_feedback == {"lint_errors": "missing"}
+    assert entry.failed_step == "ruff_fail"
+    assert entry.failed_exit_code == 1
+    assert entry.failed_summary == "ruff stderr"
+    assert entry.repair_attempts == loop._MAX_POLICY_REPAIRS
 
 
 def test_pipeline_failure_with_writer_error(monkeypatch, tmp_path):
@@ -83,15 +87,19 @@ def test_pipeline_failure_with_writer_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loop, "default_pipeline", lambda: DummyPipeline())
 
-    history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot={"jc_result": {}, "jc_metrics": {}})
+    history = loop.run_loop(
+        {"symbol": "s", "repo": "r"},
+        iterations=1,
+        baseline_snapshot=loop.BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={}),
+    )
     assert len(history) == 1
     entry = history[0]
-    assert entry.get("pipeline_passed") is False
-    assert entry.get("writer_error")
-    assert entry.get("failed_step") == "pytest_iterative_context"
-    assert entry.get("failed_exit_code") == 1
-    assert entry.get("failed_summary") == "pytest stderr"
-    assert entry.get("repair_attempts") == loop._MAX_POLICY_REPAIRS
+    assert entry.pipeline_passed is False
+    assert entry.writer_error
+    assert entry.failed_step == "pytest_iterative_context"
+    assert entry.failed_exit_code == 1
+    assert entry.failed_summary == "pytest stderr"
+    assert entry.repair_attempts == loop._MAX_POLICY_REPAIRS
 
 
 def test_pipeline_repair_succeeds(monkeypatch, tmp_path):
@@ -312,11 +320,16 @@ def test_run_loop_propagates_post_pipeline_metadata(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loop, "synthesize_valid_policy", synthesize_valid_policy)
     monkeypatch.setattr(loop, "generate_policy", lambda **kwargs: "raw")
-    history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot={"jc_result": {}, "jc_metrics": {}})
+    history = loop.run_loop(
+        {"symbol": "s", "repo": "r"},
+        iterations=1,
+        baseline_snapshot=loop.BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={}),
+    )
     assert len(history) == 1
     last = history[-1]
-    assert last.get("accepted_policy_source") == "post_pipeline_disk"
-    assert last.get("accepted_policy_changed_by_pipeline") is True
+    assert last.accepted_policy
+    assert last.accepted_policy.source == "post_pipeline_disk"
+    assert last.accepted_policy.changed_by_pipeline is True
 
 
 def test_failed_candidate_not_marked_as_accepted(monkeypatch, tmp_path):

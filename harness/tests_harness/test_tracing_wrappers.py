@@ -123,10 +123,15 @@ def test_run_loop_uses_observations(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loop, "synthesize_valid_policy", fake_synthesize_valid_policy)
 
-    baseline = {"jc_result": {"observations": [{"tool": "y"}]}, "jc_metrics": {"jc_nodes": 0, "score": 0.0}}
+    baseline = loop.BaselineSnapshot(
+        repo="r",
+        symbol="s",
+        jc_result={"observations": [{"tool": "y"}]},
+        jc_metrics={"jc_nodes": 0, "score": 0.0},
+    )
 
     history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot=baseline)
-    assert history and history[0]["score"] == 1.0
+    assert history and history[0].metrics["score"] == 1.0
     assert "flush" in events
     assert synth_calls
 

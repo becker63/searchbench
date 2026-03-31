@@ -1,24 +1,26 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Mapping, TypedDict, cast
+from typing import Any, Callable, Mapping, cast
+
+from pydantic import BaseModel, Field
 
 from .langfuse import get_langfuse_client, start_span, start_trace
 
 
-class HostedRunItemResult(TypedDict, total=False):
+class HostedRunItemResult(BaseModel):
     item: Mapping[str, object]
-    output: Mapping[str, object] | dict[str, object] | None
-    trace_id: str | None
+    output: Mapping[str, object] | dict[str, object] | None = None
+    trace_id: str | None = None
 
 
-class HostedRunResult(TypedDict, total=False):
-    run_id: str | None
-    run_name: str | None
-    dataset_name: str | None
-    dataset_version: str | None
-    items: list[HostedRunItemResult]
-    metadata: dict[str, object]
+class HostedRunResult(BaseModel):
+    run_id: str | None = None
+    run_name: str | None = None
+    dataset_name: str | None = None
+    dataset_version: str | None = None
+    items: list[HostedRunItemResult] = Field(default_factory=list)
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
 def _normalize_items(raw_items: Any) -> list[HostedRunItemResult]:
@@ -30,14 +32,13 @@ def _normalize_items(raw_items: Any) -> list[HostedRunItemResult]:
             item = cast(Mapping[str, object], entry.get("item") or entry.get("input") or {})
             output = cast(Mapping[str, object] | dict[str, object] | None, entry.get("output") or entry.get("result"))
             trace_id = cast(str | None, entry.get("trace_id") or entry.get("traceId") or entry.get("id"))
-            normalized.append({"item": item, "output": output, "trace_id": trace_id})
+            normalized.append(HostedRunItemResult(item=item, output=output, trace_id=trace_id))
         else:
-            # Object-style access
             try:
                 item_val = cast(Mapping[str, object], getattr(entry, "item", {}) or getattr(entry, "input", {}) or {})
                 output_val = cast(Mapping[str, object] | dict[str, object] | None, getattr(entry, "output", None) or getattr(entry, "result", None))
                 trace_val = cast(str | None, getattr(entry, "trace_id", None) or getattr(entry, "traceId", None) or getattr(entry, "id", None))
-                normalized.append({"item": item_val, "output": output_val, "trace_id": trace_val})
+                normalized.append(HostedRunItemResult(item=item_val, output=output_val, trace_id=trace_val))
             except Exception:
                 continue
     return normalized
@@ -92,7 +93,6 @@ def run_hosted_dataset_experiment(
     )
     run_id = getattr(root, "id", None)
     items: list[HostedRunItemResult] = []
-    # Without dataset items we cannot iterate safely; hosted caller should provide items separately.
     return HostedRunResult(
         run_id=run_id,
         run_name=run_name,
@@ -152,7 +152,7 @@ def run_local_dataset_experiment(
     for entry in data:
         span = start_span(root, f"{experiment_name}_item", metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})})
         output = task_fn(entry, span)
-        items.append({"item": entry, "output": output, "trace_id": getattr(span, "id", None)})
+        items.append(HostedRunItemResult(item=entry, output=output, trace_id=getattr(span, "id", None)))
     return HostedRunResult(
         run_id=getattr(root, "id", None),
         run_name=run_name,

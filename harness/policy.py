@@ -4,18 +4,18 @@ def score(node: object, state: object, context: object | None = None) -> float:
     Parameters
     ----------
     node: object
-        Graph node, expected to have ``state``, ``id`` and optional ``tokens`` attributes.
+        The graph node, expected to have ``state``, ``id`` and optional ``tokens`` attributes.
     state: object
         Graph‑like object providing ``in_degree`` and ``out_degree`` callables.
     context: object | None, optional
-        Additional context; if it provides a numeric ``scale`` attribute it will be applied.
+        Optional additional context; if it provides a numeric ``scale`` attribute it will be applied.
     """
-    # Safely extract attributes.
+    # Safely extract node attributes.
     n_state = getattr(node, "state", None)
     n_id = getattr(node, "id", None)
     tokens = getattr(node, "tokens", None)
 
-    total = 0.0
+    total: float = 0.0
 
     # State contribution.
     if n_state == "pending":
@@ -26,18 +26,18 @@ def score(node: object, state: object, context: object | None = None) -> float:
     # Degree contribution.
     if n_id is not None:
         degree = 0
-        in_deg_func = getattr(state, "in_degree", None)
-        out_deg_func = getattr(state, "out_degree", None)
-        if callable(in_deg_func):
+        in_func = getattr(state, "in_degree", None)
+        out_func = getattr(state, "out_degree", None)
+        if callable(in_func):
             try:
-                val = in_deg_func(n_id)
+                val = in_func(n_id)
                 if isinstance(val, (int, float)):
                     degree += int(val)
             except Exception:
                 pass
-        if callable(out_deg_func):
+        if callable(out_func):
             try:
-                val = out_deg_func(n_id)
+                val = out_func(n_id)
                 if isinstance(val, (int, float)):
                     degree += int(val)
             except Exception:

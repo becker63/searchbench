@@ -62,6 +62,7 @@ tests_harness/
   test_failure_context_budget.py
   test_filesystem_guard.py
   test_loop_failures.py
+  test_loop_machine.py
   test_observability.py
   test_pipeline_steps_scope.py
   test_pipeline_warning_semantics.py
@@ -98,6 +99,8 @@ utils/
   type_loader.py
 __init__.py
 LANGFUSE.md
+loop_machine.py
+loop_types.py
 loop.py
 policy_loader.py
 policy.py
@@ -146,7 +149,9 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, TypedDict, cast
+from typing import Mapping, Sequence, cast
+
+from pydantic import BaseModel, Field
 
 from .datasets import DatasetItem, normalize_dataset_item
 from .langfuse import record_score, start_span
@@ -154,40 +159,39 @@ from ..scorer import score
 from ..utils.repo_targets import resolve_repo_target
 
 
-class BaselineSnapshot(TypedDict, total=False):
-    dataset_name: str | None
-    dataset_version: str | None
-    item_id: str | None
-    repo: str
-    symbol: str
-    jc_result: dict[str, object]
-    jc_metrics: dict[str, float]
-    experiment_run_id: str | None
-    trace_id: str | None
-    metadata: dict[str, object]
-
-
-class BaselineBundle(TypedDict, total=False):
-    dataset_name: str | None
-    dataset_version: str | None
-    baseline_run_id: str | None
-    baseline_run_name: str | None
-    dataset_run_id: str | None
-    created_at: str | None
-    items: list[BaselineSnapshot]
-    metadata: dict[str, object]
-
-
 def _stable_repo_symbol(repo: str, symbol: str) -> str:
     return hashlib.sha256(f"{repo}::{symbol}".encode()).hexdigest()
 
 
+class BaselineSnapshot(BaseModel):
+    dataset_name: str | None = None
+    dataset_version: str | None = None
+    item_id: str | None = None
+    repo: str
+    symbol: str
+    jc_result: dict[str, object] = Field(default_factory=dict)
+    jc_metrics: dict[str, float] = Field(default_factory=dict)
+    experiment_run_id: str | None = None
+    trace_id: str | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class BaselineBundle(BaseModel):
+    dataset_name: str | None = None
+    dataset_version: str | None = None
+    baseline_run_id: str | None = None
+    baseline_run_name: str | None = None
+    dataset_run_id: str | None = None
+    created_at: str | None = None
+    items: list[BaselineSnapshot] = Field(default_factory=list)
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
 def _item_identity(item: DatasetItem) -> str:
     normalized = normalize_dataset_item(item)
-    if normalized.get("id"):
-        return cast(str, normalized.get("id"))
-    h = hashlib.sha256(f"{normalized.get('repo')}::{normalized.get('symbol')}".encode()).hexdigest()
-    return h
+    if normalized.id:
+        return normalized.id
+    return hashlib.sha256(f"{normalized.repo}::{normalized.symbol}".encode()).hexdigest()
 
 
 def baseline_key(item: DatasetItem) -> str:
@@ -195,13 +199,10 @@ def baseline_key(item: DatasetItem) -> str:
 
 
 def _snapshot_key(snapshot: BaselineSnapshot) -> str:
-    snap_id = snapshot.get("item_id")
-    if isinstance(snap_id, str):
-        return snap_id
-    repo = snapshot.get("repo")
-    symbol = snapshot.get("symbol")
-    if isinstance(repo, str) and isinstance(symbol, str):
-        return _stable_repo_symbol(repo, symbol)
+    if snapshot.item_id:
+        return snapshot.item_id
+    if snapshot.repo and snapshot.symbol:
+        return _stable_repo_symbol(snapshot.repo, snapshot.symbol)
     return ""
 
 
@@ -215,15 +216,13 @@ def baseline_metrics_from_jc(jc_result: Mapping[str, object]) -> dict[str, float
     return numeric_metrics
 
 
-def index_baselines(bundle: BaselineBundle | list[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
-    items = bundle["items"] if isinstance(bundle, Mapping) and "items" in bundle else bundle  # type: ignore[index]
+def index_baselines(bundle: BaselineBundle | Sequence[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
+    items = bundle.items if isinstance(bundle, BaselineBundle) else list(bundle)
     indexed: dict[str, BaselineSnapshot] = {}
     for snap in items:
-        if isinstance(snap, Mapping):
-            snapshot = cast(BaselineSnapshot, snap)
-            key = _snapshot_key(snapshot)
-            if key:
-                indexed[key] = snapshot
+        key = _snapshot_key(snap)
+        if key:
+            indexed[key] = snap
     return indexed
 
 
@@ -234,8 +233,9 @@ def compute_baseline_for_item(
     parent_trace=None,
 ) -> BaselineSnapshot:
     from ..runner import run_jc_iteration  # local import to avoid circular dependency
+
     normalized = normalize_dataset_item(item)
-    repo_ref = normalized["repo"]
+    repo_ref = normalized.repo
     resolved_repo = resolve_repo_target(repo_ref)
     trace = start_span(
         parent_trace,
@@ -243,16 +243,16 @@ def compute_baseline_for_item(
         metadata={
             "dataset": dataset_name,
             "dataset_version": dataset_version,
-            "item_id": normalized.get("id"),
-            "repo": normalized.get("repo"),
-            "symbol": normalized.get("symbol"),
+            "item_id": normalized.id,
+            "repo": normalized.repo,
+            "symbol": normalized.symbol,
             "run_kind": "jc_baseline",
             "repo_ref": repo_ref,
             "resolved_repo": resolved_repo,
         },
     )
-    jc_result = run_jc_iteration({"symbol": normalized["symbol"], "repo": resolved_repo}, parent_trace=trace)
-    metrics = baseline_metrics_from_jc(jc_result)
+    jc_result = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
+    metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result))
     for name, value in metrics.items():
         record_score(trace, f"baseline.{name}", value)
     if trace and hasattr(trace, "end"):
@@ -263,9 +263,9 @@ def compute_baseline_for_item(
     return BaselineSnapshot(
         dataset_name=dataset_name,
         dataset_version=dataset_version,
-        item_id=normalized.get("id"),
-        repo=normalized["repo"],
-        symbol=normalized["symbol"],
+        item_id=normalized.id,
+        repo=normalized.repo,
+        symbol=normalized.symbol,
         jc_result=cast(dict[str, object], jc_result),
         jc_metrics=metrics,
         trace_id=getattr(trace, "id", None),
@@ -274,31 +274,27 @@ def compute_baseline_for_item(
     )
 
 
-def resolve_baseline(baselines: BaselineBundle | list[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot | None:
+def resolve_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot | None:
     identity = baseline_key(item)
-    snapshots_raw = baselines["items"] if isinstance(baselines, Mapping) and "items" in baselines else baselines  # type: ignore[index]
-    snapshots: list[BaselineSnapshot] = []
-    for snap in snapshots_raw:
-        if isinstance(snap, Mapping):
-            snapshots.append(cast(BaselineSnapshot, snap))
+    snapshots = baselines.items if isinstance(baselines, BaselineBundle) else list(baselines)
     for snap in snapshots:
         if _snapshot_key(snap) == identity:
             return snap
     for snap in snapshots:
-        if snap.get("repo") == item.get("repo") and snap.get("symbol") == item.get("symbol"):
+        if snap.repo == item.repo and snap.symbol == item.symbol:
             return snap
     return None
 
 
-def require_baseline(baselines: BaselineBundle | list[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot:
+def require_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot:
     resolved = resolve_baseline(baselines, item)
     if resolved is None:
-        raise ValueError(f"No baseline snapshot found for repo={item.get('repo')} symbol={item.get('symbol')}")
+        raise ValueError(f"No baseline snapshot found for repo={item.repo} symbol={item.symbol}")
     return resolved
 
 
 def make_baseline_bundle(
-    snapshots: list[BaselineSnapshot],
+    snapshots: list[BaselineSnapshot] | Sequence[Mapping[str, object]],
     dataset_name: str | None = None,
     dataset_version: str | None = None,
     baseline_run_id: str | None = None,
@@ -306,6 +302,9 @@ def make_baseline_bundle(
     dataset_run_id: str | None = None,
     metadata: Mapping[str, object] | None = None,
 ) -> BaselineBundle:
+    snapshot_models = [
+        snap if isinstance(snap, BaselineSnapshot) else BaselineSnapshot.model_validate(snap) for snap in snapshots
+    ]
     return BaselineBundle(
         dataset_name=dataset_name,
         dataset_version=dataset_version,
@@ -313,58 +312,20 @@ def make_baseline_bundle(
         baseline_run_name=baseline_run_name,
         dataset_run_id=dataset_run_id or baseline_run_id,
         created_at=datetime.now(tz=timezone.utc).isoformat(),
-        items=snapshots,
+        items=snapshot_models,
         metadata=dict(metadata) if metadata else {},
     )
 
 
 def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
-    serializable = json.loads(json.dumps(bundle, default=str))
+    serializable = bundle.model_dump()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(serializable, indent=2))
 
 
 def load_baseline_bundle(path: Path) -> BaselineBundle:
     data: object = json.loads(path.read_text())
-    if not isinstance(data, Mapping):
-        raise ValueError("Invalid baseline bundle format")
-    items_raw = data.get("items", [])
-    snapshots: list[BaselineSnapshot] = []
-    if isinstance(items_raw, list):
-        for snap in items_raw:
-            if isinstance(snap, Mapping):
-                repo = snap.get("repo")
-                symbol = snap.get("symbol")
-                if not isinstance(repo, str) or not isinstance(symbol, str):
-                    continue
-                jc_result_obj = snap.get("jc_result", {})
-                jc_metrics_obj = snap.get("jc_metrics", {})
-                try:
-                    snapshots.append(
-                        BaselineSnapshot(
-                            dataset_name=cast(str | None, snap.get("dataset_name") or data.get("dataset_name")),
-                            dataset_version=cast(str | None, snap.get("dataset_version") or data.get("dataset_version")),
-                            item_id=cast(str | None, snap.get("item_id")),
-                            repo=repo,
-                            symbol=symbol,
-                            jc_result=jc_result_obj if isinstance(jc_result_obj, dict) else {},
-                            jc_metrics=jc_metrics_obj if isinstance(jc_metrics_obj, dict) else {},
-                            experiment_run_id=cast(str | None, snap.get("experiment_run_id")),
-                            trace_id=cast(str | None, snap.get("trace_id")),
-                            metadata=cast(dict[str, object], snap.get("metadata", {})) if isinstance(snap.get("metadata", {}), dict) else {},
-                        )
-                    )
-                except Exception:
-                    continue
-    return make_baseline_bundle(
-        snapshots,
-        dataset_name=cast(str | None, data.get("dataset_name")),
-        dataset_version=cast(str | None, data.get("dataset_version")),
-        baseline_run_id=cast(str | None, data.get("baseline_run_id")),
-        baseline_run_name=cast(str | None, data.get("baseline_run_name")),
-        dataset_run_id=cast(str | None, data.get("dataset_run_id")),
-        metadata=cast(Mapping[str, object] | None, data.get("metadata", {})) if isinstance(data.get("metadata", {}), Mapping) else None,
-    )
+    return BaselineBundle.model_validate(data)
 </file>
 
 <file path="observability/datasets.py">
@@ -372,32 +333,53 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from typing import Any, TypedDict, cast
+from typing import Any, cast
+
+from pydantic import BaseModel, Field, model_validator
 
 from .langfuse import get_langfuse_client
-
-
-class DatasetItem(TypedDict):
-    repo: str
-    symbol: str
-    id: str | None
-    metadata: dict[str, object]
-
-
-def map_task_to_dataset_item(task: Mapping[str, object]) -> DatasetItem:
-    repo = task.get("repo")
-    symbol = task.get("symbol")
-    if not isinstance(repo, str) or not isinstance(symbol, str):
-        raise ValueError("Task must include 'repo' and 'symbol'")
-    metadata = {k: v for k, v in task.items() if k not in {"repo", "symbol"}}
-    return {"repo": repo, "symbol": symbol, "metadata": metadata, "id": None}
 
 
 def _stable_id(repo: str, symbol: str) -> str:
     return hashlib.sha256(f"{repo}::{symbol}".encode()).hexdigest()
 
 
-def normalize_dataset_item(item: Mapping[str, object]) -> DatasetItem:
+class DatasetItem(BaseModel):
+    repo: str
+    symbol: str
+    metadata: dict[str, object] = Field(default_factory=dict)
+    id: str | None = None
+
+    @model_validator(mode="after")
+    def _ensure_id(self) -> "DatasetItem":
+        if not self.id:
+            self.id = _stable_id(self.repo, self.symbol)
+        return self
+
+
+class Dataset(BaseModel):
+    name: str
+    items: list[DatasetItem] = Field(default_factory=list)
+
+    @property
+    def entries(self) -> list[DatasetItem]:
+        return self.__dict__.get("items", [])
+
+
+def map_task_to_dataset_item(task: Mapping[str, object] | DatasetItem) -> DatasetItem:
+    if isinstance(task, DatasetItem):
+        return task
+    repo = task.get("repo")
+    symbol = task.get("symbol")
+    if not isinstance(repo, str) or not isinstance(symbol, str):
+        raise ValueError("Task must include 'repo' and 'symbol'")
+    metadata = {k: v for k, v in task.items() if k not in {"repo", "symbol"}}
+    return DatasetItem(repo=repo, symbol=symbol, metadata=metadata)
+
+
+def normalize_dataset_item(item: Mapping[str, object] | DatasetItem) -> DatasetItem:
+    if isinstance(item, DatasetItem):
+        return item
     repo_obj = item.get("repo")
     symbol_obj = item.get("symbol")
     if not isinstance(repo_obj, str) or not isinstance(symbol_obj, str):
@@ -406,19 +388,12 @@ def normalize_dataset_item(item: Mapping[str, object]) -> DatasetItem:
     metadata: dict[str, object] = {}
     if isinstance(metadata_obj, Mapping):
         metadata = {str(k): v for k, v in metadata_obj.items()}
-    normalized: DatasetItem = {
-        "repo": repo_obj,
-        "symbol": symbol_obj,
-        "metadata": metadata,
-        "id": None,
-    }
+    normalized = DatasetItem(repo=repo_obj, symbol=symbol_obj, metadata=metadata)
     item_id = item.get("id")
     if isinstance(item_id, str):
-        normalized["id"] = item_id
+        normalized.id = item_id
     elif item_id is not None:
-        normalized["id"] = str(item_id)
-    else:
-        normalized["id"] = _stable_id(repo_obj, symbol_obj)
+        normalized.id = str(item_id)
     return normalized
 
 
@@ -438,13 +413,13 @@ def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetIt
             dataset = client_any.dataset(name=name, version=version)  # type: ignore[arg-type]
     except Exception:
         dataset = None
-    items: list[DatasetItem] = []
     if dataset is None:
-        return items
+        return []
     try:
         raw_items = dataset.items() if callable(getattr(dataset, "items", None)) else getattr(dataset, "items", [])
     except Exception:
         raw_items = []
+    items: list[DatasetItem] = []
     for idx, item in enumerate(raw_items):
         if isinstance(item, Mapping):
             task_meta = cast(Mapping[str, object], item)
@@ -463,90 +438,99 @@ def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetIt
                 mapped = map_task_to_dataset_item({"repo": repo, "symbol": symbol, **{str(k): v for k, v in meta_map.items()}})
                 item_id = task_meta.get("id")
                 if isinstance(item_id, str):
-                    mapped["id"] = item_id
+                    mapped.id = item_id
                 elif item_id is not None:
-                    mapped["id"] = str(item_id)
-                items.append(normalize_dataset_item(mapped))
+                    mapped.id = str(item_id)
+                items.append(mapped)
             except Exception:
                 continue
     return items
 
 
-def local_dataset(name: str, items: Sequence[Mapping[str, object]]) -> dict[str, object]:
-    normalized_items = [normalize_dataset_item(item) for item in items if isinstance(item, Mapping)]
-    return {"name": name, "items": normalized_items}
+def local_dataset(name: str, items: Sequence[Mapping[str, object] | DatasetItem]) -> Dataset:
+    normalized_items = [normalize_dataset_item(item) for item in items]
+    return Dataset(name=name, items=normalized_items)
 </file>
 
 <file path="observability/experiments.py">
 from __future__ import annotations
 
-from typing import Mapping, Sequence, cast
+from typing import Mapping, Sequence
 
 from .baselines import (
     BaselineBundle,
     BaselineSnapshot,
     compute_baseline_for_item,
+    index_baselines,
     make_baseline_bundle,
     require_baseline,
     resolve_baseline,
 )
-from .datasets import DatasetItem, fetch_dataset_items, local_dataset, normalize_dataset_item
+from .datasets import Dataset, DatasetItem, fetch_dataset_items, local_dataset, normalize_dataset_item
 from .langfuse import flush_langfuse, record_score, start_trace
 from .runner_integration import HostedRunResult, run_hosted_dataset_experiment, run_local_dataset_experiment
-from ..utils.repo_targets import resolve_repo_target
 from ..loop import run_loop
+from ..loop_types import iteration_record_to_public_dict, iteration_record_to_score_input
 from ..scorer import score
+from ..utils.repo_targets import resolve_repo_target
 
 
 def _build_bundle_from_hosted(run: HostedRunResult, snapshots: list[BaselineSnapshot]) -> BaselineBundle:
     return make_baseline_bundle(
         snapshots,
-        dataset_name=run.get("dataset_name"),
-        dataset_version=run.get("dataset_version"),
-        baseline_run_id=run.get("run_id"),
-        baseline_run_name=run.get("run_name"),
-        dataset_run_id=run.get("run_id"),
-        metadata={"run_kind": "jc_baseline", "run_name": run.get("run_name")},
+        dataset_name=run.dataset_name,
+        dataset_version=run.dataset_version,
+        baseline_run_id=run.run_id,
+        baseline_run_name=run.run_name,
+        dataset_run_id=run.run_id,
+        metadata={"run_kind": "jc_baseline", "run_name": run.run_name},
     )
 
 
 def _run_local_jc_baselines(items: Sequence[DatasetItem], dataset_name: str | None, dataset_version: str | None) -> BaselineBundle:
     def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
-        return {
-            "baseline": compute_baseline_for_item(
-                normalize_dataset_item(item), dataset_name=dataset_name, dataset_version=dataset_version, parent_trace=parent_trace
-            )
-        }
+        dataset_item = normalize_dataset_item(item)
+        snapshot = compute_baseline_for_item(
+            dataset_item,
+            dataset_name=dataset_name,
+            dataset_version=dataset_version,
+            parent_trace=parent_trace,
+        )
+        return {"baseline": snapshot.model_dump()}
 
     hosted = run_local_dataset_experiment(
-        data=list(items),
+        data=[it.model_dump() for it in items],
         experiment_name="jc_baseline_local",
         task_fn=_run_item,
         metadata={"run_kind": "jc_baseline"},
     )
     baselines: list[BaselineSnapshot] = []
-    for entry in hosted.get("items", []):
-        if not isinstance(entry, Mapping):
-            continue
-        output = entry.get("output")
-        if isinstance(output, Mapping) and isinstance(output.get("baseline"), Mapping):
-            baselines.append(cast(BaselineSnapshot, output["baseline"]))
+    for entry in hosted.items:
+        if entry.output and "baseline" in entry.output:
+            try:
+                baselines.append(BaselineSnapshot.model_validate(entry.output["baseline"]))
+            except Exception:
+                continue
     return make_baseline_bundle(
         baselines,
         dataset_name=dataset_name,
         dataset_version=dataset_version,
-        baseline_run_id=hosted.get("run_id"),
-        baseline_run_name=hosted.get("run_name"),
+        baseline_run_id=hosted.run_id,
+        baseline_run_name=hosted.run_name,
         metadata={"run_kind": "jc_baseline"},
     )
 
 
 def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> BaselineBundle:
     def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
+        dataset_item = normalize_dataset_item(item)
         snapshot = compute_baseline_for_item(
-            normalize_dataset_item(item), dataset_name=name, dataset_version=version, parent_trace=parent_trace
+            dataset_item,
+            dataset_name=name,
+            dataset_version=version,
+            parent_trace=parent_trace,
         )
-        return {"baseline": snapshot}
+        return {"baseline": snapshot.model_dump()}
 
     hosted = run_hosted_dataset_experiment(
         dataset_name=name,
@@ -556,14 +540,13 @@ def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> 
         metadata={"run_kind": "jc_baseline"},
     )
     snapshots: list[BaselineSnapshot] = []
-    for entry in hosted.get("items", []):
-        if not isinstance(entry, Mapping):
-            continue
-        output = entry.get("output")
-        if isinstance(output, Mapping) and "baseline" in output and isinstance(output["baseline"], Mapping):
-            snapshots.append(cast(BaselineSnapshot, output["baseline"]))
+    for entry in hosted.items:
+        if entry.output and "baseline" in entry.output:
+            try:
+                snapshots.append(BaselineSnapshot.model_validate(entry.output["baseline"]))
+            except Exception:
+                continue
     if not snapshots:
-        # Fallback to manual computation if hosted wrapper returned nothing
         items = fetch_dataset_items(name=name, version=version)
         root = start_trace("jc_baseline_experiment", metadata={"dataset": name, "version": version, "count": len(items)})
         for item in items:
@@ -579,15 +562,13 @@ def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> 
 
 
 def run_local_jc_baseline_experiment(dataset: Mapping[str, object]) -> BaselineBundle:
-    items_obj = dataset.get("items") if isinstance(dataset, Mapping) else []
-    items: list[DatasetItem] = []
-    if isinstance(items_obj, Sequence):
-        for entry in items_obj:
-            if isinstance(entry, Mapping):
-                items.append(normalize_dataset_item(entry))
-    name = dataset.get("name") if isinstance(dataset, Mapping) else None
-    dataset_name = name if isinstance(name, str) else None
-    return _run_local_jc_baselines(items, dataset_name=dataset_name, dataset_version=None)
+    items_raw = dataset.get("items") if isinstance(dataset, Mapping) else []
+    items_seq = items_raw if isinstance(items_raw, Sequence) else []
+    filtered_items = [normalize_dataset_item(entry) for entry in items_seq if isinstance(entry, Mapping)]
+    name_val = dataset.get("name") if isinstance(dataset, Mapping) else "local"
+    ds = Dataset(name=str(name_val or "local"), items=filtered_items)
+    ds_items: list[DatasetItem] = list(ds.entries)
+    return _run_local_jc_baselines(ds_items, dataset_name=ds.name, dataset_version=None)
 
 
 def _run_ic_optimizations(
@@ -599,24 +580,30 @@ def _run_ic_optimizations(
     hosted: bool,
 ) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
-    indexed = baselines.get("items", []) if isinstance(baselines, Mapping) else []
+    indexed = index_baselines(baselines)
 
     def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
         normalized_item = normalize_dataset_item(item)
-        repo_ref = normalized_item.get("repo", "")
-        resolved_repo = resolve_repo_target(str(repo_ref))
-        baseline = resolve_baseline(indexed, normalized_item) if indexed else resolve_baseline(baselines, normalized_item)
-        baseline = require_baseline(baselines, normalized_item) if baseline is None else baseline
-        task = dict(normalized_item)
+        resolved_repo = resolve_repo_target(normalized_item.repo)
+        baseline = resolve_baseline(list(indexed.values()), normalized_item) or require_baseline(baselines, normalized_item)
+        task = normalized_item.model_dump()
         task["repo"] = resolved_repo
         history = run_loop(task, iterations=iterations, parent_trace=parent_trace, baseline_snapshot=baseline)
-        last = history[-1] if history else {}
-        jc_payload: Mapping[str, object] | dict[str, object] = baseline["jc_result"] if baseline and "jc_result" in baseline else {}
-        metrics = score({"iterative_context": last if isinstance(last, Mapping) else {}, "jcodemunch": jc_payload})
+        last_record = history[-1] if history else None
+        last_dict: Mapping[str, object] = (
+            iteration_record_to_score_input(last_record) if last_record else {}
+        )
+        metrics = score({"iterative_context": last_dict, "jcodemunch": baseline.jc_result})
         for name, value in metrics.items():
             if isinstance(value, (int, float, bool)):
                 record_score(parent_trace, f"ic_opt.{name}", float(value))
-        return {"item": normalized_item, "baseline": baseline, "history": history, "metrics": metrics}
+        history_dicts = [iteration_record_to_public_dict(r) for r in history]
+        return {
+            "item": normalized_item.model_dump(),
+            "baseline": baseline.model_dump(),
+            "history": history_dicts,
+            "metrics": metrics,
+        }
 
     if hosted:
         hosted_result = run_hosted_dataset_experiment(
@@ -624,42 +611,36 @@ def _run_ic_optimizations(
             dataset_version=dataset_version,
             experiment_name="ic_optimization",
             task_fn=_run_item,
-            metadata={"run_kind": "ic_optimization", "baseline_run_id": baselines.get("baseline_run_id") if isinstance(baselines, Mapping) else None},
+            metadata={"run_kind": "ic_optimization", "baseline_run_id": baselines.baseline_run_id},
         )
-        for entry in hosted_result.get("items", []):
-            if not isinstance(entry, Mapping):
-                continue
-            output = entry.get("output")
-            if isinstance(output, Mapping):
-                results.append(dict(output))
+        for entry in hosted_result.items:
+            if entry.output:
+                results.append(dict(entry.output))
     else:
         local_result = run_local_dataset_experiment(
-            data=list(items),
+            data=[item.model_dump() for item in items],
             experiment_name="ic_optimization_local",
             task_fn=_run_item,
-            metadata={"run_kind": "ic_optimization", "baseline_run_id": baselines.get("baseline_run_id") if isinstance(baselines, Mapping) else None},
+            metadata={"run_kind": "ic_optimization", "baseline_run_id": baselines.baseline_run_id},
         )
-        for entry in local_result.get("items", []):
-            if not isinstance(entry, Mapping):
-                continue
-            output = entry.get("output")
-            if isinstance(output, Mapping):
-                results.append(dict(output))
+        for entry in local_result.items:
+            if entry.output:
+                results.append(dict(entry.output))
     if not results:
-        # Fallback manual path if runner returned nothing
         root = start_trace(
             "ic_optimization_experiment",
             metadata={"dataset": dataset_name, "version": dataset_version, "count": len(items)},
         )
         for item in items:
-            repo_ref = item.get("repo")
-            resolved_repo = resolve_repo_target(str(repo_ref))
-            baseline = resolve_baseline(indexed, item) if indexed else resolve_baseline(baselines, item)
-            baseline = require_baseline(baselines, item) if baseline is None else baseline
-            task = dict(item)
+            resolved_repo = resolve_repo_target(item.repo)
+            baseline = resolve_baseline(list(indexed.values()), item) or require_baseline(baselines, item)
+            task = item.model_dump()
             task["repo"] = resolved_repo
             history = run_loop(task, iterations=iterations, parent_trace=root, baseline_snapshot=baseline)
-            results.append({"item": item, "baseline": baseline, "history": history})
+            history_entries: list[Mapping[str, object]] = [
+                iteration_record_to_public_dict(r) for r in history
+            ]
+            results.append({"item": item.model_dump(), "baseline": baseline.model_dump(), "history": history_entries})
         if root and hasattr(root, "end"):
             try:
                 root.end(metadata={"completed": len(results)})
@@ -689,26 +670,17 @@ def run_local_ic_optimization_experiment(
     baselines: BaselineBundle | None = None,
     recompute_baselines: bool = False,
 ) -> list[dict[str, object]]:
-    items_source = dataset.get("items") if isinstance(dataset, Mapping) else []
-    name = dataset.get("name") if isinstance(dataset, Mapping) else "local"
-    normalized_ds = local_dataset(str(name), items_source if isinstance(items_source, Sequence) else [])
-    items = normalized_ds.get("items", [])
-    if not isinstance(items, list):
-        items = []
-    name_value = normalized_ds.get("name")
-    dataset_name: str | None = name_value if isinstance(name_value, str) else None
-    if baselines is None and not recompute_baselines:
-        raise ValueError("Baselines bundle required for optimization; set recompute_baselines=True to compute.")
-    bundle = baselines if baselines is not None else _run_local_jc_baselines(items, dataset_name=dataset_name, dataset_version=None)
-    return _run_ic_optimizations(items, bundle, dataset_name=dataset_name, dataset_version=None, iterations=iterations, hosted=False)
-
-
-__all__ = [
-    "run_hosted_jc_baseline_experiment",
-    "run_local_jc_baseline_experiment",
-    "run_hosted_ic_optimization_experiment",
-    "run_local_ic_optimization_experiment",
-]
+    if isinstance(dataset, Dataset):
+        ds = dataset
+    else:
+        items_raw = dataset.get("items") if isinstance(dataset, Mapping) else []
+        items_seq = items_raw if isinstance(items_raw, Sequence) else []
+        filtered_items = [normalize_dataset_item(entry) for entry in items_seq if isinstance(entry, Mapping)]
+        name_val = dataset.get("name") if isinstance(dataset, Mapping) else "local"
+        ds = Dataset(name=str(name_val or "local"), items=filtered_items)
+    ds_items: list[DatasetItem] = list(ds.entries)
+    bundle = baselines if baselines is not None else _run_local_jc_baselines(ds_items, dataset_name=ds.name, dataset_version=None)
+    return _run_ic_optimizations(ds_items, bundle, dataset_name=ds.name, dataset_version=None, iterations=iterations, hosted=False)
 </file>
 
 <file path="observability/langfuse.py">
@@ -825,24 +797,26 @@ __all__ = [
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Mapping, TypedDict, cast
+from typing import Any, Callable, Mapping, cast
+
+from pydantic import BaseModel, Field
 
 from .langfuse import get_langfuse_client, start_span, start_trace
 
 
-class HostedRunItemResult(TypedDict, total=False):
+class HostedRunItemResult(BaseModel):
     item: Mapping[str, object]
-    output: Mapping[str, object] | dict[str, object] | None
-    trace_id: str | None
+    output: Mapping[str, object] | dict[str, object] | None = None
+    trace_id: str | None = None
 
 
-class HostedRunResult(TypedDict, total=False):
-    run_id: str | None
-    run_name: str | None
-    dataset_name: str | None
-    dataset_version: str | None
-    items: list[HostedRunItemResult]
-    metadata: dict[str, object]
+class HostedRunResult(BaseModel):
+    run_id: str | None = None
+    run_name: str | None = None
+    dataset_name: str | None = None
+    dataset_version: str | None = None
+    items: list[HostedRunItemResult] = Field(default_factory=list)
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
 def _normalize_items(raw_items: Any) -> list[HostedRunItemResult]:
@@ -854,14 +828,13 @@ def _normalize_items(raw_items: Any) -> list[HostedRunItemResult]:
             item = cast(Mapping[str, object], entry.get("item") or entry.get("input") or {})
             output = cast(Mapping[str, object] | dict[str, object] | None, entry.get("output") or entry.get("result"))
             trace_id = cast(str | None, entry.get("trace_id") or entry.get("traceId") or entry.get("id"))
-            normalized.append({"item": item, "output": output, "trace_id": trace_id})
+            normalized.append(HostedRunItemResult(item=item, output=output, trace_id=trace_id))
         else:
-            # Object-style access
             try:
                 item_val = cast(Mapping[str, object], getattr(entry, "item", {}) or getattr(entry, "input", {}) or {})
                 output_val = cast(Mapping[str, object] | dict[str, object] | None, getattr(entry, "output", None) or getattr(entry, "result", None))
                 trace_val = cast(str | None, getattr(entry, "trace_id", None) or getattr(entry, "traceId", None) or getattr(entry, "id", None))
-                normalized.append({"item": item_val, "output": output_val, "trace_id": trace_val})
+                normalized.append(HostedRunItemResult(item=item_val, output=output_val, trace_id=trace_val))
             except Exception:
                 continue
     return normalized
@@ -916,7 +889,6 @@ def run_hosted_dataset_experiment(
     )
     run_id = getattr(root, "id", None)
     items: list[HostedRunItemResult] = []
-    # Without dataset items we cannot iterate safely; hosted caller should provide items separately.
     return HostedRunResult(
         run_id=run_id,
         run_name=run_name,
@@ -976,7 +948,7 @@ def run_local_dataset_experiment(
     for entry in data:
         span = start_span(root, f"{experiment_name}_item", metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})})
         output = task_fn(entry, span)
-        items.append({"item": entry, "output": output, "trace_id": getattr(span, "id", None)})
+        items.append(HostedRunItemResult(item=entry, output=output, trace_id=getattr(span, "id", None)))
     return HostedRunResult(
         run_id=getattr(root, "id", None),
         run_name=run_name,
@@ -1643,7 +1615,18 @@ def test_baseline_key_uses_id_or_hash():
 
 def test_resolve_baseline_prefers_id():
     item = baselines.normalize_dataset_item({"repo": "r", "symbol": "s", "id": "abc"})  # type: ignore[arg-type]
-    snap = baselines.BaselineSnapshot(dataset_name=None, dataset_version=None, item_id="abc", repo="r", symbol="s", jc_result={}, jc_metrics={}, experiment_run_id=None, trace_id=None, metadata={})
+    snap = baselines.BaselineSnapshot(
+        dataset_name=None,
+        dataset_version=None,
+        item_id="abc",
+        repo="r",
+        symbol="s",
+        jc_result={},
+        jc_metrics={},
+        experiment_run_id=None,
+        trace_id=None,
+        metadata={},
+    )
     resolved = baselines.resolve_baseline([snap], item)
     assert resolved is snap
 
@@ -1666,7 +1649,7 @@ def test_baseline_bundle_roundtrip(tmp_path):
     baselines.save_baseline_bundle(bundle, path)
     loaded = baselines.load_baseline_bundle(path)
     resolved = baselines.require_baseline(loaded, baselines.normalize_dataset_item({"repo": "r", "symbol": "s"}))  # type: ignore[arg-type]
-    metrics = resolved.get("jc_metrics", {})
+    metrics = resolved.jc_metrics
     assert metrics.get("score") == 1.0
 
 
@@ -1684,10 +1667,12 @@ def test_require_baseline_errors_when_missing():
 <file path="tests_harness/test_datasets_experiments.py">
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Mapping
 
+from harness.loop_types import IterationRecord
 from harness.observability import datasets, experiments
-from harness.observability.baselines import BaselineBundle
+from harness.observability.baselines import BaselineBundle, BaselineSnapshot
+from harness.observability.runner_integration import HostedRunItemResult, HostedRunResult
 
 
 def test_fetch_dataset_items_from_client(monkeypatch):
@@ -1705,8 +1690,8 @@ def test_fetch_dataset_items_from_client(monkeypatch):
     monkeypatch.setattr(datasets, "get_langfuse_client", lambda: FakeClient())
     items = datasets.fetch_dataset_items("fake")
     assert items
-    first_item = cast(datasets.DatasetItem, items[0])
-    assert first_item.get("repo") == "r1"
+    first_item = items[0]
+    assert first_item.repo == "r1"
 
 
 def test_run_hosted_jc_baseline_experiment(monkeypatch):
@@ -1714,20 +1699,20 @@ def test_run_hosted_jc_baseline_experiment(monkeypatch):
     monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
     monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
-    monkeypatch.setattr(experiments, "compute_baseline_for_item", lambda *a, **k: {"repo": "r", "symbol": "s", "jc_result": {}, "jc_metrics": {}})
+    monkeypatch.setattr(experiments, "compute_baseline_for_item", lambda *a, **k: BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={}))
 
     def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
-        outputs = []
+        outputs: list[HostedRunItemResult] = []
         for it in items:
-            outputs.append({"item": it, "output": task_fn(it, None), "trace_id": "t1"})
-        return {"run_id": "run1", "items": outputs, "dataset_name": dataset_name, "dataset_version": dataset_version}
+            outputs.append(HostedRunItemResult(item=it.model_dump(), output=task_fn(it.model_dump(), None), trace_id="t1"))
+        return HostedRunResult(run_id="run1", items=outputs, dataset_name=dataset_name, dataset_version=dataset_version)
 
     monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_runner)
-    bundle_any = cast(Any, experiments.run_hosted_jc_baseline_experiment("fake", version=None))
-    assert bundle_any
-    first = bundle_any["items"][0]
-    assert first["symbol"] == "s"
-    assert bundle_any.get("baseline_run_id") == "run1"
+    bundle_model = experiments.run_hosted_jc_baseline_experiment("fake", version=None)
+    assert bundle_model
+    first = bundle_model.items[0]
+    assert first.symbol == "s"
+    assert bundle_model.baseline_run_id == "run1"
 
 
 def test_run_hosted_ic_optimization_experiment(monkeypatch):
@@ -1735,20 +1720,26 @@ def test_run_hosted_ic_optimization_experiment(monkeypatch):
     monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
     monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
-    monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [{"score": 2.0}])
+    monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [IterationRecord(iteration=0, metrics={"score": 2.0})])
     monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "resolved-path")
 
     def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
-        outputs = []
+        outputs: list[HostedRunItemResult] = []
         for it in items:
-            outputs.append({"item": it, "output": task_fn(it, None), "trace_id": "t2"})
-        return {"run_id": "run2", "items": outputs, "dataset_name": dataset_name, "dataset_version": dataset_version}
+            outputs.append(HostedRunItemResult(item=it.model_dump(), output=task_fn(it.model_dump(), None), trace_id="t2"))
+        return HostedRunResult(run_id="run2", items=outputs, dataset_name=dataset_name, dataset_version=dataset_version)
 
     monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_runner)
-    results_any = cast(Any, experiments.run_hosted_ic_optimization_experiment("fake", iterations=1, baselines={"items": [{"repo": "r", "symbol": "s", "jc_result": {}, "jc_metrics": {}}]}))
-    assert results_any
-    first = results_any[0]
-    assert first["item"]["symbol"] == "s"
+    results: list[dict[str, object]] = experiments.run_hosted_ic_optimization_experiment(
+        "fake",
+        iterations=1,
+        baselines=BaselineBundle(items=[BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={})]),
+    )
+    assert results
+    first: dict[str, object] = results[0]
+    item_val = first["item"]
+    assert isinstance(item_val, Mapping)
+    assert item_val["symbol"] == "s"
 
 
 def test_run_ic_optimization_requires_baseline(monkeypatch):
@@ -1774,17 +1765,17 @@ def test_run_ic_optimization_uses_provided_baseline(monkeypatch):
     monkeypatch.setattr(experiments, "run_hosted_jc_baseline_experiment", fail_run_baseline)
     monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
-    monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [{"score": 1.0}])
+    monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [IterationRecord(iteration=0, metrics={"score": 1.0})])
     monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "/tmp/resolved-r")
 
     def fake_runner(dataset_name, dataset_version, experiment_name, task_fn, **kwargs):
-        outputs = []
+        outputs: list[HostedRunItemResult] = []
         for it in items:
-            outputs.append({"item": it, "output": task_fn(it, None), "trace_id": "t3"})
-        return {"run_id": "run3", "items": outputs, "dataset_name": dataset_name, "dataset_version": dataset_version}
+            outputs.append(HostedRunItemResult(item=it.model_dump(), output=task_fn(it.model_dump(), None), trace_id="t3"))
+        return HostedRunResult(run_id="run3", items=outputs, dataset_name=dataset_name, dataset_version=dataset_version)
 
     monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_runner)
-    baselines_bundle: BaselineBundle = {"items": [{"repo": "r", "symbol": "s", "jc_result": {}, "jc_metrics": {}}]}
+    baselines_bundle = BaselineBundle(items=[BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={})])
     results_any = experiments.run_hosted_ic_optimization_experiment("fake", iterations=1, baselines=baselines_bundle)
     assert results_any and not called["baseline"]
 </file>
@@ -1798,9 +1789,9 @@ from harness.observability import datasets
 def test_normalize_dataset_item_generates_id_when_missing():
     item = {"repo": "r", "symbol": "s"}
     normalized = datasets.normalize_dataset_item(item)
-    assert normalized["repo"] == "r"
-    assert normalized["symbol"] == "s"
-    assert isinstance(normalized.get("id"), str)
+    assert normalized.repo == "r"
+    assert normalized.symbol == "s"
+    assert isinstance(normalized.id, str)
 </file>
 
 <file path="tests_harness/test_failure_context_budget.py">
@@ -1891,15 +1882,19 @@ def test_pipeline_failure_appends_history(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loop, "default_pipeline", lambda: DummyPipeline())
 
-    history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot={"jc_result": {}, "jc_metrics": {}})
+    history = loop.run_loop(
+        {"symbol": "s", "repo": "r"},
+        iterations=1,
+        baseline_snapshot=loop.BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={}),
+    )
     assert len(history) == 1
     entry = history[0]
-    assert entry.get("pipeline_passed") is False
-    assert entry.get("pipeline_feedback") == {"lint_errors": "missing"}
-    assert entry.get("failed_step") == "ruff_fail"
-    assert entry.get("failed_exit_code") == 1
-    assert entry.get("failed_summary") == "ruff stderr"
-    assert entry.get("repair_attempts") == loop._MAX_POLICY_REPAIRS
+    assert entry.pipeline_passed is False
+    assert entry.pipeline_feedback == {"lint_errors": "missing"}
+    assert entry.failed_step == "ruff_fail"
+    assert entry.failed_exit_code == 1
+    assert entry.failed_summary == "ruff stderr"
+    assert entry.repair_attempts == loop._MAX_POLICY_REPAIRS
 
 
 def test_pipeline_failure_with_writer_error(monkeypatch, tmp_path):
@@ -1925,15 +1920,19 @@ def test_pipeline_failure_with_writer_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loop, "default_pipeline", lambda: DummyPipeline())
 
-    history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot={"jc_result": {}, "jc_metrics": {}})
+    history = loop.run_loop(
+        {"symbol": "s", "repo": "r"},
+        iterations=1,
+        baseline_snapshot=loop.BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={}),
+    )
     assert len(history) == 1
     entry = history[0]
-    assert entry.get("pipeline_passed") is False
-    assert entry.get("writer_error")
-    assert entry.get("failed_step") == "pytest_iterative_context"
-    assert entry.get("failed_exit_code") == 1
-    assert entry.get("failed_summary") == "pytest stderr"
-    assert entry.get("repair_attempts") == loop._MAX_POLICY_REPAIRS
+    assert entry.pipeline_passed is False
+    assert entry.writer_error
+    assert entry.failed_step == "pytest_iterative_context"
+    assert entry.failed_exit_code == 1
+    assert entry.failed_summary == "pytest stderr"
+    assert entry.repair_attempts == loop._MAX_POLICY_REPAIRS
 
 
 def test_pipeline_repair_succeeds(monkeypatch, tmp_path):
@@ -2154,11 +2153,16 @@ def test_run_loop_propagates_post_pipeline_metadata(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loop, "synthesize_valid_policy", synthesize_valid_policy)
     monkeypatch.setattr(loop, "generate_policy", lambda **kwargs: "raw")
-    history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot={"jc_result": {}, "jc_metrics": {}})
+    history = loop.run_loop(
+        {"symbol": "s", "repo": "r"},
+        iterations=1,
+        baseline_snapshot=loop.BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={}),
+    )
     assert len(history) == 1
     last = history[-1]
-    assert last.get("accepted_policy_source") == "post_pipeline_disk"
-    assert last.get("accepted_policy_changed_by_pipeline") is True
+    assert last.accepted_policy
+    assert last.accepted_policy.source == "post_pipeline_disk"
+    assert last.accepted_policy.changed_by_pipeline is True
 
 
 def test_failed_candidate_not_marked_as_accepted(monkeypatch, tmp_path):
@@ -2235,6 +2239,135 @@ def test_noop_pipeline_returns_same_policy(monkeypatch, tmp_path):
     assert meta.get("accepted_policy_changed_by_pipeline") is False
 </file>
 
+<file path="tests_harness/test_loop_machine.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Mapping, Sequence
+
+from harness.loop_machine import OptimizationStateMachine, RepairStateMachine
+from harness.loop_types import (
+    FeedbackPackage,
+    EvaluationResult,
+    LoopContext,
+    LoopDependencies,
+    OptimizationMachineModel,
+    PreparedTasks,
+    RepairContext,
+    RepairMachineModel,
+    PipelineStepResult,
+)
+from harness.pipeline.types import StepResult
+
+
+def test_optimization_machine_success_path():
+    deps = LoopDependencies(
+        prepare_iteration_tasks=lambda task, trace: PreparedTasks(
+            base_task=task, resolved_repo_path=None, jc_repo_id=None
+        ),
+        evaluate_policy_on_item=lambda ic_task, baseline, iteration_span=None, iteration_index=None: EvaluationResult(
+            metrics={"score": 1.0}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="policy"
+        ),
+        build_iteration_feedback=lambda evaluation, prev_score, prev_classified, repo_root: FeedbackPackage(
+            tests="", scoring_context="", comparison_summary=None, feedback={"score": 1.0}, feedback_str="", guidance_hint="hint", diff_str="", diff_hint=""
+        ),
+        attempt_policy_generation=lambda **kwargs: ("policy", None),
+        run_policy_pipeline=lambda pipeline, repo_root, repair_obs=None: (
+            [PipelineStepResult(name="step", success=True, exit_code=0, stdout="", stderr="")],
+            [StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")],
+            True,
+        ),
+        finalize_successful_policy=lambda **kwargs: (
+            "policy",
+            {
+                "repair_attempts": 0,
+                "max_policy_repairs": 1,
+                "accepted_policy_source": "post_pipeline_disk",
+                "accepted_policy_changed_by_pipeline": False,
+            },
+        ),
+        finalize_failed_repair=lambda **kwargs: ("", "policy"),
+        classify_results=lambda results: {},
+        format_pipeline_failure_context=lambda *a, **k: "",
+        read_policy=lambda: "policy",
+        write_policy=lambda code: None,
+        get_writer_model=lambda: "model",
+        record_score=lambda *a, **k: None,
+        start_span=lambda *a, **k: None,
+        find_repo_root=lambda: Path("."),
+        default_pipeline=lambda: object(),
+    )
+    model = OptimizationMachineModel(
+        context=LoopContext(task={"symbol": "s"}, iterations=1, baseline_snapshot=None, run_trace=None),
+        deps=deps,
+        max_policy_repairs=1,
+    )
+    machine = OptimizationStateMachine(model)
+    history = machine.run()
+    assert history and history[0].pipeline_passed is True
+    assert history[0].accepted_policy and history[0].accepted_policy.source == "post_pipeline_disk"
+    state = getattr(machine, "current_state")
+    assert getattr(state, "id", None) == machine.completed.id  # type: ignore[attr-defined]
+
+
+def test_repair_machine_retries_until_exhaustion():
+    attempts: list[int] = []
+
+    def attempt_policy_generation(**kwargs):
+        return "candidate", None
+
+    def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
+        attempts.append(1)
+        result = StepResult(name="step", success=False, exit_code=1, stdout="", stderr="boom")
+        return [PipelineStepResult.from_mapping(result)], [result], False
+
+    def finalize_failed_repair(*, metadata: dict[str, object], pipeline_results: Sequence[Mapping[str, object]], classified: Mapping[str, object], **kwargs):
+        metadata["pipeline_feedback"] = classified
+        metadata["failed_step"] = pipeline_results[0].get("name")
+        metadata["failed_exit_code"] = pipeline_results[0].get("exit_code")
+        metadata["failed_summary"] = "boom"
+        return ("ctx", "policy")
+
+    deps = LoopDependencies(
+        prepare_iteration_tasks=lambda *a, **k: PreparedTasks(
+            base_task={}, resolved_repo_path=None, jc_repo_id=None
+        ),
+        evaluate_policy_on_item=lambda *a, **k: evaluation,
+        build_iteration_feedback=lambda *a, **k: feedback,
+        attempt_policy_generation=attempt_policy_generation,
+        run_policy_pipeline=run_policy_pipeline,
+        finalize_successful_policy=lambda **kwargs: ("policy", {}),
+        finalize_failed_repair=finalize_failed_repair,
+        classify_results=lambda results: {"test_failures": "boom"},
+        format_pipeline_failure_context=lambda *a, **k: "",
+        read_policy=lambda: "policy",
+        write_policy=lambda code: None,
+        get_writer_model=lambda: "model",
+        record_score=lambda *a, **k: None,
+        start_span=lambda *a, **k: None,
+        find_repo_root=lambda: Path("."),
+        default_pipeline=lambda: object(),
+    )
+    evaluation = EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="policy")
+    feedback = FeedbackPackage(tests="", scoring_context="", comparison_summary=None, feedback={}, feedback_str="", guidance_hint="", diff_str="", diff_hint="")
+    repair_ctx = RepairContext(
+        repo_root=Path("."),
+        evaluation=evaluation,
+        feedback=feedback,
+        max_repair_attempts=2,
+        parent_trace=None,
+        writer_model="model",
+    )
+    repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
+    machine = RepairStateMachine(repair_model)
+    outcome = machine.run()
+    assert outcome.success is False
+    assert outcome.attempts_used == 2
+    assert outcome.metadata.get("pipeline_feedback") == {"test_failures": "boom"}
+    state = getattr(machine, "current_state")
+    assert getattr(state, "id", None) == machine.repair_exhausted.id  # type: ignore[attr-defined]
+</file>
+
 <file path="tests_harness/test_observability.py">
 from __future__ import annotations
 
@@ -2271,7 +2404,7 @@ from harness.pipeline.types import StepResult, ExecutionBackend
 
 class FakeBackend(ExecutionBackend):
     def __init__(self):
-        self.last_cmd: list[str] | None = None
+        self.last_cmd: list[str] = []
 
     def run(self, cmd: list[str], cwd: Path, name: str | None = None) -> StepResult:
         self.last_cmd = cmd
@@ -2438,10 +2571,11 @@ from typing import Any, Mapping
 
 from harness.observability import baselines, experiments
 from harness import loop, runner
+from harness.loop_types import IterationRecord
 
 
 def test_baseline_resolves_repo(monkeypatch, tmp_path):
-    called = {"repo": None}
+    called: dict[str, object | None] = {"repo": None}
 
     def fake_run_jc_iteration(task: Mapping[str, object], parent_trace=None):
         called["repo"] = task.get("repo")
@@ -2451,26 +2585,30 @@ def test_baseline_resolves_repo(monkeypatch, tmp_path):
     repo_dir.mkdir()
     monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
     monkeypatch.setattr(runner, "run_jc_iteration", fake_run_jc_iteration)
-    snap = baselines.compute_baseline_for_item({"repo": "small", "symbol": "s"})  # type: ignore[arg-type]
+    snap = baselines.compute_baseline_for_item(
+        baselines.normalize_dataset_item({"id": "item1", "repo": "small", "symbol": "s", "metadata": {}})
+    )
     assert called["repo"] == str(repo_dir)
     # logical repo ref preserved
-    assert snap["repo"] == "small"
+    assert snap.repo == "small"
 
 
 def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
     calls: list[str] = []
 
     def fake_run_loop(task: Mapping[str, object], iterations: int, parent_trace=None, baseline_snapshot=None):
-        calls.append(task.get("repo", ""))
-        return [{"score": 1.0}]
+        calls.append(str(task.get("repo", "")))
+        return [IterationRecord(iteration=0, metrics={"score": 1.0}, pipeline_passed=True)]
 
     repo_dir = tmp_path / "medium_repo"
     repo_dir.mkdir()
     monkeypatch.setenv("TEST_REPO_MEDIUM", str(repo_dir))
     monkeypatch.setattr(experiments, "run_loop", fake_run_loop)
-    baselines_bundle: Any = {"items": [{"repo": "medium", "symbol": "s", "jc_result": {}, "jc_metrics": {}}]}
-    experiments._run_ic_optimizations(  # type: ignore[attr-defined]
-        [{"repo": "medium", "symbol": "s"}],
+    baselines_bundle: Any = baselines.make_baseline_bundle(
+        [baselines.BaselineSnapshot(repo="medium", symbol="s", jc_result={}, jc_metrics={}, item_id="item2")]
+    )
+    experiments._run_ic_optimizations(  # type: ignore[attr-defined,arg-type]
+        [baselines.normalize_dataset_item({"id": "item3", "repo": "medium", "symbol": "s", "metadata": {}})],
         baselines_bundle,
         dataset_name=None,
         dataset_version=None,
@@ -2578,6 +2716,8 @@ from __future__ import annotations
 import importlib
 from importlib import util as importlib_util
 
+from harness.loop_types import IterationRecord
+from harness.observability.baselines import BaselineBundle
 
 def test_root_shim_invokes_harness_main(monkeypatch):
     harness_run = importlib.import_module("harness.run")
@@ -2603,7 +2743,11 @@ def test_ad_hoc_runner_resolves_repo(monkeypatch, tmp_path, capsys):
     repo_dir = tmp_path / "small_repo"
     repo_dir.mkdir()
     monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
-    monkeypatch.setattr("harness.run.run_loop", lambda task, iterations=3: [{"score": 1.0}], raising=False)
+    monkeypatch.setattr(
+        "harness.run.run_loop",
+        lambda task, iterations=3: [IterationRecord(iteration=0, metrics={"score": 1.0})],
+        raising=False,
+    )
     harness_run.main([])
     out = capsys.readouterr().out
     assert "small_repo" in out
@@ -2617,13 +2761,14 @@ def test_ad_hoc_runner_prints_failed_step(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
 
     history = [
-        {
-            "score": 0.0,
-            "pipeline_passed": False,
-            "failed_step": "basedpyright",
-            "failed_exit_code": 1,
-            "failed_summary": "type errors here",
-        }
+        IterationRecord(
+            iteration=0,
+            metrics={"score": 0.0},
+            pipeline_passed=False,
+            failed_step="basedpyright",
+            failed_exit_code=1,
+            failed_summary="type errors here",
+        )
     ]
     monkeypatch.setattr("harness.run.run_loop", lambda task, iterations=3: history, raising=False)
     harness_run.main([])
@@ -2639,7 +2784,7 @@ def test_hosted_baseline_flow_calls_experiment(monkeypatch, tmp_path, capsys):
 
     def fake_run_hosted_jc_baseline_experiment(name, version=None):
         called["jc"] = True
-        return {"items": []}
+        return BaselineBundle(items=[])
 
     monkeypatch.setattr(harness_run, "run_hosted_jc_baseline_experiment", fake_run_hosted_jc_baseline_experiment)
     argv = ["--dataset", "ds", "--jc-baseline"]
@@ -2685,7 +2830,7 @@ def test_run_hosted_dataset_experiment_uses_get_dataset(monkeypatch):
         experiment_name="exp",
         task_fn=lambda item, trace=None: {"ok": True},
     )
-    assert result.get("run_id") == "rid"
+    assert result.run_id == "rid"
     assert calls["get_dataset"] == 1 and calls["run_experiment"] == 1
 
 
@@ -2706,7 +2851,7 @@ def test_run_local_dataset_experiment_calls_client(monkeypatch):
         experiment_name="exp_local",
         task_fn=lambda item, trace=None: {"ok": True},
     )
-    assert result.get("run_id") == "rid"
+    assert result.run_id == "rid"
     assert calls["run_experiment"] == 1
 </file>
 
@@ -2892,10 +3037,15 @@ def test_run_loop_uses_observations(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loop, "synthesize_valid_policy", fake_synthesize_valid_policy)
 
-    baseline = {"jc_result": {"observations": [{"tool": "y"}]}, "jc_metrics": {"jc_nodes": 0, "score": 0.0}}
+    baseline = loop.BaselineSnapshot(
+        repo="r",
+        symbol="s",
+        jc_result={"observations": [{"tool": "y"}]},
+        jc_metrics={"jc_nodes": 0, "score": 0.0},
+    )
 
     history = loop.run_loop({"symbol": "s", "repo": "r"}, iterations=1, baseline_snapshot=baseline)
-    assert history and history[0]["score"] == 1.0
+    assert history and history[0].metrics["score"] == 1.0
     assert "flush" in events
     assert synth_calls
 
@@ -3000,6 +3150,8 @@ import json
 
 import pytest
 
+from typing import TypedDict
+
 from harness import writer
 
 
@@ -3048,19 +3200,34 @@ def _make_client(content, capture, parsed=None):
     return DummyClient()
 
 
-def _base_inputs():
-    return dict(
-        feedback={"a": 1},
-        current_policy="def score(node, state):\n    return 0.0\n",
-        tests="",
-        scoring_context="",
-        feedback_str="",
-        guidance_hint="",
-        diff_str="",
-        diff_hint="",
-        comparison_summary="IC vs JC summary",
-        parent_trace=None,
-    )
+class BaseInputs(TypedDict, total=False):
+    feedback: dict[str, object]
+    current_policy: str
+    tests: str
+    scoring_context: str
+    feedback_str: str
+    guidance_hint: str
+    diff_str: str
+    diff_hint: str
+    comparison_summary: str | None
+    parent_trace: object | None
+    failure_context: str | None
+    repair_attempt: int
+
+
+def _base_inputs() -> BaseInputs:
+    return {
+        "feedback": {"a": 1},
+        "current_policy": "def score(node, state):\n    return 0.0\n",
+        "tests": "",
+        "scoring_context": "",
+        "feedback_str": "",
+        "guidance_hint": "",
+        "diff_str": "",
+        "diff_hint": "",
+        "comparison_summary": "IC vs JC summary",
+        "parent_trace": None,
+    }
 
 
 def test_generate_policy_accepts_structured_code(monkeypatch):
@@ -3074,13 +3241,21 @@ def test_generate_policy_accepts_structured_code(monkeypatch):
     assert "def score" in code
     assert ("writer.policy_compiled", 1.0) in scores
     assert ("writer.policy_generated", 1.0) in scores
-    assert calls and calls[0]["response_format"]["type"] == "json_schema"
-    schema = calls[0]["response_format"]["json_schema"]["schema"]
+    assert calls
+    assert isinstance(calls[0]["response_format"], dict)
+    response_format = calls[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert isinstance(response_format["json_schema"], dict)
+    json_schema = response_format["json_schema"]
+    assert isinstance(json_schema["schema"], dict)
+    schema = json_schema["schema"]
     assert schema["required"] == ["code"]
     assert schema["properties"] == {"code": {"type": "string"}}
-    assert calls[0]["response_format"]["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["strict"] is True
     assert schema.get("additionalProperties") is False
-    assert calls[0]["max_completion_tokens"] > 0
+    max_tokens = calls[0]["max_completion_tokens"]
+    assert isinstance(max_tokens, int)
+    assert max_tokens > 0
 
 
 @pytest.mark.parametrize(
@@ -3956,20 +4131,961 @@ def format_scoring_context(types: str, examples: str, max_chars: int = 8000) -> 
 - `policy_loader.py` now simply loads `policy.py`, validates a callable `score`, and adapts 1/2/3-arg callables to `score(node, state, context) -> float`. No sandbox or restricted execution.
 </file>
 
+<file path="loop_machine.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Mapping, Sequence, cast
+
+from statemachine import State, StateChart
+from statemachine.event import BoundEvent
+
+_BOUND_EVENT = cast(Any, BoundEvent)
+
+# python-statemachine 3.x uses ``name`` on events while older callback dispatchers
+# expect ``key``. Patch in a lightweight compatibility property so callbacks work
+# uniformly without scattering conditionals.
+if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
+    setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
+
+from .loop_types import (
+    AcceptedPolicy,
+    EvaluationResult,
+    FeedbackPackage,
+    IterationRecord,
+    LoopContext,
+    LoopDependencies,
+    OptimizationMachineModel,
+    PipelineStepResult,
+    PreparedTasks,
+    RepairContext,
+    RepairMachineModel,
+    RepairOutcome,
+)
+
+
+def _safe_end_span(span: object | None, **kwargs) -> None:
+    """Best-effort guard for Langfuse span termination."""
+    if span is None or not hasattr(span, "end"):
+        return
+    try:
+        cast(Any, span).end(**kwargs)
+    except Exception:
+        pass
+
+
+class _TransitionTraceListener:
+    """Lightweight listener to collect transition metadata for observability."""
+
+    def __init__(self, label: str, sink: dict[str, list[str]] | None = None):
+        self.label: str = label
+        self.sink: dict[str, list[str]] = sink if sink is not None else {}
+
+    def on_transition(self, event: object, state: State, event_data, **kwargs) -> None:
+        machine = cast("StateChart", event_data.machine)
+        trace_sink: dict[str, list[str]] = getattr(machine.model, "trace", self.sink)
+        bucket = trace_sink.setdefault(self.label, [])
+        bucket.append(f"{state.id}->{event_data.transition.target.id}")
+
+
+class _RepairTracingListener:
+    """Listener that manages repair attempt span lifecycle."""
+
+    def on_enter_generating_candidate(self, event: object, state: State, event_data, **kwargs) -> None:
+        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
+        model = machine.model
+        if not model.started:
+            return
+        ctx = model.context
+        if ctx.repair_observation is None:
+            ctx.repair_observation = model.deps.start_span(
+                ctx.parent_trace,
+                f"policy_repair_attempt_{ctx.attempts_used}",
+                metadata={"attempt": ctx.attempts_used},
+            )
+
+    def on_enter_retrying(self, event: object, state: State, event_data, **kwargs) -> None:
+        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
+        self._end_attempt(machine, status="retrying")
+
+    def on_enter_candidate_valid(self, event: object, state: State, event_data, **kwargs) -> None:
+        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
+        self._end_attempt(machine, status="passed")
+
+    def on_enter_repair_exhausted(self, event: object, state: State, event_data, **kwargs) -> None:
+        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
+        self._end_attempt(machine, status="failed")
+
+    def _end_attempt(self, machine: "RepairStateMachine", status: str) -> None:
+        ctx = machine.model.context
+        attempt_index = ctx.attempts_used - 1 if ctx.attempts_used > 0 else ctx.attempts_used
+        metadata: dict[str, object] = {"status": status, "attempt": attempt_index}
+        if ctx.pipeline_passed is False:
+            metadata["pipeline_passed"] = False
+        if ctx.metadata.get("error"):
+            metadata["error"] = ctx.metadata["error"]
+        _safe_end_span(ctx.repair_observation, metadata=metadata)
+        ctx.repair_observation = None
+
+
+class _OptimizationTracingListener:
+    """Listener that owns iteration spans and summary metrics."""
+
+    def __init__(self) -> None:
+        self._last_recorded_iteration: int | None = None
+
+    def on_enter_evaluating(self, event: object, state: State, event_data, **kwargs) -> None:
+        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
+        ctx = machine.model.context
+        if ctx.prepared_tasks is None:
+            machine.model.current_iteration_span = None  # noqa: SLF001
+            return
+        ic_task, jc_task = ctx.prepared_tasks.build_iteration_tasks()
+        machine.model.current_iteration_span = machine.model.deps.start_span(  # noqa: SLF001
+            ctx.run_trace,
+            f"iteration_{ctx.current_iteration}",
+            metadata={
+                "iteration": ctx.current_iteration,
+                "iterations": ctx.iterations,
+                "task": dict(ic_task),
+                "jc_repo": jc_task.get("repo"),
+            },
+        )
+
+    def on_exit_accepted_round(self, event: object, state: State, event_data, **kwargs) -> None:
+        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
+        self._finalize_iteration(machine, status="complete")
+
+    def on_enter_completed(self, event: object, state: State, event_data, **kwargs) -> None:
+        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
+        self._finalize_iteration(machine, status="completed")
+
+    def on_enter_failed(self, event: object, state: State, event_data, **kwargs) -> None:
+        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
+        self._finalize_iteration(machine, status="failed")
+
+    def _finalize_iteration(self, machine: "OptimizationStateMachine", status: str) -> None:
+        ctx = machine.model.context
+        span = machine.model.current_iteration_span
+        record = ctx.history[-1] if ctx.history else None
+        if record is not None and self._last_recorded_iteration == record.iteration:
+            machine.model.current_iteration_span = None  # noqa: SLF001
+            return
+
+        handle = span or ctx.run_trace
+        if record is not None:
+            self._record_iteration_scores(machine, handle, record)
+            self._last_recorded_iteration = record.iteration
+
+        if span is not None:
+            status_val = status
+            if record and (record.error or record.writer_error or record.pipeline_passed is False):
+                status_val = "failed"
+            metadata: dict[str, object] = {
+                "status": status_val,
+                "iteration": record.iteration if record else ctx.current_iteration,
+            }
+            if record and record.pipeline_passed is not None:
+                metadata["pipeline_passed"] = record.pipeline_passed
+            failure_val = record.error if record else None
+            failure_val = failure_val or (record.writer_error if record else None)
+            if failure_val:
+                metadata["error"] = failure_val
+            _safe_end_span(span, metadata=metadata)
+        machine.model.current_iteration_span = None  # noqa: SLF001
+
+    def _record_iteration_scores(
+        self,
+        machine: "OptimizationStateMachine",
+        handle: object | None,
+        record: IterationRecord,
+    ) -> None:
+        deps = machine.deps
+        score_meta = {"iteration": record.iteration}
+        if record.pipeline_passed is not None:
+            deps.record_score(handle, "pipeline_passed", bool(record.pipeline_passed), score_meta)
+        for key in ("score", "coverage_delta", "tool_error_rate"):
+            value = record.metrics.get(key)
+            if isinstance(value, (int, float, bool)):
+                deps.record_score(handle, f"metrics.{key}", float(value), score_meta)
+
+
+class RepairStateMachine(StateChart[RepairMachineModel]):
+    """
+    Drives the candidate generation + pipeline repair loop using state-driven callbacks.
+    """
+
+    catch_errors_as_events = True
+
+    generating_candidate = State(initial=True)
+    running_pipeline = State()
+    retrying = State()
+    candidate_valid = State(final=True)
+    repair_exhausted = State(final=True)
+
+    writer_generated = generating_candidate.to(running_pipeline)
+    writer_retryable_failure = generating_candidate.to(retrying)
+    writer_exhausted = generating_candidate.to(repair_exhausted)
+    pipeline_passed = running_pipeline.to(candidate_valid)
+    pipeline_retryable_failure = running_pipeline.to(retrying)
+    pipeline_exhausted = running_pipeline.to(repair_exhausted)
+    retry = retrying.to(generating_candidate)
+
+    @property
+    def context(self) -> RepairContext:
+        return self.model.context
+
+    @property
+    def deps(self) -> LoopDependencies:
+        return self.model.deps
+
+    def __init__(self, model: RepairMachineModel):
+        super().__init__(
+            model=model,
+            listeners=[
+                _TransitionTraceListener("repair", model.trace),
+                _RepairTracingListener(),
+            ],
+        )
+
+    # Entry point ---------------------------------------------------------
+    def run(self) -> RepairOutcome:
+        self.model.started = True
+        # Initialize repair-level observation once per machine run.
+        ctx = self.context
+        if ctx.repair_observation is None:
+            ctx.repair_observation = self.deps.start_span(
+                ctx.parent_trace,
+                f"policy_repair_attempt_{ctx.attempts_used}",
+                metadata={"attempt": ctx.attempts_used},
+            )
+        self._run_writer()
+        attempts_used = self.context.attempts_used
+        final_attempts = (
+            self.context.max_repair_attempts
+            if self.context.pipeline_passed is False
+            else min(attempts_used, self.context.max_repair_attempts)
+        )
+        self.context.attempts_used = final_attempts
+        self.context.metadata["repair_attempts"] = (
+            max(0, final_attempts - 1)
+            if self.context.pipeline_passed
+            else self.context.max_repair_attempts
+        )
+        self.context.metadata["max_policy_repairs"] = self.context.max_repair_attempts
+        return RepairOutcome(
+            policy=self.deps.read_policy(),
+            pipeline_results=self.context.pipeline_results,
+            success=self.context.pipeline_passed,
+            attempts_used=final_attempts,
+            metadata=self.context.metadata,
+        )
+
+    # Writer/pipeline execution ------------------------------------------
+    def on_enter_generating_candidate(self, event: object, state: State) -> None:
+        if not self.model.started:
+            return
+        self._run_writer()
+
+    def on_enter_retrying(self, event: object, state: State) -> None:
+        if self._attempts_remaining():
+            self.raise_("retry")  # type: ignore[call-arg]
+        else:
+            self.raise_("writer_exhausted")  # type: ignore[call-arg]
+
+    def _attempts_remaining(self) -> bool:
+        return self.context.attempts_used < self.context.max_repair_attempts
+
+    def _run_writer(self) -> None:
+        ctx = self.context
+        deps = self.deps
+        guidance = (
+            "Repair mode: produce the smallest change that makes harness/policy.py pass ruff, basedpyright, and pytest. "
+            "Add missing parameter annotations and return type -> float. Do not optimize score until the policy is valid."
+            if ctx.attempts_used > 0
+            else ctx.feedback.guidance_hint
+        )
+        if ctx.last_classified and ctx.last_classified.get("type_errors"):
+            guidance += " Fix all type errors and ensure parameters are annotated; avoid unknown types."
+
+        new_code, writer_error = deps.attempt_policy_generation(
+            feedback=ctx.feedback.feedback,
+            initial_policy=ctx.evaluation.policy_code,
+            tests=ctx.feedback.tests,
+            scoring_context=ctx.feedback.scoring_context,
+            feedback_str=ctx.feedback.feedback_str,
+            guidance_hint=guidance,
+            diff_str=ctx.feedback.diff_str,
+            diff_hint=ctx.feedback.diff_hint,
+            comparison_summary=ctx.feedback.comparison_summary,
+            failure_context_str=ctx.failure_context,
+            repair_attempt=ctx.attempts_used,
+            parent_trace=ctx.repair_observation,
+            pipeline_feedback=ctx.last_classified,
+        )
+
+        if new_code is None:
+            ctx.metadata["writer_error"] = writer_error
+            ctx.attempts_used += 1
+            ctx.failure_context = self._format_failure(
+                [], writer_error, ctx.attempts_used
+            )
+            if self._attempts_remaining():
+                self.raise_("writer_retryable_failure")  # type: ignore[call-arg]
+            else:
+                self.raise_("writer_exhausted")  # type: ignore[call-arg]
+            return
+
+        deps.write_policy(new_code)
+        ctx.candidate_code = new_code
+        self.raise_("writer_generated")  # type: ignore[call-arg]
+        self._run_pipeline()
+
+    def _run_pipeline(self) -> None:
+        ctx = self.context
+        deps = self.deps
+        pipeline_results, raw_results, pipeline_success = deps.run_policy_pipeline(
+            ctx.pipeline or deps.default_pipeline(),
+            ctx.repo_root,
+            repair_obs=ctx.repair_observation,
+        )
+        ctx.pipeline_results = pipeline_results
+        ctx.pipeline_passed = pipeline_success
+        ctx.attempts_used += 1
+
+        if pipeline_success:
+            final_policy, success_meta = deps.finalize_successful_policy(
+                new_code=ctx.candidate_code or deps.read_policy(),
+                attempts_used=ctx.attempts_used,
+                max_repair_attempts=ctx.max_repair_attempts,
+                repair_obs=ctx.repair_observation,
+            )
+            ctx.candidate_code = final_policy
+            ctx.metadata.update(success_meta)
+            self.raise_("pipeline_passed")  # type: ignore[call-arg]
+            return
+
+        classified = deps.classify_results(raw_results)
+        ctx.last_classified = classified
+        ctx.failure_context, ctx.evaluation.policy_code = deps.finalize_failed_repair(
+            metadata=ctx.metadata,
+            pipeline_results=[step.to_mapping() for step in pipeline_results],
+            classified=classified,
+            writer_model=ctx.writer_model,
+            attempts_used=ctx.attempts_used,
+        )
+        if self._attempts_remaining():
+            self.raise_("pipeline_retryable_failure")  # type: ignore[call-arg]
+        else:
+            self.raise_("pipeline_exhausted")  # type: ignore[call-arg]
+
+    # Helpers -------------------------------------------------------------
+    def _format_failure(self, pipeline_results, writer_error, attempt: int) -> str:
+        return self.deps.format_pipeline_failure_context(
+            [step.to_mapping() for step in pipeline_results],
+            self.context.last_classified,
+            writer_error,
+            self.context.writer_model,
+            attempt,
+        )
+
+
+class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
+    """Top-level orchestrator for a full loop run driven by state callbacks."""
+
+    preparing = State(initial=True)
+    evaluating = State()
+    repairing = State()
+    accepted_round = State()
+    completed = State(final=True)
+    failed = State(final=True)
+
+    prepare = preparing.to(evaluating, cond="prep_ready") | preparing.to(failed)
+    evaluation_done = evaluating.to(
+        repairing, cond="evaluation_successful"
+    ) | evaluating.to(accepted_round, unless="evaluation_successful")
+    repair_done = repairing.to(accepted_round)
+    advance = accepted_round.to(
+        evaluating, cond="has_more_iterations"
+    ) | accepted_round.to(completed)
+
+    @property
+    def context(self) -> LoopContext:
+        return self.model.context
+
+    @property
+    def deps(self) -> LoopDependencies:
+        return self.model.deps
+
+    @property
+    def max_policy_repairs(self) -> int:
+        return self.model.max_policy_repairs
+
+    def __init__(self, model: OptimizationMachineModel):
+        super().__init__(
+            model=model,
+            listeners=[
+                _TransitionTraceListener("optimization", model.trace),
+                _OptimizationTracingListener(),
+            ],
+        )
+
+    # Entry point ---------------------------------------------------------
+    def run(self) -> list[IterationRecord]:
+        self._prepare_context()
+        self.raise_("prepare")  # type: ignore[call-arg]
+        return self.context.history
+
+    # Guards --------------------------------------------------------------
+    def prep_ready(self) -> bool:
+        return self.model.prep_ok
+
+    def evaluation_successful(self) -> bool:
+        return bool(self.model.current_evaluation and self.model.current_evaluation.success)
+
+    def has_more_iterations(self) -> bool:
+        return self.context.current_iteration + 1 < self.context.iterations
+
+    # Preparation ---------------------------------------------------------
+    def _prepare_context(self) -> None:
+        try:
+            self.context.prepared_tasks = self.deps.prepare_iteration_tasks(
+                self.context.task, self.context.run_trace
+            )
+            self.model.prep_ok = self.context.prepared_tasks is not None
+        except Exception:
+            self.model.prep_ok = False
+
+    # Evaluation ----------------------------------------------------------
+    def on_enter_evaluating(self, event, state) -> None:  # noqa: ANN001
+        self.model.current_evaluation = None
+        self.model.current_repair_outcome = None
+        if self.context.prepared_tasks is None:
+            self.model.current_evaluation = None
+            self.raise_("evaluation_done")  # type: ignore[call-arg]
+            return
+
+        ic_task, jc_task = self.context.prepared_tasks.build_iteration_tasks()
+        self.model.current_evaluation = self.deps.evaluate_policy_on_item(
+            ic_task,
+            self.context.baseline_snapshot,
+            self.model.current_iteration_span,
+            self.context.current_iteration,
+        )
+        self.raise_("evaluation_done")  # type: ignore[call-arg]
+
+    # Repair --------------------------------------------------------------
+    def on_enter_repairing(self, event, state) -> None:  # noqa: ANN001
+        evaluation = self.model.current_evaluation
+        if evaluation is None:
+            self.model.current_repair_outcome = None
+            self.raise_("repair_done")  # type: ignore[call-arg]
+            return
+
+        repo_root = self.deps.find_repo_root()
+        feedback = self.deps.build_iteration_feedback(
+            evaluation,
+            self.context.prev_score,
+            self.context.prev_classified,
+            repo_root,
+        )
+        repair_outcome = self._run_repair_phase(
+            repo_root, evaluation, feedback, self.model.current_iteration_span
+        )
+        self.model.current_repair_outcome = repair_outcome
+        self.raise_("repair_done")  # type: ignore[call-arg]
+
+    # Acceptance / recording ---------------------------------------------
+    def on_enter_accepted_round(self, event, state) -> None:  # noqa: ANN001
+        evaluation = self.model.current_evaluation
+        repair_outcome = self.model.current_repair_outcome
+
+        if evaluation is None:
+            self.raise_("advance")  # type: ignore[call-arg]
+            return
+
+        record = self._build_iteration_record(
+            iteration=self.context.current_iteration,
+            evaluation=evaluation,
+            repair_outcome=repair_outcome,
+        )
+        self._record_iteration(
+            record,
+            pipeline_passed=repair_outcome.success if repair_outcome else None,
+        )
+        if repair_outcome and repair_outcome.success:
+            score_val = record.metrics.get("score")
+            self.context.prev_score = (
+                float(score_val) if isinstance(score_val, (int, float)) else None
+            )
+            self.context.prev_classified = {
+                "type_errors": "",
+                "lint_errors": "",
+                "test_failures": "",
+                "passed": [],
+            }
+
+        self.context.current_iteration += 1
+        self.raise_("advance")  # type: ignore[call-arg]
+
+    def _run_repair_phase(
+        self,
+        repo_root: Path,
+        evaluation: EvaluationResult,
+        feedback: FeedbackPackage,
+        iteration_span: object | None,
+    ) -> RepairOutcome:
+        if self.deps.repair_via_synthesize:
+            outcome = self.deps.repair_via_synthesize(
+                evaluation, feedback, repo_root, iteration_span
+            )
+            if outcome.pipeline_results and not isinstance(
+                outcome.pipeline_results[0], PipelineStepResult
+            ):
+                outcome.pipeline_results = [
+                    PipelineStepResult.from_mapping(r) for r in outcome.pipeline_results
+                ]  # type: ignore[arg-type]
+            return outcome
+        repair_ctx = RepairContext(
+            repo_root=repo_root,
+            evaluation=evaluation,
+            feedback=feedback,
+            max_repair_attempts=self.max_policy_repairs,
+            parent_trace=iteration_span,
+            writer_model=self.deps.get_writer_model(),
+            pipeline=self.deps.default_pipeline(),
+        )
+        repair_model = RepairMachineModel(
+            context=repair_ctx,
+            deps=self._repair_dependencies(),
+        )
+        repair_machine = RepairStateMachine(repair_model)
+        return repair_machine.run()
+
+    def _build_iteration_record(
+        self,
+        iteration: int,
+        evaluation: EvaluationResult,
+        repair_outcome: RepairOutcome | None,
+    ) -> IterationRecord:
+        metadata = dict(repair_outcome.metadata) if repair_outcome else {}
+        metrics_map = dict(evaluation.metrics)
+        metrics_map.update(metadata)
+        pipeline_feedback = metadata.get("pipeline_feedback")
+        pipeline_feedback_map = (
+            pipeline_feedback if isinstance(pipeline_feedback, Mapping) else None
+        )
+        repair_attempts_val = metadata.get("repair_attempts")
+        max_repairs_val = metadata.get("max_policy_repairs")
+        error_val = metadata.get("error")
+        writer_err_val = metadata.get("writer_error")
+        record = IterationRecord(
+            iteration=iteration,
+            metrics=metrics_map,
+            pipeline_passed=repair_outcome.success
+            if repair_outcome and isinstance(repair_outcome.success, bool)
+            else None,
+            pipeline_feedback=pipeline_feedback_map,
+            repair_attempts=repair_attempts_val
+            if isinstance(repair_attempts_val, int)
+            else (repair_outcome.attempts_used if repair_outcome else None),
+            max_policy_repairs=max_repairs_val
+            if isinstance(max_repairs_val, int)
+            else self.max_policy_repairs,
+            error=error_val if isinstance(error_val, str) else None,
+            writer_error=writer_err_val if isinstance(writer_err_val, str) else None,
+        )
+        failed_step = (
+            self._first_failed_step(repair_outcome.pipeline_results)
+            if repair_outcome
+            else None
+        )
+        if failed_step:
+            record.failed_step = failed_step.name
+            record.failed_exit_code = failed_step.exit_code
+            record.failed_summary = failed_step.stderr or failed_step.stdout
+        failed_summary_val = metadata.get("failed_summary")
+        if isinstance(failed_summary_val, str) and not record.failed_summary:
+            record.failed_summary = failed_summary_val
+        if repair_outcome and repair_outcome.success:
+            source_val = metadata.get("accepted_policy_source")
+            changed_val = metadata.get("accepted_policy_changed_by_pipeline")
+            record.accepted_policy = AcceptedPolicy(
+                code=repair_outcome.policy,
+                source=source_val if isinstance(source_val, str) else None,
+                changed_by_pipeline=changed_val
+                if isinstance(changed_val, bool)
+                else None,
+                repair_attempts=record.repair_attempts or repair_outcome.attempts_used,
+                max_policy_repairs=record.max_policy_repairs or self.max_policy_repairs,
+            )
+        return record
+
+    def _record_iteration(
+        self,
+        record: IterationRecord,
+        pipeline_passed: bool | None = None,
+    ) -> None:
+        pipeline_val = (
+            record.pipeline_passed if pipeline_passed is None else pipeline_passed
+        )
+        record.pipeline_passed = pipeline_val
+        self.context.history.append(record)
+
+    def _first_failed_step(
+        self, steps: Sequence[PipelineStepResult]
+    ) -> PipelineStepResult | None:
+        for step in steps:
+            if isinstance(step.exit_code, int) and step.exit_code != 0:
+                return step
+            if step.exit_code is None and step.success is False:
+                return step
+        return None
+
+    def _repair_dependencies(self) -> LoopDependencies:
+        # Reuse the same dependency set for nested repair machine where possible.
+        return LoopDependencies(
+            prepare_iteration_tasks=self.deps.prepare_iteration_tasks,
+            evaluate_policy_on_item=self.deps.evaluate_policy_on_item,
+            build_iteration_feedback=self.deps.build_iteration_feedback,
+            attempt_policy_generation=self.deps.attempt_policy_generation,
+            run_policy_pipeline=self.deps.run_policy_pipeline,
+            finalize_successful_policy=self.deps.finalize_successful_policy,
+            finalize_failed_repair=self.deps.finalize_failed_repair,
+            classify_results=self.deps.classify_results,
+            format_pipeline_failure_context=self.deps.format_pipeline_failure_context,
+            read_policy=self.deps.read_policy,
+            write_policy=self.deps.write_policy,
+            get_writer_model=self.deps.get_writer_model,
+            record_score=self.deps.record_score,
+            start_span=self.deps.start_span,
+            find_repo_root=self.deps.find_repo_root,
+            default_pipeline=self.deps.default_pipeline,
+            repair_via_synthesize=None,
+        )
+</file>
+
+<file path="loop_types.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from .pipeline.types import StepResult
+
+if TYPE_CHECKING:
+    from .observability.baselines import BaselineSnapshot
+
+
+class PreparedTasks(BaseModel):
+    """Resolved IC/JC tasks for a single iteration."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    base_task: Mapping[str, object]
+    resolved_repo_path: str | None
+    jc_repo_id: str | None
+
+    def build_iteration_tasks(self) -> tuple[dict[str, object], dict[str, object]]:
+        ic_task = dict(self.base_task)
+        jc_task = dict(self.base_task)
+        if self.resolved_repo_path is not None:
+            ic_task["repo"] = self.resolved_repo_path
+        if self.jc_repo_id is not None:
+            jc_task["repo"] = self.jc_repo_id
+        elif self.resolved_repo_path is not None:
+            jc_task["repo"] = self.resolved_repo_path
+        return ic_task, jc_task
+
+
+class EvaluationResult(BaseModel):
+    """Outputs from evaluating the currently accepted policy."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    metrics: dict[str, object]
+    ic_result: Mapping[str, object]
+    jc_result: Mapping[str, object]
+    jc_metrics: Mapping[str, object]
+    comparison_summary: str | None
+    policy_code: str
+    success: bool = True
+    error: str | None = None
+
+
+class FeedbackPackage(BaseModel):
+    """Inputs used to steer policy repair/generation."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    tests: str
+    scoring_context: str
+    comparison_summary: str | None
+    feedback: dict[str, object]
+    feedback_str: str
+    guidance_hint: str
+    diff_str: str
+    diff_hint: str
+
+
+class PipelineStepResult(BaseModel):
+    """Structured view of a pipeline step result."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    name: str
+    success: bool
+    exit_code: int | None
+    stdout: str
+    stderr: str
+
+    @classmethod
+    def from_mapping(cls, step: Mapping[str, object] | object) -> "PipelineStepResult":
+        if isinstance(step, Mapping):
+            name = str(step.get("name") or "")
+            success = bool(step.get("success", False))
+            exit_code = step.get("exit_code")
+            exit_code_val = int(exit_code) if isinstance(exit_code, int) else None
+            stdout = str(step.get("stdout") or "")
+            stderr = str(step.get("stderr") or "")
+            return cls(name=name, success=success, exit_code=exit_code_val, stdout=stdout, stderr=stderr)
+        name = getattr(step, "name", "") or ""
+        success = bool(getattr(step, "success", False))
+        exit_code_val = getattr(step, "exit_code", None)
+        exit_code_val = int(exit_code_val) if isinstance(exit_code_val, int) else None
+        stdout = str(getattr(step, "stdout", "") or "")
+        stderr = str(getattr(step, "stderr", "") or "")
+        return cls(name=name, success=success, exit_code=exit_code_val, stdout=stdout, stderr=stderr)
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "success": self.success,
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+        }
+
+
+class RepairOutcome(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    policy: str
+    pipeline_results: list[PipelineStepResult]
+    success: bool
+    attempts_used: int
+    metadata: dict[str, object]
+
+
+class AcceptedPolicy(BaseModel):
+    """Represents the accepted policy artifact and provenance."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    code: str
+    source: str | None
+    changed_by_pipeline: bool | None
+    repair_attempts: int
+    max_policy_repairs: int
+
+
+class IterationRecord(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    iteration: int
+    metrics: dict[str, object]
+    pipeline_passed: bool | None = None
+    pipeline_feedback: Mapping[str, object] | None = None
+    failed_step: str | None = None
+    failed_exit_code: int | None = None
+    failed_summary: str | None = None
+    accepted_policy: AcceptedPolicy | None = None
+    error: str | None = None
+    writer_error: str | None = None
+    repair_attempts: int | None = None
+    max_policy_repairs: int | None = None
+
+
+class LoopContext(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    task: Mapping[str, object]
+    iterations: int
+    baseline_snapshot: "BaselineSnapshot | None" = None
+    run_trace: object | None
+    history: list[IterationRecord] = Field(default_factory=list)
+    prepared_tasks: PreparedTasks | None = None
+    prev_score: float | None = None
+    prev_classified: dict[str, object] | None = None
+    current_iteration: int = 0
+
+
+class LoopDependencies(BaseModel):
+    """Functions injected for side effects to keep the state machine thin."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    prepare_iteration_tasks: Callable[[Mapping[str, object], object | None], PreparedTasks]
+    evaluate_policy_on_item: Callable[[Mapping[str, object], "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
+    build_iteration_feedback: Callable[[EvaluationResult, float | None, dict[str, object] | None, Path], FeedbackPackage]
+    attempt_policy_generation: Callable[..., tuple[str | None, str | None]]
+    run_policy_pipeline: Callable[..., tuple[list[PipelineStepResult], list[StepResult], bool]]
+    finalize_successful_policy: Callable[..., tuple[str, dict[str, object]]]
+    finalize_failed_repair: Callable[..., tuple[str, str]]
+    classify_results: Callable[[Sequence[StepResult]], Mapping[str, object]]
+    format_pipeline_failure_context: Callable[[list[Mapping[str, object]], Mapping[str, object] | None, str | None, str | None, int], str]
+    read_policy: Callable[[], str]
+    write_policy: Callable[[str], None]
+    get_writer_model: Callable[[], str | None]
+    record_score: Callable[[object, str, float, Mapping[str, object] | None], None]
+    start_span: Callable[..., object | None]
+    find_repo_root: Callable[[], Path]
+    default_pipeline: Callable[[], object]
+    repair_via_synthesize: Callable[[EvaluationResult, FeedbackPackage, Path, object | None], RepairOutcome] | None = None
+
+
+class RepairContext(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    repo_root: Path
+    evaluation: EvaluationResult
+    feedback: FeedbackPackage
+    max_repair_attempts: int
+    parent_trace: object | None
+    writer_model: str | None
+    failure_context: str | None = None
+    last_classified: Mapping[str, object] | None = None
+    attempts_used: int = 0
+    metadata: dict[str, object] = Field(default_factory=dict)
+    pipeline_results: list[PipelineStepResult] = Field(default_factory=list)
+    success: bool = False
+    pipeline_passed: bool = False
+    candidate_code: str | None = None
+    pipeline: object | None = None
+    repair_observation: object | None = None
+
+
+class AggregateScorecard(BaseModel):
+    """Placeholder for dataset-level aggregation."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    aggregate_score: float | None = None
+    mean_score: float | None = None
+    min_score: float | None = None
+    stddev_score: float | None = None
+    item_scores: dict[str, float] = Field(default_factory=dict)
+
+
+def iteration_record_to_public_dict(record: IterationRecord) -> dict[str, object]:
+    """Serialize iteration records for external consumers (CLI, scoring)."""
+    data: dict[str, object] = dict(record.metrics)
+    if record.pipeline_passed is not None:
+        data["pipeline_passed"] = record.pipeline_passed
+    if record.pipeline_feedback is not None:
+        data["pipeline_feedback"] = dict(record.pipeline_feedback)
+    if record.failed_step is not None:
+        data["failed_step"] = record.failed_step
+    if record.failed_exit_code is not None:
+        data["failed_exit_code"] = record.failed_exit_code
+    if record.failed_summary is not None:
+        data["failed_summary"] = record.failed_summary
+    if record.accepted_policy:
+        data["accepted_policy_source"] = record.accepted_policy.source
+        data["accepted_policy_changed_by_pipeline"] = record.accepted_policy.changed_by_pipeline
+        data["repair_attempts"] = record.accepted_policy.repair_attempts
+        data["max_policy_repairs"] = record.accepted_policy.max_policy_repairs
+    if record.error is not None:
+        data["error"] = record.error
+    if record.writer_error is not None:
+        data["writer_error"] = record.writer_error
+    if record.repair_attempts is not None:
+        data.setdefault("repair_attempts", record.repair_attempts)
+    if record.max_policy_repairs is not None:
+        data.setdefault("max_policy_repairs", record.max_policy_repairs)
+    return data
+
+
+def iteration_record_to_score_input(record: IterationRecord) -> Mapping[str, object]:
+    """Boundary helper for scorers expecting mapping input."""
+    return iteration_record_to_public_dict(record)
+
+
+class RepairMachineModel(BaseModel):
+    """Mutable state model for the repair state machine."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    context: RepairContext
+    deps: "LoopDependencies"
+    state: str | None = None
+    started: bool = False
+    trace: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class OptimizationMachineModel(BaseModel):
+    """Mutable state model for the optimization state machine."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    context: LoopContext
+    deps: "LoopDependencies"
+    max_policy_repairs: int
+    state: str | None = None
+    prep_ok: bool = False
+    current_iteration_span: object | None = None
+    current_evaluation: EvaluationResult | None = None
+    current_repair_outcome: RepairOutcome | None = None
+    trace: dict[str, list[str]] = Field(default_factory=dict)
+
+
+def _rebuild_forward_refs() -> None:
+    try:
+        from .observability.baselines import BaselineSnapshot  # local import to avoid cycles
+    except Exception:
+        return
+    LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
+    LoopDependencies.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
+    RepairContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
+    RepairMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
+    OptimizationMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
+
+
+_rebuild_forward_refs()
+</file>
+
 <file path="loop.py">
 from __future__ import annotations
 
 import difflib
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 from pathlib import Path
 from typing import Any
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
 from .observability.langfuse import flush_langfuse, record_score, start_span, start_trace
-from .observability.baselines import baseline_metrics_from_jc
+from .observability.baselines import BaselineSnapshot, baseline_metrics_from_jc
 from .pipeline import classify_results, default_pipeline
+from .pipeline.types import StepResult
+from .loop_machine import OptimizationStateMachine, RepairStateMachine
+from .loop_types import (
+    FeedbackPackage,
+    EvaluationResult,
+    IterationRecord,
+    LoopContext,
+    LoopDependencies,
+    OptimizationMachineModel,
+    PipelineStepResult,
+    PreparedTasks,
+    RepairContext,
+    RepairMachineModel,
+    RepairOutcome,
+)
 from .policy_loader import load_policy
 from .runner import run_ic_iteration
 from .scorer import score
@@ -3981,6 +5097,9 @@ from .utils.failure_context import pack_failure_context
 from .utils.test_loader import format_tests_for_prompt, load_tests
 from .utils.type_loader import format_scoring_context, load_scoring_examples, load_scoring_types
 from .writer import generate_policy
+
+if TYPE_CHECKING:
+    from .observability.baselines import BaselineSnapshot
 
 _POLICY_PATH = Path(__file__).with_name("policy.py")
 _MAX_POLICY_REPAIRS = 3
@@ -4066,7 +5185,7 @@ def _step_succeeded(step: Mapping[str, object]) -> bool:
     return bool(success_val)
 
 
-def _first_failed_step(steps: list[object]) -> Mapping[str, object] | None:
+def _first_failed_step(steps: Sequence[Mapping[str, object] | object]) -> Mapping[str, object] | None:
     def _as_mapping(step: object) -> Mapping[str, object] | None:
         if isinstance(step, Mapping):
             return step
@@ -4131,6 +5250,243 @@ def _format_pipeline_failure_context(
     )
 
 
+def prepare_iteration_tasks(task: Mapping[str, object], parent_trace=None) -> PreparedTasks:
+    """Resolve repo paths and index JC repo once for the run."""
+    repo_path = task.get("repo")
+    resolved_repo_path = repo_path if isinstance(repo_path, str) else None
+    jc_repo_id: str | None = None
+    index_obs = None
+    if isinstance(repo_path, str):
+        try:
+            index_obs = start_span(parent_trace, "index_repo", metadata={"repo": repo_path})
+            result = index_folder(repo_path)
+            repo_id = result["repo"]
+            jc_repo_id = repo_id
+            if index_obs and hasattr(index_obs, "end"):
+                index_obs.end(metadata={"repo": repo_id})
+        except Exception as e:  # noqa: BLE001
+            if index_obs is not None and hasattr(index_obs, "end"):
+                try:
+                    index_obs.end(error=e)
+                except Exception:
+                    pass
+    return PreparedTasks(base_task=dict(task), resolved_repo_path=resolved_repo_path, jc_repo_id=jc_repo_id)
+
+
+def evaluate_policy_on_item(
+    ic_task: Mapping[str, object],
+    baseline_snapshot: BaselineSnapshot | None,
+    iteration_span: object | None = None,
+    iteration_index: int | None = None,
+) -> EvaluationResult:
+    """Load current policy, execute IC iteration, and compute metrics."""
+    policy_load_obs = None
+    try:
+        policy_load_obs = start_span(iteration_span, "policy_load", metadata={"iteration": iteration_index})
+        score_fn = load_policy()
+        if policy_load_obs and hasattr(policy_load_obs, "end"):
+            policy_load_obs.end(metadata={"status": "loaded"})
+    except ImportError as e:
+        if policy_load_obs is not None and hasattr(policy_load_obs, "end"):
+            try:
+                policy_load_obs.end(error=e)
+            except Exception:
+                pass
+        metrics_map = {
+            "score": -10.0,
+            "error": f"policy_import_error: {str(e)}",
+        }
+        record_score(iteration_span, "metrics.score", _as_float(metrics_map.get("score", 0.0)))
+        return EvaluationResult(
+            metrics=metrics_map,
+            ic_result={},
+            jc_result={},
+            jc_metrics={},
+            comparison_summary=None,
+            policy_code="",
+            success=False,
+            error=str(metrics_map.get("error")),
+        )
+
+    ic_result = run_ic_iteration(dict(ic_task), score_fn, parent_trace=iteration_span)
+    jc_result = baseline_snapshot.jc_result if baseline_snapshot is not None else {}
+    jc_metrics = baseline_snapshot.jc_metrics if baseline_snapshot is not None else {}
+    if not isinstance(jc_metrics, Mapping):
+        jc_metrics = baseline_metrics_from_jc(jc_result if isinstance(jc_result, Mapping) else {})
+
+    combined_result = {"iterative_context": ic_result, "jcodemunch": jc_result}
+    metrics_map: dict[str, object] = dict(score(combined_result))
+    if ic_result.get("node_count", 0) == 0:
+        metrics_map["score"] = _as_float(metrics_map.get("score", 0.0)) - 1.0
+        metrics_map["error"] = "no_tool_usage"
+
+    total_ic, errors_ic = _tool_call_stats(ic_result)
+    total_jc, errors_jc = _tool_call_stats(jc_result if isinstance(jc_result, Mapping) else {})
+    total_calls = total_ic + total_jc
+    total_errors = errors_ic + errors_jc
+    metrics_map["tool_error_rate"] = (total_errors / total_calls) if total_calls else 0.0
+    metrics_map["no_tool_usage"] = total_ic == 0
+    comparison = build_comparison(metrics_map, jc_metrics if isinstance(jc_metrics, Mapping) else {})
+    comparison_summary = format_comparison_summary(comparison)
+    metrics_map.setdefault("iteration_regression", False)
+    metrics_map["jc_baseline_metrics"] = dict(jc_metrics) if isinstance(jc_metrics, Mapping) else {}
+    metrics_map["comparison"] = comparison
+    for name, value in metrics_map.items():
+        if isinstance(value, (int, float, bool)):
+            record_score(iteration_span, f"metrics.{name}", float(value))
+
+    policy_code = _read_policy()
+    return EvaluationResult(
+        metrics=metrics_map,
+        ic_result=ic_result,
+        jc_result=jc_result if isinstance(jc_result, Mapping) else {},
+        jc_metrics=jc_metrics if isinstance(jc_metrics, Mapping) else {},
+        comparison_summary=comparison_summary,
+        policy_code=policy_code,
+    )
+
+
+def build_iteration_feedback(
+    evaluation: EvaluationResult,
+    prev_score: float | None,
+    prev_classified: dict[str, object] | None,
+    repo_root: Path,
+) -> FeedbackPackage:
+    """Package evaluation outputs into writer-facing inputs."""
+    tests = load_tests(repo_root)
+    tests_str = format_tests_for_prompt(tests)
+    types_str = load_scoring_types(repo_root)
+    examples_str = load_scoring_examples(repo_root)
+    scoring_ctx = format_scoring_context(types_str, examples_str)
+
+    diff_str = ""
+    diff_hint = ""
+    if prev_score is not None and prev_classified is not None:
+        try:
+            diff = compute_diff(prev_score, _as_float(evaluation.metrics.get("score", 0.0)), prev_classified, prev_classified)
+            diff_str = format_diff(diff)
+            diff_hint = interpret_diff(diff)
+        except Exception:
+            diff_str = ""
+            diff_hint = ""
+
+    return FeedbackPackage(
+        tests=tests_str,
+        scoring_context=scoring_ctx,
+        comparison_summary=evaluation.comparison_summary,
+        feedback=dict(evaluation.metrics),
+        feedback_str=str(evaluation.metrics.get("error", "")),
+        guidance_hint="Fix errors before improving score",
+        diff_str=diff_str,
+        diff_hint=diff_hint,
+    )
+
+
+def attempt_policy_generation(
+    *,
+    feedback: dict[str, object],
+    initial_policy: str,
+    tests: str,
+    scoring_context: str,
+    feedback_str: str,
+    guidance_hint: str,
+    diff_str: str,
+    diff_hint: str,
+    comparison_summary: str | None,
+    failure_context_str: str | None,
+    repair_attempt: int,
+    parent_trace=None,
+    pipeline_feedback: Mapping[str, object] | None = None,
+) -> tuple[str | None, str | None]:
+    try:
+        new_code = generate_policy(
+            feedback={**feedback, **({"pipeline_feedback": pipeline_feedback} if pipeline_feedback else {})},
+            current_policy=initial_policy,
+            tests=tests,
+            scoring_context=scoring_context,
+            feedback_str=str(feedback_str),
+            guidance_hint=guidance_hint,
+            diff_str=diff_str,
+            diff_hint=diff_hint,
+            comparison_summary=comparison_summary,
+            parent_trace=parent_trace,
+            failure_context=failure_context_str,
+            repair_attempt=repair_attempt,
+        )
+        new_code = _clean_policy_code(new_code)
+        return new_code, None
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)
+
+
+def run_policy_pipeline(pipeline, repo_root: Path, repair_obs: object | None = None) -> tuple[list[PipelineStepResult], list[StepResult], bool]:
+    step_results = pipeline.run(repo_root, observation=repair_obs)
+    pipeline_results = [PipelineStepResult.from_mapping(r) for r in _map_steps(list(step_results))]
+    normalized_results = pipeline_results or [PipelineStepResult.from_mapping(r) for r in _map_steps(list(step_results))]
+    pipeline_success = all(_step_succeeded(r.to_mapping()) for r in normalized_results)
+    return pipeline_results, list(step_results), pipeline_success
+
+
+def finalize_successful_policy(
+    *,
+    new_code: str,
+    attempts_used: int,
+    max_repair_attempts: int,
+    repair_obs=None,
+) -> tuple[str, dict[str, object]]:
+    final_policy = _read_policy()
+    metadata: dict[str, object] = {
+        "repair_attempts": attempts_used - 1,
+        "max_policy_repairs": max_repair_attempts,
+        "accepted_policy_source": "post_pipeline_disk",
+        "accepted_policy_changed_by_pipeline": final_policy != new_code,
+    }
+    return final_policy, metadata
+
+
+def finalize_failed_repair(
+    *,
+    metadata: dict[str, object],
+    pipeline_results: list[Mapping[str, object]],
+    classified: Mapping[str, object],
+    writer_model: str | None,
+    attempts_used: int,
+) -> tuple[str, str]:
+    failed_step = _first_failed_step(pipeline_results)
+    if failed_step:
+        metadata["failed_step"] = failed_step.get("name")
+        metadata["failed_exit_code"] = failed_step.get("exit_code")
+        metadata["failed_summary"] = _compact_failure(failed_step)
+    metadata["pipeline_feedback"] = classified
+    metadata["error"] = "pipeline_failed"
+    writer_err_val = metadata.get("writer_error")
+    writer_err_str = str(writer_err_val) if writer_err_val is not None else None
+    failure_context_str = _format_pipeline_failure_context(pipeline_results, classified, writer_err_str, writer_model, attempts_used)
+    return failure_context_str, _read_policy()
+
+
+def _build_dependencies(repair_override=None) -> LoopDependencies:
+    return LoopDependencies(
+        prepare_iteration_tasks=prepare_iteration_tasks,
+        evaluate_policy_on_item=evaluate_policy_on_item,
+        build_iteration_feedback=build_iteration_feedback,
+        attempt_policy_generation=attempt_policy_generation,
+        run_policy_pipeline=run_policy_pipeline,
+        finalize_successful_policy=finalize_successful_policy,
+        finalize_failed_repair=finalize_failed_repair,
+        classify_results=lambda results: classify_results(list(results)),
+        format_pipeline_failure_context=_format_pipeline_failure_context,
+        read_policy=_read_policy,
+        write_policy=_write_policy,
+        get_writer_model=get_writer_model,
+        record_score=record_score,
+        start_span=start_span,
+        find_repo_root=find_repo_root,
+        default_pipeline=default_pipeline,
+        repair_via_synthesize=repair_override,
+    )
+
+
 def synthesize_valid_policy(
     *,
     repo_root: Path,
@@ -4143,253 +5499,107 @@ def synthesize_valid_policy(
     diff_str: str,
     diff_hint: str,
     comparison_summary: str | None,
-    parent_trace=None,
+    parent_trace: object | None = None,
     max_repair_attempts: int = _MAX_POLICY_REPAIRS,
-) -> tuple[str, list[Mapping[str, object]], bool, int, dict[str, object]]:
-    """
-    Generate and iteratively repair policy until validation pipeline passes or attempts exhausted.
-    Returns (policy_code, pipeline_results, success, attempts_used, metadata).
-    """
-    attempts_used = 0
-    failure_context_str: str | None = None
-    writer_model = get_writer_model()
-    pipeline_results: list[Mapping[str, object]] = []
-    metadata: dict[str, object] = {}
-    last_classified: Mapping[str, object] | None = None
-    pipeline = default_pipeline()
-    while attempts_used < max_repair_attempts:
-        repair_obs = start_span(parent_trace, f"policy_repair_attempt_{attempts_used}", metadata={"attempt": attempts_used})
-        guidance = (
-            "Repair mode: produce the smallest change that makes harness/policy.py pass ruff, basedpyright, and pytest. "
-            "Add missing parameter annotations and return type -> float. Do not optimize score until the policy is valid."
-            if attempts_used > 0
-            else guidance_hint
-        )
-        if last_classified and last_classified.get("type_errors"):
-            guidance += " Fix all type errors and ensure parameters are annotated; avoid unknown types."
-        try:
-            new_code = generate_policy(
-                feedback={**feedback, **({"pipeline_feedback": last_classified} if last_classified else {})},
-                current_policy=initial_policy,
-                tests=tests,
-                scoring_context=scoring_context,
-                feedback_str=str(feedback_str),
-                guidance_hint=guidance,
-                diff_str=diff_str,
-                diff_hint=diff_hint,
-                comparison_summary=comparison_summary,
-                parent_trace=repair_obs,
-                failure_context=failure_context_str,
-                repair_attempt=attempts_used,
-            )
-            new_code = _clean_policy_code(new_code)
-            if "import " in new_code:
-                if repair_obs and hasattr(repair_obs, "end"):
-                    repair_obs.end(error="blocked_import")
-                metadata["error"] = "blocked_import"
-                break
-            _write_policy(new_code)
-        except Exception as e:  # noqa: BLE001
-            metadata["writer_error"] = str(e)
-            attempts_used += 1
-            if repair_obs and hasattr(repair_obs, "end"):
-                try:
-                    repair_obs.end(error=e)
-                except Exception:
-                    pass
-            failure_context_str = _format_pipeline_failure_context([], {}, metadata.get("writer_error"), writer_model, attempts_used)
-            continue
+) -> tuple[str, list[dict[str, object]], bool, int, dict[str, object]]:
+    """Compatibility wrapper that reuses the repair state machine."""
+    evaluation = EvaluationResult(
+        metrics=dict(feedback),
+        ic_result={},
+        jc_result={},
+        jc_metrics={},
+        comparison_summary=comparison_summary,
+        policy_code=initial_policy,
+    )
+    feedback_pkg = FeedbackPackage(
+        tests=tests,
+        scoring_context=scoring_context,
+        comparison_summary=comparison_summary,
+        feedback=dict(feedback),
+        feedback_str=feedback_str,
+        guidance_hint=guidance_hint,
+        diff_str=diff_str,
+        diff_hint=diff_hint,
+    )
+    repair_ctx = RepairContext(
+        repo_root=repo_root,
+        evaluation=evaluation,
+        feedback=feedback_pkg,
+        max_repair_attempts=max_repair_attempts,
+        parent_trace=parent_trace,
+        writer_model=get_writer_model(),
+        pipeline=default_pipeline(),
+    )
+    repair_model = RepairMachineModel(
+        context=repair_ctx,
+        deps=_build_dependencies(),
+    )
+    repair_machine = RepairStateMachine(repair_model)
+    outcome = repair_machine.run()
+    pipeline_results = [r.to_mapping() for r in outcome.pipeline_results]
+    return outcome.policy, pipeline_results, outcome.success, outcome.attempts_used, outcome.metadata
 
-        step_results = pipeline.run(repo_root, observation=repair_obs)
-        pipeline_results = _map_steps(list(step_results))
-        normalized_results = pipeline_results or _map_steps(list(step_results))
-        pipeline_success = all(_step_succeeded(r) for r in normalized_results)
-        attempts_used += 1
-        if pipeline_success:
-            # Ruff may have modified files; accept on-disk version.
-            final_policy = _read_policy()
-            metadata["repair_attempts"] = attempts_used - 1
-            metadata["max_policy_repairs"] = max_repair_attempts
-            metadata["accepted_policy_source"] = "post_pipeline_disk"
-            metadata["accepted_policy_changed_by_pipeline"] = final_policy != new_code
-            if repair_obs and hasattr(repair_obs, "end"):
-                repair_obs.end(metadata={"status": "passed"})
-            return final_policy, pipeline_results, True, attempts_used, metadata
 
-        classified = classify_results(step_results)
-        last_classified = classified
-        failed_step = _first_failed_step(pipeline_results)
-        if failed_step:
-            metadata["failed_step"] = failed_step.get("name")
-            metadata["failed_exit_code"] = failed_step.get("exit_code")
-            metadata["failed_summary"] = _compact_failure(failed_step)
-        metadata["pipeline_feedback"] = classified
-        metadata["error"] = "pipeline_failed"
-        failure_context_str = _format_pipeline_failure_context(pipeline_results, classified, metadata.get("writer_error"), writer_model, attempts_used)
-        initial_policy = _read_policy()
-        if repair_obs and hasattr(repair_obs, "end"):
-            repair_obs.end(metadata={"status": "failed", "error": metadata.get("error")})
-    metadata.setdefault("repair_attempts", attempts_used)
-    metadata["max_policy_repairs"] = max_repair_attempts
-    if pipeline_results and all(_step_succeeded(r) for r in pipeline_results):
-        return _read_policy(), pipeline_results, True, attempts_used, metadata
-    return initial_policy, pipeline_results, False, attempts_used, metadata
+_ORIGINAL_SYNTHESIZE = synthesize_valid_policy
 
 
 def run_loop(
     task: Mapping[str, object],
     iterations: int = 5,
-    parent_trace=None,
-    baseline_snapshot: Mapping[str, object] | None = None,
-) -> list[dict[str, object]]:
+    parent_trace: object | None = None,
+    baseline_snapshot: BaselineSnapshot | None = None,
+) -> list[IterationRecord]:
     """
     Closed-loop optimizer: execute, score, rewrite policy, repeat.
     """
-    history: list[dict[str, object]] = []
-    prev_score: float | None = None
-    prev_classified: dict[str, object] | None = None
-    repo_path = task.get("repo")
-    resolved_repo_path = repo_path if isinstance(repo_path, str) else None
-    jc_repo_id: str | None = None
     root_meta = {"task": dict(task), "iterations": iterations}
-    writer_model = get_writer_model()
     run_trace = start_span(parent_trace, "run_loop", metadata=root_meta, input=task) if parent_trace else start_trace("run_loop", metadata=root_meta, input=task)
-    index_obs = None
-    if isinstance(repo_path, str):
-        try:
-            index_obs = start_span(run_trace, "index_repo", metadata={"repo": repo_path})
-            result = index_folder(repo_path)
-            repo_id = result["repo"]
-            jc_repo_id = repo_id
-            if index_obs and hasattr(index_obs, "end"):
-                index_obs.end(metadata={"repo": repo_id})
-        except Exception as e:  # noqa: BLE001
-            if index_obs is not None:
-                try:
-                    index_obs.end(error=e)
-                except Exception:
-                    pass
-
-    try:
-        for i in range(iterations):
-            ic_task = dict(task)
-            if resolved_repo_path is not None:
-                ic_task["repo"] = resolved_repo_path
-            jc_task = dict(task)
-            if jc_repo_id is not None:
-                jc_task["repo"] = jc_repo_id
-            elif resolved_repo_path is not None:
-                jc_task["repo"] = resolved_repo_path
-
-            iteration_span = start_span(
-                run_trace,
-                f"iteration_{i}",
-                metadata={"iteration": i, "iterations": iterations, "task": dict(ic_task), "jc_repo": jc_task.get("repo")},
-            )
-            policy_load_obs = None
-            try:
-                policy_load_obs = start_span(iteration_span, "policy_load", metadata={"iteration": i})
-                score_fn = load_policy()
-                if policy_load_obs and hasattr(policy_load_obs, "end"):
-                    policy_load_obs.end(metadata={"status": "loaded"})
-            except ImportError as e:
-                if policy_load_obs is not None:
-                    try:
-                        policy_load_obs.end(error=e)
-                    except Exception:
-                        pass
-                metrics_map = {
-                    "score": -10.0,
-                    "error": f"policy_import_error: {str(e)}",
-                }
-                record_score(iteration_span, "metrics.score", _as_float(metrics_map.get("score", 0.0)))
-                history.append(metrics_map)
-                if iteration_span and hasattr(iteration_span, "end"):
-                    try:
-                        iteration_span.end(metadata={"status": "failed", "error": metrics_map.get("error")})
-                    except Exception:
-                        pass
-                continue
-
-            ic_result = run_ic_iteration(ic_task, score_fn, parent_trace=iteration_span)
-            jc_result = baseline_snapshot.get("jc_result") if isinstance(baseline_snapshot, Mapping) else {}
-            jc_metrics = baseline_snapshot.get("jc_metrics") if isinstance(baseline_snapshot, Mapping) else {}
-            if not isinstance(jc_metrics, Mapping):
-                jc_metrics = baseline_metrics_from_jc(jc_result if isinstance(jc_result, Mapping) else {})
-            combined_result = {"iterative_context": ic_result, "jcodemunch": jc_result}
-            metrics_map: dict[str, object] = dict(score(combined_result))
-            if ic_result.get("node_count", 0) == 0:
-                metrics_map["score"] = _as_float(metrics_map.get("score", 0.0)) - 1.0
-                metrics_map["error"] = "no_tool_usage"
-            total_ic, errors_ic = _tool_call_stats(ic_result)
-            total_jc, errors_jc = _tool_call_stats(jc_result if isinstance(jc_result, Mapping) else {})
-            total_calls = total_ic + total_jc
-            total_errors = errors_ic + errors_jc
-            metrics_map["tool_error_rate"] = (total_errors / total_calls) if total_calls else 0.0
-            metrics_map["no_tool_usage"] = total_ic == 0
-            comparison = build_comparison(metrics_map, jc_metrics if isinstance(jc_metrics, Mapping) else {})
-            comparison_summary = format_comparison_summary(comparison)
-            metrics_map.setdefault("iteration_regression", False)
-            metrics_map["jc_baseline_metrics"] = dict(jc_metrics) if isinstance(jc_metrics, Mapping) else {}
-            metrics_map["comparison"] = comparison
-            for name, value in metrics_map.items():
-                if isinstance(value, (int, float, bool)):
-                    record_score(iteration_span, f"metrics.{name}", float(value))
-
-            repo_root = find_repo_root()
-            tests = load_tests(repo_root)
-            tests_str = format_tests_for_prompt(tests)
-            types_str = load_scoring_types(repo_root)
-            examples_str = load_scoring_examples(repo_root)
-            scoring_ctx = format_scoring_context(types_str, examples_str)
-            initial_policy = _read_policy()
-            candidate_policy, pipeline_results, pipeline_success, repairs_used, repair_meta = synthesize_valid_policy(
+    repair_override = None
+    if synthesize_valid_policy is not _ORIGINAL_SYNTHESIZE:
+        def _compat_repair(evaluation: EvaluationResult, feedback: FeedbackPackage, repo_root: Path, parent_trace: object | None) -> RepairOutcome:
+            policy, pipeline_results, pipeline_success, attempts, metadata = synthesize_valid_policy(  # type: ignore[call-arg]
                 repo_root=repo_root,
-                initial_policy=initial_policy,
-                feedback=metrics_map,
-                tests=tests_str,
-                scoring_context=scoring_ctx,
-                feedback_str=str(metrics_map.get("error", "")),
-                guidance_hint="Fix errors before improving score",
-                diff_str="",
-                diff_hint="",
-                comparison_summary=comparison_summary,
-                parent_trace=iteration_span,
+                initial_policy=evaluation.policy_code,
+                feedback=feedback.feedback,
+                tests=feedback.tests,
+                scoring_context=feedback.scoring_context,
+                feedback_str=feedback.feedback_str,
+                guidance_hint=feedback.guidance_hint,
+                diff_str=feedback.diff_str,
+                diff_hint=feedback.diff_hint,
+                comparison_summary=feedback.comparison_summary,
+                parent_trace=parent_trace,
                 max_repair_attempts=_MAX_POLICY_REPAIRS,
             )
-            metrics_map.update(repair_meta)
-            metrics_map["pipeline_passed"] = pipeline_success
-            metrics_map["repair_attempts"] = repair_meta.get("repair_attempts", repairs_used)
-            metrics_map["max_policy_repairs"] = repair_meta.get("max_policy_repairs", _MAX_POLICY_REPAIRS)
-            metrics_map["pipeline_feedback"] = repair_meta.get("pipeline_feedback", {})
-            if pipeline_results:
-                metrics_map["failed_step"] = metrics_map.get("failed_step") or _first_failed_step(pipeline_results).get("name") if _first_failed_step(pipeline_results) else None
-                metrics_map["failed_exit_code"] = metrics_map.get("failed_exit_code") or (metrics_map.get("failed_step") and repair_meta.get("failed_exit_code"))
-                metrics_map["failed_summary"] = metrics_map.get("failed_summary") or repair_meta.get("failed_summary")
-            if not pipeline_success:
-                record_score(iteration_span, "pipeline_passed", False)
-                history.append(metrics_map)
-                if iteration_span and hasattr(iteration_span, "end"):
-                    try:
-                        iteration_span.end(metadata={"status": "failed", "pipeline_passed": False, "error": metrics_map.get("error"), "writer_error": metrics_map.get("writer_error")})
-                    except Exception:
-                        pass
-                continue
+            return RepairOutcome(
+                policy=policy,
+                pipeline_results=[PipelineStepResult.from_mapping(r) for r in pipeline_results],
+                success=pipeline_success,
+                attempts_used=attempts,
+                metadata=metadata,
+            )
 
-            record_score(iteration_span, "pipeline_passed", True)
-            history.append(metrics_map)
-            prev_score = _as_float(metrics_map.get("score", 0.0))
-            prev_classified = {
-                "type_errors": "",
-                "lint_errors": "",
-                "test_failures": "",
-                "passed": [],
-            }
-            if iteration_span and hasattr(iteration_span, "end"):
-                try:
-                    iteration_span.end(metadata={"status": "complete", "score": prev_score})
-                except Exception:
-                    pass
+        repair_override = _compat_repair
+    baseline_model = (
+        BaselineSnapshot.model_validate(baseline_snapshot)
+        if isinstance(baseline_snapshot, Mapping)
+        else baseline_snapshot
+    )
+    context = LoopContext(
+        task=task,
+        iterations=iterations,
+        baseline_snapshot=baseline_model,
+        run_trace=run_trace,
+    )
+    opt_model = OptimizationMachineModel(
+        context=context,
+        deps=_build_dependencies(repair_override),
+        max_policy_repairs=_MAX_POLICY_REPAIRS,
+    )
+    machine = OptimizationStateMachine(opt_model)
+    history: list[IterationRecord] = []
+    try:
+        history = machine.run()
     except KeyboardInterrupt:
         if run_trace and hasattr(run_trace, "end"):
             try:
@@ -4462,18 +5672,18 @@ def score(node: object, state: object, context: object | None = None) -> float:
     Parameters
     ----------
     node: object
-        Graph node, expected to have ``state``, ``id`` and optional ``tokens`` attributes.
+        The graph node, expected to have ``state``, ``id`` and optional ``tokens`` attributes.
     state: object
         Graph‑like object providing ``in_degree`` and ``out_degree`` callables.
     context: object | None, optional
-        Additional context; if it provides a numeric ``scale`` attribute it will be applied.
+        Optional additional context; if it provides a numeric ``scale`` attribute it will be applied.
     """
-    # Safely extract attributes.
+    # Safely extract node attributes.
     n_state = getattr(node, "state", None)
     n_id = getattr(node, "id", None)
     tokens = getattr(node, "tokens", None)
 
-    total = 0.0
+    total: float = 0.0
 
     # State contribution.
     if n_state == "pending":
@@ -4484,18 +5694,18 @@ def score(node: object, state: object, context: object | None = None) -> float:
     # Degree contribution.
     if n_id is not None:
         degree = 0
-        in_deg_func = getattr(state, "in_degree", None)
-        out_deg_func = getattr(state, "out_degree", None)
-        if callable(in_deg_func):
+        in_func = getattr(state, "in_degree", None)
+        out_func = getattr(state, "out_degree", None)
+        if callable(in_func):
             try:
-                val = in_deg_func(n_id)
+                val = in_func(n_id)
                 if isinstance(val, (int, float)):
                     degree += int(val)
             except Exception:
                 pass
-        if callable(out_deg_func):
+        if callable(out_func):
             try:
-                val = out_deg_func(n_id)
+                val = out_func(n_id)
                 if isinstance(val, (int, float)):
                     degree += int(val)
             except Exception:
@@ -4531,6 +5741,7 @@ dependencies = [
     "pytest>=8.3.0",
     "pytest-timeout>=2.3.1",
     "python-dotenv>=1.0.0",
+    "python-statemachine>=3.0.0",
 ]
 
 [tool.uv.sources]
@@ -4549,6 +5760,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from harness.loop import run_loop
+from harness.loop_types import IterationRecord
 from harness.observability.baselines import BaselineBundle, load_baseline_bundle, save_baseline_bundle
 from harness.observability.experiments import (
     run_hosted_ic_optimization_experiment,
@@ -4587,7 +5799,7 @@ def main(argv: list[str] | None = None) -> None:
             if args.baseline_path:
                 save_baseline_bundle(bundle, Path(args.baseline_path))
                 print(f"[RUN] Baseline bundle saved to {args.baseline_path}")
-            print(f"[RUN] Baselines computed: {len(bundle.get('items', []))}")
+            print(f"[RUN] Baselines computed: {len(bundle.items)}")
         elif args.dataset and args.ic_optimize:
             print(f"[RUN] Hosted IC optimization experiment: {args.dataset}")
             bundle = _load_baseline(args.baseline_path)
@@ -4607,14 +5819,14 @@ def main(argv: list[str] | None = None) -> None:
             task: Mapping[str, object] = {"symbol": args.symbol, "repo": resolved_repo}
             print(f"[RUN] Ad hoc run for repo '{repo_ref}' -> {resolved_repo}, symbol='{args.symbol}'")
             history = run_loop(task, iterations=args.iterations)
-            last = history[-1] if history else {}
-            last_score: Any = last.get("score") if isinstance(last, Mapping) else None
+            last: IterationRecord | None = history[-1] if history else None
+            last_score: Any = last.metrics.get("score") if last else None
             print(f"[RUN] Completed {len(history)} iterations. Last score: {last_score}")
-            if isinstance(last, Mapping):
-                failed_step = last.get("failed_step")
-                failed_exit = last.get("failed_exit_code")
-                failed_summary = last.get("failed_summary")
-                last_error = last.get("error") or last.get("writer_error")
+            if last:
+                failed_step = last.failed_step
+                failed_exit = last.failed_exit_code
+                failed_summary = last.failed_summary
+                last_error = last.error or last.writer_error
                 if failed_step:
                     print(f"[RUN] Last failed step: {failed_step}")
                     if failed_exit is not None:

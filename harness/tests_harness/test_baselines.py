@@ -13,7 +13,18 @@ def test_baseline_key_uses_id_or_hash():
 
 def test_resolve_baseline_prefers_id():
     item = baselines.normalize_dataset_item({"repo": "r", "symbol": "s", "id": "abc"})  # type: ignore[arg-type]
-    snap = baselines.BaselineSnapshot(dataset_name=None, dataset_version=None, item_id="abc", repo="r", symbol="s", jc_result={}, jc_metrics={}, experiment_run_id=None, trace_id=None, metadata={})
+    snap = baselines.BaselineSnapshot(
+        dataset_name=None,
+        dataset_version=None,
+        item_id="abc",
+        repo="r",
+        symbol="s",
+        jc_result={},
+        jc_metrics={},
+        experiment_run_id=None,
+        trace_id=None,
+        metadata={},
+    )
     resolved = baselines.resolve_baseline([snap], item)
     assert resolved is snap
 
@@ -36,7 +47,7 @@ def test_baseline_bundle_roundtrip(tmp_path):
     baselines.save_baseline_bundle(bundle, path)
     loaded = baselines.load_baseline_bundle(path)
     resolved = baselines.require_baseline(loaded, baselines.normalize_dataset_item({"repo": "r", "symbol": "s"}))  # type: ignore[arg-type]
-    metrics = resolved.get("jc_metrics", {})
+    metrics = resolved.jc_metrics
     assert metrics.get("score") == 1.0
 
 

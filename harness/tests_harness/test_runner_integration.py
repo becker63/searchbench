@@ -35,7 +35,7 @@ def test_run_hosted_dataset_experiment_uses_get_dataset(monkeypatch):
         experiment_name="exp",
         task_fn=lambda item, trace=None: {"ok": True},
     )
-    assert result.get("run_id") == "rid"
+    assert result.run_id == "rid"
     assert calls["get_dataset"] == 1 and calls["run_experiment"] == 1
 
 
@@ -56,5 +56,5 @@ def test_run_local_dataset_experiment_calls_client(monkeypatch):
         experiment_name="exp_local",
         task_fn=lambda item, trace=None: {"ok": True},
     )
-    assert result.get("run_id") == "rid"
+    assert result.run_id == "rid"
     assert calls["run_experiment"] == 1
