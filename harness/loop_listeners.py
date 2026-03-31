@@ -21,7 +21,28 @@ def _safe_end_span(span: object | None, **kwargs) -> None:
 
 
 class RepairTracingListener:
-    """Listener that manages repair attempt span lifecycle."""
+    """Listener that owns the full repair attempt span lifecycle.
+
+    Opens spans via ``on_transition`` (which fires before the machine's
+    ``on_enter_generating_candidate`` callback) so the span exists before
+    ``_run_writer()`` does any work.  Closes spans on state-exit transitions
+    (``retrying``, ``candidate_valid``, ``repair_exhausted``).
+    """
+
+    def on_transition(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
+        target = getattr(event_data, "target", None)
+        if target is None or getattr(target, "id", None) != "generating_candidate":
+            return
+        from .loop_machine import RepairStateMachine
+
+        machine: RepairStateMachine = cast(RepairStateMachine, getattr(event_data, "machine", None))
+        ctx = machine.model.context
+        if ctx.repair_observation is None:
+            ctx.repair_observation = machine.model.deps.start_span(
+                ctx.parent_trace,
+                f"policy_repair_attempt_{ctx.attempts_used}",
+                metadata={"attempt": ctx.attempts_used},
+            )
 
     def on_enter_retrying(self, event: object, state: State, event_data, **kwargs) -> None:
         from .loop_machine import RepairStateMachine

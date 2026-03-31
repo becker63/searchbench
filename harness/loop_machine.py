@@ -100,13 +100,6 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
 
     # Writer/pipeline execution ------------------------------------------
     def on_enter_generating_candidate(self, event: object, state: State) -> None:
-        ctx = self.context
-        if ctx.repair_observation is None:
-            ctx.repair_observation = self.deps.start_span(
-                ctx.parent_trace,
-                f"policy_repair_attempt_{ctx.attempts_used}",
-                metadata={"attempt": ctx.attempts_used},
-            )
         self._run_writer()
 
     def on_enter_retrying(self, event: object, state: State) -> None:
