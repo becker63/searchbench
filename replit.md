@@ -12,7 +12,10 @@ A benchmarking and optimization harness for AI agents that navigate codebases. I
 
 - **`harness/`** — Core benchmarking engine (main package)
   - `run.py` — Entry point (CLI with argparse)
-  - `loop.py` / `loop_machine.py` — Optimization state machine
+  - `loop.py` — Thin bootstrap / dependency wiring layer
+  - `loop_machine.py` — State machine orchestration core (`OptimizationStateMachine`, `RepairStateMachine`)
+  - `loop_listeners.py` — Extracted tracing listeners (`RepairTracingListener`, `OptimizationTracingListener`)
+  - `loop_types.py` — Pydantic models for machine state, context, outcomes
   - `runner.py` — Agent execution and tool call handling
   - `policy.py` — Active scoring policy (dynamically updated)
   - `pipeline/` — Validation steps (Ruff, Pyright, Pytest)
@@ -21,10 +24,10 @@ A benchmarking and optimization harness for AI agents that navigate codebases. I
   - `utils/` — Helpers for diffing, repo resolution, etc.
 
 - **`iterative-context/`** — Git submodule (graph-based codebase exploration)
-  - Currently empty; stub package created in `iterative_context/`
+  - Populated via `git submodule update --init --recursive`
 
 - **`jcodemunch-mcp/`** — Git submodule (MCP adapter for JCodeMunch baseline)
-  - Currently empty; stub package created in `jcodemunch_mcp/`
+  - Currently uses stub package; run `git submodule update --init --recursive` to populate
 
 ## Backends
 
@@ -50,9 +53,9 @@ uv run python run.py --repo small --symbol expand_node --iterations 3
 
 ## Setup Notes
 
-- Git submodules (`iterative-context`, `jcodemunch-mcp`) are empty stubs. To fully enable backends, run: `git submodule update --init --recursive`
-- The `requires-python` was lowered from `>=3.13` to `>=3.12` to match available Replit runtime
+- The `requires-python` was lowered from `>=3.13` to `>=3.12` across all workspace members to match available Replit runtime
 - `mcp` package was added to `harness/pyproject.toml` as it was an implicit dependency
+- After cloning, run `git submodule update --init --recursive` to populate submodules
 
 ## Environment Variables Needed
 
