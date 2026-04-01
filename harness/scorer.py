@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""
+Leaf operation: deterministic scoring/metrics.
+No entrypoint or session policy logic.
+"""
+
 from collections.abc import Mapping
 from typing import Dict, cast
 

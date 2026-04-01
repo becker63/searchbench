@@ -9,7 +9,7 @@ from typing import Mapping, Sequence, cast
 from pydantic import BaseModel, Field
 
 from .datasets import DatasetItem, normalize_dataset_item
-from .langfuse import start_span
+from .langfuse import start_observation
 from .score_emitter import emit_score_for_handle
 from ..scorer import score
 from ..utils.repo_targets import resolve_repo_target
@@ -93,9 +93,9 @@ def compute_baseline_for_item(
     normalized = normalize_dataset_item(item)
     repo_ref = normalized.repo
     resolved_repo = resolve_repo_target(repo_ref)
-    trace = start_span(
-        parent_trace,
-        "jc_baseline_item",
+    with start_observation(
+        name="jc_baseline_item",
+        parent=parent_trace,
         metadata={
             "dataset": dataset_name,
             "dataset_version": dataset_version,
@@ -106,39 +106,34 @@ def compute_baseline_for_item(
             "repo_ref": repo_ref,
             "resolved_repo": resolved_repo,
         },
-    )
-    jc_result = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
-    metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result))
-    trace_id = getattr(trace, "id", None)
-    dataset_run_id = getattr(parent_trace, "id", None)
-    for name, value in metrics.items():
-        data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
-        score_id = f"{trace_id}-baseline.{name}" if trace_id else None
-        emit_score_for_handle(
-            trace,
-            name=f"baseline.{name}",
-            value=float(value) if isinstance(value, bool) else value,
-            data_type=data_type,
-            dataset_run_id=dataset_run_id,
-            score_id=score_id,
+    ) as trace:
+        jc_result = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
+        metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result))
+        trace_id = getattr(trace, "id", None)
+        dataset_run_id = getattr(parent_trace, "id", None)
+        for name, value in metrics.items():
+            data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
+            score_id = f"{trace_id}-baseline.{name}" if trace_id else None
+            emit_score_for_handle(
+                trace,
+                name=f"baseline.{name}",
+                value=float(value) if isinstance(value, bool) else value,
+                data_type=data_type,
+                dataset_run_id=dataset_run_id,
+                score_id=score_id,
+            )
+        return BaselineSnapshot(
+            dataset_name=dataset_name,
+            dataset_version=dataset_version,
+            item_id=normalized.id,
+            repo=normalized.repo,
+            symbol=normalized.symbol,
+            jc_result=dict(jc_result),
+            jc_metrics=metrics,
+            trace_id=trace_id,
+            experiment_run_id=dataset_run_id,
+            metadata={"run_kind": "jc_baseline"},
         )
-    if trace and hasattr(trace, "end"):
-        try:
-            trace.end(metadata={"jc_nodes": metrics.get("jc_nodes", 0)})
-        except Exception:
-            pass
-    return BaselineSnapshot(
-        dataset_name=dataset_name,
-        dataset_version=dataset_version,
-        item_id=normalized.id,
-        repo=normalized.repo,
-        symbol=normalized.symbol,
-        jc_result=dict(jc_result),
-        jc_metrics=metrics,
-        trace_id=getattr(trace, "id", None),
-        experiment_run_id=getattr(parent_trace, "id", None),
-        metadata={"run_kind": "jc_baseline"},
-    )
 
 
 def resolve_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot | None:

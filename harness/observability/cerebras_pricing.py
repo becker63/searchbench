@@ -3,19 +3,19 @@ from __future__ import annotations
 CEREBRAS_PRICING: list[dict[str, str | float]] = [
     {
         "name": "Zaizai GLM 4.7",
-        "match_pattern": r"(?i)zaizai.*glm.*4\\.7",
+        "match_pattern": r"(?i)zaizai.*glm.*4\.7",
         "input_price_per_million": 2.25,
         "output_price_per_million": 2.75,
     },
     {
         "name": "GPT OSS 120B",
-        "match_pattern": r"(?i)gpt[-_ ]oss[-_ ]120b",
+        "match_pattern": r"(?i)gpt[-_ ]?oss[-_ ]?120b",
         "input_price_per_million": 0.35,
         "output_price_per_million": 0.75,
     },
     {
         "name": "Llama 3.1 8B",
-        "match_pattern": r"(?i)llama[-_ ]3\\.1[-_ ]8b",
+        "match_pattern": r"(?i)llama[-_ ]?3\.1[-_ ]?8b",
         "input_price_per_million": 0.10,
         "output_price_per_million": 0.10,
     },
@@ -34,15 +34,112 @@ def pricing_payload() -> list[dict[str, object]]:
     for entry in CEREBRAS_PRICING:
         payload.append(
             {
-                "name": entry["name"],
+                "model_name": entry["name"],
                 "match_pattern": entry["match_pattern"],
-                "prices": {
-                    "input": entry["input_price_per_million"],
-                    "output": entry["output_price_per_million"],
-                },
+                # Use pricing tiers (default tier only) to align with v4 Models API
+                "pricing_tiers": [
+                    {
+                        "name": "standard",
+                        "is_default": True,
+                        "priority": 0,
+                        "conditions": [],
+                        "prices": {
+                            "input": entry["input_price_per_million"],
+                            "output": entry["output_price_per_million"],
+                        },
+                    }
+                ],
+                "unit": "TOKENS",
             }
         )
     return payload
 
 
-__all__ = ["CEREBRAS_PRICING", "pricing_payload"]
+def cost_details_for_usage(model: str | None, usage_details: dict[str, object] | None) -> dict[str, float] | None:
+    """
+    Derive cost_details locally using the Cerebras pricing table to guarantee costs when inference lags.
+    Prices are per million tokens; usage is expected to be token counts.
+    """
+    if not model or not usage_details:
+        return None
+    price_entry = None
+    for entry in CEREBRAS_PRICING:
+        import re
+
+        if re.search(entry["match_pattern"], model, flags=re.IGNORECASE):
+            price_entry = entry
+            break
+    if not price_entry:
+        return None
+    def _as_num(val: object) -> float:
+        if isinstance(val, (int, float)):
+            return float(val)
+        try:
+            return float(val)  # type: ignore[arg-type]
+        except Exception:
+            return 0.0
+
+    inp = _as_num(usage_details.get("input") or usage_details.get("prompt_tokens") or usage_details.get("total"))
+    out = _as_num(usage_details.get("output") or usage_details.get("completion_tokens") or 0)
+    input_price = float(price_entry["input_price_per_million"]) / 1_000_000
+    output_price = float(price_entry["output_price_per_million"]) / 1_000_000
+    costs: dict[str, float] = {}
+    if inp > 0:
+        costs["input"] = inp * input_price
+    if out > 0:
+        costs["output"] = out * output_price
+    total = sum(costs.values())
+    if total > 0:
+        costs["total"] = total
+    return costs or None
+
+
+def sync_cerebras_models(client: object | None = None) -> None:
+    """
+    Sync Cerebras model definitions to Langfuse Cloud Models API.
+
+    Requires a v4 Langfuse client with `api.models.create` available.
+    """
+    if client is None:
+        from .langfuse import get_langfuse_client
+
+        client = get_langfuse_client()
+    models_api = getattr(getattr(client, "api", None), "models", None)
+    create_fn = getattr(models_api, "create", None) if models_api else None
+    list_fn = getattr(models_api, "list", None) if models_api else None
+    delete_fn = getattr(models_api, "delete", None) if models_api else None
+    if not callable(create_fn):
+        raise RuntimeError("Langfuse client does not expose api.models.create; sync models via HTTP or UI.")
+    if not callable(list_fn) or not callable(delete_fn):
+        raise RuntimeError("Langfuse client does not expose api.models.list/delete; cannot upsert models.")
+
+    # Upsert: fetch existing model ids by name, delete, then recreate with current patterns/prices.
+    existing_by_name: dict[str, str] = {}
+    try:
+        page = 1
+        while True:
+            res = list_fn(page=page, limit=100)
+            for model in getattr(res, "data", []) or []:
+                name = getattr(model, "model_name", None)
+                if isinstance(name, str):
+                    existing_by_name[name] = getattr(model, "id", None)
+            meta = getattr(res, "meta", None)
+            if not meta or getattr(meta, "page", 1) >= getattr(meta, "total_pages", 1):
+                break
+            page += 1
+    except Exception:
+        existing_by_name = {}
+
+    for model_def in pricing_payload():
+        name = model_def["model_name"]
+        existing_id = existing_by_name.get(name)
+        if existing_id:
+            try:
+                delete_fn(id=existing_id)
+            except Exception:
+                # best-effort; continue to create if delete fails
+                pass
+        create_fn(**model_def)
+
+
+__all__ = ["CEREBRAS_PRICING", "pricing_payload", "sync_cerebras_models"]

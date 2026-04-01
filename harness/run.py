@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+"""
+CLI entrypoint: parse arguments, build typed requests, and dispatch to application services.
+No leaf logic or internal coordination lives here.
+"""
+
 import argparse
 from pathlib import Path
 from typing import Any, Mapping
 
-from harness.loop import run_loop
-from harness.loop_types import IterationRecord
+from harness.entrypoints import (
+    AdHocOptimizationRequest,
+    HostedICOptimizationRequest,
+    HostedJCBaselineRequest,
+)
+from harness.loop import IterationRecord, run_loop
 from harness.observability.baselines import BaselineBundle, load_baseline_bundle, save_baseline_bundle
 from harness.observability.experiments import (
     run_hosted_ic_optimization_experiment,
     run_hosted_jc_baseline_experiment,
 )
 from harness.observability.langfuse import flush_langfuse
+from harness.observability.session_policy import SessionConfig, resolve_session_id
 from harness.utils.repo_targets import resolve_repo_target
 
 
@@ -35,12 +45,30 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--recompute-baselines", action="store_true", help="Recompute baselines if none provided")
     parser.add_argument("--repo", help="Repo target ref or path for ad hoc run (e.g., small, medium)", default="small")
     parser.add_argument("--symbol", help="Symbol/function name for ad hoc run", default="expand_node")
+    parser.add_argument("--session-id", help="Optional explicit session id")
+    parser.add_argument(
+        "--session-scope",
+        choices=["run", "item"],
+        help="Session scope (default run for ad hoc, item for hosted)",
+    )
+    parser.add_argument(
+        "--allow-session-fallback",
+        action="store_true",
+        help="Allow deterministic fallback session id generation at entrypoints",
+    )
     args = parser.parse_args(argv)
 
     try:
         if args.dataset and args.jc_baseline:
             print(f"[RUN] Hosted JC baseline experiment: {args.dataset}")
-            bundle = run_hosted_jc_baseline_experiment(args.dataset, version=args.version)
+            scope = args.session_scope or "item"
+            session_cfg = SessionConfig(
+                session_id=args.session_id,
+                session_scope=scope,  # type: ignore[arg-type]
+                allow_generated_fallback=args.allow_session_fallback,
+            )
+            jc_req = HostedJCBaselineRequest(dataset=args.dataset, version=args.version, session=session_cfg)
+            bundle = run_hosted_jc_baseline_experiment(jc_req)
             if args.baseline_path:
                 save_baseline_bundle(bundle, Path(args.baseline_path))
                 print(f"[RUN] Baseline bundle saved to {args.baseline_path}")
@@ -50,20 +78,43 @@ def main(argv: list[str] | None = None) -> None:
             bundle = _load_baseline(args.baseline_path)
             if bundle:
                 print("[RUN] Loaded baseline bundle")
-            results = run_hosted_ic_optimization_experiment(
-                args.dataset,
+            scope = args.session_scope or "item"
+            session_cfg = SessionConfig(
+                session_id=args.session_id,
+                session_scope=scope,  # type: ignore[arg-type]
+                allow_generated_fallback=args.allow_session_fallback,
+            )
+            ic_req = HostedICOptimizationRequest(
+                dataset=args.dataset,
                 version=args.version,
                 iterations=args.iterations,
                 baselines=bundle,
                 recompute_baselines=args.recompute_baselines,
+                session=session_cfg,
             )
+            results = run_hosted_ic_optimization_experiment(ic_req)
             print(f"[RUN] Optimization items completed: {len(results)}")
         else:
             repo_ref = args.repo or "small"
             resolved_repo = resolve_repo_target(repo_ref)
             task: Mapping[str, object] = {"symbol": args.symbol, "repo": resolved_repo}
             print(f"[RUN] Ad hoc run for repo '{repo_ref}' -> {resolved_repo}, symbol='{args.symbol}'")
-            history = run_loop(task, iterations=args.iterations)
+            session_cfg = SessionConfig(
+                session_id=args.session_id,
+                session_scope=(args.session_scope or "run"),  # type: ignore[arg-type]
+                allow_generated_fallback=args.allow_session_fallback,
+            )
+            ad_req = AdHocOptimizationRequest(
+                repo_ref=repo_ref,
+                symbol=args.symbol,
+                iterations=args.iterations,
+                session=session_cfg,
+            )
+            resolved_session = resolve_session_id(
+                session_cfg,
+                run_id=repo_ref,
+            )
+            history = run_loop(task, iterations=ad_req.iterations, session_id=resolved_session)
             last: IterationRecord | None = history[-1] if history else None
             last_score: Any = last.metrics.get("score") if last else None
             print(f"[RUN] Completed {len(history)} iterations. Last score: {last_score}")

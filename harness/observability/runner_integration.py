@@ -5,7 +5,7 @@ from typing import Any, Callable, Mapping, cast
 
 from pydantic import BaseModel, Field
 
-from .langfuse import get_langfuse_client
+from .langfuse import flush_langfuse, get_langfuse_client
 
 
 class HostedRunItemResult(BaseModel):
@@ -73,7 +73,7 @@ def run_hosted_dataset_experiment(
     result = cast(Any, dataset).run_experiment(**run_kwargs)
     run_id = cast(str | None, getattr(result, "id", None) or getattr(result, "run_id", None))
     items_raw = getattr(result, "items", None) or getattr(result, "item_results", None)
-    return HostedRunResult(
+    hosted_result = HostedRunResult(
         run_id=run_id,
         run_name=run_name,
         dataset_name=dataset_name,
@@ -81,6 +81,8 @@ def run_hosted_dataset_experiment(
         items=_normalize_items(items_raw),
         metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})},
     )
+    flush_langfuse()
+    return hosted_result
 
 
 __all__ = ["HostedRunResult", "run_hosted_dataset_experiment"]

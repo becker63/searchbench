@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+"""
+Leaf operation: policy writer/generator.
+No CLI or orchestration logic; only generation and validation.
+"""
+
 import json
 import time
 from typing import Any, Mapping
 
-from .observability.langfuse import get_tracing_openai_client, start_span
+from .observability.langfuse import get_tracing_openai_client, start_observation
 from .observability.score_emitter import emit_score_for_handle
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from .prompts import WriterPromptContext
 from .utils.template_loader import render_prompt_template
+from .runner import _usage_from_response  # reuse usage mapping for OpenAI-style responses
 
 _client: Any | None = None
 _WRITER_TEMPLATE = "policy_writer.jinja"
@@ -145,10 +151,6 @@ def generate_policy(
     if failure_context:
         failure_context = failure_context[:failure_context_budget]
     completion_tokens = model_budget.completion_reserve
-    writer_obs = start_span(parent_trace, "policy_writer", metadata={"model": model})
-    response = None
-    emit_score_for_handle(writer_obs, name="writer.policy_generated", value=False, data_type="BOOLEAN")
-    emit_score_for_handle(writer_obs, name="writer.policy_compiled", value=False, data_type="BOOLEAN")
     prompt_content = _render_writer_prompt(
         current_policy=current_policy,
         failure_context=failure_context,
@@ -161,85 +163,91 @@ def generate_policy(
         tests=tests,
         scoring_context=scoring_context,
     )
-    for attempt in range(3):
-        attempt_obs = start_span(writer_obs, f"writer_attempt_{attempt}", metadata={"attempt": attempt, "model": model})
-        try:
-            system_content, user_content = prompt_content.split("===USER===", 1)
-            response = client.chat.completions.create(
+    with start_observation(
+        name="policy_writer",
+        parent=parent_trace,
+        metadata={"model": model},
+    ) as writer_obs:
+        response = None
+        emit_score_for_handle(writer_obs, name="writer.policy_generated", value=False, data_type="BOOLEAN")
+        emit_score_for_handle(writer_obs, name="writer.policy_compiled", value=False, data_type="BOOLEAN")
+        for attempt in range(3):
+            start_time = time.perf_counter()
+            with start_observation(
+                name=f"writer_attempt_{attempt}",
+                parent=writer_obs,
+                as_type="generation",
                 model=model,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "policy_code",
-                        "schema": {
-                            "type": "object",
-                            "properties": {"code": {"type": "string"}},
-                            "required": ["code"],
-                            "additionalProperties": False,
+                metadata={"attempt": attempt, "model": model},
+            ) as attempt_obs:
+                try:
+                    system_content, user_content = prompt_content.split("===USER===", 1)
+                    response = client.chat.completions.create(
+                        model=model,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "policy_code",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"code": {"type": "string"}},
+                                    "required": ["code"],
+                                    "additionalProperties": False,
+                                },
+                                "strict": True,
+                            },
                         },
-                        "strict": True,
-                    },
-                },
-                max_completion_tokens=completion_tokens,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_content.strip(),
-                    },
-                    {
-                        "role": "user",
-                        "content": user_content.strip(),
-                    },
-                ],
-            )
-            if attempt_obs and hasattr(attempt_obs, "end"):
-                try:
-                    attempt_obs.end(metadata={"model": model})
-                except Exception:
-                    pass
-            break
-        except Exception as e:  # noqa: BLE001
-            if attempt_obs and hasattr(attempt_obs, "end"):
-                try:
-                    attempt_obs.end(error=e)
-                except Exception:
-                    pass
-            time.sleep(2 * (attempt + 1))
-    else:
-        if writer_obs and hasattr(writer_obs, "end"):
-            try:
-                writer_obs.end(error="writer_failed")
-            except Exception:
-                pass
-        raise RuntimeError("Writer failed after retries")
+                        max_completion_tokens=completion_tokens,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": system_content.strip(),
+                            },
+                            {
+                                "role": "user",
+                                "content": user_content.strip(),
+                            },
+                        ],
+                    )
+                    latency_ms = (time.perf_counter() - start_time) * 1000
+                    usage_details = _usage_from_response(response)
+                    if usage_details is None:
+                        raise RuntimeError("Cerebras response missing usage; provide usage_details explicitly or enable provider usage output.")
+                    from .observability.cerebras_pricing import cost_details_for_usage
 
-    try:
-        raw_code = _extract_policy_code(response)
-        code = _ensure_valid_policy_code(raw_code)
+                    cost_details = cost_details_for_usage(model, usage_details) if usage_details else None
+                    attempt_obs.update(
+                        metadata={"model": model, "attempt": attempt, "latency_ms": latency_ms},
+                        usage_details=usage_details,
+                        cost_details=cost_details,
+                    )
+                    break
+                except Exception as e:  # noqa: BLE001
+                    attempt_obs.end(error=e)
+                    time.sleep(2 * (attempt + 1))
+        else:
+            writer_obs.end(error="writer_failed")
+            raise RuntimeError("Writer failed after retries")
+
+        try:
+            raw_code = _extract_policy_code(response)
+            code = _ensure_valid_policy_code(raw_code)
+            emit_score_for_handle(
+                writer_obs,
+                name="writer.policy_compiled",
+                value=True,
+                data_type="BOOLEAN",
+                comment=json.dumps({"model": model}),
+            )
+        except Exception as exc:  # noqa: BLE001
+            writer_obs.end(error=exc, metadata={"model": model})
+            raise
         emit_score_for_handle(
             writer_obs,
-            name="writer.policy_compiled",
+            name="writer.policy_generated",
             value=True,
             data_type="BOOLEAN",
             comment=json.dumps({"model": model}),
         )
-    except Exception as exc:  # noqa: BLE001
-        if writer_obs and hasattr(writer_obs, "end"):
-            try:
-                writer_obs.end(error=exc, metadata={"model": model})
-            except Exception:
-                pass
-        raise
-    emit_score_for_handle(
-        writer_obs,
-        name="writer.policy_generated",
-        value=True,
-        data_type="BOOLEAN",
-        comment=json.dumps({"model": model}),
-    )
-    if writer_obs and hasattr(writer_obs, "end"):
-        try:
-            writer_obs.end(metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
-        except Exception:
-            pass
-    return code
+        writer_obs.update(metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
+        return code

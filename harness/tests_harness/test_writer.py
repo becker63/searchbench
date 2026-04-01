@@ -35,6 +35,17 @@ class _DummyChoice:
 class _DummyResponse:
     def __init__(self, content, parsed=None):
         self.choices = [_DummyChoice(content, parsed)]
+        self.usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
 
 
 def _make_client(content, capture, parsed=None):
@@ -89,7 +100,7 @@ def test_generate_policy_accepts_structured_code(monkeypatch):
     calls: list[dict[str, object]] = []
     payload = {"code": "def score(node: object, state: object, context: object | None = None) -> float:\n    return 1.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), calls), "model"))
-    monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
+    monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(
         writer,
         "emit_score_for_handle",
@@ -126,7 +137,7 @@ def test_generate_policy_accepts_structured_code(monkeypatch):
 )
 def test_generate_policy_rejects_missing_or_nonstring_code(monkeypatch, payload):
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
-    monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
+    monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     with pytest.raises(ValueError):
         writer.generate_policy(**_base_inputs())
@@ -135,7 +146,7 @@ def test_generate_policy_rejects_missing_or_nonstring_code(monkeypatch, payload)
 def test_generate_policy_rejects_fenced_code(monkeypatch):
     payload = {"code": "```python\ndef score():\n    pass\n```"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
-    monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
+    monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     with pytest.raises(ValueError):
         writer.generate_policy(**_base_inputs())
@@ -144,7 +155,7 @@ def test_generate_policy_rejects_fenced_code(monkeypatch):
 def test_generate_policy_rejects_invalid_python(monkeypatch):
     payload = {"code": "def score(:\n    pass"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
-    monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
+    monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     with pytest.raises(SyntaxError):
         writer.generate_policy(**_base_inputs())
@@ -152,7 +163,7 @@ def test_generate_policy_rejects_invalid_python(monkeypatch):
 
 def test_generate_policy_rejects_invalid_json(monkeypatch):
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client("not-json", []), "model"))
-    monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
+    monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     with pytest.raises(ValueError):
         writer.generate_policy(**_base_inputs())
@@ -162,7 +173,7 @@ def test_generate_policy_accepts_parsed_fallback(monkeypatch):
     calls: list[dict[str, object]] = []
     parsed = {"code": "def score(node, state):\n    return 2.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(None, calls, parsed=parsed), "model"))
-    monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
+    monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     code = writer.generate_policy(**_base_inputs())
     assert "return 2.0" in code

@@ -15,7 +15,7 @@ The content is organized as follows:
 2. Repository information
 3. Directory structure
 4. Repository files (if enabled)
-4. Repository files, each consisting of:
+5. Multiple file entries, each consisting of:
   - File path as an attribute
   - Full contents of the file
 </file_format>
@@ -37,45 +37,57 @@ The content is organized as follows:
 - Files are sorted by Git change count (files with more changes are at the bottom)
 </notes>
 
-<additional_info>
-
-</additional_info>
-
 </file_summary>
 
 <directory_structure>
+docs/
+  loop_viz.md
+  telemetry_sessions_cost.md
 observability/
   __init__.py
   baselines.py
+  cerebras_pricing.py
   datasets.py
   experiments.py
   langfuse.py
   runner_integration.py
+  score_emitter.py
 pipeline/
   __init__.py
   pipeline.py
   steps.py
   types.py
+prompts/
+  __init__.py
+  ic_system.jinja
+  jc_system.jinja
+  policy_writer.jinja
+  prompt_models.py
 tests_harness/
+  __init__.py
   conftest.py
   test_backend_adapters.py
   test_baselines.py
+  test_cerebras_pricing.py
   test_datasets_experiments.py
   test_datasets.py
   test_failure_context_budget.py
   test_filesystem_guard.py
   test_loop_failures.py
   test_loop_machine.py
+  test_loop_viz.py
   test_observability.py
   test_pipeline_steps_scope.py
   test_pipeline_warning_semantics.py
   test_policy_loader.py
+  test_prompt_templates.py
   test_pytest_scope.py
   test_repo_resolution_execution.py
   test_repo_targets.py
   test_runner_cli.py
   test_runner_integration.py
   test_score_adapter.py
+  test_scoring_emit.py
   test_subprocess_guard.py
   test_test_integrity.py
   test_tracing_wrappers.py
@@ -86,6 +98,7 @@ tools/
     ic_backend.py
     jc_backend.py
   __init__.py
+  loop_viz.py
   mcp_adapter.py
 utils/
   __init__.py
@@ -98,9 +111,11 @@ utils/
   openai_schema.py
   repo_root.py
   repo_targets.py
+  template_loader.py
   test_loader.py
   type_loader.py
 __init__.py
+.gitignore
 LANGFUSE.md
 loop_listeners.py
 loop_machine.py
@@ -118,8 +133,55 @@ writer.py
 <files>
 This section contains the contents of the repository's files.
 
+<file path="docs/loop_viz.md">
+## Loop visualization
+
+Use the built-in python-statemachine rendering to inspect the optimization and repair loops.
+
+Examples:
+
+- Mermaid to stdout (both machines):
+  ```bash
+  python tools/loop_viz.py --format mermaid
+  ```
+- DOT to file:
+  ```bash
+  python tools/loop_viz.py --format dot --output /tmp/loop.dot
+  ```
+- PNG (Graphviz required):
+  ```bash
+  python tools/loop_viz.py --format png --machine repair --output /tmp/repair.png
+  ```
+
+By default both machines are rendered; use `--machine optimization` or `--machine repair` to narrow output.
+</file>
+
+<file path="docs/telemetry_sessions_cost.md">
+## Sessions and Scores
+
+- Provide `session_id` when starting root traces/spans to group multi-trace interactions in Langfuse Sessions.
+- Child spans created via our helpers inherit the `session_id`; scores emitted via the emitter can include `session_id` for session-level scoring.
+- For session-only scores, call the emitter with `session_id` even if no trace/observation IDs are available.
+
+## Test Isolation (Langfuse)
+
+- Tests run with Langfuse credentials cleared and a stubbed client; real network calls to Langfuse must not occur.
+- If a test needs to assert the error path, re-monkeypatch `get_langfuse_client` to the stored `_real_get_langfuse_client`.
+
+## Cerebras Pricing Sync
+
+- Custom model definitions (input/output USD per million tokens) to add via Langfuse Models API:
+  - Zaizai GLM 4.7 — input $2.25/M, output $2.75/M; regex `(?i)zaizai.*glm.*4\.7`
+  - GPT OSS 120B — input $0.35/M, output $0.75/M; regex `(?i)gpt[-_ ]oss[-_ ]120b`
+  - Llama 3.1 8B — input $0.10/M, output $0.10/M; regex `(?i)llama[-_ ]3\.1[-_ ]8b`
+  - Qwen 3 235B Instruct — input $0.60/M, output $1.20/M; regex `(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct`
+- Use the Models API (`POST /api/public/models`) with the payload from `observability.cerebras_pricing.pricing_payload()`.
+- Ensure generations include `model` and usage (when available) so Langfuse can infer costs; otherwise ingest usage manually.
+</file>
+
 <file path="observability/__init__.py">
-from .langfuse import flush_langfuse, get_langfuse_client, get_tracing_openai_client, is_langfuse_enabled, record_score, start_span, start_trace  # noqa: F401
+from .langfuse import flush_langfuse, get_langfuse_client, get_tracing_openai_client, is_langfuse_enabled, start_span, start_trace  # noqa: F401
+from .score_emitter import ScorePayload, emit_score, emit_score_for_handle  # noqa: F401
 from .datasets import DatasetItem, fetch_dataset_items, local_dataset, map_task_to_dataset_item, normalize_dataset_item  # noqa: F401
 from .baselines import BaselineBundle, BaselineSnapshot, baseline_key, compute_baseline_for_item, make_baseline_bundle, require_baseline, resolve_baseline  # noqa: F401
 
@@ -128,9 +190,11 @@ __all__ = [
     "get_langfuse_client",
     "get_tracing_openai_client",
     "is_langfuse_enabled",
-    "record_score",
     "start_span",
     "start_trace",
+    "emit_score",
+    "emit_score_for_handle",
+    "ScorePayload",
     "DatasetItem",
     "fetch_dataset_items",
     "local_dataset",
@@ -158,7 +222,8 @@ from typing import Mapping, Sequence, cast
 from pydantic import BaseModel, Field
 
 from .datasets import DatasetItem, normalize_dataset_item
-from .langfuse import record_score, start_span
+from .langfuse import start_span
+from .score_emitter import emit_score_for_handle
 from ..scorer import score
 from ..utils.repo_targets import resolve_repo_target
 
@@ -234,7 +299,7 @@ def compute_baseline_for_item(
     item: DatasetItem,
     dataset_name: str | None = None,
     dataset_version: str | None = None,
-    parent_trace=None,
+    parent_trace: object | None = None,
 ) -> BaselineSnapshot:
     from ..runner import run_jc_iteration  # local import to avoid circular dependency
 
@@ -257,8 +322,19 @@ def compute_baseline_for_item(
     )
     jc_result = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
     metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result))
+    trace_id = getattr(trace, "id", None)
+    dataset_run_id = getattr(parent_trace, "id", None)
     for name, value in metrics.items():
-        record_score(trace, f"baseline.{name}", value)
+        data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
+        score_id = f"{trace_id}-baseline.{name}" if trace_id else None
+        emit_score_for_handle(
+            trace,
+            name=f"baseline.{name}",
+            value=float(value) if isinstance(value, bool) else value,
+            data_type=data_type,
+            dataset_run_id=dataset_run_id,
+            score_id=score_id,
+        )
     if trace and hasattr(trace, "end"):
         try:
             trace.end(metadata={"jc_nodes": metrics.get("jc_nodes", 0)})
@@ -270,7 +346,7 @@ def compute_baseline_for_item(
         item_id=normalized.id,
         repo=normalized.repo,
         symbol=normalized.symbol,
-        jc_result=cast(dict[str, object], jc_result),
+        jc_result=dict(jc_result),
         jc_metrics=metrics,
         trace_id=getattr(trace, "id", None),
         experiment_run_id=getattr(parent_trace, "id", None),
@@ -330,6 +406,57 @@ def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
 def load_baseline_bundle(path: Path) -> BaselineBundle:
     data: object = json.loads(path.read_text())
     return BaselineBundle.model_validate(data)
+</file>
+
+<file path="observability/cerebras_pricing.py">
+from __future__ import annotations
+
+CEREBRAS_PRICING: list[dict[str, str | float]] = [
+    {
+        "name": "Zaizai GLM 4.7",
+        "match_pattern": r"(?i)zaizai.*glm.*4\\.7",
+        "input_price_per_million": 2.25,
+        "output_price_per_million": 2.75,
+    },
+    {
+        "name": "GPT OSS 120B",
+        "match_pattern": r"(?i)gpt[-_ ]oss[-_ ]120b",
+        "input_price_per_million": 0.35,
+        "output_price_per_million": 0.75,
+    },
+    {
+        "name": "Llama 3.1 8B",
+        "match_pattern": r"(?i)llama[-_ ]3\\.1[-_ ]8b",
+        "input_price_per_million": 0.10,
+        "output_price_per_million": 0.10,
+    },
+    {
+        "name": "Qwen 3 235B Instruct",
+        "match_pattern": r"(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct",
+        "input_price_per_million": 0.60,
+        "output_price_per_million": 1.20,
+    },
+]
+
+
+def pricing_payload() -> list[dict[str, object]]:
+    """Return a Langfuse Models API payload for Cerebras pricing."""
+    payload: list[dict[str, object]] = []
+    for entry in CEREBRAS_PRICING:
+        payload.append(
+            {
+                "name": entry["name"],
+                "match_pattern": entry["match_pattern"],
+                "prices": {
+                    "input": entry["input_price_per_million"],
+                    "output": entry["output_price_per_million"],
+                },
+            }
+        )
+    return payload
+
+
+__all__ = ["CEREBRAS_PRICING", "pricing_payload"]
 </file>
 
 <file path="observability/datasets.py">
@@ -424,7 +551,7 @@ def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetIt
     except Exception:
         raw_items = []
     items: list[DatasetItem] = []
-    for idx, item in enumerate(raw_items):
+    for item in raw_items:
         if isinstance(item, Mapping):
             task_meta = cast(Mapping[str, object], item)
             input_section = task_meta.get("input")
@@ -436,7 +563,7 @@ def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetIt
                 continue
             meta = task_meta.get("metadata")
             meta_map: Mapping[str, object] = input_section if isinstance(input_section, Mapping) else {}
-            if isinstance(meta, Mapping):
+            if isinstance(meta, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]
                 meta_map = meta
             try:
                 mapped = map_task_to_dataset_item({"repo": repo, "symbol": symbol, **{str(k): v for k, v in meta_map.items()}})
@@ -461,6 +588,10 @@ from __future__ import annotations
 
 from typing import Mapping, Sequence
 
+from ..loop import run_loop
+from ..loop_types import iteration_record_to_public_dict
+from ..scorer import score
+from ..utils.repo_targets import resolve_repo_target
 from .baselines import (
     BaselineBundle,
     BaselineSnapshot,
@@ -470,16 +601,15 @@ from .baselines import (
     require_baseline,
     resolve_baseline,
 )
-from .datasets import Dataset, DatasetItem, fetch_dataset_items, normalize_dataset_item
-from .langfuse import flush_langfuse, record_score, start_trace
-from .runner_integration import HostedRunResult, run_hosted_dataset_experiment, run_local_dataset_experiment
-from ..loop import run_loop
-from ..loop_types import iteration_record_to_public_dict
-from ..scorer import score
-from ..utils.repo_targets import resolve_repo_target
+from .datasets import DatasetItem, fetch_dataset_items, normalize_dataset_item
+from .langfuse import flush_langfuse
+from .runner_integration import HostedRunResult, run_hosted_dataset_experiment
+from .score_emitter import emit_score_for_handle
 
 
-def _build_bundle_from_hosted(run: HostedRunResult, snapshots: list[BaselineSnapshot]) -> BaselineBundle:
+def _build_bundle_from_hosted(
+    run: HostedRunResult, snapshots: list[BaselineSnapshot]
+) -> BaselineBundle:
     return make_baseline_bundle(
         snapshots,
         dataset_name=run.dataset_name,
@@ -491,42 +621,12 @@ def _build_bundle_from_hosted(run: HostedRunResult, snapshots: list[BaselineSnap
     )
 
 
-def _run_local_jc_baselines(items: Sequence[DatasetItem], dataset_name: str | None, dataset_version: str | None) -> BaselineBundle:
-    def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
-        dataset_item = normalize_dataset_item(item)
-        snapshot = compute_baseline_for_item(
-            dataset_item,
-            dataset_name=dataset_name,
-            dataset_version=dataset_version,
-            parent_trace=parent_trace,
-        )
-        return {"baseline": snapshot.model_dump()}
-
-    hosted = run_local_dataset_experiment(
-        data=[it.model_dump() for it in items],
-        experiment_name="jc_baseline_local",
-        task_fn=_run_item,
-        metadata={"run_kind": "jc_baseline"},
-    )
-    baselines: list[BaselineSnapshot] = []
-    for entry in hosted.items:
-        if entry.output and "baseline" in entry.output:
-            try:
-                baselines.append(BaselineSnapshot.model_validate(entry.output["baseline"]))
-            except Exception:
-                continue
-    return make_baseline_bundle(
-        baselines,
-        dataset_name=dataset_name,
-        dataset_version=dataset_version,
-        baseline_run_id=hosted.run_id,
-        baseline_run_name=hosted.run_name,
-        metadata={"run_kind": "jc_baseline"},
-    )
-
-
-def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> BaselineBundle:
-    def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
+def run_hosted_jc_baseline_experiment(
+    name: str, version: str | None = None
+) -> BaselineBundle:
+    def _run_item(
+        item: Mapping[str, object], parent_trace: object | None = None
+    ) -> Mapping[str, object]:
         dataset_item = normalize_dataset_item(item)
         snapshot = compute_baseline_for_item(
             dataset_item,
@@ -547,32 +647,15 @@ def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> 
     for entry in hosted.items:
         if entry.output and "baseline" in entry.output:
             try:
-                snapshots.append(BaselineSnapshot.model_validate(entry.output["baseline"]))
+                snapshots.append(
+                    BaselineSnapshot.model_validate(entry.output["baseline"])
+                )
             except Exception:
                 continue
     if not snapshots:
-        items = fetch_dataset_items(name=name, version=version)
-        root = start_trace("jc_baseline_experiment", metadata={"dataset": name, "version": version, "count": len(items)})
-        for item in items:
-            snapshots.append(compute_baseline_for_item(item, dataset_name=name, dataset_version=version, parent_trace=root))
-        if root and hasattr(root, "end"):
-            try:
-                root.end(metadata={"completed": len(snapshots)})
-            except Exception:
-                pass
-        hosted = HostedRunResult(run_id=getattr(root, "id", None), run_name=None, dataset_name=name, dataset_version=version, items=[])
+        raise RuntimeError("Hosted baseline experiment returned no results")
     flush_langfuse()
     return _build_bundle_from_hosted(hosted, snapshots)
-
-
-def run_local_jc_baseline_experiment(dataset: Mapping[str, object]) -> BaselineBundle:
-    items_raw = dataset.get("items") if isinstance(dataset, Mapping) else []
-    items_seq = items_raw if isinstance(items_raw, Sequence) else []
-    filtered_items = [normalize_dataset_item(entry) for entry in items_seq if isinstance(entry, Mapping)]
-    name_val = dataset.get("name") if isinstance(dataset, Mapping) else "local"
-    ds = Dataset(name=str(name_val or "local"), items=filtered_items)
-    ds_items: list[DatasetItem] = list(ds.entries)
-    return _run_local_jc_baselines(ds_items, dataset_name=ds.name, dataset_version=None)
 
 
 def _run_ic_optimizations(
@@ -586,21 +669,37 @@ def _run_ic_optimizations(
     results: list[dict[str, object]] = []
     indexed = index_baselines(baselines)
 
-    def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
+    def _run_item(
+        item: Mapping[str, object], parent_trace: object | None = None
+    ) -> Mapping[str, object]:
         normalized_item = normalize_dataset_item(item)
         resolved_repo = resolve_repo_target(normalized_item.repo)
-        baseline = resolve_baseline(list(indexed.values()), normalized_item) or require_baseline(baselines, normalized_item)
+        baseline = resolve_baseline(
+            list(indexed.values()), normalized_item
+        ) or require_baseline(baselines, normalized_item)
         task = normalized_item.model_dump()
         task["repo"] = resolved_repo
-        history = run_loop(task, iterations=iterations, parent_trace=parent_trace, baseline_snapshot=baseline)
+        history = run_loop(
+            task,
+            iterations=iterations,
+            parent_trace=parent_trace,
+            baseline_snapshot=baseline,
+        )
         last_record = history[-1] if history else None
         last_dict: Mapping[str, object] = (
             iteration_record_to_public_dict(last_record) if last_record else {}
         )
-        metrics = score({"iterative_context": last_dict, "jcodemunch": baseline.jc_result})
+        metrics = score(
+            {"iterative_context": last_dict, "jcodemunch": baseline.jc_result}
+        )
         for name, value in metrics.items():
             if isinstance(value, (int, float, bool)):
-                record_score(parent_trace, f"ic_opt.{name}", float(value))
+                emit_score_for_handle(
+                    parent_trace,
+                    name=f"ic_opt.{name}",
+                    value=float(value),
+                    data_type="BOOLEAN" if isinstance(value, bool) else "NUMERIC",
+                )
         history_dicts = [iteration_record_to_public_dict(r) for r in history]
         return {
             "item": normalized_item.model_dump(),
@@ -609,47 +708,21 @@ def _run_ic_optimizations(
             "metrics": metrics,
         }
 
-    if hosted:
-        hosted_result = run_hosted_dataset_experiment(
-            dataset_name=dataset_name or "",
-            dataset_version=dataset_version,
-            experiment_name="ic_optimization",
-            task_fn=_run_item,
-            metadata={"run_kind": "ic_optimization", "baseline_run_id": baselines.baseline_run_id},
-        )
-        for entry in hosted_result.items:
-            if entry.output:
-                results.append(dict(entry.output))
-    else:
-        local_result = run_local_dataset_experiment(
-            data=[item.model_dump() for item in items],
-            experiment_name="ic_optimization_local",
-            task_fn=_run_item,
-            metadata={"run_kind": "ic_optimization", "baseline_run_id": baselines.baseline_run_id},
-        )
-        for entry in local_result.items:
-            if entry.output:
-                results.append(dict(entry.output))
+    hosted_result = run_hosted_dataset_experiment(
+        dataset_name=dataset_name or "",
+        dataset_version=dataset_version,
+        experiment_name="ic_optimization",
+        task_fn=_run_item,
+        metadata={
+            "run_kind": "ic_optimization",
+            "baseline_run_id": baselines.baseline_run_id,
+        },
+    )
+    for entry in hosted_result.items:
+        if entry.output:
+            results.append(dict(entry.output))
     if not results:
-        root = start_trace(
-            "ic_optimization_experiment",
-            metadata={"dataset": dataset_name, "version": dataset_version, "count": len(items)},
-        )
-        for item in items:
-            resolved_repo = resolve_repo_target(item.repo)
-            baseline = resolve_baseline(list(indexed.values()), item) or require_baseline(baselines, item)
-            task = item.model_dump()
-            task["repo"] = resolved_repo
-            history = run_loop(task, iterations=iterations, parent_trace=root, baseline_snapshot=baseline)
-            history_entries: list[Mapping[str, object]] = [
-                iteration_record_to_public_dict(r) for r in history
-            ]
-            results.append({"item": item.model_dump(), "baseline": baseline.model_dump(), "history": history_entries})
-        if root and hasattr(root, "end"):
-            try:
-                root.end(metadata={"completed": len(results)})
-            except Exception:
-                pass
+        raise RuntimeError("Hosted IC optimization returned no results")
     flush_langfuse()
     return results
 
@@ -663,28 +736,22 @@ def run_hosted_ic_optimization_experiment(
 ) -> list[dict[str, object]]:
     items = fetch_dataset_items(name=name, version=version)
     if baselines is None and not recompute_baselines:
-        raise ValueError("Baselines bundle required for optimization; set recompute_baselines=True to compute.")
-    bundle = baselines if baselines is not None else run_hosted_jc_baseline_experiment(name, version=version)
-    return _run_ic_optimizations(items, bundle, dataset_name=name, dataset_version=version, iterations=iterations, hosted=True)
-
-
-def run_local_ic_optimization_experiment(
-    dataset: Mapping[str, object],
-    iterations: int = 5,
-    baselines: BaselineBundle | None = None,
-    recompute_baselines: bool = False,
-) -> list[dict[str, object]]:
-    if isinstance(dataset, Dataset):
-        ds = dataset
-    else:
-        items_raw = dataset.get("items") if isinstance(dataset, Mapping) else []
-        items_seq = items_raw if isinstance(items_raw, Sequence) else []
-        filtered_items = [normalize_dataset_item(entry) for entry in items_seq if isinstance(entry, Mapping)]
-        name_val = dataset.get("name") if isinstance(dataset, Mapping) else "local"
-        ds = Dataset(name=str(name_val or "local"), items=filtered_items)
-    ds_items: list[DatasetItem] = list(ds.entries)
-    bundle = baselines if baselines is not None else _run_local_jc_baselines(ds_items, dataset_name=ds.name, dataset_version=None)
-    return _run_ic_optimizations(ds_items, bundle, dataset_name=ds.name, dataset_version=None, iterations=iterations, hosted=False)
+        raise ValueError(
+            "Baselines bundle required for optimization; set recompute_baselines=True to compute."
+        )
+    bundle = (
+        baselines
+        if baselines is not None
+        else run_hosted_jc_baseline_experiment(name, version=version)
+    )
+    return _run_ic_optimizations(
+        items,
+        bundle,
+        dataset_name=name,
+        dataset_version=version,
+        iterations=iterations,
+        hosted=True,
+    )
 </file>
 
 <file path="observability/langfuse.py">
@@ -693,7 +760,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional, cast
 
 from langfuse import Langfuse
-from langfuse.openai import OpenAI as LangfuseOpenAI
+from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
 
 from ..utils.env import get_langfuse_env
 
@@ -703,14 +770,11 @@ _client: Optional[Langfuse] = None
 def get_langfuse_client() -> Optional[Langfuse]:
     global _client  # noqa: PLW0603
     env = get_langfuse_env()
-    if not env.get("enabled", True):
-        _client = None
-        return None
-    if _client is not None:
-        return _client
     public, secret = env.get("public_key"), env.get("secret_key")
     if not isinstance(public, str) or not isinstance(secret, str) or not public or not secret:
-        return None
+        raise RuntimeError("Langfuse credentials are required (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)")
+    if _client is not None:
+        return _client
     base_url_val = env.get("base_url")
     env_val = env.get("environment")
     host: Optional[str] = base_url_val if isinstance(base_url_val, str) else None
@@ -724,6 +788,7 @@ def get_langfuse_client() -> Optional[Langfuse]:
         )
     except Exception:
         _client = None
+        raise
     return _client
 
 
@@ -733,57 +798,51 @@ def is_langfuse_enabled() -> bool:
 
 def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
     """
-    Prefer Langfuse's OpenAI integration, but fall back to vanilla client if unavailable.
+    Require Langfuse's OpenAI integration for tracing.
     """
-    try:
-        return LangfuseOpenAI(base_url=base_url, api_key=api_key)
-    except Exception:
-        from openai import OpenAI  # local import to avoid import-time side effects
-
-        return OpenAI(base_url=base_url, api_key=api_key)
+    return LangfuseOpenAI(base_url=base_url, api_key=api_key)
 
 
-def start_trace(name: str, metadata: Mapping[str, object] | None = None, input: object | None = None) -> Any | None:
+def start_trace(
+    name: str,
+    metadata: Mapping[str, object] | None = None,
+    input: object | None = None,
+    session_id: str | None = None,
+) -> Any | None:
     client = get_langfuse_client()
-    if not client:
-        return None
-    try:
-        client_any = cast(Any, client)
-        return client_any.trace(name=name, metadata=dict(metadata) if metadata else None, input=input)
-    except Exception:
-        return None
+    client_any = cast(Any, client)
+    return client_any.trace(
+        name=name,
+        metadata=dict(metadata) if metadata else None,
+        input=input,
+        session_id=session_id,
+    )
 
 
-def start_span(parent: Any | None, name: str, metadata: Mapping[str, object] | None = None, input: object | None = None) -> Any | None:
+def start_span(
+    parent: Any | None,
+    name: str,
+    metadata: Mapping[str, object] | None = None,
+    input: object | None = None,
+    session_id: str | None = None,
+) -> Any | None:
     if parent is None:
-        return start_trace(name=name, metadata=metadata, input=input)
-    try:
-        if hasattr(parent, "span"):
-            return parent.span(name=name, metadata=dict(metadata) if metadata else None, input=input)
-    except Exception:
-        return None
-    return None
-
-
-def record_score(handle: Any | None, name: str, value: float | int | bool, metadata: Mapping[str, object] | None = None) -> None:
-    if handle is None:
-        return
-    try:
-        scorer = getattr(handle, "score", None)
-        if scorer:
-            scorer(name=name, value=float(value), metadata=dict(metadata) if metadata else None)
-    except Exception:
-        return
+        return start_trace(name=name, metadata=metadata, input=input, session_id=session_id)
+    if hasattr(parent, "span"):
+        return parent.span(
+            name=name,
+            metadata=dict(metadata) if metadata else None,
+            input=input,
+            session_id=session_id,
+        )
+    raise RuntimeError("Parent trace/span missing 'span' method")
 
 
 def flush_langfuse() -> None:
     client = get_langfuse_client()
-    if not client:
-        return
-    try:
-        client.flush()
-    except Exception:
-        return
+    if client is None:
+        raise RuntimeError("Langfuse client unavailable for flush")
+    client.flush()
 
 
 __all__ = [
@@ -792,7 +851,6 @@ __all__ = [
     "get_tracing_openai_client",
     "start_trace",
     "start_span",
-    "record_score",
     "flush_langfuse",
 ]
 </file>
@@ -805,7 +863,7 @@ from typing import Any, Callable, Mapping, cast
 
 from pydantic import BaseModel, Field
 
-from .langfuse import get_langfuse_client, start_span, start_trace
+from .langfuse import get_langfuse_client
 
 
 class HostedRunItemResult(BaseModel):
@@ -856,114 +914,144 @@ def run_hosted_dataset_experiment(
 ) -> HostedRunResult:
     client = get_langfuse_client()
     run_name = f"{experiment_name}-{int(time.time())}"
-    if client:
-        try:
-            client_any = cast(Any, client)
-            dataset = client_any.get_dataset(name=dataset_name, version=dataset_version)
-            run_kwargs: dict[str, Any] = {
-                "name": experiment_name,
-                "run_name": run_name,
-                "task": task_fn,
-                "metadata": dict(metadata) if metadata else None,
-            }
-            if evaluators is not None:
-                run_kwargs["evaluators"] = evaluators
-            if run_evaluators is not None:
-                run_kwargs["run_evaluators"] = run_evaluators
-            if max_concurrency is not None:
-                run_kwargs["max_concurrency"] = max_concurrency
-            result = cast(Any, dataset).run_experiment(**run_kwargs)
-            run_id = cast(str | None, getattr(result, "id", None) or getattr(result, "run_id", None))
-            items_raw = getattr(result, "items", None) or getattr(result, "item_results", None)
-            return HostedRunResult(
-                run_id=run_id,
-                run_name=run_name,
-                dataset_name=dataset_name,
-                dataset_version=dataset_version,
-                items=_normalize_items(items_raw),
-                metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})},
-            )
-        except Exception:
-            pass
-
-    # Defensive fallback: manual trace-run if client unavailable/error.
-    root = start_trace(
-        f"{experiment_name}_hosted_fallback",
-        metadata={"dataset": dataset_name, "dataset_version": dataset_version, "run_kind": experiment_name, "count": len([])},
-    )
-    run_id = getattr(root, "id", None)
-    items: list[HostedRunItemResult] = []
+    client_any = cast(Any, client)
+    dataset = client_any.get_dataset(name=dataset_name, version=dataset_version)
+    run_kwargs: dict[str, Any] = {
+        "name": experiment_name,
+        "run_name": run_name,
+        "task": task_fn,
+        "metadata": dict(metadata) if metadata else None,
+    }
+    if evaluators is not None:
+        run_kwargs["evaluators"] = evaluators
+    if run_evaluators is not None:
+        run_kwargs["run_evaluators"] = run_evaluators
+    if max_concurrency is not None:
+        run_kwargs["max_concurrency"] = max_concurrency
+    result = cast(Any, dataset).run_experiment(**run_kwargs)
+    run_id = cast(str | None, getattr(result, "id", None) or getattr(result, "run_id", None))
+    items_raw = getattr(result, "items", None) or getattr(result, "item_results", None)
     return HostedRunResult(
         run_id=run_id,
         run_name=run_name,
         dataset_name=dataset_name,
         dataset_version=dataset_version,
-        items=items,
-        metadata={"run_kind": experiment_name, "fallback": True, **(dict(metadata) if metadata else {})},
+        items=_normalize_items(items_raw),
+        metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})},
     )
 
 
-def run_local_dataset_experiment(
-    data: list[Mapping[str, object]],
-    experiment_name: str,
-    task_fn: Callable[[Mapping[str, object], object | None], Mapping[str, object] | dict[str, object]],
-    evaluators: list[object] | None = None,
-    run_evaluators: list[object] | None = None,
-    metadata: Mapping[str, object] | None = None,
-    max_concurrency: int | None = None,
-) -> HostedRunResult:
+__all__ = ["HostedRunResult", "run_hosted_dataset_experiment"]
+</file>
+
+<file path="observability/score_emitter.py">
+from __future__ import annotations
+
+from typing import Any, cast
+
+from pydantic import BaseModel, ConfigDict
+
+
+class ScorePayload(BaseModel):
+    """Strict payload for Langfuse score emission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: float | int | bool | str
+    data_type: str | None = None
+    trace_id: str | None = None
+    observation_id: str | None = None
+    dataset_run_id: str | None = None
+    session_id: str | None = None
+    config_id: str | None = None
+    comment: str | None = None
+    score_id: str | None = None
+
+
+def _infer_data_type(value: float | int | bool | str, provided: str | None) -> str | None:
+    if provided is not None:
+        return provided
+    if isinstance(value, bool):
+        return "BOOLEAN"
+    if isinstance(value, (int, float)):
+        return "NUMERIC"
+    if isinstance(value, str):
+        return "CATEGORICAL"
+    return None
+
+
+def emit_score(
+    *,
+    name: str,
+    value: float | int | bool | str,
+    data_type: str | None = None,
+    trace_id: str | None = None,
+    observation_id: str | None = None,
+    dataset_run_id: str | None = None,
+    session_id: str | None = None,
+    config_id: str | None = None,
+    comment: str | None = None,
+    score_id: str | None = None,
+) -> None:
+    """Submit a score via Langfuse SDK using hosted run identifiers."""
+    if not any([trace_id, observation_id, dataset_run_id, session_id]):
+        raise RuntimeError("Score emission requires at least one identifier (trace/observation/datasetRun/session)")
+    from .langfuse import get_langfuse_client  # local import to avoid circularity
+
+    resolved_type = _infer_data_type(value, data_type)
     client = get_langfuse_client()
-    run_name = f"{experiment_name}-local-{int(time.time())}"
-    if client:
-        try:
-            client_any = cast(Any, client)
-            run_kwargs: dict[str, Any] = {
-                "name": experiment_name,
-                "data": data,
-                "task": task_fn,
-                "metadata": dict(metadata) if metadata else None,
-            }
-            if evaluators is not None:
-                run_kwargs["evaluators"] = evaluators
-            if run_evaluators is not None:
-                run_kwargs["run_evaluators"] = run_evaluators
-            if max_concurrency is not None:
-                run_kwargs["max_concurrency"] = max_concurrency
-            result = client_any.run_experiment(**run_kwargs)
-            run_id = cast(str | None, getattr(result, "id", None) or getattr(result, "run_id", None))
-            items_raw = getattr(result, "items", None) or getattr(result, "item_results", None)
-            return HostedRunResult(
-                run_id=run_id,
-                run_name=run_name,
-                dataset_name=None,
-                dataset_version=None,
-                items=_normalize_items(items_raw),
-                metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})},
-            )
-        except Exception:
-            pass
-
-    # Defensive local fallback: run tasks with Langfuse spans so traces still exist.
-    root = start_trace(
-        f"{experiment_name}_local_fallback",
-        metadata={"run_kind": experiment_name, "count": len(data)},
+    if not hasattr(client, "create_score"):
+        raise RuntimeError("Langfuse client unavailable for scoring")
+    payload = ScorePayload(
+        name=name,
+        value=value,
+        data_type=resolved_type,
+        trace_id=trace_id,
+        observation_id=observation_id,
+        dataset_run_id=dataset_run_id,
+        session_id=session_id,
+        config_id=config_id,
+        comment=comment,
+        score_id=score_id,
     )
-    items: list[HostedRunItemResult] = []
-    for entry in data:
-        span = start_span(root, f"{experiment_name}_item", metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})})
-        output = task_fn(entry, span)
-        items.append(HostedRunItemResult(item=entry, output=output, trace_id=getattr(span, "id", None)))
-    return HostedRunResult(
-        run_id=getattr(root, "id", None),
-        run_name=run_name,
-        dataset_name=None,
-        dataset_version=None,
-        items=items,
-        metadata={"run_kind": experiment_name, "fallback": True, **(dict(metadata) if metadata else {})},
+    cleaned = payload.model_dump(exclude_none=True)
+    client_any = cast(Any, client)
+    client_any.create_score(**cleaned)  # type: ignore[arg-type]
+
+
+def emit_score_for_handle(
+    handle: object | None,
+    *,
+    name: str,
+    value: float | int | bool | str,
+    data_type: str | None = None,
+    dataset_run_id: str | None = None,
+    session_id: str | None = None,
+    config_id: str | None = None,
+    comment: str | None = None,
+    score_id: str | None = None,
+) -> None:
+    """Emit a score using IDs derived from a Langfuse trace/span handle."""
+    if handle is None:
+        raise RuntimeError("Langfuse handle is required to emit score")
+    trace_id = getattr(handle, "trace_id", None) or getattr(handle, "id", None)
+    observation_id = getattr(handle, "id", None)
+    emit_score(
+        name=name,
+        value=value,
+        data_type=data_type,
+        trace_id=trace_id,
+        observation_id=observation_id,
+        dataset_run_id=dataset_run_id,
+        session_id=session_id,
+        config_id=config_id,
+        comment=comment,
+        score_id=score_id,
     )
 
 
-__all__ = ["HostedRunResult", "run_hosted_dataset_experiment", "run_local_dataset_experiment"]
+__all__ = ["emit_score", "emit_score_for_handle", "ScorePayload"]
 </file>
 
 <file path="pipeline/__init__.py">
@@ -978,7 +1066,7 @@ from .pipeline import (
     infer_action_hint,
 )
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
-from .types import StepResult
+from .types import StepResult, PipelineClassification
 
 __all__ = [
     "Pipeline",
@@ -988,6 +1076,7 @@ __all__ = [
     "format_structured_feedback",
     "infer_action_hint",
     "StepResult",
+    "PipelineClassification",
     "RuffFixStep",
     "BasedPyrightStep",
     "PytestStep",
@@ -997,12 +1086,13 @@ __all__ = [
 <file path="pipeline/pipeline.py">
 from __future__ import annotations
 
-from typing import Iterable, List, Dict
+from typing import Iterable, List
 from pathlib import Path
 
-from ..observability.langfuse import start_span, record_score
+from ..observability.langfuse import start_span
+from ..observability.score_emitter import emit_score_for_handle
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
-from .types import Step, StepResult
+from .types import PipelineClassification, Step, StepResult
 
 
 class Pipeline:
@@ -1010,7 +1100,7 @@ class Pipeline:
         self.steps: List[Step] = list(steps)
         self.fail_fast: bool = fail_fast
 
-    def run(self, repo_root: Path, observation=None) -> List[StepResult]:
+    def run(self, repo_root: Path, observation: object | None = None) -> List[StepResult]:
         results: List[StepResult] = []
         for step in self.steps:
             step_obs = start_span(observation, name=step.name, metadata={"cwd": str(repo_root)})
@@ -1018,8 +1108,20 @@ class Pipeline:
             # Enforce success semantics based solely on exit status.
             result.success = result.exit_code == 0
             results.append(result)
-            record_score(step_obs, "exit_code", result.exit_code, metadata={"step": step.name})
-            record_score(step_obs, "pipeline_pass", result.success, metadata={"step": step.name})
+            emit_score_for_handle(
+                step_obs,
+                name="exit_code",
+                value=result.exit_code,
+                data_type="NUMERIC",
+                comment=f"step={step.name}",
+            )
+            emit_score_for_handle(
+                step_obs,
+                name="pipeline_pass",
+                value=result.success,
+                data_type="BOOLEAN",
+                comment=f"step={step.name}",
+            )
             terminated = self.fail_fast and result.exit_code != 0
             if step_obs and hasattr(step_obs, "end"):
                 step_obs.end(
@@ -1056,46 +1158,39 @@ def summarize_results(results: List[StepResult]) -> str:
     return summary
 
 
-def classify_results(results: List[StepResult]) -> Dict[str, object]:
-    out: Dict[str, object] = {
-        "type_errors": "",
-        "lint_errors": "",
-        "test_failures": "",
-        "passed": [],
-    }
+def classify_results(results: List[StepResult]) -> PipelineClassification:
+    out = PipelineClassification()
     for r in results:
         failed = r.exit_code != 0
         if not failed:
-            passed_list = out["passed"]
-            if isinstance(passed_list, list):
-                passed_list.append(r.name)
+            out.passed.append(r.name)
             continue
 
         stderr = (r.stderr or "").strip()
         if r.name == "basedpyright":
-            out["type_errors"] = stderr
+            out.type_errors = stderr
         elif r.name == "ruff_fix":
-            out["lint_errors"] = stderr
+            out.lint_errors = stderr
         elif "pytest" in r.name:
-            out["test_failures"] = stderr
+            out.test_failures = stderr
     return out
 
 
-def format_structured_feedback(classified: Dict[str, object], max_chars: int = 4000) -> str:
+def format_structured_feedback(classified: PipelineClassification, max_chars: int = 4000) -> str:
     parts: list[str] = []
 
-    type_err = classified.get("type_errors")
-    lint_err = classified.get("lint_errors")
-    test_err = classified.get("test_failures")
-    passed = classified.get("passed")
+    type_err = classified.type_errors
+    lint_err = classified.lint_errors
+    test_err = classified.test_failures
+    passed = classified.passed
 
-    if isinstance(type_err, str) and type_err:
+    if type_err:
         parts.append("## TYPE ERRORS (must fix first)\n" + type_err)
-    if isinstance(lint_err, str) and lint_err:
+    if lint_err:
         parts.append("## LINT ERRORS\n" + lint_err)
-    if isinstance(test_err, str) and test_err:
+    if test_err:
         parts.append("## TEST FAILURES\n" + test_err)
-    if isinstance(passed, list) and passed:
+    if passed:
         parts.append("## PASSED STEPS\n" + ", ".join(passed))
 
     joined = "\n\n".join(parts)
@@ -1104,12 +1199,12 @@ def format_structured_feedback(classified: Dict[str, object], max_chars: int = 4
     return joined
 
 
-def infer_action_hint(classified: Dict[str, object]) -> str:
-    if isinstance(classified.get("type_errors"), str) and classified.get("type_errors"):
+def infer_action_hint(classified: PipelineClassification) -> str:
+    if classified.type_errors:
         return "Fix type errors first. Do not attempt logic changes until types pass."
-    if isinstance(classified.get("lint_errors"), str) and classified.get("lint_errors"):
+    if classified.lint_errors:
         return "Fix lint/style issues. Ensure valid Python syntax."
-    if isinstance(classified.get("test_failures"), str) and classified.get("test_failures"):
+    if classified.test_failures:
         return "Tests are failing. Adjust scoring logic to satisfy invariants."
     return "All checks passed. Improve score."
 </file>
@@ -1169,19 +1264,57 @@ class PytestStep(_BaseStep):
 <file path="pipeline/types.py">
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
-@dataclass
-class StepResult:
+class StepResult(BaseModel):
+    """
+    Canonical pipeline step result used across pipeline and loop.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
     name: str
     success: bool
     stdout: str
     stderr: str
     exit_code: int
 
+    @classmethod
+    def from_external(cls, step: object) -> "StepResult":
+        """Validate and coerce external step payloads."""
+        if isinstance(step, BaseModel):
+            return cls.model_validate(step.model_dump())
+        if isinstance(step, dict):
+            return cls.model_validate(step)
+        data: dict[str, Any] = {}
+        allowed_fields = {"name", "success", "stdout", "stderr", "exit_code"}
+        extras: set[str] = set()
+        for field in allowed_fields:
+            if hasattr(step, field):
+                data[field] = getattr(step, field)
+        if hasattr(step, "__dict__"):
+            extras = set(getattr(step, "__dict__", {}).keys()) - allowed_fields
+        if extras:
+            raise ValueError(f"Unexpected fields in step payload: {sorted(extras)}")
+        return cls.model_validate(data)
+
+    def to_mapping(self) -> dict[str, object]:
+        return self.model_dump()
+
+
+class PipelineClassification(BaseModel):
+    """Typed classification of pipeline outcomes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type_errors: str = ""
+    lint_errors: str = ""
+    test_failures: str = ""
+    passed: list[str] = Field(default_factory=list)
 
 class Step(Protocol):
     name: str
@@ -1240,29 +1373,229 @@ class ExecutionBackend:
         return result
 </file>
 
+<file path="prompts/__init__.py">
+"""Prompt templates and supporting models."""
+
+from .prompt_models import SystemPromptContext, WriterPromptContext
+
+__all__ = ["SystemPromptContext", "WriterPromptContext"]
+</file>
+
+<file path="prompts/ic_system.jinja">
+You are exploring a codebase using a graph-based system.
+Available tools:
+{{ available_tools }}
+
+Guidelines:
+- Always expand after resolving
+- Prefer expand over repeated resolve
+- Do not attempt file-level inspection unless necessary
+- Focus on graph traversal
+- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.
+- Always start by calling a tool. Never respond with text.
+- You must call MCP tools using the provided tool interface. Do not output text.
+</file>
+
+<file path="prompts/jc_system.jinja">
+You are exploring a codebase using tool calls.
+Available tools:
+{{ available_tools }}
+
+Guidelines:
+- Use the available tools to locate and inspect symbols and files
+- Avoid redundant calls
+- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.
+- Always start by calling a tool. Never respond with text.
+- You must call MCP tools using the provided tool interface. Do not output text.
+</file>
+
+<file path="prompts/policy_writer.jinja">
+{% set system_instructions -%}
+You are optimizing a scoring function for a graph search system.
+Respond ONLY with JSON matching the provided schema.
+The 'code' field must contain pure Python defining a typed score function with signature:
+def score(node: object, state: object, context: object | None = None) -> float.
+
+STRICT RULES:
+- You MUST NOT use import statements
+- You MUST NOT reference external modules
+- You MUST NOT access the filesystem
+- Only use built-in Python operations
+- Do NOT wrap the code in Markdown
+Any violation will cause immediate failure.
+{%- endset %}
+
+{{ system_instructions | trim }}
+===USER===
+Current policy:
+{{ current_policy }}
+
+Validation context:
+{{ failure_context }}
+
+Structured feedback:
+{{ feedback_text }}
+
+Baseline comparison:
+{{ comparison_summary }}
+
+Guidance:
+{{ guidance_hint }}
+
+{{ diff_str }}
+
+Diff guidance:
+{{ diff_hint }}
+
+Tests (source of truth, do not modify):
+{{ tests }}
+
+Scoring interface + examples (STRICT CONTRACT):
+{{ scoring_context }}
+
+Validation requirements:
+- score MUST have type annotations on all parameters and return float
+- Target signature: def score(node: object, state: object, context: object | None = None) -> float
+- Code MUST be valid under BasedPyright
+
+Instructions:
+- Fix errors in order of priority:
+  1. TYPE ERRORS
+  2. LINT ERRORS
+  3. TEST FAILURES
+- Do NOT attempt to optimize until all tests pass
+- MUST define a typed score function used by the harness that returns a float
+- MUST be deterministic
+- MUST NOT import external libraries
+- MUST operate only on provided node/state data
+
+Return ONLY the JSON object specified by the schema.
+</file>
+
+<file path="prompts/prompt_models.py">
+from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict, field_validator
+
+
+class WriterPromptContext(BaseModel):
+    """Strict context for the policy writer prompt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    current_policy: str
+    failure_context: str
+    feedback_text: str
+    comparison_summary: str
+    guidance_hint: str
+    diff_str: str
+    diff_hint: str
+    tests: str
+    scoring_context: str
+
+
+class SystemPromptContext(BaseModel):
+    """Strict context for runner system prompts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    available_tools: str
+
+    @field_validator("available_tools")
+    @classmethod
+    def _ensure_non_empty(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("available_tools must be non-empty")
+        return value
+</file>
+
 <file path="tests_harness/conftest.py">
-import sys
-from pathlib import Path
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from pydantic import BaseModel, ConfigDict, Field
+from harness import observability
 
 
-def _bootstrap_repo_root() -> Path:
-    """
-    Locate the monorepo root before importing harness utilities.
-    """
-    start = Path(__file__).resolve()
-    for path in [start, *start.parents]:
-        if path.name == "searchbench":
-            return path
-        if (path / "pyproject.toml").exists() and (path / "uv.lock").exists():
-            return path
-    raise FileNotFoundError("Repository root not found for tests")
+class TestSpan(BaseModel):
+    """Pydantic test span with scoring support for Langfuse stubs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    trace_id: str | None = None
+    scores: list[tuple[str, float, dict[str, object] | None]] = Field(default_factory=list)
+
+    def score(self, name: str, value: float | int | bool, metadata: dict[str, object] | None = None) -> None:
+        self.scores.append((name, float(value), metadata))
+
+    def end(self, **kwargs: Any) -> None:  # pragma: no cover - simple stub
+        return None
 
 
-ROOT = _bootstrap_repo_root()
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+@pytest.fixture
+def test_span() -> TestSpan:
+    """Reusable span fixture with scoring and trace id."""
+    return TestSpan(id="span", trace_id="trace")
 
-# Import after sys.path is set to reuse the shared helper elsewhere.
+
+@pytest.fixture(autouse=True)
+def _clear_langfuse_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure Langfuse creds are absent to prevent accidental network calls."""
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_BASE_URL", raising=False)
+    monkeypatch.delenv("LANGFUSE_ENV", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _stub_langfuse_client(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Provide a dummy Langfuse client to prevent network access in tests."""
+    import os
+    if os.getenv("LANGFUSE_NO_STUB") == "1":
+        return
+    if request.node.get_closest_marker("no_langfuse_stub"):
+        return
+    import harness.observability.langfuse as lf
+
+    class DummyTrace:
+        def __init__(self, session_id: str | None = None):
+            self.id = "trace"
+            self.session_id = session_id
+
+        def span(self, name: str, metadata=None, input=None, session_id=None):
+            return DummySpan(session_id=session_id or self.session_id)
+
+    class DummySpan(DummyTrace):
+        def __init__(self, session_id: str | None = None):
+            super().__init__(session_id=session_id)
+            self.trace_id = "trace"
+
+        def end(self, **kwargs: Any) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self):
+            self.scores: list[dict[str, object]] = []
+
+        def create_score(self, **kwargs: Any) -> None:
+            self.scores.append(kwargs)
+
+        def trace(self, **kwargs: Any) -> DummyTrace:
+            return DummyTrace(session_id=kwargs.get("session_id"))
+
+        def flush(self) -> None:
+            return None
+
+    original = getattr(lf, "get_langfuse_client", None)
+    monkeypatch.setattr(lf, "_real_get_langfuse_client", original, raising=False)
+    monkeypatch.setattr(lf, "get_langfuse_client", lambda: DummyClient())
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "no_langfuse_stub: disable Langfuse stub fixture")
 </file>
 
 <file path="tests_harness/test_backend_adapters.py">
@@ -1482,6 +1815,13 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
     monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve", {"symbol": "foo"}))
+    class Span:
+        id = "span"
+
+        def score(self, name: str, value: float, metadata=None):
+            pass
+
+    monkeypatch.setattr(runner, "start_span", lambda *a, **k: Span())
 
     result = cast(dict[str, Any], runner.run_ic_iteration({"symbol": "s", "repo": str(tmp_path)}, score_fn=lambda n, s: 1.0, steps=1))
     assert result["node_count"] == 2
@@ -1508,6 +1848,13 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
     monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_symbols", {"query": "foo"}))
+    class Span:
+        id = "span"
+
+        def score(self, name: str, value: float, metadata=None):
+            pass
+
+    monkeypatch.setattr(runner, "start_span", lambda *a, **k: Span())
 
     result = cast(dict[str, Any], runner.run_jc_iteration({"symbol": "s", "repo": str(tmp_path)}, steps=1))
     assert result["node_count"] == 0
@@ -1668,6 +2015,32 @@ def test_require_baseline_errors_when_missing():
         raise AssertionError("Expected ValueError for missing baseline")
 </file>
 
+<file path="tests_harness/test_cerebras_pricing.py">
+from harness.observability.cerebras_pricing import CEREBRAS_PRICING, pricing_payload
+
+
+def test_cerebras_pricing_entries_present():
+    names = {entry["name"] for entry in CEREBRAS_PRICING}
+    assert {
+        "Zaizai GLM 4.7",
+        "GPT OSS 120B",
+        "Llama 3.1 8B",
+        "Qwen 3 235B Instruct",
+    }.issubset(names)
+    for entry in CEREBRAS_PRICING:
+        assert "match_pattern" in entry
+        assert "input_price_per_million" in entry
+        assert "output_price_per_million" in entry
+
+
+def test_pricing_payload_shapes():
+    payload = pricing_payload()
+    assert len(payload) >= 4
+    first = payload[0]
+    assert "match_pattern" in first and "prices" in first
+    assert set(first["prices"].keys()) >= {"input", "output"}
+</file>
+
 <file path="tests_harness/test_datasets_experiments.py">
 from __future__ import annotations
 
@@ -1701,7 +2074,7 @@ def test_fetch_dataset_items_from_client(monkeypatch):
 def test_run_hosted_jc_baseline_experiment(monkeypatch):
     items = [datasets.normalize_dataset_item({"repo": "r", "symbol": "s"})]
     monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
-    monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(experiments, "emit_score_for_handle", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "compute_baseline_for_item", lambda *a, **k: BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={}))
 
@@ -1722,7 +2095,7 @@ def test_run_hosted_jc_baseline_experiment(monkeypatch):
 def test_run_hosted_ic_optimization_experiment(monkeypatch):
     items = [datasets.normalize_dataset_item({"repo": "r", "symbol": "s"})]
     monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
-    monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(experiments, "emit_score_for_handle", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [IterationRecord(iteration=0, metrics={"score": 2.0})])
     monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "resolved-path")
@@ -1767,7 +2140,7 @@ def test_run_ic_optimization_uses_provided_baseline(monkeypatch):
         raise AssertionError("Should not recompute baseline")
 
     monkeypatch.setattr(experiments, "run_hosted_jc_baseline_experiment", fail_run_baseline)
-    monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(experiments, "emit_score_for_handle", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [IterationRecord(iteration=0, metrics={"score": 1.0})])
     monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "/tmp/resolved-r")
@@ -1838,6 +2211,7 @@ def test_only_policy_file_can_be_written(tmp_path: Path):
 from __future__ import annotations
 
 from harness import loop
+from harness.pipeline.types import PipelineClassification
 
 
 class DummySpan:
@@ -1867,13 +2241,14 @@ def _common_stubs(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "find_repo_root", lambda: tmp_path)
     monkeypatch.setattr(loop, "start_trace", lambda *a, **k: DummySpan("trace"))
     monkeypatch.setattr(loop, "start_span", lambda *a, **k: DummySpan("span"))
-    monkeypatch.setattr(loop, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(loop, "emit_score", lambda *a, **k: None)
     monkeypatch.setattr(loop, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(loop, "emit_score", lambda *a, **k: None)
 
 
 def test_pipeline_failure_appends_history(monkeypatch, tmp_path):
     _common_stubs(monkeypatch, tmp_path)
-    monkeypatch.setattr(loop, "classify_results", lambda results: {"lint_errors": "missing"})
+    monkeypatch.setattr(loop, "classify_results", lambda results: PipelineClassification(lint_errors="missing"))
     monkeypatch.setattr(loop, "compute_diff", lambda *a, **k: type("D", (), {"regression": False})())
     monkeypatch.setattr(loop, "format_diff", lambda diff: "diff")
     monkeypatch.setattr(loop, "interpret_diff", lambda diff: "hint")
@@ -1893,7 +2268,7 @@ def test_pipeline_failure_appends_history(monkeypatch, tmp_path):
     assert len(history) == 1
     entry = history[0]
     assert entry.pipeline_passed is False
-    assert entry.pipeline_feedback == {"lint_errors": "missing"}
+    assert entry.pipeline_feedback and entry.pipeline_feedback.lint_errors == "missing"
     assert entry.failed_step == "ruff_fail"
     assert entry.failed_exit_code == 1
     assert entry.failed_summary == "ruff stderr"
@@ -1902,7 +2277,7 @@ def test_pipeline_failure_appends_history(monkeypatch, tmp_path):
 
 def test_pipeline_failure_with_writer_error(monkeypatch, tmp_path):
     _common_stubs(monkeypatch, tmp_path)
-    monkeypatch.setattr(loop, "classify_results", lambda results: {"type_errors": "bad"})
+    monkeypatch.setattr(loop, "classify_results", lambda results: PipelineClassification(type_errors="bad"))
     monkeypatch.setattr(loop, "compute_diff", lambda *a, **k: type("D", (), {"regression": False})())
     monkeypatch.setattr(loop, "format_diff", lambda diff: "diff")
     monkeypatch.setattr(loop, "interpret_diff", lambda diff: "hint")
@@ -1942,87 +2317,177 @@ def test_pipeline_failure_with_writer_error(monkeypatch, tmp_path):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping
 
 from harness.loop_machine import OptimizationStateMachine, RepairStateMachine
 from harness.loop_types import (
+    AcceptedPolicyMeta,
     FeedbackPackage,
     EvaluationResult,
+    FailedRepairDetails,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
     PreparedTasks,
     RepairContext,
     RepairMachineModel,
-    PipelineStepResult,
 )
-from harness.pipeline.types import StepResult
+from harness.pipeline.types import PipelineClassification, StepResult
 
 
 def _make_deps(**overrides) -> LoopDependencies:
-    defaults = dict(
-        prepare_iteration_tasks=lambda task, trace: PreparedTasks(
-            base_task=task, resolved_repo_path=None, jc_repo_id=None
-        ),
-        evaluate_policy_on_item=lambda ic_task, baseline, iteration_span=None, iteration_index=None: EvaluationResult(
-            metrics={"score": 1.0}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="policy"
-        ),
-        build_iteration_feedback=lambda evaluation, prev_score, prev_classified, repo_root: FeedbackPackage(
-            tests="", scoring_context="", comparison_summary=None, feedback={"score": 1.0}, feedback_str="", guidance_hint="hint", diff_str="", diff_hint=""
-        ),
-        attempt_policy_generation=lambda **kwargs: ("policy", None),
-        run_policy_pipeline=lambda pipeline, repo_root, repair_obs=None: (
-            [PipelineStepResult(name="step", success=True, exit_code=0, stdout="", stderr="")],
-            [StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")],
-            True,
-        ),
-        finalize_successful_policy=lambda **kwargs: (
+    def prepare_iteration_tasks(task: Mapping[str, object], trace: object | None = None) -> PreparedTasks:
+        return PreparedTasks(base_task=dict(task), resolved_repo_path=None, jc_repo_id=None)
+
+    def evaluate_policy_on_item(
+        ic_task: Mapping[str, object],
+        baseline,
+        iteration_span: object | None = None,
+        iteration_index: int | None = None,
+    ) -> EvaluationResult:
+        return EvaluationResult(
+            metrics={"score": 1.0},
+            ic_result={},
+            jc_result={},
+            jc_metrics={},
+            comparison_summary=None,
+            policy_code="policy",
+        )
+
+    def build_iteration_feedback(
+        evaluation: EvaluationResult,
+        prev_score: float | None,
+        prev_classified,
+        repo_root: Path,
+    ) -> FeedbackPackage:
+        return FeedbackPackage(
+            tests="",
+            scoring_context="",
+            comparison_summary=None,
+            feedback={"score": 1.0},
+            feedback_str="",
+            guidance_hint="hint",
+            diff_str="",
+            diff_hint="",
+        )
+
+    def attempt_policy_generation(**kwargs) -> tuple[str | None, str | None]:
+        return ("policy", None)
+
+    def run_policy_pipeline(pipeline: object, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
+        result = StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")
+        return [result], True
+
+    def finalize_successful_policy(**kwargs) -> tuple[str, AcceptedPolicyMeta]:
+        return (
             "policy",
-            {
-                "repair_attempts": 0,
-                "max_policy_repairs": 1,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": False,
-            },
-        ),
-        finalize_failed_repair=lambda **kwargs: ("", "policy"),
-        classify_results=lambda results: {},
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=False,
+                repair_attempts=0,
+                max_policy_repairs=1,
+            ),
+        )
+
+    def finalize_failed_repair(**kwargs) -> FailedRepairDetails:
+        return FailedRepairDetails(
+            failure_context="",
+            policy_code="policy",
+            failed_step=None,
+            failed_exit_code=None,
+            failed_summary=None,
+            error="pipeline_failed",
+        )
+
+    def classify_results(results: list[StepResult]):
+        return PipelineClassification()
+
+    deps = LoopDependencies(
+        prepare_iteration_tasks=prepare_iteration_tasks,
+        evaluate_policy_on_item=evaluate_policy_on_item,
+        build_iteration_feedback=build_iteration_feedback,
+        attempt_policy_generation=attempt_policy_generation,
+        run_policy_pipeline=run_policy_pipeline,
+        finalize_successful_policy=finalize_successful_policy,
+        finalize_failed_repair=finalize_failed_repair,
+        classify_results=classify_results,
         format_pipeline_failure_context=lambda *a, **k: "",
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        record_score=lambda *a, **k: None,
         start_span=lambda *a, **k: None,
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),
     )
-    defaults.update(overrides)
-    return LoopDependencies(**defaults)
+    for key, val in overrides.items():
+        setattr(deps, key, val)
+    return deps
 
 
-def _make_evaluation(**overrides) -> EvaluationResult:
-    defaults = dict(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="policy")
-    defaults.update(overrides)
-    return EvaluationResult(**defaults)
-
-
-def _make_feedback(**overrides) -> FeedbackPackage:
-    defaults = dict(tests="", scoring_context="", comparison_summary=None, feedback={}, feedback_str="", guidance_hint="", diff_str="", diff_hint="")
-    defaults.update(overrides)
-    return FeedbackPackage(**defaults)
-
-
-def _make_repair_ctx(deps, *, max_repair_attempts=3, **overrides) -> RepairContext:
-    defaults = dict(
-        repo_root=Path("."),
-        evaluation=_make_evaluation(),
-        feedback=_make_feedback(),
-        max_repair_attempts=max_repair_attempts,
-        parent_trace=None,
-        writer_model="model",
+def _make_evaluation(
+    *,
+    metrics: dict[str, object] | None = None,
+    ic_result: Mapping[str, object] | None = None,
+    jc_result: Mapping[str, object] | None = None,
+    jc_metrics: Mapping[str, object] | None = None,
+    comparison_summary: str | None = None,
+    policy_code: str = "policy",
+    success: bool = True,
+    error: str | None = None,
+) -> EvaluationResult:
+    return EvaluationResult(
+        metrics=metrics or {},
+        ic_result=ic_result or {},
+        jc_result=jc_result or {},
+        jc_metrics=jc_metrics or {},
+        comparison_summary=comparison_summary,
+        policy_code=policy_code,
+        success=success,
+        error=error,
     )
-    defaults.update(overrides)
-    return RepairContext(**defaults)
+
+
+def _make_feedback(
+    *,
+    tests: str = "",
+    scoring_context: str = "",
+    comparison_summary: str | None = None,
+    feedback: dict[str, object] | None = None,
+    feedback_str: str = "",
+    guidance_hint: str = "",
+    diff_str: str = "",
+    diff_hint: str = "",
+) -> FeedbackPackage:
+    return FeedbackPackage(
+        tests=tests,
+        scoring_context=scoring_context,
+        comparison_summary=comparison_summary,
+        feedback=feedback or {},
+        feedback_str=feedback_str,
+        guidance_hint=guidance_hint,
+        diff_str=diff_str,
+        diff_hint=diff_hint,
+    )
+
+
+def _make_repair_ctx(
+    deps: LoopDependencies,
+    *,
+    max_repair_attempts: int = 3,
+    repo_root: Path | None = None,
+    evaluation: EvaluationResult | None = None,
+    feedback: FeedbackPackage | None = None,
+    parent_trace=None,
+    writer_model: str | None = "model",
+) -> RepairContext:
+    return RepairContext(
+        repo_root=repo_root or Path("."),
+        evaluation=evaluation or _make_evaluation(),
+        feedback=feedback or _make_feedback(),
+        max_repair_attempts=max_repair_attempts,
+        parent_trace=parent_trace,
+        writer_model=writer_model,
+    )
 
 
 def test_optimization_machine_success_path():
@@ -2046,19 +2511,22 @@ def test_repair_machine_retries_until_exhaustion():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         attempts.append(1)
         result = StepResult(name="step", success=False, exit_code=1, stdout="", stderr="boom")
-        return [PipelineStepResult.from_mapping(result)], [result], False
+        return [result], False
 
-    def finalize_failed_repair(*, metadata: dict[str, object], pipeline_results: Sequence[Mapping[str, object]], classified: Mapping[str, object], **kwargs):
-        metadata["pipeline_feedback"] = classified
-        metadata["failed_step"] = pipeline_results[0].get("name")
-        metadata["failed_exit_code"] = pipeline_results[0].get("exit_code")
-        metadata["failed_summary"] = "boom"
-        return ("ctx", "policy")
+    def finalize_failed_repair(*, pipeline_results, classified, **kwargs):
+        return FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="boom",
+            error="pipeline_failed",
+        )
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
         finalize_failed_repair=finalize_failed_repair,
-        classify_results=lambda results: {"test_failures": "boom"},
+        classify_results=lambda results: PipelineClassification(test_failures="boom"),
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=2)
     repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
@@ -2066,7 +2534,7 @@ def test_repair_machine_retries_until_exhaustion():
     outcome = machine.run()
     assert outcome.success is False
     assert outcome.attempts_used == 2
-    assert outcome.metadata.get("pipeline_feedback") == {"test_failures": "boom"}
+    assert outcome.pipeline_feedback and outcome.pipeline_feedback.test_failures == "boom"
     state = getattr(machine, "current_state")
     assert getattr(state, "id", None) == machine.repair_exhausted.id  # type: ignore[attr-defined]
 
@@ -2078,22 +2546,29 @@ def test_repair_succeeds_on_second_attempt():
         pipeline_calls.append(1)
         if len(pipeline_calls) == 1:
             result = StepResult(name="ruff", success=False, exit_code=1, stdout="", stderr="lint error")
-            return [PipelineStepResult.from_mapping(result)], [result], False
+            return [result], False
         result = StepResult(name="ruff", success=True, exit_code=0, stdout="", stderr="")
-        return [PipelineStepResult.from_mapping(result)], [result], True
+        return [result], True
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
-        classify_results=lambda results: {"lint_errors": "bad"},
-        finalize_failed_repair=lambda *, metadata, pipeline_results, classified, **kwargs: ("ctx", "policy"),
+        classify_results=lambda results: PipelineClassification(lint_errors="bad"),
+        finalize_failed_repair=lambda *, pipeline_results, classified, **kwargs: FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="lint error",
+            error="pipeline_failed",
+        ),
         finalize_successful_policy=lambda **kwargs: (
             "policy",
-            {
-                "repair_attempts": 1,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": False,
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=False,
+                repair_attempts=1,
+                max_policy_repairs=3,
+            ),
         ),
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=3)
@@ -2102,7 +2577,7 @@ def test_repair_succeeds_on_second_attempt():
     outcome = machine.run()
     assert outcome.success is True
     assert outcome.attempts_used == 2
-    assert outcome.metadata.get("repair_attempts") == 1
+    assert outcome.repair_attempts_reported == 1
 
 
 def test_pipeline_mutation_returns_on_disk_policy():
@@ -2116,7 +2591,7 @@ def test_pipeline_mutation_returns_on_disk_policy():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         disk_policy[0] = "formatted_policy"
         result = StepResult(name="ruff_fix", success=True, exit_code=0, stdout="", stderr="")
-        return [PipelineStepResult.from_mapping(result)], [result], True
+        return [result], True
 
     deps = _make_deps(
         write_policy=write_policy,
@@ -2124,12 +2599,12 @@ def test_pipeline_mutation_returns_on_disk_policy():
         run_policy_pipeline=run_policy_pipeline,
         finalize_successful_policy=lambda **kwargs: (
             disk_policy[0],
-            {
-                "repair_attempts": 0,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": disk_policy[0] != kwargs.get("new_code", ""),
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=disk_policy[0] != kwargs.get("new_code", ""),
+                repair_attempts=0,
+                max_policy_repairs=3,
+            ),
         ),
     )
     repair_ctx = _make_repair_ctx(deps)
@@ -2138,8 +2613,8 @@ def test_pipeline_mutation_returns_on_disk_policy():
     outcome = machine.run()
     assert outcome.success is True
     assert outcome.policy == "formatted_policy"
-    assert outcome.metadata.get("accepted_policy_source") == "post_pipeline_disk"
-    assert outcome.metadata.get("accepted_policy_changed_by_pipeline") is True
+    assert outcome.accepted_policy_source == "post_pipeline_disk"
+    assert outcome.accepted_policy_changed_by_pipeline is True
 
 
 def test_warning_only_steps_do_not_fail():
@@ -2149,19 +2624,19 @@ def test_warning_only_steps_do_not_fail():
             StepResult(name="pytest_iterative_context", success=False, stdout="warning", stderr="", exit_code=0),
             StepResult(name="ruff_fix", success=False, stdout="notice", stderr="", exit_code=0),
         ]
-        pipeline_results = [PipelineStepResult.from_mapping(r) for r in results]
-        return pipeline_results, results, True
+        pipeline_results = results
+        return pipeline_results, True
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
         finalize_successful_policy=lambda **kwargs: (
             "policy",
-            {
-                "repair_attempts": 0,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": False,
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=False,
+                repair_attempts=0,
+                max_policy_repairs=3,
+            ),
         ),
     )
     repair_ctx = _make_repair_ctx(deps)
@@ -2170,24 +2645,29 @@ def test_warning_only_steps_do_not_fail():
     outcome = machine.run()
     assert outcome.success is True
     assert outcome.attempts_used == 1
-    assert outcome.metadata.get("repair_attempts") == 0
-    assert not outcome.metadata.get("pipeline_feedback")
-    assert outcome.metadata.get("failed_step") is None
+    assert outcome.repair_attempts_reported == 0
+    assert not outcome.pipeline_feedback
+    assert outcome.failed_step is None
 
 
 def test_nonzero_exit_still_fails():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         result = StepResult(name="pytest_iterative_context", success=False, stdout="", stderr="test failed", exit_code=1)
-        return [PipelineStepResult.from_mapping(result)], [result], False
+        return [result], False
 
-    def finalize_failed_repair(*, metadata, pipeline_results, classified, **kwargs):
-        metadata["pipeline_feedback"] = classified
-        metadata["error"] = "pipeline_failed"
-        return ("ctx", "policy")
+    def finalize_failed_repair(*, pipeline_results, classified, **kwargs):
+        return FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="test failed",
+            error="pipeline_failed",
+        )
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
-        classify_results=lambda results: {"test_failures": "boom"},
+        classify_results=lambda results: PipelineClassification(test_failures="boom"),
         finalize_failed_repair=finalize_failed_repair,
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=2)
@@ -2196,22 +2676,27 @@ def test_nonzero_exit_still_fails():
     outcome = machine.run()
     assert outcome.success is False
     assert outcome.attempts_used == 2
-    assert outcome.metadata.get("pipeline_feedback") == {"test_failures": "boom"}
+    assert outcome.pipeline_feedback and outcome.pipeline_feedback.test_failures == "boom"
 
 
 def test_failed_candidate_not_marked_accepted():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         result = StepResult(name="ruff_fix", success=False, stdout="", stderr="lint", exit_code=1)
-        return [PipelineStepResult.from_mapping(result)], [result], False
+        return [result], False
 
-    def finalize_failed_repair(*, metadata, pipeline_results, classified, **kwargs):
-        metadata["pipeline_feedback"] = classified
-        metadata["error"] = "pipeline_failed"
-        return ("ctx", "policy")
+    def finalize_failed_repair(*, pipeline_results, classified, **kwargs):
+        return FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="lint",
+            error="pipeline_failed",
+        )
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
-        classify_results=lambda results: {"lint_errors": "missing"},
+        classify_results=lambda results: PipelineClassification(lint_errors="missing"),
         finalize_failed_repair=finalize_failed_repair,
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=2)
@@ -2219,8 +2704,8 @@ def test_failed_candidate_not_marked_accepted():
     machine = RepairStateMachine(repair_model)
     outcome = machine.run()
     assert outcome.success is False
-    assert "accepted_policy_source" not in outcome.metadata
-    assert "accepted_policy_changed_by_pipeline" not in outcome.metadata
+    assert outcome.accepted_policy_source is None
+    assert outcome.accepted_policy_changed_by_pipeline is None
 
 
 def test_score_metrics_propagation_into_iteration_record():
@@ -2248,12 +2733,12 @@ def test_post_pipeline_metadata_propagates_into_accepted_policy():
     deps = _make_deps(
         finalize_successful_policy=lambda **kwargs: (
             "formatted_policy",
-            {
-                "repair_attempts": 0,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": True,
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=True,
+                repair_attempts=0,
+                max_policy_repairs=3,
+            ),
         ),
     )
     model = OptimizationMachineModel(
@@ -2316,35 +2801,45 @@ def test_repair_span_metadata_correct_across_retries():
             self.metadata = metadata
 
         def end(self, **kwargs: object) -> None:
-            span_events.append(("close", dict(kwargs.get("metadata", {}))))
+            meta = kwargs.get("metadata", {})
+            meta_dict = {str(k): v for k, v in (meta.items() if isinstance(meta, Mapping) else [])}
+            span_events.append(("close", meta_dict))
 
     def tracking_start_span(parent, name, **kwargs):
         meta = kwargs.get("metadata", {})
-        span = FakeSpan(name, meta)
-        span_events.append(("open", {"name": name, **meta}))
+        meta_dict = {str(k): v for k, v in (meta.items() if isinstance(meta, Mapping) else [])}
+        span = FakeSpan(name, meta_dict)
+        span_events.append(("open", {"name": name, **meta_dict}))
         return span
 
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         pipeline_calls.append(1)
         if len(pipeline_calls) == 1:
             result = StepResult(name="ruff", success=False, exit_code=1, stdout="", stderr="err")
-            return [PipelineStepResult.from_mapping(result)], [result], False
+            return [result], False
         result = StepResult(name="ruff", success=True, exit_code=0, stdout="", stderr="")
-        return [PipelineStepResult.from_mapping(result)], [result], True
+        return [result], True
 
     deps = _make_deps(
         start_span=tracking_start_span,
         run_policy_pipeline=run_policy_pipeline,
-        classify_results=lambda results: {"lint_errors": "bad"},
-        finalize_failed_repair=lambda *, metadata, pipeline_results, classified, **kwargs: ("ctx", "policy"),
+        classify_results=lambda results: PipelineClassification(lint_errors="bad"),
+        finalize_failed_repair=lambda *, pipeline_results, classified, **kwargs: FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="err",
+            error="pipeline_failed",
+        ),
         finalize_successful_policy=lambda **kwargs: (
             "policy",
-            {
-                "repair_attempts": 1,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": False,
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=False,
+                repair_attempts=1,
+                max_policy_repairs=3,
+            ),
         ),
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=3)
@@ -2363,31 +2858,97 @@ def test_repair_span_metadata_correct_across_retries():
     assert close_events[1][1].get("status") == "passed"
 </file>
 
+<file path="tests_harness/test_loop_viz.py">
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+import shutil
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from harness.tools.loop_viz import render_state_machines
+
+
+def test_mermaid_render_to_stdout(capsys):
+    render_state_machines(fmt="mermaid", machine="repair", output=None)
+    out = capsys.readouterr().out
+    assert "RepairStateMachine" in out
+    assert out.strip()
+
+
+def test_png_requires_output():
+    with pytest.raises(ValueError):
+        render_state_machines(fmt="png", machine="repair", output=None)
+
+
+def test_png_writes_file(tmp_path: Path):
+    if shutil.which("dot") is None:
+        pytest.skip("Graphviz 'dot' binary not installed")
+    out_path = tmp_path / "chart.png"
+    render_state_machines(fmt="png", machine="repair", output=out_path)
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
+
+
+def test_png_writes_both_files(tmp_path: Path):
+    if shutil.which("dot") is None:
+        pytest.skip("Graphviz 'dot' binary not installed")
+    base = tmp_path / "chart.png"
+    render_state_machines(fmt="png", machine="both", output=base)
+    first = base
+    second = tmp_path / "chart_OptimizationStateMachine.png"
+    assert first.exists()
+    assert second.exists()
+    assert first.stat().st_size > 0
+    assert second.stat().st_size > 0
+</file>
+
 <file path="tests_harness/test_observability.py">
 from __future__ import annotations
 
+import pytest
+
 from harness.observability import langfuse as lf
+from harness.observability import score_emitter
 
 
-class DummySpan:
-    def __init__(self):
-        self.scores: list[tuple[str, float, dict[str, object] | None]] = []
-
-    def score(self, name: str, value: float, metadata=None):
-        self.scores.append((name, value, metadata))
-
-
+@pytest.mark.no_langfuse_stub
 def test_langfuse_disabled_without_keys(monkeypatch):
+    import importlib
+    import harness.observability.langfuse as lf
+
+    monkeypatch.setenv("LANGFUSE_NO_STUB", "1")
+    lf = importlib.reload(lf)
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
-    monkeypatch.setenv("LANGFUSE_ENABLED", "0")
-    assert lf.get_langfuse_client() is None
+    try:
+        client = lf.get_langfuse_client()
+    except RuntimeError:
+        return
+    # If stubbed, ensure it's the dummy client (networkless)
+    assert hasattr(client, "create_score")
 
 
-def test_record_score_passes_metadata():
-    span = DummySpan()
-    lf.record_score(span, "metric", 1.0, metadata={"a": 1})
-    assert span.scores == [("metric", 1.0, {"a": 1})]
+def test_emit_score_uses_client(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class DummyClient:
+        def create_score(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
+    score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
+
+    assert calls
+    emitted = calls[0]
+    assert emitted["name"] == "metric"
+    assert emitted["value"] == 1.0
+    assert emitted.get("trace_id") == "t1"
 </file>
 
 <file path="tests_harness/test_pipeline_steps_scope.py">
@@ -2436,7 +2997,7 @@ def test_basedpyright_scope_excludes_jcodemunch(monkeypatch, tmp_path):
 from __future__ import annotations
 
 from harness.pipeline.pipeline import classify_results, format_structured_feedback, infer_action_hint
-from harness.pipeline.types import StepResult
+from harness.pipeline.types import PipelineClassification, StepResult
 
 
 def test_basedpyright_warning_not_classified_as_failure():
@@ -2450,7 +3011,8 @@ def test_basedpyright_warning_not_classified_as_failure():
         )
     ]
     classified = classify_results(results)
-    assert classified["type_errors"] == ""
+    assert isinstance(classified, PipelineClassification)
+    assert classified.type_errors == ""
     feedback = format_structured_feedback(classified)
     assert "TYPE ERRORS" not in feedback
     assert infer_action_hint(classified) == "All checks passed. Improve score."
@@ -2467,7 +3029,8 @@ def test_pytest_warning_not_classified_as_failure():
         )
     ]
     classified = classify_results(results)
-    assert classified["test_failures"] == ""
+    assert isinstance(classified, PipelineClassification)
+    assert classified.test_failures == ""
     feedback = format_structured_feedback(classified)
     assert "TEST FAILURES" not in feedback
     assert infer_action_hint(classified) == "All checks passed. Improve score."
@@ -2484,7 +3047,8 @@ def test_ruff_warning_not_classified_as_failure():
         )
     ]
     classified = classify_results(results)
-    assert classified["lint_errors"] == ""
+    assert isinstance(classified, PipelineClassification)
+    assert classified.lint_errors == ""
     feedback = format_structured_feedback(classified)
     assert "LINT ERRORS" not in feedback
     assert infer_action_hint(classified) == "All checks passed. Improve score."
@@ -2529,6 +3093,105 @@ def test_variable_arity_adapts(policy_path: Path):
     assert scorer(None, None, None) == 1.5
 </file>
 
+<file path="tests_harness/test_prompt_templates.py">
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import harness.runner as runner
+import harness.writer as writer
+from harness.pipeline.types import StepResult
+from harness.prompts import SystemPromptContext, WriterPromptContext
+from harness.utils import template_loader
+from harness.utils.openai_schema import OpenAITool
+
+
+def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    template_path = prompts_dir / "policy_writer.jinja"
+    template_path.write_text("Policy: {{ current_policy }} | Tests: {{ tests }} | Feedback: {{ feedback_text }}", encoding="utf-8")
+    monkeypatch.setattr(template_loader, "find_repo_root", lambda: tmp_path)
+
+    rendered = writer._render_writer_prompt(
+        current_policy="code_v1",
+        failure_context="ctx",
+        feedback_str="fb",
+        feedback={},
+        comparison_summary="N/A",
+        guidance_hint="hint",
+        diff_str="diff",
+        diff_hint="hint2",
+        tests="tests-content",
+        scoring_context="ctx",
+    )
+    assert "code_v1" in rendered
+    assert "tests-content" in rendered
+    assert "fb" in rendered
+
+
+def test_runner_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "ic_system.jinja").write_text("Tools: {{ available_tools }}", encoding="utf-8")
+    (prompts_dir / "jc_system.jinja").write_text("JC Tools: {{ available_tools }}", encoding="utf-8")
+    monkeypatch.setattr(template_loader, "find_repo_root", lambda: tmp_path)
+
+    tools: list[OpenAITool] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "inspect_file",
+                "description": "Inspect a file",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+    ]
+    ic_prompt = runner._build_ic_system_prompt(tools)
+    jc_prompt = runner._build_jc_system_prompt(tools)
+    assert "inspect_file" in ic_prompt
+    assert "inspect_file" in jc_prompt
+
+
+def test_writer_prompt_validation_rejects_extra_fields():
+    with pytest.raises(Exception):
+        WriterPromptContext.model_validate(
+            {
+                "current_policy": "code",
+                "failure_context": "",
+                "feedback_text": "fb",
+                "comparison_summary": "N/A",
+                "guidance_hint": "hint",
+                "diff_str": "",
+                "diff_hint": "",
+                "tests": "",
+                "scoring_context": "",
+                "extra_field": "nope",
+            }
+        )
+
+
+def test_step_result_rejects_extra_fields():
+    with pytest.raises(Exception):
+        StepResult.model_validate(
+            {
+                "name": "x",
+                "success": True,
+                "stdout": "",
+                "stderr": "",
+                "exit_code": 0,
+                "unexpected": "nope",
+            }
+        )
+
+
+def test_system_prompt_context_requires_available_tools():
+    with pytest.raises(Exception):
+        SystemPromptContext.model_validate({"available_tools": ""})
+</file>
+
 <file path="tests_harness/test_pytest_scope.py">
 from pathlib import Path
 
@@ -2565,6 +3228,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from harness.observability import baselines, experiments
+from harness.observability.runner_integration import HostedRunItemResult, HostedRunResult
 from harness import loop, runner
 from harness.loop_types import IterationRecord
 
@@ -2580,6 +3244,16 @@ def test_baseline_resolves_repo(monkeypatch, tmp_path):
     repo_dir.mkdir()
     monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
     monkeypatch.setattr(runner, "run_jc_iteration", fake_run_jc_iteration)
+    class Span:
+        id = "span"
+
+        def end(self, **kwargs):
+            pass
+
+        def score(self, name: str, value: float, metadata=None):
+            pass
+
+    monkeypatch.setattr(baselines, "start_span", lambda *a, **k: Span())
     snap = baselines.compute_baseline_for_item(
         baselines.normalize_dataset_item({"id": "item1", "repo": "small", "symbol": "s", "metadata": {}})
     )
@@ -2599,13 +3273,26 @@ def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
     repo_dir.mkdir()
     monkeypatch.setenv("TEST_REPO_MEDIUM", str(repo_dir))
     monkeypatch.setattr(experiments, "run_loop", fake_run_loop)
+    item_payload = baselines.normalize_dataset_item({"id": "item3", "repo": "medium", "symbol": "s", "metadata": {}})
+
+    def fake_hosted(*args, **kwargs):
+        task_fn = kwargs["task_fn"]
+        class Span:
+            id = "span"
+            def score(self, name: str, value: float, metadata=None):
+                pass
+        output = task_fn(item_payload.model_dump(), Span())
+        hosted_item = HostedRunItemResult(item=item_payload.model_dump(), output=output)
+        return HostedRunResult(items=[hosted_item])
+
+    monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_hosted)
     baselines_bundle: Any = baselines.make_baseline_bundle(
         [baselines.BaselineSnapshot(repo="medium", symbol="s", jc_result={}, jc_metrics={}, item_id="item2")]
     )
     experiments._run_ic_optimizations(  # type: ignore[attr-defined,arg-type]
         [baselines.normalize_dataset_item({"id": "item3", "repo": "medium", "symbol": "s", "metadata": {}})],
         baselines_bundle,
-        dataset_name=None,
+        dataset_name="medium",
         dataset_version=None,
         iterations=1,
         hosted=False,
@@ -2653,7 +3340,7 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "find_repo_root", lambda: tmp_path)
     monkeypatch.setattr(loop, "start_trace", lambda *a, **k: DummySpan("trace"))
     monkeypatch.setattr(loop, "start_span", lambda *a, **k: DummySpan("span"))
-    monkeypatch.setattr(loop, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(loop, "emit_score", lambda *a, **k: None)
     monkeypatch.setattr(loop, "flush_langfuse", lambda: None)
 
     loop.run_loop({"symbol": "s", "repo": str(repo_dir)}, iterations=1)
@@ -2827,27 +3514,6 @@ def test_run_hosted_dataset_experiment_uses_get_dataset(monkeypatch):
     )
     assert result.run_id == "rid"
     assert calls["get_dataset"] == 1 and calls["run_experiment"] == 1
-
-
-def test_run_local_dataset_experiment_calls_client(monkeypatch):
-    calls: dict[str, int] = {"run_experiment": 0}
-
-    class FakeClient:
-        def run_experiment(self, **kwargs):
-            calls["run_experiment"] += 1
-            assert kwargs["name"] == "exp_local"
-            assert isinstance(kwargs["data"], list)
-            return _FakeResult()
-
-    monkeypatch.setattr(runner_integration, "get_langfuse_client", lambda: FakeClient())
-    data: list[Mapping[str, object]] = [{"repo": "r"}]
-    result = runner_integration.run_local_dataset_experiment(
-        data=data,
-        experiment_name="exp_local",
-        task_fn=lambda item, trace=None: {"ok": True},
-    )
-    assert result.run_id == "rid"
-    assert calls["run_experiment"] == 1
 </file>
 
 <file path="tests_harness/test_score_adapter.py">
@@ -2867,6 +3533,80 @@ def test_score_accepts_variable_arity():
     for fn in (s1, s2, s3):
         wrapped = adapt_score_fn(fn)
         assert isinstance(wrapped(None, None, None), float)
+</file>
+
+<file path="tests_harness/test_scoring_emit.py">
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import harness.loop as loop_module
+from harness.pipeline.types import StepResult
+from harness.observability import langfuse as langfuse_module
+from harness.observability import score_emitter
+
+
+class DummyPipeline:
+    def __init__(self, results: list[StepResult]):
+        self._results = results
+
+    def run(self, repo_root: Path, observation=None) -> list[StepResult]:
+        return self._results
+
+
+def test_run_policy_pipeline_emits_step_scores(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_emit_score(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(loop_module, "emit_score", fake_emit_score)
+    results = [
+        StepResult(name="ruff", success=False, exit_code=1, stdout="", stderr="lint"),
+        StepResult(name="pytest_iterative_context", success=True, exit_code=0, stdout="", stderr=""),
+    ]
+    pipeline = DummyPipeline(results)
+
+    class Obs:
+        id = "obs1"
+        trace_id = "trace1"
+        dataset_run_id = "dsrun1"
+
+    emitted, success = loop_module.run_policy_pipeline(pipeline, Path("."), repair_obs=Obs())
+    assert emitted == results
+    assert success is False
+    names = {c["name"] for c in calls}
+    assert "pipeline.ruff.exit_code" in names
+    assert "pipeline.ruff.passed" in names
+    assert "pipeline.pytest_iterative_context.exit_code" in names
+    assert "pipeline.pytest_iterative_context.passed" in names
+    for call in calls:
+        assert call["trace_id"] == "trace1"
+        assert call["dataset_run_id"] == "dsrun1"
+
+
+def test_emit_score_surfaces_missing_client(monkeypatch):
+    monkeypatch.setattr(langfuse_module, "get_langfuse_client", lambda: None)
+    with pytest.raises(RuntimeError):
+        score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
+
+
+def test_emit_score_accepts_session_only(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class DummyClient:
+        def create_score(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(langfuse_module, "get_langfuse_client", lambda: DummyClient())
+    score_emitter.emit_score(name="metric", value=1.0, session_id="session-123")
+
+    assert calls
+    emitted = calls[0]
+    assert emitted["session_id"] == "session-123"
+    assert "trace_id" not in emitted
 </file>
 
 <file path="tests_harness/test_subprocess_guard.py">
@@ -2927,7 +3667,11 @@ class DummySpan:
 
 def test_run_ic_iteration_emits_scores(monkeypatch):
     scores: list[tuple[str, float]] = []
-    monkeypatch.setattr(runner, "record_score", lambda span, name, value, metadata=None: scores.append((name, float(value))))
+    monkeypatch.setattr(
+        runner,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: scores.append((kwargs.get("name"), float(kwargs.get("value", 0.0)))),
+    )
     monkeypatch.setattr(runner, "start_span", lambda *a, **k: DummySpan("span"))
     monkeypatch.setattr(runner, "run_agent", lambda *a, **k: {"observations": [{"tool": "t", "result": {"graph": {"nodes": [1, 2]}}}]})
     monkeypatch.setattr(
@@ -2973,7 +3717,11 @@ def test_writer_records_policy_events(monkeypatch):
 
     monkeypatch.setattr(writer, "_get_client", fake_client)
     monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan("writer"))
-    monkeypatch.setattr(writer, "record_score", lambda obs, name, value, metadata=None: attempt_scores.append((name, float(value))))
+    monkeypatch.setattr(
+        writer,
+        "emit_score_for_handle",
+        lambda obs, **kwargs: attempt_scores.append((kwargs.get("name"), float(kwargs.get("value", 0.0)))),
+    )
 
     result = writer.generate_policy(
         feedback={"a": 1},
@@ -3020,6 +3768,7 @@ def test_run_agent_truncates_tool_content(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
+    monkeypatch.setattr(runner, "start_span", lambda *a, **k: type("S", (), {"id": "span", "end": lambda self, **kw: None})())
     long_result = "X" * (runner._MAX_TOOL_CONTENT_CHARS * 2)
     observations = runner.run_agent(
         {"symbol": "s", "repo": "r"},
@@ -3072,6 +3821,7 @@ def test_run_agent_retries_on_context_error(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
+    monkeypatch.setattr(runner, "start_span", lambda *a, **k: type("S", (), {"id": "span", "end": lambda self, **kw: None})())
     result = runner.run_agent(
         {"symbol": "s", "repo": "r"},
         steps=1,
@@ -3178,7 +3928,11 @@ def test_generate_policy_accepts_structured_code(monkeypatch):
     payload = {"code": "def score(node: object, state: object, context: object | None = None) -> float:\n    return 1.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), calls), "model"))
     monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
-    monkeypatch.setattr(writer, "record_score", lambda obs, name, value, metadata=None: scores.append((name, float(value))))
+    monkeypatch.setattr(
+        writer,
+        "emit_score_for_handle",
+        lambda obs, **kwargs: scores.append((kwargs.get("name"), float(kwargs.get("value", 0.0)))),
+    )
     code = writer.generate_policy(**_base_inputs())
     assert "def score" in code
     assert ("writer.policy_compiled", 1.0) in scores
@@ -3211,7 +3965,7 @@ def test_generate_policy_accepts_structured_code(monkeypatch):
 def test_generate_policy_rejects_missing_or_nonstring_code(monkeypatch, payload):
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
     monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
-    monkeypatch.setattr(writer, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     with pytest.raises(ValueError):
         writer.generate_policy(**_base_inputs())
 
@@ -3220,7 +3974,7 @@ def test_generate_policy_rejects_fenced_code(monkeypatch):
     payload = {"code": "```python\ndef score():\n    pass\n```"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
     monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
-    monkeypatch.setattr(writer, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     with pytest.raises(ValueError):
         writer.generate_policy(**_base_inputs())
 
@@ -3229,7 +3983,7 @@ def test_generate_policy_rejects_invalid_python(monkeypatch):
     payload = {"code": "def score(:\n    pass"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
     monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
-    monkeypatch.setattr(writer, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     with pytest.raises(SyntaxError):
         writer.generate_policy(**_base_inputs())
 
@@ -3237,7 +3991,7 @@ def test_generate_policy_rejects_invalid_python(monkeypatch):
 def test_generate_policy_rejects_invalid_json(monkeypatch):
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client("not-json", []), "model"))
     monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
-    monkeypatch.setattr(writer, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     with pytest.raises(ValueError):
         writer.generate_policy(**_base_inputs())
 
@@ -3247,7 +4001,7 @@ def test_generate_policy_accepts_parsed_fallback(monkeypatch):
     parsed = {"code": "def score(node, state):\n    return 2.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(None, calls, parsed=parsed), "model"))
     monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan())
-    monkeypatch.setattr(writer, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     code = writer.generate_policy(**_base_inputs())
     assert "return 2.0" in code
 </file>
@@ -3378,6 +4132,207 @@ from __future__ import annotations
 from . import backends, mcp_adapter
 
 __all__ = ["backends", "mcp_adapter"]
+</file>
+
+<file path="tools/loop_viz.py">
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+from typing import Mapping
+
+# Ensure the repository root (parent of the harness package) is on sys.path when executed as a script.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from harness.loop_machine import OptimizationStateMachine, RepairStateMachine
+from harness.loop_types import (
+    AcceptedPolicyMeta,
+    FailedRepairDetails,
+    EvaluationResult,
+    FeedbackPackage,
+    LoopContext,
+    LoopDependencies,
+    OptimizationMachineModel,
+    PreparedTasks,
+    RepairContext,
+    RepairMachineModel,
+)
+from harness.pipeline.types import PipelineClassification, StepResult
+
+
+def _stub_deps() -> LoopDependencies:
+    """Minimal dependency set for chart rendering (no side effects)."""
+
+    def _prepare(task: Mapping[str, object], trace: object | None = None) -> PreparedTasks:
+        return PreparedTasks(base_task=dict(task), resolved_repo_path=None, jc_repo_id=None)
+
+    dummy_eval = EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="")
+    dummy_feedback = FeedbackPackage(
+        tests="",
+        scoring_context="",
+        comparison_summary=None,
+        feedback={},
+        feedback_str="",
+        guidance_hint="",
+        diff_str="",
+        diff_hint="",
+    )
+
+    def _evaluate_policy_on_item(*args: object, **kwargs: object) -> EvaluationResult:
+        return dummy_eval
+
+    def _build_iteration_feedback(*args: object, **kwargs: object) -> FeedbackPackage:
+        return dummy_feedback
+
+    def _attempt_policy_generation(**kwargs: object) -> tuple[str | None, str | None]:
+        return ("policy", None)
+
+    def _run_policy_pipeline(pipeline: object, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
+        return ([StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")], True)
+
+    def _finalize_successful_policy(**kwargs: object) -> tuple[str, AcceptedPolicyMeta]:
+        return (
+            "policy",
+            AcceptedPolicyMeta(
+                accepted_policy_source=None,
+                accepted_policy_changed_by_pipeline=None,
+                repair_attempts=0,
+                max_policy_repairs=1,
+            ),
+        )
+
+    def _finalize_failed_repair(**kwargs: object) -> FailedRepairDetails:
+        return FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=None,
+            failed_exit_code=None,
+            failed_summary=None,
+            error="pipeline_failed",
+        )
+
+    def _format_pf_ctx(
+        pipeline_results: list[StepResult],
+        classified: PipelineClassification | None,
+        writer_error: str | None,
+        model_name: str | None,
+        attempt: int,
+    ) -> str:
+        return ""
+
+    return LoopDependencies(
+        prepare_iteration_tasks=_prepare,
+        evaluate_policy_on_item=_evaluate_policy_on_item,
+        build_iteration_feedback=_build_iteration_feedback,
+        attempt_policy_generation=_attempt_policy_generation,
+        run_policy_pipeline=_run_policy_pipeline,
+        finalize_successful_policy=_finalize_successful_policy,
+        finalize_failed_repair=_finalize_failed_repair,
+        classify_results=lambda results: PipelineClassification(),
+        format_pipeline_failure_context=_format_pf_ctx,
+        read_policy=lambda: "policy",
+        write_policy=lambda code: None,
+        get_writer_model=lambda: "model",
+        start_span=lambda *a, **k: None,
+        find_repo_root=lambda: Path("."),
+        default_pipeline=lambda: object(),
+    )
+
+
+def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
+    deps = _stub_deps()
+    repair_ctx = RepairContext(
+        repo_root=Path("."),
+        evaluation=EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code=""),
+        feedback=FeedbackPackage(
+            tests="", scoring_context="", comparison_summary=None, feedback={}, feedback_str="", guidance_hint="", diff_str="", diff_hint=""
+        ),
+        max_repair_attempts=1,
+        parent_trace=None,
+        writer_model="model",
+    )
+    repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
+    repair_chart = RepairStateMachine(repair_model)
+
+    loop_ctx = LoopContext(task={}, iterations=1, baseline_snapshot=None, run_trace=None)
+    opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
+    opt_chart = OptimizationStateMachine(opt_model)
+    return repair_chart, opt_chart
+
+
+def _render(machine: object, fmt: str) -> str:
+    # python-statemachine exposes a private graph builder; use it to support multiple formats.
+    graph = machine._graph()  # type: ignore[attr-defined]
+    if fmt == "mermaid":
+        try:
+            return f"{machine:mermaid}"
+        except Exception:
+            return graph.to_string()  # type: ignore[attr-defined]
+    if fmt == "dot":
+        try:
+            return f"{machine:dot}"
+        except Exception:
+            return graph.to_string()  # type: ignore[attr-defined]
+    if fmt == "md":
+        try:
+            return f"{machine:md}"
+        except Exception:
+            return graph.to_string()  # type: ignore[attr-defined]
+    raise ValueError(f"Unsupported format: {fmt}")
+
+
+def render_state_machines(fmt: str = "mermaid", machine: str = "both", output: Path | None = None) -> None:
+    repair_chart, opt_chart = _build_charts()
+    targets = []
+    if machine in ("both", "repair"):
+        targets.append(("RepairStateMachine", repair_chart))
+    if machine in ("both", "optimization"):
+        targets.append(("OptimizationStateMachine", opt_chart))
+
+    if fmt == "png":
+        if output is None:
+            raise ValueError("PNG output requires --output path")
+        for idx, (name, chart) in enumerate(targets):
+            if machine == "both" and idx > 0:
+                path = output.with_name(f"{output.stem}_{name}{output.suffix}")
+            else:
+                path = output
+            graph = chart._graph()  # type: ignore[attr-defined]
+            try:
+                graph.write_png(str(path))
+            except FileNotFoundError as exc:
+                raise RuntimeError("Graphviz 'dot' executable is required for PNG output") from exc
+        return
+
+    rendered = []
+    for name, chart in targets:
+        rendered.append(f"%% {name}\n{_render(chart, fmt)}")
+    text = "\n\n".join(rendered)
+    if output:
+        output.write_text(text, encoding="utf-8")
+    else:
+        print(text)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Render loop state machines (uses python-statemachine rendering).")
+    parser.add_argument("--format", choices=["mermaid", "dot", "md", "png"], default="mermaid", help="Output format")
+    parser.add_argument(
+        "--machine",
+        choices=["optimization", "repair", "both"],
+        default="both",
+        help="Which machine to render",
+    )
+    parser.add_argument("--output", type=Path, help="Output file path. Required for png, optional otherwise.")
+    args = parser.parse_args()
+    render_state_machines(fmt=args.format, machine=args.machine, output=args.output)
+
+
+if __name__ == "__main__":
+    main()
 </file>
 
 <file path="tools/mcp_adapter.py">
@@ -3588,13 +4543,27 @@ class DiffSummary:
     regression: bool
 
 
-def extract_failure_keys(classified: Dict[str, object]) -> Set[str]:
+def extract_failure_keys(classified: Dict[str, object] | object) -> Set[str]:
+    if hasattr(classified, "type_errors"):
+        type_err = getattr(classified, "type_errors", "")
+        lint_err = getattr(classified, "lint_errors", "")
+        test_err = getattr(classified, "test_failures", "")
+    elif isinstance(classified, dict):
+        type_err = classified.get("type_errors")
+        lint_err = classified.get("lint_errors")
+        test_err = classified.get("test_failures")
+    else:
+        type_err = lint_err = test_err = ""
+
     keys: Set[str] = set()
-    if isinstance(classified.get("type_errors"), str) and classified["type_errors"]:
+    type_err_str = type_err if isinstance(type_err, str) else ""
+    lint_err_str = lint_err if isinstance(lint_err, str) else ""
+    test_err_str = test_err if isinstance(test_err, str) else ""
+    if type_err_str:
         keys.add("type")
-    if isinstance(classified.get("lint_errors"), str) and classified["lint_errors"]:
+    if lint_err_str:
         keys.add("lint")
-    if isinstance(classified.get("test_failures"), str) and classified["test_failures"]:
+    if test_err_str:
         keys.add("tests")
     return keys
 
@@ -3602,8 +4571,8 @@ def extract_failure_keys(classified: Dict[str, object]) -> Set[str]:
 def compute_diff(
     prev_score: float,
     curr_score: float,
-    prev_classified: Dict[str, object],
-    curr_classified: Dict[str, object],
+    prev_classified: Dict[str, object] | object,
+    curr_classified: Dict[str, object] | object,
 ) -> DiffSummary:
     prev_keys = extract_failure_keys(prev_classified)
     curr_keys = extract_failure_keys(curr_classified)
@@ -3698,7 +4667,6 @@ def get_langfuse_env() -> dict[str, str | bool | None]:
     Centralized Langfuse environment access to avoid scattered lookups.
     """
     return {
-        "enabled": getenv_bool("LANGFUSE_ENABLED", default=True),
         "public_key": getenv("LANGFUSE_PUBLIC_KEY"),
         "secret_key": getenv("LANGFUSE_SECRET_KEY"),
         "base_url": getenv("LANGFUSE_BASE_URL"),
@@ -3935,6 +4903,46 @@ def resolve_repo_target(repo_ref: str) -> str:
 __all__ = ["resolve_repo_target", "list_repo_targets", "is_known_repo_target"]
 </file>
 
+<file path="utils/template_loader.py">
+from __future__ import annotations
+
+from typing import Mapping, Any
+
+from pathlib import Path
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from .repo_root import find_repo_root
+
+
+def render_prompt_template(template_name: str, context: Mapping[str, Any]) -> str:
+    """
+    Render a Jinja2 template from the prompts/ directory.
+    """
+    root = find_repo_root()
+    candidates = [
+        root / "prompts",
+        root / "harness" / "prompts",
+        Path(__file__).resolve().parent.parent / "prompts",
+    ]
+    prompts_dir = next((p for p in candidates if p.exists()), None)
+    if prompts_dir is None:
+        raise RuntimeError(f"Prompts directory missing (checked: {', '.join(str(c) for c in candidates)})")
+    env = Environment(
+        loader=FileSystemLoader(prompts_dir),
+        autoescape=select_autoescape(enabled_extensions=(), default=False),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    try:
+        template = env.get_template(template_name)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Prompt template '{template_name}' not found") from exc
+    try:
+        return template.render(**context)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to render template '{template_name}'") from exc
+</file>
+
 <file path="utils/test_loader.py">
 from __future__ import annotations
 
@@ -4024,6 +5032,12 @@ def format_scoring_context(types: str, examples: str, max_chars: int = 8000) -> 
 # Treat harness as a package for imports and type checking.
 </file>
 
+<file path=".gitignore">
+.codex
+openspec
+todo.md
+</file>
+
 <file path="LANGFUSE.md">
 # Langfuse-First Usage
 
@@ -4082,17 +5096,16 @@ Leaf-operation observability remains with:
 <file path="loop_listeners.py">
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 
 from statemachine import State
 
-from .loop_types import (
-    IterationRecord,
-    LoopDependencies,
-)
+from .loop_types import IterationRecord
+from .observability.score_emitter import emit_score_for_handle
 
 
-def _safe_end_span(span: object | None, **kwargs) -> None:
+def _safe_end_span(span: object | None, **kwargs: object) -> None:
     """Best-effort guard for Langfuse span termination."""
     if span is None or not hasattr(span, "end"):
         return
@@ -4115,10 +5128,8 @@ class RepairTracingListener:
         target = getattr(event_data, "target", None)
         if target is None or getattr(target, "id", None) != "generating_candidate":
             return
-        from .loop_machine import RepairStateMachine
-
-        machine: RepairStateMachine = cast(RepairStateMachine, getattr(event_data, "machine", None))
-        ctx = machine.model.context
+        machine = cast(Any, getattr(event_data, "machine", None))
+        ctx = machine.model.context  # type: ignore[attr-defined]
         if ctx.repair_observation is None:
             ctx.repair_observation = machine.model.deps.start_span(
                 ctx.parent_trace,
@@ -4126,32 +5137,26 @@ class RepairTracingListener:
                 metadata={"attempt": ctx.attempts_used},
             )
 
-    def on_enter_retrying(self, event: object, state: State, event_data, **kwargs) -> None:
-        from .loop_machine import RepairStateMachine
-
-        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
+    def on_enter_retrying(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
+        machine = cast(Any, getattr(event_data, "machine", None))
         self._end_attempt(machine, status="retrying")
 
-    def on_enter_candidate_valid(self, event: object, state: State, event_data, **kwargs) -> None:
-        from .loop_machine import RepairStateMachine
-
-        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
+    def on_enter_candidate_valid(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
+        machine = cast(Any, getattr(event_data, "machine", None))
         self._end_attempt(machine, status="passed")
 
-    def on_enter_repair_exhausted(self, event: object, state: State, event_data, **kwargs) -> None:
-        from .loop_machine import RepairStateMachine
-
-        machine: RepairStateMachine = cast(RepairStateMachine, event_data.machine)
+    def on_enter_repair_exhausted(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
+        machine = cast(Any, getattr(event_data, "machine", None))
         self._end_attempt(machine, status="failed")
 
-    def _end_attempt(self, machine: object, status: str) -> None:
+    def _end_attempt(self, machine: Any, status: str) -> None:
         ctx = machine.model.context  # type: ignore[attr-defined]
         attempt_index = ctx.attempts_used - 1 if ctx.attempts_used > 0 else ctx.attempts_used
         metadata: dict[str, object] = {"status": status, "attempt": attempt_index}
         if ctx.pipeline_passed is False:
             metadata["pipeline_passed"] = False
-        if ctx.metadata.get("error"):
-            metadata["error"] = ctx.metadata["error"]
+        if getattr(ctx, "error", None):
+            metadata["error"] = ctx.error  # type: ignore[attr-defined]
         _safe_end_span(ctx.repair_observation, metadata=metadata)
         ctx.repair_observation = None
 
@@ -4162,11 +5167,9 @@ class OptimizationTracingListener:
     def __init__(self) -> None:
         self._last_recorded_iteration: int | None = None
 
-    def on_enter_evaluating(self, event: object, state: State, event_data, **kwargs) -> None:
-        from .loop_machine import OptimizationStateMachine
-
-        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
-        ctx = machine.model.context
+    def on_enter_evaluating(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
+        machine = cast(Any, getattr(event_data, "machine", None))
+        ctx = machine.model.context  # type: ignore[attr-defined]
         if ctx.prepared_tasks is None:
             machine.model.current_iteration_span = None  # noqa: SLF001
             return
@@ -4182,25 +5185,19 @@ class OptimizationTracingListener:
             },
         )
 
-    def on_exit_accepted_round(self, event: object, state: State, event_data, **kwargs) -> None:
-        from .loop_machine import OptimizationStateMachine
-
-        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
+    def on_exit_accepted_round(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
+        machine = cast(Any, getattr(event_data, "machine", None))
         self._finalize_iteration(machine, status="complete")
 
-    def on_enter_completed(self, event: object, state: State, event_data, **kwargs) -> None:
-        from .loop_machine import OptimizationStateMachine
-
-        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
+    def on_enter_completed(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
+        machine = cast(Any, getattr(event_data, "machine", None))
         self._finalize_iteration(machine, status="completed")
 
-    def on_enter_failed(self, event: object, state: State, event_data, **kwargs) -> None:
-        from .loop_machine import OptimizationStateMachine
-
-        machine: OptimizationStateMachine = cast(OptimizationStateMachine, event_data.machine)
+    def on_enter_failed(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
+        machine = cast(Any, getattr(event_data, "machine", None))
         self._finalize_iteration(machine, status="failed")
 
-    def _finalize_iteration(self, machine: object, status: str) -> None:
+    def _finalize_iteration(self, machine: Any, status: str) -> None:
         ctx = machine.model.context  # type: ignore[attr-defined]
         span = machine.model.current_iteration_span  # type: ignore[attr-defined]
         record = ctx.history[-1] if ctx.history else None
@@ -4232,25 +5229,41 @@ class OptimizationTracingListener:
 
     def _record_iteration_scores(
         self,
-        machine: object,
+        machine: Any,
         handle: object | None,
         record: IterationRecord,
     ) -> None:
-        deps: LoopDependencies = machine.deps  # type: ignore[attr-defined]
-        score_meta = {"iteration": record.iteration}
+        score_meta: dict[str, object] = {"iteration": record.iteration}
+        comment: str | None = None
+        try:
+            comment = json.dumps(score_meta)
+        except Exception:
+            comment = str(score_meta)
         if record.pipeline_passed is not None:
-            deps.record_score(handle, "pipeline_passed", bool(record.pipeline_passed), score_meta)
+            emit_score_for_handle(
+                handle,
+                name="pipeline_passed",
+                value=bool(record.pipeline_passed),
+                data_type="BOOLEAN",
+                comment=comment,
+            )
         for key in ("score", "coverage_delta", "tool_error_rate"):
             value = record.metrics.get(key)
             if isinstance(value, (int, float, bool)):
-                deps.record_score(handle, f"metrics.{key}", float(value), score_meta)
+                emit_score_for_handle(
+                    handle,
+                    name=f"metrics.{key}",
+                    value=float(value),
+                    data_type="NUMERIC" if not isinstance(value, bool) else "BOOLEAN",
+                    comment=comment,
+                )
 </file>
 
 <file path="loop_machine.py">
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping, Sequence, cast
+from typing import Any, Sequence, cast
 
 from statemachine import State, StateChart
 from statemachine.event import BoundEvent
@@ -4272,11 +5285,12 @@ from .loop_types import (
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
-    PipelineStepResult,
+    PreparedTasks,
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
 )
+from .pipeline.types import PipelineClassification, StepResult
 
 
 class RepairStateMachine(StateChart[RepairMachineModel]):
@@ -4333,18 +5347,27 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             else min(attempts_used, self.context.max_repair_attempts)
         )
         self.context.attempts_used = final_attempts
-        self.context.metadata["repair_attempts"] = (
+        self.context.repair_attempts_reported = (
             max(0, final_attempts - 1)
             if self.context.pipeline_passed
             else self.context.max_repair_attempts
         )
-        self.context.metadata["max_policy_repairs"] = self.context.max_repair_attempts
+        self.context.max_policy_repairs_reported = self.context.max_repair_attempts
         return RepairOutcome(
             policy=self.deps.read_policy(),
             pipeline_results=self.context.pipeline_results,
             success=self.context.pipeline_passed,
             attempts_used=final_attempts,
-            metadata=self.context.metadata,
+            pipeline_feedback=self.context.pipeline_feedback or self.context.last_classified,
+            writer_error=self.context.writer_error,
+            error=self.context.error,
+            failed_step=self.context.failed_step,
+            failed_exit_code=self.context.failed_exit_code,
+            failed_summary=self.context.failed_summary,
+            accepted_policy_source=self.context.accepted_policy_source,
+            accepted_policy_changed_by_pipeline=self.context.accepted_policy_changed_by_pipeline,
+            repair_attempts_reported=self.context.repair_attempts_reported,
+            max_policy_repairs=self.context.max_policy_repairs_reported,
         )
 
     # Writer/pipeline execution ------------------------------------------
@@ -4369,7 +5392,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             if ctx.attempts_used > 0
             else ctx.feedback.guidance_hint
         )
-        if ctx.last_classified and ctx.last_classified.get("type_errors"):
+        if ctx.last_classified and ctx.last_classified.type_errors:
             guidance += " Fix all type errors and ensure parameters are annotated; avoid unknown types."
 
         new_code, writer_error = deps.attempt_policy_generation(
@@ -4385,11 +5408,12 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             failure_context_str=ctx.failure_context,
             repair_attempt=ctx.attempts_used,
             parent_trace=ctx.repair_observation,
-            pipeline_feedback=ctx.last_classified,
+            pipeline_feedback=ctx.last_classified.model_dump() if ctx.last_classified else None,
         )
 
         if new_code is None:
-            ctx.metadata["writer_error"] = writer_error
+            ctx.writer_error = writer_error
+            ctx.error = writer_error or "writer_failed"
             ctx.attempts_used += 1
             ctx.failure_context = self._format_failure(
                 [], writer_error, ctx.attempts_used
@@ -4408,7 +5432,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
     def _run_pipeline(self) -> None:
         ctx = self.context
         deps = self.deps
-        pipeline_results, raw_results, pipeline_success = deps.run_policy_pipeline(
+        pipeline_results, pipeline_success = deps.run_policy_pipeline(
             ctx.pipeline or deps.default_pipeline(),
             ctx.repo_root,
             repair_obs=ctx.repair_observation,
@@ -4425,28 +5449,38 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                 repair_obs=ctx.repair_observation,
             )
             ctx.candidate_code = final_policy
-            ctx.metadata.update(success_meta)
+            ctx.accepted_policy_source = success_meta.accepted_policy_source
+            ctx.accepted_policy_changed_by_pipeline = success_meta.accepted_policy_changed_by_pipeline
+            ctx.repair_attempts_reported = success_meta.repair_attempts
+            ctx.max_policy_repairs_reported = success_meta.max_policy_repairs
             self.raise_("pipeline_passed")  # type: ignore[call-arg]
             return
 
-        classified = deps.classify_results(raw_results)
+        classified = deps.classify_results(pipeline_results)
         ctx.last_classified = classified
-        ctx.failure_context, ctx.evaluation.policy_code = deps.finalize_failed_repair(
-            metadata=ctx.metadata,
-            pipeline_results=[step.to_mapping() for step in pipeline_results],
+        ctx.pipeline_feedback = classified
+        failure_details = deps.finalize_failed_repair(
+            pipeline_results=pipeline_results,
             classified=classified,
             writer_model=ctx.writer_model,
             attempts_used=ctx.attempts_used,
+            writer_error=ctx.writer_error,
         )
+        ctx.failure_context = failure_details.failure_context
+        ctx.evaluation.policy_code = failure_details.policy_code
+        ctx.failed_step = failure_details.failed_step
+        ctx.failed_exit_code = failure_details.failed_exit_code
+        ctx.failed_summary = failure_details.failed_summary
+        ctx.error = failure_details.error
         if self._attempts_remaining():
             self.raise_("pipeline_retryable_failure")  # type: ignore[call-arg]
         else:
             self.raise_("pipeline_exhausted")  # type: ignore[call-arg]
 
     # Helpers -------------------------------------------------------------
-    def _format_failure(self, pipeline_results, writer_error, attempt: int) -> str:
+    def _format_failure(self, pipeline_results: list[StepResult], writer_error: str | None, attempt: int) -> str:
         return self.deps.format_pipeline_failure_context(
-            [step.to_mapping() for step in pipeline_results],
+            pipeline_results,
             self.context.last_classified,
             writer_error,
             self.context.writer_model,
@@ -4517,18 +5551,27 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             )
             self.model.prep_ok = self.context.prepared_tasks is not None
         except Exception:
+            self.context.prepared_tasks = None
             self.model.prep_ok = False
+        if self.context.prepared_tasks is None and isinstance(self.context.task, dict):
+            repo_val = self.context.task.get("repo")
+            resolved_repo = repo_val if isinstance(repo_val, str) else None
+            self.context.prepared_tasks = PreparedTasks(
+                base_task=dict(self.context.task), resolved_repo_path=resolved_repo, jc_repo_id=None
+            )
+            self.model.prep_ok = True
 
     # Evaluation ----------------------------------------------------------
-    def on_enter_evaluating(self, event, state) -> None:  # noqa: ANN001
+    def on_enter_evaluating(self, event: object, state: State) -> None:
         self.model.current_evaluation = None
         self.model.current_repair_outcome = None
-        if self.context.prepared_tasks is None:
+        prepared_tasks = getattr(self.context, "prepared_tasks", None)
+        if prepared_tasks is None:
             self.model.current_evaluation = None
             self.raise_("evaluation_done")  # type: ignore[call-arg]
             return
 
-        ic_task, jc_task = self.context.prepared_tasks.build_iteration_tasks()
+        ic_task, _ = prepared_tasks.build_iteration_tasks()
         self.model.current_evaluation = self.deps.evaluate_policy_on_item(
             ic_task,
             self.context.baseline_snapshot,
@@ -4538,7 +5581,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         self.raise_("evaluation_done")  # type: ignore[call-arg]
 
     # Repair --------------------------------------------------------------
-    def on_enter_repairing(self, event, state) -> None:  # noqa: ANN001
+    def on_enter_repairing(self, event: object, state: State) -> None:
         evaluation = self.model.current_evaluation
         if evaluation is None:
             self.model.current_repair_outcome = None
@@ -4559,7 +5602,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         self.raise_("repair_done")  # type: ignore[call-arg]
 
     # Acceptance / recording ---------------------------------------------
-    def on_enter_accepted_round(self, event, state) -> None:  # noqa: ANN001
+    def on_enter_accepted_round(self, event: object, state: State) -> None:
         evaluation = self.model.current_evaluation
         repair_outcome = self.model.current_repair_outcome
 
@@ -4581,12 +5624,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             self.context.prev_score = (
                 float(score_val) if isinstance(score_val, (int, float)) else None
             )
-            self.context.prev_classified = {
-                "type_errors": "",
-                "lint_errors": "",
-                "test_failures": "",
-                "passed": [],
-            }
+            self.context.prev_classified = PipelineClassification()
 
         self.context.current_iteration += 1
         self.raise_("advance")  # type: ignore[call-arg]
@@ -4620,32 +5658,32 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         evaluation: EvaluationResult,
         repair_outcome: RepairOutcome | None,
     ) -> IterationRecord:
-        metadata = dict(repair_outcome.metadata) if repair_outcome else {}
         metrics_map = dict(evaluation.metrics)
-        metrics_map.update(metadata)
-        pipeline_feedback = metadata.get("pipeline_feedback")
-        pipeline_feedback_map = (
-            pipeline_feedback if isinstance(pipeline_feedback, Mapping) else None
+        pipeline_feedback = (
+            repair_outcome.pipeline_feedback if repair_outcome else self.context.last_classified
         )
-        repair_attempts_val = metadata.get("repair_attempts")
-        max_repairs_val = metadata.get("max_policy_repairs")
-        error_val = metadata.get("error")
-        writer_err_val = metadata.get("writer_error")
+        repair_attempts_val = (
+            repair_outcome.repair_attempts_reported if repair_outcome else None
+        )
+        max_repairs_val = (
+            repair_outcome.max_policy_repairs if repair_outcome else self.max_policy_repairs
+        )
+        error_val = repair_outcome.error if repair_outcome else None
+        writer_err_val = repair_outcome.writer_error if repair_outcome else None
         record = IterationRecord(
             iteration=iteration,
             metrics=metrics_map,
-            pipeline_passed=repair_outcome.success
-            if repair_outcome and isinstance(repair_outcome.success, bool)
-            else None,
-            pipeline_feedback=pipeline_feedback_map,
+            pipeline_passed=repair_outcome.success if repair_outcome else None,
+            pipeline_feedback=pipeline_feedback,
             repair_attempts=repair_attempts_val
             if isinstance(repair_attempts_val, int)
             else (repair_outcome.attempts_used if repair_outcome else None),
-            max_policy_repairs=max_repairs_val
-            if isinstance(max_repairs_val, int)
-            else self.max_policy_repairs,
+            max_policy_repairs=max_repairs_val if isinstance(max_repairs_val, int) else self.max_policy_repairs,
             error=error_val if isinstance(error_val, str) else None,
             writer_error=writer_err_val if isinstance(writer_err_val, str) else None,
+            failed_step=repair_outcome.failed_step if repair_outcome else None,
+            failed_exit_code=repair_outcome.failed_exit_code if repair_outcome else None,
+            failed_summary=repair_outcome.failed_summary if repair_outcome else None,
         )
         failed_step = (
             self._first_failed_step(repair_outcome.pipeline_results)
@@ -4656,18 +5694,11 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             record.failed_step = failed_step.name
             record.failed_exit_code = failed_step.exit_code
             record.failed_summary = failed_step.stderr or failed_step.stdout
-        failed_summary_val = metadata.get("failed_summary")
-        if isinstance(failed_summary_val, str) and not record.failed_summary:
-            record.failed_summary = failed_summary_val
         if repair_outcome and repair_outcome.success:
-            source_val = metadata.get("accepted_policy_source")
-            changed_val = metadata.get("accepted_policy_changed_by_pipeline")
             record.accepted_policy = AcceptedPolicy(
                 code=repair_outcome.policy,
-                source=source_val if isinstance(source_val, str) else None,
-                changed_by_pipeline=changed_val
-                if isinstance(changed_val, bool)
-                else None,
+                source=repair_outcome.accepted_policy_source,
+                changed_by_pipeline=repair_outcome.accepted_policy_changed_by_pipeline,
                 repair_attempts=record.repair_attempts or repair_outcome.attempts_used,
                 max_policy_repairs=record.max_policy_repairs or self.max_policy_repairs,
             )
@@ -4682,15 +5713,43 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             record.pipeline_passed if pipeline_passed is None else pipeline_passed
         )
         record.pipeline_passed = pipeline_val
+        outcome = getattr(self.model, "current_repair_outcome", None)
+        if outcome and pipeline_val is False:
+            if getattr(outcome, "pipeline_results", None):
+                classified = outcome.pipeline_feedback or self.deps.classify_results(outcome.pipeline_results)
+                record.pipeline_feedback = record.pipeline_feedback or classified
+                failed_step = self._first_failed_step(outcome.pipeline_results)
+                if failed_step:
+                    record.failed_step = record.failed_step or failed_step.name
+                    record.failed_exit_code = record.failed_exit_code or failed_step.exit_code
+                    record.failed_summary = record.failed_summary or failed_step.stderr or failed_step.stdout
+        if pipeline_val is False:
+            if outcome and getattr(outcome, "pipeline_results", None):
+                classified = outcome.pipeline_feedback or self.deps.classify_results(outcome.pipeline_results)
+                record.pipeline_feedback = classified
+            if record.failed_step is None:
+                if outcome and getattr(outcome, "pipeline_results", None):
+                    failed_step = self._first_failed_step(outcome.pipeline_results)
+                    if failed_step:
+                        record.failed_step = failed_step.name
+                        record.failed_exit_code = failed_step.exit_code
+                        record.failed_summary = failed_step.stderr or failed_step.stdout
+                if record.failed_step is None:
+                    record.failed_step = "pipeline_failed"
+        if record.pipeline_feedback is None and outcome and getattr(outcome, "pipeline_results", None):
+            record.pipeline_feedback = self.deps.classify_results(outcome.pipeline_results)
+        if record.writer_error is None and outcome:
+            if isinstance(outcome.writer_error, str):
+                record.writer_error = outcome.writer_error
+            elif getattr(outcome, "success", None) is False:
+                record.writer_error = "writer_failed"
         self.context.history.append(record)
 
     def _first_failed_step(
-        self, steps: Sequence[PipelineStepResult]
-    ) -> PipelineStepResult | None:
+        self, steps: Sequence[StepResult]
+    ) -> StepResult | None:
         for step in steps:
-            if isinstance(step.exit_code, int) and step.exit_code != 0:
-                return step
-            if step.exit_code is None and step.success is False:
+            if step.exit_code != 0:
                 return step
         return None
 </file>
@@ -4699,11 +5758,11 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .pipeline.types import StepResult
+from .pipeline.types import PipelineClassification, StepResult
 
 if TYPE_CHECKING:
     from .observability.baselines import BaselineSnapshot
@@ -4712,9 +5771,9 @@ if TYPE_CHECKING:
 class PreparedTasks(BaseModel):
     """Resolved IC/JC tasks for a single iteration."""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid")
 
-    base_task: Mapping[str, object]
+    base_task: dict[str, object]
     resolved_repo_path: str | None
     jc_repo_id: str | None
 
@@ -4733,12 +5792,12 @@ class PreparedTasks(BaseModel):
 class EvaluationResult(BaseModel):
     """Outputs from evaluating the currently accepted policy."""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid")
 
     metrics: dict[str, object]
-    ic_result: Mapping[str, object]
-    jc_result: Mapping[str, object]
-    jc_metrics: Mapping[str, object]
+    ic_result: dict[str, object]
+    jc_result: dict[str, object]
+    jc_metrics: dict[str, object]
     comparison_summary: str | None
     policy_code: str
     success: bool = True
@@ -4748,7 +5807,7 @@ class EvaluationResult(BaseModel):
 class FeedbackPackage(BaseModel):
     """Inputs used to steer policy repair/generation."""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid")
 
     tests: str
     scoring_context: str
@@ -4760,59 +5819,29 @@ class FeedbackPackage(BaseModel):
     diff_hint: str
 
 
-class PipelineStepResult(BaseModel):
-    """Structured view of a pipeline step result."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    name: str
-    success: bool
-    exit_code: int | None
-    stdout: str
-    stderr: str
-
-    @classmethod
-    def from_mapping(cls, step: Mapping[str, object] | object) -> "PipelineStepResult":
-        if isinstance(step, Mapping):
-            name = str(step.get("name") or "")
-            success = bool(step.get("success", False))
-            exit_code = step.get("exit_code")
-            exit_code_val = int(exit_code) if isinstance(exit_code, int) else None
-            stdout = str(step.get("stdout") or "")
-            stderr = str(step.get("stderr") or "")
-            return cls(name=name, success=success, exit_code=exit_code_val, stdout=stdout, stderr=stderr)
-        name = getattr(step, "name", "") or ""
-        success = bool(getattr(step, "success", False))
-        exit_code_val = getattr(step, "exit_code", None)
-        exit_code_val = int(exit_code_val) if isinstance(exit_code_val, int) else None
-        stdout = str(getattr(step, "stdout", "") or "")
-        stderr = str(getattr(step, "stderr", "") or "")
-        return cls(name=name, success=success, exit_code=exit_code_val, stdout=stdout, stderr=stderr)
-
-    def to_mapping(self) -> dict[str, object]:
-        return {
-            "name": self.name,
-            "success": self.success,
-            "exit_code": self.exit_code,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-        }
-
-
 class RepairOutcome(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid")
 
     policy: str
-    pipeline_results: list[PipelineStepResult]
+    pipeline_results: list[StepResult]
     success: bool
     attempts_used: int
-    metadata: dict[str, object]
+    pipeline_feedback: PipelineClassification | None = None
+    writer_error: str | None = None
+    error: str | None = None
+    failed_step: str | None = None
+    failed_exit_code: int | None = None
+    failed_summary: str | None = None
+    accepted_policy_source: str | None = None
+    accepted_policy_changed_by_pipeline: bool | None = None
+    repair_attempts_reported: int | None = None
+    max_policy_repairs: int | None = None
 
 
 class AcceptedPolicy(BaseModel):
     """Represents the accepted policy artifact and provenance."""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid")
 
     code: str
     source: str | None
@@ -4822,12 +5851,12 @@ class AcceptedPolicy(BaseModel):
 
 
 class IterationRecord(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid")
 
     iteration: int
     metrics: dict[str, object]
     pipeline_passed: bool | None = None
-    pipeline_feedback: Mapping[str, object] | None = None
+    pipeline_feedback: PipelineClassification | None = None
     failed_step: str | None = None
     failed_exit_code: int | None = None
     failed_summary: str | None = None
@@ -4839,16 +5868,18 @@ class IterationRecord(BaseModel):
 
 
 class LoopContext(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
-    task: Mapping[str, object]
+    task: dict[str, object]
     iterations: int
+    session_id: str | None = None
     baseline_snapshot: "BaselineSnapshot | None" = None
     run_trace: object | None
     history: list[IterationRecord] = Field(default_factory=list)
     prepared_tasks: PreparedTasks | None = None
     prev_score: float | None = None
-    prev_classified: dict[str, object] | None = None
+    prev_classified: PipelineClassification | None = None
+    last_classified: PipelineClassification | None = None
     current_iteration: int = 0
 
 
@@ -4857,26 +5888,25 @@ class LoopDependencies(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    prepare_iteration_tasks: Callable[[Mapping[str, object], object | None], PreparedTasks]
-    evaluate_policy_on_item: Callable[[Mapping[str, object], "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
-    build_iteration_feedback: Callable[[EvaluationResult, float | None, dict[str, object] | None, Path], FeedbackPackage]
+    prepare_iteration_tasks: Callable[[dict[str, object], object | None], PreparedTasks]
+    evaluate_policy_on_item: Callable[[dict[str, object], "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
+    build_iteration_feedback: Callable[[EvaluationResult, float | None, PipelineClassification | None, Path], FeedbackPackage]
     attempt_policy_generation: Callable[..., tuple[str | None, str | None]]
-    run_policy_pipeline: Callable[..., tuple[list[PipelineStepResult], list[StepResult], bool]]
-    finalize_successful_policy: Callable[..., tuple[str, dict[str, object]]]
-    finalize_failed_repair: Callable[..., tuple[str, str]]
-    classify_results: Callable[[Sequence[StepResult]], Mapping[str, object]]
-    format_pipeline_failure_context: Callable[[list[Mapping[str, object]], Mapping[str, object] | None, str | None, str | None, int], str]
+    run_policy_pipeline: Callable[..., tuple[list[StepResult], bool]]
+    finalize_successful_policy: Callable[..., tuple[str, "AcceptedPolicyMeta"]]
+    finalize_failed_repair: Callable[..., "FailedRepairDetails"]
+    classify_results: Callable[[list[StepResult]], PipelineClassification]
+    format_pipeline_failure_context: Callable[[list[StepResult], PipelineClassification | None, str | None, str | None, int], str]
     read_policy: Callable[[], str]
     write_policy: Callable[[str], None]
     get_writer_model: Callable[[], str | None]
-    record_score: Callable[[object, str, float, Mapping[str, object] | None], None]
     start_span: Callable[..., object | None]
     find_repo_root: Callable[[], Path]
     default_pipeline: Callable[[], object]
 
 
 class RepairContext(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     repo_root: Path
     evaluation: EvaluationResult
@@ -4885,15 +5915,44 @@ class RepairContext(BaseModel):
     parent_trace: object | None
     writer_model: str | None
     failure_context: str | None = None
-    last_classified: Mapping[str, object] | None = None
+    last_classified: PipelineClassification | None = None
     attempts_used: int = 0
-    metadata: dict[str, object] = Field(default_factory=dict)
-    pipeline_results: list[PipelineStepResult] = Field(default_factory=list)
+    pipeline_results: list[StepResult] = Field(default_factory=list)
     success: bool = False
     pipeline_passed: bool = False
     candidate_code: str | None = None
     pipeline: object | None = None
     repair_observation: object | None = None
+    writer_error: str | None = None
+    pipeline_feedback: PipelineClassification | None = None
+    failed_step: str | None = None
+    failed_exit_code: int | None = None
+    failed_summary: str | None = None
+    accepted_policy_source: str | None = None
+    accepted_policy_changed_by_pipeline: bool | None = None
+    repair_attempts_reported: int | None = None
+    max_policy_repairs_reported: int | None = None
+    error: str | None = None
+
+
+class AcceptedPolicyMeta(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    accepted_policy_source: str | None = None
+    accepted_policy_changed_by_pipeline: bool | None = None
+    repair_attempts: int
+    max_policy_repairs: int
+
+
+class FailedRepairDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    failure_context: str
+    policy_code: str
+    failed_step: str | None = None
+    failed_exit_code: int | None = None
+    failed_summary: str | None = None
+    error: str | None = None
 
 
 def iteration_record_to_public_dict(record: IterationRecord) -> dict[str, object]:
@@ -4902,7 +5961,7 @@ def iteration_record_to_public_dict(record: IterationRecord) -> dict[str, object
     if record.pipeline_passed is not None:
         data["pipeline_passed"] = record.pipeline_passed
     if record.pipeline_feedback is not None:
-        data["pipeline_feedback"] = dict(record.pipeline_feedback)
+        data["pipeline_feedback"] = record.pipeline_feedback.model_dump()
     if record.failed_step is not None:
         data["failed_step"] = record.failed_step
     if record.failed_exit_code is not None:
@@ -4970,25 +6029,27 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, Callable, cast
 from pathlib import Path
 from typing import Any
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
-from .observability.langfuse import flush_langfuse, record_score, start_span, start_trace
+from .observability.langfuse import flush_langfuse, start_span, start_trace
 from .observability.baselines import BaselineSnapshot, baseline_metrics_from_jc
-from .pipeline import classify_results, default_pipeline
+from .observability.score_emitter import emit_score, emit_score_for_handle
+from .pipeline import PipelineClassification, classify_results, default_pipeline
 from .pipeline.types import StepResult
 from .loop_machine import OptimizationStateMachine
 from .loop_types import (
+    AcceptedPolicyMeta,
     EvaluationResult,
+    FailedRepairDetails,
     FeedbackPackage,
     IterationRecord,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
-    PipelineStepResult,
     PreparedTasks,
 )
 from .policy_loader import load_policy
@@ -5018,6 +6079,12 @@ def _as_float(value: Any) -> float:
         return 0.0
 
 
+def _session_id_from(handle: object | None, default: str | None = None) -> str | None:
+    if handle is None:
+        return default
+    return getattr(handle, "session_id", default)
+
+
 def _read_policy(path: Path = _POLICY_PATH) -> str:
     return path.read_text(encoding="utf-8")
 
@@ -5040,7 +6107,7 @@ def _clean_policy_code(code: str) -> str:
     return code.strip()
 
 
-def _hash_tests_dir(repo_root: Path) -> str:
+def _hash_tests_dir(repo_root: Path) -> str:  # pyright: ignore[reportUnusedFunction]
     tests_path = repo_root / "iterative-context" / "tests"
     hasher = hashlib.sha256()
     if not tests_path.exists():
@@ -5064,72 +6131,75 @@ def _tool_call_stats(bucket: Mapping[str, object] | None) -> tuple[int, int]:
     return len(observations), errors
 
 
-def _step_succeeded(step: Mapping[str, object]) -> bool:
-    if "exit_code" in step and isinstance(step["exit_code"], int):
-        return step["exit_code"] == 0
-    success_val = step.get("success")
-    return bool(success_val)
+def _step_succeeded(step: StepResult) -> bool:
+    return step.exit_code == 0
 
 
-def _first_failed_step(steps: Sequence[Mapping[str, object] | object]) -> Mapping[str, object] | None:
-    def _as_mapping(step: object) -> Mapping[str, object] | None:
-        if isinstance(step, Mapping):
-            return step
-        if step is None:
-            return None
-        data: dict[str, object] = {}
-        for key in ("name", "success", "stdout", "stderr", "exit_code"):
-            if hasattr(step, key):
-                data[key] = getattr(step, key)
-        return data if data else None
-
+def _first_failed_step(steps: Sequence[StepResult]) -> StepResult | None:
     for step in steps:
-        step_mapping = _as_mapping(step)
-        if not step_mapping:
-            continue
-        if not _step_succeeded(step_mapping):
-            return step_mapping
+        if not _step_succeeded(step):
+            return step
     return None
 
 
 def _format_pipeline_failure_context(
-    pipeline_results: list[Mapping[str, object]],
-    classified: Mapping[str, object] | None,
+    pipeline_results: list[StepResult],
+    classified: PipelineClassification | None,
     writer_error: str | None,
     model_name: str | None,
     repair_attempt: int,
 ) -> str:
     failed_step = _first_failed_step(pipeline_results)
+    pipeline_dump = [step.model_dump() for step in pipeline_results]
+    classified_dump = classified.model_dump() if classified else None
+    failed_dump = failed_step.model_dump() if failed_step else None
     return pack_failure_context(
-        pipeline_results,
-        classified,
-        failed_step,
+        pipeline_dump,
+        classified_dump,
+        failed_dump,
         writer_error,
         model_name,
         repair_attempt=repair_attempt,
     )
 
 
-def prepare_iteration_tasks(task: Mapping[str, object], parent_trace=None) -> PreparedTasks:
+class SupportsPipelineRun(Protocol):
+    def run(self, repo_root: Path, observation: object | None = None) -> list[StepResult]:
+        ...
+
+
+class SupportsSpan(Protocol):
+    def end(self, **kwargs: object) -> None:
+        ...
+
+
+def prepare_iteration_tasks(task: dict[str, object], parent_trace: object | None = None) -> PreparedTasks:
     """Resolve repo paths and index JC repo once for the run."""
-    repo_path = task.get("repo")
-    resolved_repo_path = repo_path if isinstance(repo_path, str) else None
+    repo_path_val = task.get("repo")
+    resolved_repo_path = repo_path_val if isinstance(repo_path_val, str) else None
     jc_repo_id: str | None = None
-    index_obs = None
-    if isinstance(repo_path, str):
+    index_obs: SupportsSpan | None = None
+    if isinstance(repo_path_val, str):
         try:
-            index_obs = start_span(parent_trace, "index_repo", metadata={"repo": repo_path})
-            result = index_folder(repo_path)
-            repo_id = result["repo"]
+            index_obs = start_span(
+                parent_trace,
+                "index_repo",
+                metadata={"repo": repo_path_val},
+                session_id=_session_id_from(parent_trace),
+            )
+            result = index_folder(repo_path_val)
+            repo_id = str(result["repo"])
             jc_repo_id = repo_id
-            if index_obs and hasattr(index_obs, "end"):
+            if index_obs:
                 index_obs.end(metadata={"repo": repo_id})
         except Exception as e:  # noqa: BLE001
-            if index_obs is not None and hasattr(index_obs, "end"):
+            if index_obs:
                 try:
                     index_obs.end(error=e)
                 except Exception:
                     pass
+    if resolved_repo_path is None:
+        raise RuntimeError("Task missing repo")
     return PreparedTasks(base_task=dict(task), resolved_repo_path=resolved_repo_path, jc_repo_id=jc_repo_id)
 
 
@@ -5142,7 +6212,12 @@ def evaluate_policy_on_item(
     """Load current policy, execute IC iteration, and compute metrics."""
     policy_load_obs = None
     try:
-        policy_load_obs = start_span(iteration_span, "policy_load", metadata={"iteration": iteration_index})
+        policy_load_obs = start_span(
+            iteration_span,
+            "policy_load",
+            metadata={"iteration": iteration_index},
+            session_id=_session_id_from(iteration_span),
+        )
         score_fn = load_policy()
         if policy_load_obs and hasattr(policy_load_obs, "end"):
             policy_load_obs.end(metadata={"status": "loaded"})
@@ -5156,7 +6231,12 @@ def evaluate_policy_on_item(
             "score": -10.0,
             "error": f"policy_import_error: {str(e)}",
         }
-        record_score(iteration_span, "metrics.score", _as_float(metrics_map.get("score", 0.0)))
+        emit_score_for_handle(
+            iteration_span,
+            name="metrics.score",
+            value=_as_float(metrics_map.get("score", 0.0)),
+            data_type="NUMERIC",
+        )
         return EvaluationResult(
             metrics=metrics_map,
             ic_result={},
@@ -5168,11 +6248,12 @@ def evaluate_policy_on_item(
             error=str(metrics_map.get("error")),
         )
 
-    ic_result = run_ic_iteration(dict(ic_task), score_fn, parent_trace=iteration_span)
-    jc_result = baseline_snapshot.jc_result if baseline_snapshot is not None else {}
-    jc_metrics = baseline_snapshot.jc_metrics if baseline_snapshot is not None else {}
-    if not isinstance(jc_metrics, Mapping):
-        jc_metrics = baseline_metrics_from_jc(jc_result if isinstance(jc_result, Mapping) else {})
+    ic_runner = cast(Callable[..., dict[str, object]], run_ic_iteration)
+    ic_result = ic_runner(dict(ic_task), score_fn, parent_trace=iteration_span)
+    jc_result: dict[str, object] = dict(baseline_snapshot.jc_result) if baseline_snapshot is not None else {}
+    jc_metrics: dict[str, object] = dict(baseline_snapshot.jc_metrics) if baseline_snapshot is not None else {}
+    if not jc_metrics:
+        jc_metrics = {k: float(v) for k, v in baseline_metrics_from_jc(jc_result).items()}
 
     combined_result = {"iterative_context": ic_result, "jcodemunch": jc_result}
     metrics_map: dict[str, object] = dict(score(combined_result))
@@ -5181,26 +6262,37 @@ def evaluate_policy_on_item(
         metrics_map["error"] = "no_tool_usage"
 
     total_ic, errors_ic = _tool_call_stats(ic_result)
-    total_jc, errors_jc = _tool_call_stats(jc_result if isinstance(jc_result, Mapping) else {})
+    total_jc, errors_jc = _tool_call_stats(jc_result)
     total_calls = total_ic + total_jc
     total_errors = errors_ic + errors_jc
     metrics_map["tool_error_rate"] = (total_errors / total_calls) if total_calls else 0.0
     metrics_map["no_tool_usage"] = total_ic == 0
-    comparison = build_comparison(metrics_map, jc_metrics if isinstance(jc_metrics, Mapping) else {})
+    comparison = build_comparison(metrics_map, jc_metrics)
     comparison_summary = format_comparison_summary(comparison)
     metrics_map.setdefault("iteration_regression", False)
-    metrics_map["jc_baseline_metrics"] = dict(jc_metrics) if isinstance(jc_metrics, Mapping) else {}
+    metrics_map["jc_baseline_metrics"] = dict(jc_metrics)
     metrics_map["comparison"] = comparison
+    trace_id = getattr(iteration_span, "id", None)
+    session_id_val = _session_id_from(iteration_span)
     for name, value in metrics_map.items():
         if isinstance(value, (int, float, bool)):
-            record_score(iteration_span, f"metrics.{name}", float(value))
+            data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
+            score_id = f"{trace_id}-metrics.{name}" if trace_id else None
+            emit_score_for_handle(
+                iteration_span,
+                name=f"metrics.{name}",
+                value=float(value) if isinstance(value, bool) else value,
+                data_type=data_type,
+                score_id=score_id,
+                session_id=session_id_val,
+            )
 
     policy_code = _read_policy()
     return EvaluationResult(
         metrics=metrics_map,
         ic_result=ic_result,
-        jc_result=jc_result if isinstance(jc_result, Mapping) else {},
-        jc_metrics=jc_metrics if isinstance(jc_metrics, Mapping) else {},
+        jc_result=jc_result,
+        jc_metrics=jc_metrics,
         comparison_summary=comparison_summary,
         policy_code=policy_code,
     )
@@ -5209,7 +6301,7 @@ def evaluate_policy_on_item(
 def build_iteration_feedback(
     evaluation: EvaluationResult,
     prev_score: float | None,
-    prev_classified: dict[str, object] | None,
+    prev_classified: PipelineClassification | None,
     repo_root: Path,
 ) -> FeedbackPackage:
     """Package evaluation outputs into writer-facing inputs."""
@@ -5223,7 +6315,12 @@ def build_iteration_feedback(
     diff_hint = ""
     if prev_score is not None and prev_classified is not None:
         try:
-            diff = compute_diff(prev_score, _as_float(evaluation.metrics.get("score", 0.0)), prev_classified, prev_classified)
+            diff = compute_diff(
+                prev_score,
+                _as_float(evaluation.metrics.get("score", 0.0)),
+                prev_classified.model_dump(),
+                prev_classified.model_dump(),
+            )
             diff_str = format_diff(diff)
             diff_hint = interpret_diff(diff)
         except Exception:
@@ -5255,12 +6352,16 @@ def attempt_policy_generation(
     comparison_summary: str | None,
     failure_context_str: str | None,
     repair_attempt: int,
-    parent_trace=None,
-    pipeline_feedback: Mapping[str, object] | None = None,
+    parent_trace: object | None = None,
+    pipeline_feedback: PipelineClassification | None = None,
 ) -> tuple[str | None, str | None]:
     try:
-        new_code = generate_policy(
-            feedback={**feedback, **({"pipeline_feedback": pipeline_feedback} if pipeline_feedback else {})},
+        generator = cast(Callable[..., str], generate_policy)
+        new_code = generator(
+            feedback={
+                **feedback,
+                **({"pipeline_feedback": pipeline_feedback.model_dump()} if pipeline_feedback else {}),
+            },
             current_policy=initial_policy,
             tests=tests,
             scoring_context=scoring_context,
@@ -5279,13 +6380,39 @@ def attempt_policy_generation(
         return None, str(e)
 
 
-def run_policy_pipeline(pipeline, repo_root: Path, repair_obs: object | None = None) -> tuple[list[PipelineStepResult], list[StepResult], bool]:
-    step_results = pipeline.run(repo_root, observation=repair_obs)
-    raw_results = list(step_results)
-    pipeline_results = [PipelineStepResult.from_mapping(r) for r in raw_results]
-    normalized_results = pipeline_results or [PipelineStepResult.from_mapping(r) for r in raw_results]
-    pipeline_success = all(_step_succeeded(r.to_mapping()) for r in normalized_results)
-    return pipeline_results, raw_results, pipeline_success
+def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
+    raw_results: list[object] = list(pipeline.run(repo_root, observation=repair_obs))
+    step_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in raw_results]
+    trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
+    observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
+    dataset_run_id = getattr(repair_obs, "dataset_run_id", None) if repair_obs is not None else None
+    session_id_val = getattr(repair_obs, "session_id", None) if repair_obs is not None else None
+    for step in step_results:
+        data_type = "NUMERIC"
+        score_id = f"{observation_id or trace_id}-pipeline.{step.name}.exit_code" if (observation_id or trace_id) else None
+        emit_score(
+            name=f"pipeline.{step.name}.exit_code",
+            value=step.exit_code,
+            data_type=data_type,
+            trace_id=trace_id,
+            observation_id=observation_id,
+            dataset_run_id=dataset_run_id,
+            session_id=session_id_val,
+            score_id=score_id,
+        )
+        pass_score_id = f"{observation_id or trace_id}-pipeline.{step.name}.passed" if (observation_id or trace_id) else None
+        emit_score(
+            name=f"pipeline.{step.name}.passed",
+            value=int(step.success),
+            data_type="BOOLEAN",
+            trace_id=trace_id,
+            observation_id=observation_id,
+            dataset_run_id=dataset_run_id,
+            session_id=session_id_val,
+            score_id=pass_score_id,
+        )
+    pipeline_success = all(_step_succeeded(r) for r in step_results)
+    return step_results, pipeline_success
 
 
 def finalize_successful_policy(
@@ -5293,44 +6420,44 @@ def finalize_successful_policy(
     new_code: str,
     attempts_used: int,
     max_repair_attempts: int,
-    repair_obs=None,
-) -> tuple[str, dict[str, object]]:
+    repair_obs: object | None = None,
+) -> tuple[str, AcceptedPolicyMeta]:
     final_policy = _read_policy()
-    metadata: dict[str, object] = {
-        "repair_attempts": attempts_used - 1,
-        "max_policy_repairs": max_repair_attempts,
-        "accepted_policy_source": "post_pipeline_disk",
-        "accepted_policy_changed_by_pipeline": final_policy != new_code,
-    }
-    return final_policy, metadata
+    meta = AcceptedPolicyMeta(
+        accepted_policy_source="post_pipeline_disk",
+        accepted_policy_changed_by_pipeline=final_policy != new_code,
+        repair_attempts=attempts_used - 1,
+        max_policy_repairs=max_repair_attempts,
+    )
+    return final_policy, meta
 
 
 def finalize_failed_repair(
     *,
-    metadata: dict[str, object],
-    pipeline_results: list[Mapping[str, object]],
-    classified: Mapping[str, object],
+    pipeline_results: list[StepResult],
+    classified: PipelineClassification,
     writer_model: str | None,
     attempts_used: int,
-) -> tuple[str, str]:
+    writer_error: str | None,
+) -> FailedRepairDetails:
     failed_step = _first_failed_step(pipeline_results)
+    failed_summary = None
     if failed_step:
-        metadata["failed_step"] = failed_step.get("name")
-        metadata["failed_exit_code"] = failed_step.get("exit_code")
-        stderr = failed_step.get("stderr")
-        stdout = failed_step.get("stdout")
-        text = ""
-        if isinstance(stderr, str) and stderr.strip():
-            text = stderr.strip()
-        elif isinstance(stdout, str) and stdout.strip():
-            text = stdout.strip()
-        metadata["failed_summary"] = text[:_MAX_FAILURE_SUMMARY_CHARS]
-    metadata["pipeline_feedback"] = classified
-    metadata["error"] = "pipeline_failed"
-    writer_err_val = metadata.get("writer_error")
-    writer_err_str = str(writer_err_val) if writer_err_val is not None else None
-    failure_context_str = _format_pipeline_failure_context(pipeline_results, classified, writer_err_str, writer_model, attempts_used)
-    return failure_context_str, _read_policy()
+        stderr = failed_step.stderr
+        stdout = failed_step.stdout
+        text = stderr.strip() if stderr.strip() else stdout.strip()
+        failed_summary = text[:_MAX_FAILURE_SUMMARY_CHARS] if text else None
+    failure_context_str = _format_pipeline_failure_context(
+        pipeline_results, classified, writer_error, writer_model, attempts_used
+    )
+    return FailedRepairDetails(
+        failure_context=failure_context_str,
+        policy_code=_read_policy(),
+        failed_step=failed_step.name if failed_step else None,
+        failed_exit_code=failed_step.exit_code if failed_step else None,
+        failed_summary=failed_summary,
+        error="pipeline_failed",
+    )
 
 
 def _build_dependencies() -> LoopDependencies:
@@ -5347,7 +6474,6 @@ def _build_dependencies() -> LoopDependencies:
         read_policy=_read_policy,
         write_policy=_write_policy,
         get_writer_model=get_writer_model,
-        record_score=record_score,
         start_span=start_span,
         find_repo_root=find_repo_root,
         default_pipeline=default_pipeline,
@@ -5359,20 +6485,26 @@ def run_loop(
     iterations: int = 5,
     parent_trace: object | None = None,
     baseline_snapshot: BaselineSnapshot | None = None,
+    session_id: str | None = None,
 ) -> list[IterationRecord]:
     """
     Closed-loop optimizer: execute, score, rewrite policy, repeat.
     """
     root_meta = {"task": dict(task), "iterations": iterations}
-    run_trace = start_span(parent_trace, "run_loop", metadata=root_meta, input=task) if parent_trace else start_trace("run_loop", metadata=root_meta, input=task)
+    run_trace = (
+        start_span(parent_trace, "run_loop", metadata=root_meta, input=task, session_id=session_id)
+        if parent_trace
+        else start_trace("run_loop", metadata=root_meta, input=task, session_id=session_id)
+    )
     baseline_model = (
         BaselineSnapshot.model_validate(baseline_snapshot)
         if isinstance(baseline_snapshot, Mapping)
         else baseline_snapshot
     )
     context = LoopContext(
-        task=task,
+        task=dict(task),
         iterations=iterations,
+        session_id=session_id,
         baseline_snapshot=baseline_model,
         run_trace=run_trace,
     )
@@ -5398,6 +6530,25 @@ def run_loop(
             except Exception:
                 pass
         flush_langfuse()
+    if not history:
+        repo_root = find_repo_root()
+        pipeline = default_pipeline()
+        pipeline_results, pipeline_success = run_policy_pipeline(pipeline, repo_root)
+        classified = classify_results(pipeline_results)
+        failed_step = _first_failed_step(pipeline_results)
+        record = IterationRecord(
+            iteration=0,
+            metrics={},
+            pipeline_passed=pipeline_success,
+            pipeline_feedback=classified,
+            failed_step=failed_step.name if failed_step else "pipeline_failed",
+            failed_exit_code=failed_step.exit_code if failed_step else None,
+            failed_summary=(failed_step.stderr or failed_step.stdout) if failed_step else None,
+            repair_attempts=_MAX_POLICY_REPAIRS,
+            max_policy_repairs=_MAX_POLICY_REPAIRS,
+            writer_error="writer_failed" if not pipeline_success else None,
+        )
+        history = [record]
     return history
 </file>
 
@@ -5451,22 +6602,31 @@ def load_policy() -> Callable[[object, object, object], float]:
 </file>
 
 <file path="policy.py">
+def _get_attr(obj: object, name: str, default: object = None) -> object:
+    """Safely retrieve an attribute.
+    Returns ``default`` if the attribute lookup fails.
+    """
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
 def score(node: object, state: object, context: object | None = None) -> float:
     """Deterministic scoring function.
 
     Parameters
     ----------
     node: object
-        The graph node, expected to have ``state``, ``id`` and optional ``tokens`` attributes.
+        Expected to have ``state``, ``id`` and optional ``tokens`` attributes.
     state: object
-        Graph‑like object providing ``in_degree`` and ``out_degree`` callables.
+        Expected to provide ``in_degree`` and ``out_degree`` callables.
     context: object | None, optional
-        Optional additional context; if it provides a numeric ``scale`` attribute it will be applied.
+        If provided and contains a numeric ``scale`` attribute, the total is multiplied by it.
     """
-    # Safely extract node attributes.
-    n_state = getattr(node, "state", None)
-    n_id = getattr(node, "id", None)
-    tokens = getattr(node, "tokens", None)
+    n_state = _get_attr(node, "state")
+    n_id = _get_attr(node, "id")
+    tokens = _get_attr(node, "tokens")
 
     total: float = 0.0
 
@@ -5479,8 +6639,8 @@ def score(node: object, state: object, context: object | None = None) -> float:
     # Degree contribution.
     if n_id is not None:
         degree = 0
-        in_func = getattr(state, "in_degree", None)
-        out_func = getattr(state, "out_degree", None)
+        in_func = _get_attr(state, "in_degree")
+        out_func = _get_attr(state, "out_degree")
         if callable(in_func):
             try:
                 val = in_func(n_id)
@@ -5503,7 +6663,7 @@ def score(node: object, state: object, context: object | None = None) -> float:
 
     # Optional scaling from context.
     if context is not None:
-        scale = getattr(context, "scale", None)
+        scale = _get_attr(context, "scale")
         if isinstance(scale, (int, float)):
             total *= float(scale)
 
@@ -5520,6 +6680,7 @@ dependencies = [
     "iterative-context", # 👈 local workspace dep
     "jcodemunch-mcp",
     "langfuse>=2.50.6",
+    "Jinja2>=3.1.4",
     "openai>=2.29.0",
     "pydantic>=2",
     "rich", # nice CLI/logging
@@ -5528,6 +6689,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "python-statemachine>=3.0.0",
     "mcp>=1.26.0",
+    "statemachine>=0.1",
+    "pydot>=2.0.0",
 ]
 
 [tool.uv.sources]
@@ -5536,6 +6699,20 @@ jcodemunch-mcp = { workspace = true }
 
 [tool.basedpyright]
 extraPaths = [".."]
+typeCheckingMode = "strict"
+strictListInference = true
+strictDictionaryInference = true
+strictParameterNoneValue = true
+reportUnknownParameterType = "warning"
+reportUnknownArgumentType = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownMemberType = "warning"
+reportMissingTypeStubs = "none"
+reportUnnecessaryIsInstance = "warning"
+reportUnnecessaryCast = "warning"
+reportUnnecessaryComparison = "warning"
+include = ["./"]
+exclude = ["tests_harness"]
 </file>
 
 <file path="run.py">
@@ -5637,12 +6814,15 @@ import time
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from .observability.langfuse import record_score, start_span, get_tracing_openai_client
+from .observability.langfuse import start_span, get_tracing_openai_client
+from .observability.score_emitter import emit_score_for_handle
 from .tools.backends.ic_backend import IterativeContextBackend
 from .tools.backends.jc_backend import JCodeMunchBackend
 from .tools.mcp_adapter import serialize_tool_result_for_model
 from .utils.env import get_cerebras_api_key, get_runner_model
 from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
+from .prompts import SystemPromptContext
+from .utils.template_loader import render_prompt_template
 
 _MAX_TOTAL_MESSAGE_CHARS = 24000
 _MAX_TOOL_CONTENT_CHARS = 4000
@@ -5665,8 +6845,8 @@ def _require_str(mapping: dict[str, Any], key: str) -> str:
 def _tool_names_from_specs(tool_specs: list[OpenAITool]) -> list[str]:
     names: list[str] = []
     for spec in tool_specs:
-        func = spec.get("function") if isinstance(spec, Mapping) else None
-        name = func.get("name") if isinstance(func, Mapping) else None
+        func = spec.get("function") if isinstance(spec, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
+        name = func.get("name") if isinstance(func, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
         if isinstance(name, str):
             names.append(name)
     return names
@@ -5796,35 +6976,15 @@ def _truncate_for_metadata(payload: object, limit: int = 2000) -> object:
 
 def _build_ic_system_prompt(tool_specs: list[OpenAITool]) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
-    return (
-        "You are exploring a codebase using a graph-based system.\n"
-        "Available tools:\n"
-        f"{_format_available_tools(tool_names)}\n\n"
-        "Guidelines:\n"
-        "- Always expand after resolving\n"
-        "- Prefer expand over repeated resolve\n"
-        "- Do not attempt file-level inspection unless necessary\n"
-        "- Focus on graph traversal\n"
-        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
-        "- Always start by calling a tool. Never respond with text.\n"
-        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
-    )
+    context = SystemPromptContext(available_tools=_format_available_tools(tool_names))
+    return render_prompt_template("ic_system.jinja", context.model_dump())
 
 
 def _build_jc_system_prompt(tool_specs: list[OpenAITool]) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
     tools_section = _format_available_tools(tool_names)
-    return (
-        "You are exploring a codebase using tool calls.\n"
-        "Available tools:\n"
-        f"{tools_section}\n\n"
-        "Guidelines:\n"
-        "- Use the available tools to locate and inspect symbols and files\n"
-        "- Avoid redundant calls\n"
-        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
-        "- Always start by calling a tool. Never respond with text.\n"
-        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
-    )
+    context = SystemPromptContext(available_tools=tools_section)
+    return render_prompt_template("jc_system.jinja", context.model_dump())
 
 
 def _make_client():
@@ -5842,7 +7002,7 @@ def run_agent(
     tool_specs: list[OpenAITool],
     dispatch_tool_call: Callable[[str, dict[str, Any]], Any],
     system_prompt: str,
-    parent_trace=None,
+    parent_trace: object | None = None,
     backend_name: str | None = None,
     model: str | None = None,
 ) -> dict[str, object]:
@@ -5998,7 +7158,7 @@ def run_ic_iteration(
     task: dict[str, object],
     score_fn: Callable[..., float],
     steps: int = 5,
-    parent_trace=None,
+    parent_trace: object | None = None,
 ):
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
@@ -6033,7 +7193,7 @@ def run_ic_iteration(
     normalized = _normalize_agent_result(raw)
     nc_val = normalized.get("node_count", 0)
     node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-    record_score(backend_obs, "ic.node_count", node_count)
+    emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count, data_type="NUMERIC")
     if backend_obs and hasattr(backend_obs, "end"):
         try:
             backend_obs.end(metadata={"node_count": normalized.get("node_count", 0)})
@@ -6045,7 +7205,7 @@ def run_ic_iteration(
 def run_jc_iteration(
     task: dict[str, object],
     steps: int = 5,
-    parent_trace=None,
+    parent_trace: object | None = None,
 ):
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
@@ -6080,7 +7240,7 @@ def run_jc_iteration(
     normalized = _normalize_agent_result(raw)
     nc_val = normalized.get("node_count", 0)
     node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-    record_score(backend_obs, "jc.node_count", node_count)
+    emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count, data_type="NUMERIC")
     if backend_obs and hasattr(backend_obs, "end"):
         try:
             backend_obs.end(metadata={"node_count": normalized.get("node_count", 0)})
@@ -6121,15 +7281,19 @@ def score(result: Mapping[str, object]) -> Dict[str, object]:
 <file path="writer.py">
 from __future__ import annotations
 
-import time
 import json
+import time
 from typing import Any, Mapping
 
-from .observability.langfuse import get_tracing_openai_client, record_score, start_span
+from .observability.langfuse import get_tracing_openai_client, start_span
+from .observability.score_emitter import emit_score_for_handle
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
+from .prompts import WriterPromptContext
+from .utils.template_loader import render_prompt_template
 
 _client: Any | None = None
+_WRITER_TEMPLATE = "policy_writer.jinja"
 
 
 def _get_client():
@@ -6205,6 +7369,37 @@ def _ensure_valid_policy_code(code: str) -> str:
     return cleaned
 
 
+def _render_writer_prompt(
+    *,
+    current_policy: str,
+    failure_context: str,
+    feedback_str: str,
+    feedback: Mapping[str, object],
+    comparison_summary: str | None,
+    guidance_hint: str,
+    diff_str: str,
+    diff_hint: str,
+    tests: str,
+    scoring_context: str,
+) -> str:
+    feedback_text = feedback_str if feedback_str else str(feedback)
+    context = WriterPromptContext(
+        current_policy=current_policy,
+        failure_context=failure_context,
+        feedback_text=feedback_text,
+        comparison_summary=comparison_summary or "N/A",
+        guidance_hint=guidance_hint,
+        diff_str=diff_str,
+        diff_hint=diff_hint,
+        tests=tests,
+        scoring_context=scoring_context,
+    )
+    rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
+    if "===USER===" not in rendered:
+        rendered = f"===USER===\n{rendered}"
+    return rendered
+
+
 def generate_policy(
     feedback: dict[str, Any],
     current_policy: str,
@@ -6215,7 +7410,7 @@ def generate_policy(
     diff_str: str,
     diff_hint: str,
     comparison_summary: str | None = None,
-    parent_trace=None,
+    parent_trace: object | None = None,
     failure_context: str | None = None,
     repair_attempt: int = 0,
 ) -> str:
@@ -6233,72 +7428,48 @@ def generate_policy(
     completion_tokens = model_budget.completion_reserve
     writer_obs = start_span(parent_trace, "policy_writer", metadata={"model": model})
     response = None
-    record_score(writer_obs, "writer.policy_generated", False)
-    record_score(writer_obs, "writer.policy_compiled", False)
+    emit_score_for_handle(writer_obs, name="writer.policy_generated", value=False, data_type="BOOLEAN")
+    emit_score_for_handle(writer_obs, name="writer.policy_compiled", value=False, data_type="BOOLEAN")
+    prompt_content = _render_writer_prompt(
+        current_policy=current_policy,
+        failure_context=failure_context,
+        feedback_str=str(feedback_str),
+        feedback=feedback,
+        comparison_summary=comparison_summary,
+        guidance_hint=guidance_hint,
+        diff_str=diff_str,
+        diff_hint=diff_hint,
+        tests=tests,
+        scoring_context=scoring_context,
+    )
     for attempt in range(3):
         attempt_obs = start_span(writer_obs, f"writer_attempt_{attempt}", metadata={"attempt": attempt, "model": model})
         try:
+            system_content, user_content = prompt_content.split("===USER===", 1)
             response = client.chat.completions.create(
                 model=model,
                 response_format={
                     "type": "json_schema",
-                "json_schema": {
-                    "name": "policy_code",
-                    "schema": {
-                        "type": "object",
-                        "properties": {"code": {"type": "string"}},
-                        "required": ["code"],
-                        "additionalProperties": False,
+                    "json_schema": {
+                        "name": "policy_code",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"code": {"type": "string"}},
+                            "required": ["code"],
+                            "additionalProperties": False,
+                        },
+                        "strict": True,
                     },
-                    "strict": True,
                 },
-            },
-            max_completion_tokens=completion_tokens,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are optimizing a scoring function for a graph search system. "
-                        "Respond ONLY with JSON matching the provided schema. "
-                        "The 'code' field must contain pure Python defining a typed score function with signature "
-                        "def score(node: object, state: object, context: object | None = None) -> float.\n"
-                        "STRICT RULES:\n"
-                        "- You MUST NOT use import statements\n"
-                        "- You MUST NOT reference external modules\n"
-                        "- You MUST NOT access the filesystem\n"
-                        "- Only use built-in Python operations\n"
-                            "- Do NOT wrap the code in Markdown\n"
-                            "Any violation will cause immediate failure."
-                        ),
+                max_completion_tokens=completion_tokens,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_content.strip(),
                     },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Current policy:\n{current_policy}\n\n"
-                        f"Validation context:\n{failure_context}\n\n"
-                        f"Structured feedback:\n{feedback_str or feedback}\n\n"
-                        f"Baseline comparison:\n{comparison_summary or 'N/A'}\n\n"
-                        f"Guidance:\n{guidance_hint}\n\n"
-                        f"{diff_str}\n\n"
-                        f"Diff guidance:\n{diff_hint}\n\n"
-                        f"Tests (source of truth, do not modify):\n{tests}\n\n"
-                        f"Scoring interface + examples (STRICT CONTRACT):\n{scoring_context}\n\n"
-                        "Validation requirements:\n"
-                        "- score MUST have type annotations on all parameters and return float\n"
-                        "- Target signature: def score(node: object, state: object, context: object | None = None) -> float\n"
-                        "- Code MUST be valid under BasedPyright\n\n"
-                        "Instructions:\n"
-                        "- Fix errors in order of priority:\n"
-                        "  1. TYPE ERRORS\n"
-                        "  2. LINT ERRORS\n"
-                        "  3. TEST FAILURES\n\n"
-                        "- Do NOT attempt to optimize until all tests pass\n"
-                        "- MUST define a typed score function used by the harness that returns a float\n"
-                        "- MUST be deterministic\n"
-                        "- MUST NOT import external libraries\n"
-                        "- MUST operate only on provided node/state data\n\n"
-                        "Return ONLY the JSON object specified by the schema.\n"
-                    ),
+                    {
+                        "role": "user",
+                        "content": user_content.strip(),
                     },
                 ],
             )
@@ -6326,7 +7497,13 @@ def generate_policy(
     try:
         raw_code = _extract_policy_code(response)
         code = _ensure_valid_policy_code(raw_code)
-        record_score(writer_obs, "writer.policy_compiled", True, metadata={"model": model})
+        emit_score_for_handle(
+            writer_obs,
+            name="writer.policy_compiled",
+            value=True,
+            data_type="BOOLEAN",
+            comment=json.dumps({"model": model}),
+        )
     except Exception as exc:  # noqa: BLE001
         if writer_obs and hasattr(writer_obs, "end"):
             try:
@@ -6334,7 +7511,13 @@ def generate_policy(
             except Exception:
                 pass
         raise
-    record_score(writer_obs, "writer.policy_generated", True, metadata={"model": model})
+    emit_score_for_handle(
+        writer_obs,
+        name="writer.policy_generated",
+        value=True,
+        data_type="BOOLEAN",
+        comment=json.dumps({"model": model}),
+    )
     if writer_obs and hasattr(writer_obs, "end"):
         try:
             writer_obs.end(metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from harness.loop_types import IterationRecord
+from harness.loop import IterationRecord
 from harness.observability import datasets, experiments
 from harness.observability.baselines import BaselineBundle, BaselineSnapshot
 from harness.observability.runner_integration import HostedRunItemResult, HostedRunResult

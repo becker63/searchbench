@@ -2,8 +2,9 @@
 
 ## Environment
 - Required to enable: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`
-- Optional: `LANGFUSE_BASE_URL`, `LANGFUSE_ENV`, `LANGFUSE_ENABLED=0` to disable
+- Optional: `LANGFUSE_BASE_URL`, `LANGFUSE_TRACING_ENVIRONMENT`, `LANGFUSE_RELEASE`, `LANGFUSE_DEBUG=True` for verbose rollout, `LANGFUSE_ENABLED=0` to disable
 - Model config remains: `CEREBRAS_API_KEY`, `RUNNER_MODEL`, `WRITER_MODEL`
+- Span filter: keep Langfuse v4 default (no infra OTEL spans). Do not set `should_export_span` unless you need HTTP/DB/queue instrumentation.
 
 ## Benchmark Model
 - Langfuse datasets are the canonical benchmark source.
@@ -28,6 +29,7 @@
   - `run_local_jc_baseline_experiment(dataset)`
   - `run_local_ic_optimization_experiment(dataset, iterations=..., baselines=bundle, recompute_baselines=False)`
 - Hosted runs create dataset runs/compare UX; local runs create traces/scores only. Per-item traces include dataset info, item id, baseline run id, and run kind (`jc_baseline` vs `ic_optimization`).
+- Cost/usage: Cerebras generations must include `model` and usage (OpenAI-style prompt/completion/total). If the provider omits usage, supply it explicitly; do not emit zeroed usage. Costs are inferred via Langfuse model definitions.
 
 ## Tracing & Scoring
 
@@ -47,6 +49,7 @@ Leaf-operation observability remains with:
 - JC baseline experiment (hosted runner): `python run.py --jc-baseline --dataset DATASET_NAME [--version v1] [--baseline-path bundle.json]`
 - IC optimization experiment (hosted runner): `python run.py --ic-optimize --dataset DATASET_NAME [--version v1] --iterations 5 --baseline-path bundle.json [--recompute-baselines]`
 - Console output is concise; Langfuse stores detailed traces/scores. `flush_langfuse()` runs on exit.
+- To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.observability.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `observability/cerebras_pricing.py`.
 
 ## Policy Loading
 - `policy_loader.py` now simply loads `policy.py`, validates a callable `score`, and adapts 1/2/3-arg callables to `score(node, state, context) -> float`. No sandbox or restricted execution.

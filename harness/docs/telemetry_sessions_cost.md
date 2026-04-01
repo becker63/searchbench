@@ -1,20 +1,27 @@
-## Sessions and Scores
+## Sessions and Scores (Langfuse v4)
 
-- Provide `session_id` when starting root traces/spans to group multi-trace interactions in Langfuse Sessions.
-- Child spans created via our helpers inherit the `session_id`; scores emitted via the emitter can include `session_id` for session-level scoring.
-- For session-only scores, call the emitter with `session_id` even if no trace/observation IDs are available.
+- Use `propagate_context(trace_name/session_id/user_id/tags/metadata/version)` once at entry; all observations inherit it.
+- Root/child observations are started via `start_observation` (no legacy trace/span helpers).
+- Scores can be emitted with observation/trace or just `session_id` for session-only metrics.
 
 ## Test Isolation (Langfuse)
 
 - Tests run with Langfuse credentials cleared and a stubbed client; real network calls to Langfuse must not occur.
 - If a test needs to assert the error path, re-monkeypatch `get_langfuse_client` to the stored `_real_get_langfuse_client`.
 
-## Cerebras Pricing Sync
+## Cerebras Pricing & Usage
 
-- Custom model definitions (input/output USD per million tokens) to add via Langfuse Models API:
+- Custom model definitions (USD per million tokens) to sync to Langfuse Cloud:
   - Zaizai GLM 4.7 — input $2.25/M, output $2.75/M; regex `(?i)zaizai.*glm.*4\.7`
   - GPT OSS 120B — input $0.35/M, output $0.75/M; regex `(?i)gpt[-_ ]oss[-_ ]120b`
   - Llama 3.1 8B — input $0.10/M, output $0.10/M; regex `(?i)llama[-_ ]3\.1[-_ ]8b`
   - Qwen 3 235B Instruct — input $0.60/M, output $1.20/M; regex `(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct`
-- Use the Models API (`POST /api/public/models`) with the payload from `observability.cerebras_pricing.pricing_payload()`.
-- Ensure generations include `model` and usage (when available) so Langfuse can infer costs; otherwise ingest usage manually.
+- Sync helper: `observability.cerebras_pricing.sync_cerebras_models()` calls `client.api.models.create` for each entry (requires Langfuse Cloud credentials).
+- Generations must include `model` and `usage_details` (OpenAI-style prompt/completion/total) so Langfuse can infer cost. If the provider omits usage, supply it explicitly or add an estimator; do not emit zeroed usage.
+
+## Sessions (where and how)
+
+- Session IDs are resolved only at public entrypoints (CLI or hosted experiment wrappers) via session policy, then propagated.
+- Defaults: ad hoc CLI → run-scope; hosted dataset experiments → item-scope (with optional deterministic fallback).
+- Children inherit session_id from the propagated context; avoid overwriting mid-run.
+- Session-only scores are allowed by passing `session_id` directly to the emitter; otherwise use observation handles to keep grouping.

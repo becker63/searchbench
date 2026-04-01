@@ -50,5 +50,7 @@ def get_langfuse_env() -> dict[str, str | bool | None]:
         "public_key": getenv("LANGFUSE_PUBLIC_KEY"),
         "secret_key": getenv("LANGFUSE_SECRET_KEY"),
         "base_url": getenv("LANGFUSE_BASE_URL"),
-        "environment": getenv("LANGFUSE_ENV"),
+        "tracing_environment": getenv("LANGFUSE_TRACING_ENVIRONMENT"),
+        "release": getenv("LANGFUSE_RELEASE"),
+        "debug": getenv_bool("LANGFUSE_DEBUG", default=False),
     }

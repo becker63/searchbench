@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional, cast
+from contextlib import contextmanager
+from typing import Any, Mapping, Optional
 
-from langfuse import Langfuse
+from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
 
 from ..utils.env import get_langfuse_env
@@ -10,33 +11,54 @@ from ..utils.env import get_langfuse_env
 _client: Optional[Langfuse] = None
 
 
-def get_langfuse_client() -> Optional[Langfuse]:
-    global _client  # noqa: PLW0603
+def _coerce_metadata(metadata: Mapping[str, object] | None) -> dict[str, str] | None:
+    if metadata is None:
+        return None
+    coerced: dict[str, str] = {}
+    for key, value in metadata.items():
+        coerced[str(key)] = "" if value is None else str(value)
+    return coerced
+
+
+def _coerce_tags(tags: list[str] | None) -> list[str] | None:
+    if tags is None:
+        return None
+    return [tag for tag in tags if isinstance(tag, str) and tag]
+
+
+def _build_client() -> Langfuse:
     env = get_langfuse_env()
     public, secret = env.get("public_key"), env.get("secret_key")
     if not isinstance(public, str) or not isinstance(secret, str) or not public or not secret:
         raise RuntimeError("Langfuse credentials are required (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)")
-    if _client is not None:
-        return _client
-    base_url_val = env.get("base_url")
-    env_val = env.get("environment")
-    host: Optional[str] = base_url_val if isinstance(base_url_val, str) else None
-    environment: Optional[str] = env_val if isinstance(env_val, str) else None
-    try:
-        _client = Langfuse(
-            public_key=public,
-            secret_key=secret,
-            host=host if host else None,
-            environment=environment if environment else None,
-        )
-    except Exception:
-        _client = None
-        raise
+    host = env.get("base_url")
+    tracing_env = env.get("tracing_environment")
+    release = env.get("release")
+    debug = bool(env.get("debug"))
+    return Langfuse(
+        public_key=public,
+        secret_key=secret,
+        host=host if isinstance(host, str) and host else None,
+        environment=tracing_env if isinstance(tracing_env, str) and tracing_env else None,
+        release=release if isinstance(release, str) and release else None,
+        debug=debug,
+        # Keep default span filter (no infra spans) by not overriding should_export_span.
+    )
+
+
+def get_langfuse_client() -> Langfuse:
+    global _client  # noqa: PLW0603
+    if _client is None:
+        _client = _build_client()
     return _client
 
 
 def is_langfuse_enabled() -> bool:
-    return get_langfuse_client() is not None
+    try:
+        get_langfuse_client()
+        return True
+    except Exception:
+        return False
 
 
 def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
@@ -46,53 +68,136 @@ def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
     return LangfuseOpenAI(base_url=base_url, api_key=api_key)
 
 
-def start_trace(
-    name: str,
-    metadata: Mapping[str, object] | None = None,
-    input: object | None = None,
+def propagate_context(
+    *,
+    trace_name: str | None = None,
     session_id: str | None = None,
-) -> Any | None:
+    user_id: str | None = None,
+    tags: list[str] | None = None,
+    metadata: Mapping[str, object] | None = None,
+    version: str | None = None,
+):
+    """
+    Apply correlating attributes to all observations created in the current context.
+    """
+    kwargs: dict[str, Any] = {}
+    if trace_name:
+        kwargs["trace_name"] = trace_name
+    if session_id:
+        kwargs["session_id"] = session_id
+    if user_id:
+        kwargs["user_id"] = user_id
+    coerced_tags = _coerce_tags(tags)
+    if coerced_tags:
+        kwargs["tags"] = coerced_tags
+    coerced_metadata = _coerce_metadata(metadata)
+    if coerced_metadata:
+        kwargs["metadata"] = coerced_metadata
+    if version:
+        kwargs["version"] = version
+    return propagate_attributes(**kwargs)
+
+
+@contextmanager
+def start_root_observation(
+    name: str,
+    *,
+    as_type: str = "span",
+    input: object | None = None,
+    model: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> Any:
+    """
+    Start a root observation as the current observation.
+    """
     client = get_langfuse_client()
-    client_any = cast(Any, client)
-    return client_any.trace(
+    with client.start_as_current_observation(
+        as_type=as_type,
         name=name,
-        metadata=dict(metadata) if metadata else None,
         input=input,
-        session_id=session_id,
-    )
+        model=model,
+        metadata=_coerce_metadata(metadata),
+    ) as observation:
+        yield observation
 
 
-def start_span(
-    parent: Any | None,
+@contextmanager
+def start_child_observation(
+    parent: Any,
     name: str,
-    metadata: Mapping[str, object] | None = None,
+    *,
+    as_type: str = "span",
     input: object | None = None,
-    session_id: str | None = None,
-) -> Any | None:
+    model: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> Any:
+    """
+    Start a child observation from a parent observation.
+    """
+    if parent is None or not hasattr(parent, "start_observation"):
+        raise RuntimeError("Parent observation is required to start a child observation")
+    with parent.start_observation(
+        name=name,
+        as_type=as_type,
+        input=input,
+        model=model,
+        metadata=_coerce_metadata(metadata),
+    ) as observation:
+        yield observation
+
+
+@contextmanager
+def start_observation(
+    name: str,
+    *,
+    parent: Any | None = None,
+    as_type: str = "span",
+    input: object | None = None,
+    model: str | None = None,
+    metadata: Mapping[str, object] | None = None,
+):
+    """
+    Convenience wrapper to start a root or child observation based on parent presence.
+    """
     if parent is None:
-        return start_trace(name=name, metadata=metadata, input=input, session_id=session_id)
-    if hasattr(parent, "span"):
-        return parent.span(
-            name=name,
-            metadata=dict(metadata) if metadata else None,
+        with start_root_observation(
+            name,
+            as_type=as_type,
             input=input,
-            session_id=session_id,
-        )
-    raise RuntimeError("Parent trace/span missing 'span' method")
+            model=model,
+            metadata=metadata,
+        ) as observation:
+            yield observation
+    else:
+        with start_child_observation(
+            parent,
+            name,
+            as_type=as_type,
+            input=input,
+            model=model,
+            metadata=metadata,
+        ) as observation:
+            yield observation
 
 
 def flush_langfuse() -> None:
     client = get_langfuse_client()
-    if client is None:
-        raise RuntimeError("Langfuse client unavailable for flush")
-    client.flush()
+    # Ensure buffered events are sent; shutdown if supported by the SDK.
+    flush = getattr(client, "flush", None)
+    if callable(flush):
+        flush()
+    shutdown = getattr(client, "shutdown", None)
+    if callable(shutdown):
+        shutdown()
 
 
 __all__ = [
     "get_langfuse_client",
     "is_langfuse_enabled",
     "get_tracing_openai_client",
-    "start_trace",
-    "start_span",
+    "propagate_context",
+    "start_observation",
+    "start_root_observation",
+    "start_child_observation",
     "flush_langfuse",
 ]

@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Mapping
 
-from harness.loop_machine import OptimizationStateMachine, RepairStateMachine
-from harness.loop_types import (
+from harness.loop import (
+    OptimizationStateMachine,
+    RepairStateMachine,
     AcceptedPolicyMeta,
     FeedbackPackage,
     EvaluationResult,
@@ -99,7 +100,7 @@ def _make_deps(**overrides) -> LoopDependencies:
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        start_span=lambda *a, **k: None,
+        start_observation=lambda *a, **k: None,
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),
     )
@@ -452,7 +453,7 @@ def test_repair_span_opens_before_writer_for_attempt_zero():
         def end(self, **kwargs: object) -> None:
             self.ended.append(kwargs)
 
-    def tracking_start_span(parent, name, **kwargs):
+    def tracking_start_span(parent=None, name=None, **kwargs):
         span = FakeSpan(name, kwargs.get("metadata", {}))
         span_log.append(("open", {"name": name, **kwargs.get("metadata", {})}))
         return span
@@ -462,7 +463,7 @@ def test_repair_span_opens_before_writer_for_attempt_zero():
         return ("policy", None)
 
     deps = _make_deps(
-        start_span=tracking_start_span,
+        start_observation=tracking_start_span,
         attempt_policy_generation=tracking_attempt_policy_generation,
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=1)
@@ -489,7 +490,7 @@ def test_repair_span_metadata_correct_across_retries():
             meta_dict = {str(k): v for k, v in (meta.items() if isinstance(meta, Mapping) else [])}
             span_events.append(("close", meta_dict))
 
-    def tracking_start_span(parent, name, **kwargs):
+    def tracking_start_span(parent=None, name=None, **kwargs):
         meta = kwargs.get("metadata", {})
         meta_dict = {str(k): v for k, v in (meta.items() if isinstance(meta, Mapping) else [])}
         span = FakeSpan(name, meta_dict)
@@ -505,7 +506,7 @@ def test_repair_span_metadata_correct_across_retries():
         return [result], True
 
     deps = _make_deps(
-        start_span=tracking_start_span,
+        start_observation=tracking_start_span,
         run_policy_pipeline=run_policy_pipeline,
         classify_results=lambda results: PipelineClassification(lint_errors="bad"),
         finalize_failed_repair=lambda *, pipeline_results, classified, **kwargs: FailedRepairDetails(

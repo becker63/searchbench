@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+"""
+Leaf operation: policy pipeline execution (lint/tests/etc.).
+No CLI or session policy; receives normalized inputs only.
+"""
+
 from typing import Iterable, List
 from pathlib import Path
 
-from ..observability.langfuse import start_span
+from ..observability.langfuse import start_observation
 from ..observability.score_emitter import emit_score_for_handle
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
 from .types import PipelineClassification, Step, StepResult
@@ -17,28 +22,31 @@ class Pipeline:
     def run(self, repo_root: Path, observation: object | None = None) -> List[StepResult]:
         results: List[StepResult] = []
         for step in self.steps:
-            step_obs = start_span(observation, name=step.name, metadata={"cwd": str(repo_root)})
-            result = step.run(repo_root)
-            # Enforce success semantics based solely on exit status.
-            result.success = result.exit_code == 0
-            results.append(result)
-            emit_score_for_handle(
-                step_obs,
-                name="exit_code",
-                value=result.exit_code,
-                data_type="NUMERIC",
-                comment=f"step={step.name}",
-            )
-            emit_score_for_handle(
-                step_obs,
-                name="pipeline_pass",
-                value=result.success,
-                data_type="BOOLEAN",
-                comment=f"step={step.name}",
-            )
-            terminated = self.fail_fast and result.exit_code != 0
-            if step_obs and hasattr(step_obs, "end"):
-                step_obs.end(
+            with start_observation(
+                name=step.name,
+                parent=observation,
+                metadata={"cwd": str(repo_root)},
+            ) as step_obs:
+                result = step.run(repo_root)
+                # Enforce success semantics based solely on exit status.
+                result.success = result.exit_code == 0
+                results.append(result)
+                emit_score_for_handle(
+                    step_obs,
+                    name="exit_code",
+                    value=result.exit_code,
+                    data_type="NUMERIC",
+                    comment=f"step={step.name}",
+                )
+                emit_score_for_handle(
+                    step_obs,
+                    name="pipeline_pass",
+                    value=result.success,
+                    data_type="BOOLEAN",
+                    comment=f"step={step.name}",
+                )
+                terminated = self.fail_fast and result.exit_code != 0
+                step_obs.update(
                     metadata={
                         "step": step.name,
                         "success": result.success,
@@ -49,8 +57,8 @@ class Pipeline:
                         "terminated_pipeline": terminated,
                     }
                 )
-            if terminated:
-                break
+                if terminated:
+                    break
         return results
 
 

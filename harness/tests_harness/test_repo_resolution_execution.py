@@ -5,7 +5,7 @@ from typing import Any, Mapping
 from harness.observability import baselines, experiments
 from harness.observability.runner_integration import HostedRunItemResult, HostedRunResult
 from harness import loop, runner
-from harness.loop_types import IterationRecord
+from harness.loop import IterationRecord
 
 
 def test_baseline_resolves_repo(monkeypatch, tmp_path):
@@ -28,7 +28,7 @@ def test_baseline_resolves_repo(monkeypatch, tmp_path):
         def score(self, name: str, value: float, metadata=None):
             pass
 
-    monkeypatch.setattr(baselines, "start_span", lambda *a, **k: Span())
+    monkeypatch.setattr(baselines, "start_observation", lambda *a, **k: Span())
     snap = baselines.compute_baseline_for_item(
         baselines.normalize_dataset_item({"id": "item1", "repo": "small", "symbol": "s", "metadata": {}})
     )
@@ -40,7 +40,7 @@ def test_baseline_resolves_repo(monkeypatch, tmp_path):
 def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
     calls: list[str] = []
 
-    def fake_run_loop(task: Mapping[str, object], iterations: int, parent_trace=None, baseline_snapshot=None):
+    def fake_run_loop(task: Mapping[str, object], iterations: int, parent_trace=None, baseline_snapshot=None, session_id=None):
         calls.append(str(task.get("repo", "")))
         return [IterationRecord(iteration=0, metrics={"score": 1.0}, pipeline_passed=True)]
 
@@ -71,6 +71,7 @@ def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
         dataset_version=None,
         iterations=1,
         hosted=False,
+        session_config=None,
     )
     assert calls and calls[0] == str(repo_dir)
 
@@ -113,8 +114,8 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loop, "default_pipeline", lambda: DummyPipeline())
     monkeypatch.setattr(loop, "find_repo_root", lambda: tmp_path)
-    monkeypatch.setattr(loop, "start_trace", lambda *a, **k: DummySpan("trace"))
-    monkeypatch.setattr(loop, "start_span", lambda *a, **k: DummySpan("span"))
+    monkeypatch.setattr(loop, "start_observation", lambda *a, **k: DummySpan("trace"))
+    monkeypatch.setattr(loop, "start_observation", lambda *a, **k: DummySpan("span"))
     monkeypatch.setattr(loop, "emit_score", lambda *a, **k: None)
     monkeypatch.setattr(loop, "flush_langfuse", lambda: None)
 

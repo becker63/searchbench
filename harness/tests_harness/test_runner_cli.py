@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 from importlib import util as importlib_util
 
-from harness.loop_types import IterationRecord
+from harness.loop import IterationRecord
 from harness.observability.baselines import BaselineBundle
 
 def test_root_shim_invokes_harness_main(monkeypatch):
@@ -32,7 +32,7 @@ def test_ad_hoc_runner_resolves_repo(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
     monkeypatch.setattr(
         "harness.run.run_loop",
-        lambda task, iterations=3: [IterationRecord(iteration=0, metrics={"score": 1.0})],
+        lambda task, iterations=3, session_id=None: [IterationRecord(iteration=0, metrics={"score": 1.0})],
         raising=False,
     )
     harness_run.main([])
@@ -57,7 +57,7 @@ def test_ad_hoc_runner_prints_failed_step(monkeypatch, tmp_path, capsys):
             failed_summary="type errors here",
         )
     ]
-    monkeypatch.setattr("harness.run.run_loop", lambda task, iterations=3: history, raising=False)
+    monkeypatch.setattr("harness.run.run_loop", lambda task, iterations=3, session_id=None: history, raising=False)
     harness_run.main([])
     out = capsys.readouterr().out
     assert "Last failed step: basedpyright" in out

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import pytest
+
 from harness import runner, writer
+
+ORIGINAL_USAGE_FROM_RESPONSE = runner._usage_from_response
 
 
 class DummySpan:
@@ -15,6 +20,9 @@ class DummySpan:
     def score(self, name: str, value: float | int | bool, metadata=None):
         self.scores.append((name, float(value)))
 
+    def update(self, **kwargs):
+        pass
+
 
 def test_run_ic_iteration_emits_scores(monkeypatch):
     scores: list[tuple[str, float]] = []
@@ -23,7 +31,11 @@ def test_run_ic_iteration_emits_scores(monkeypatch):
         "emit_score_for_handle",
         lambda handle, **kwargs: scores.append((kwargs.get("name"), float(kwargs.get("value", 0.0)))),
     )
-    monkeypatch.setattr(runner, "start_span", lambda *a, **k: DummySpan("span"))
+    @contextmanager
+    def span_cm(name="span"):
+        yield DummySpan(name)
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     monkeypatch.setattr(runner, "run_agent", lambda *a, **k: {"observations": [{"tool": "t", "result": {"graph": {"nodes": [1, 2]}}}]})
     monkeypatch.setattr(
         runner,
@@ -50,6 +62,17 @@ def test_writer_records_policy_events(monkeypatch):
     class DummyResponse:
         def __init__(self):
             self.choices = [DummyChoice()]
+            self.usage = type(
+                "U",
+                (),
+                {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "prompt_tokens_details": {},
+                    "completion_tokens_details": {},
+                },
+            )()
 
     class DummyCompletions:
         def create(self, **kwargs):
@@ -67,7 +90,11 @@ def test_writer_records_policy_events(monkeypatch):
         return DummyClient(), "test-model"
 
     monkeypatch.setattr(writer, "_get_client", fake_client)
-    monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan("writer"))
+    @contextmanager
+    def span_cm(name="writer"):
+        yield DummySpan(name)
+
+    monkeypatch.setattr(writer, "start_observation", lambda *a, **k: span_cm())
     monkeypatch.setattr(
         writer,
         "emit_score_for_handle",
@@ -103,6 +130,125 @@ def test_run_agent_truncates_tool_content(monkeypatch):
             message = Msg()
 
         choices = [Choice()]
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+
+        def __init__(self):
+            self.usage = self.__class__.usage
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+
+        def __init__(self):
+            self.usage = self.__class__.usage
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+
+        def __init__(self):
+            self.usage = self.__class__.usage
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
 
     class DummyCompletions:
         def __init__(self):
@@ -119,7 +265,11 @@ def test_run_agent_truncates_tool_content(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
-    monkeypatch.setattr(runner, "start_span", lambda *a, **k: type("S", (), {"id": "span", "end": lambda self, **kw: None})())
+    @contextmanager
+    def span_cm():
+        yield type("S", (), {"id": "span", "end": lambda self, **kw: None, "update": lambda self, **kw: None})()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     long_result = "X" * (runner._MAX_TOOL_CONTENT_CHARS * 2)
     observations = runner.run_agent(
         {"symbol": "s", "repo": "r"},
@@ -142,6 +292,18 @@ def test_run_agent_retries_on_context_error(monkeypatch):
         status_code = 400
 
     class DummyResponse:
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+
         class Choice:
             class Msg:
                 def __init__(self):
@@ -172,7 +334,14 @@ def test_run_agent_retries_on_context_error(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
-    monkeypatch.setattr(runner, "start_span", lambda *a, **k: type("S", (), {"id": "span", "end": lambda self, **kw: None})())
+    patched_usage = lambda resp: {"input": 1, "output": 1, "total": 2}
+    monkeypatch.setattr(runner, "_usage_from_response", patched_usage)
+    monkeypatch.setitem(runner.run_agent.__globals__, "_usage_from_response", patched_usage)
+    @contextmanager
+    def span_cm():
+        yield type("S", (), {"id": "span", "end": lambda self, **kw: None, "update": lambda self, **kw: None})()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     result = runner.run_agent(
         {"symbol": "s", "repo": "r"},
         steps=1,
@@ -184,3 +353,67 @@ def test_run_agent_retries_on_context_error(monkeypatch):
     )
     assert len(completions.calls) == 2
     assert result["observations"]
+
+
+def test_usage_from_response_maps_openai_fields():
+    class DummyUsage:
+        prompt_tokens = 10
+        completion_tokens = 5
+        total_tokens = 15
+        prompt_tokens_details = {"cached_tokens": 2}
+        completion_tokens_details = {"reasoning_tokens": 3}
+
+    class DummyResponse:
+        usage = DummyUsage()
+
+    mapped = ORIGINAL_USAGE_FROM_RESPONSE(DummyResponse())
+    assert mapped is not None
+    assert mapped["input"] == 10
+    assert mapped["output"] == 5
+    assert mapped["total"] == 15
+    assert mapped["prompt_tokens_details.cached_tokens"] == 2
+    assert mapped["input_cached_tokens"] == 2
+    assert mapped["completion_tokens_details.reasoning_tokens"] == 3
+    assert mapped["output_reasoning_tokens"] == 3
+
+
+def test_run_agent_requires_usage(monkeypatch):
+    class DummyResponse:
+        class Choice:
+            class Msg:
+                def __init__(self):
+                    self.tool_calls = [
+                        type("Call", (), {"id": "1", "function": type("F", (), {"name": "tool", "arguments": "{}"})()})()
+                    ]
+
+            message = Msg()
+
+        choices = [Choice()]
+
+    class DummyCompletions:
+        def create(self, **kwargs):
+            return DummyResponse()
+
+    class DummyClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": DummyCompletions()})()
+
+    monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
+    monkeypatch.setattr(runner, "_usage_from_response", lambda resp: None)
+
+    @contextmanager
+    def span_cm():
+        yield type("S", (), {"id": "span", "end": lambda self, **kw: None, "update": lambda self, **kw: None})()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+
+    with pytest.raises(RuntimeError, match="missing usage"):
+        runner.run_agent(
+            {"symbol": "s", "repo": "r"},
+            steps=1,
+            tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
+            dispatch_tool_call=lambda *a, **k: {},
+            system_prompt="sys",
+            parent_trace=None,
+            backend_name="test",
+        )

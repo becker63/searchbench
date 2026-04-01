@@ -54,7 +54,9 @@ def emit_score(
 
     resolved_type = _infer_data_type(value, data_type)
     client = get_langfuse_client()
-    if not hasattr(client, "create_score"):
+    scores_api = getattr(getattr(client, "api", None), "scores", None)
+    create_fn = getattr(scores_api, "create", None) if scores_api else getattr(client, "create_score", None)
+    if not callable(create_fn):
         raise RuntimeError("Langfuse client unavailable for scoring")
     payload = ScorePayload(
         name=name,
@@ -69,8 +71,7 @@ def emit_score(
         score_id=score_id,
     )
     cleaned = payload.model_dump(exclude_none=True)
-    client_any = cast(Any, client)
-    client_any.create_score(**cleaned)  # type: ignore[arg-type]
+    create_fn(**cleaned)  # type: ignore[arg-type]
 
 
 def emit_score_for_handle(

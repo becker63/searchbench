@@ -10,8 +10,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from harness.loop_machine import OptimizationStateMachine, RepairStateMachine
-from harness.loop_types import (
+from harness.loop import (
+    OptimizationStateMachine,
+    RepairStateMachine,
     AcceptedPolicyMeta,
     FailedRepairDetails,
     EvaluationResult,
@@ -99,7 +100,7 @@ def _stub_deps() -> LoopDependencies:
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        start_span=lambda *a, **k: None,
+        start_observation=lambda *a, **k: None,
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),
     )

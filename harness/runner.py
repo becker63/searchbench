@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+"""
+Leaf operation: deterministic tool-running agent (runner).
+No CLI parsing or high-level orchestration lives here.
+"""
+
 import json
 import time
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from .observability.langfuse import start_span, get_tracing_openai_client
+from .observability.langfuse import get_tracing_openai_client, start_observation
 from .observability.score_emitter import emit_score_for_handle
 from .tools.backends.ic_backend import IterativeContextBackend
 from .tools.backends.jc_backend import JCodeMunchBackend
@@ -71,6 +76,41 @@ def _compact_tool_content(result: Any, limit: int = _MAX_TOOL_CONTENT_CHARS) -> 
     if not isinstance(serialized, str):
         serialized = str(serialized)
     return _truncate_text(serialized, limit)
+
+
+def _usage_from_response(resp: Any) -> dict[str, object] | None:
+    """
+    Normalize OpenAI-style usage into Langfuse usage_details shape.
+    """
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return None
+    payload: dict[str, object] = {}
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    total_tokens = getattr(usage, "total_tokens", None)
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    if isinstance(prompt_tokens, (int, float)):
+        payload["prompt_tokens"] = prompt_tokens
+        payload["input"] = prompt_tokens
+    if isinstance(completion_tokens, (int, float)):
+        payload["completion_tokens"] = completion_tokens
+        payload["output"] = completion_tokens
+    if isinstance(total_tokens, (int, float)):
+        payload["total_tokens"] = total_tokens
+        payload["total"] = total_tokens
+    if isinstance(prompt_details, Mapping):
+        for key, val in prompt_details.items():
+            if isinstance(val, (int, float)):
+                payload[f"prompt_tokens_details.{key}"] = val
+                payload[f"input_{key}"] = val
+    if isinstance(completion_details, Mapping):
+        for key, val in completion_details.items():
+            if isinstance(val, (int, float)):
+                payload[f"completion_tokens_details.{key}"] = val
+                payload[f"output_{key}"] = val
+    return payload or None
 
 
 def _message_content_length(msg: Mapping[str, object]) -> int:
@@ -216,99 +256,102 @@ def run_agent(
     ]
 
     observations: list[dict[str, object]] = []
-    agent_obs = start_span(parent_trace, "agent_run", metadata={"backend": backend_name or "unknown", "model": model_name, "task": task})
-    for step_index in range(steps):
-        model_obs = start_span(agent_obs, "model_completion", metadata={"model": model_name, "backend": backend_name, "step": step_index})
-        start_time = time.perf_counter()
-        response = None
-        attempt = 0
-        while True:
-            try:
-                budgeted = _aggressive_compact_messages(messages) if attempt else _enforce_message_budget(messages)
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=cast(Any, budgeted),
-                    tools=cast(Any, tool_specs),
-                    tool_choice="required",
-                )
-                break
-            except Exception as exc:  # noqa: BLE001
-                if not _is_context_error(exc) or attempt:
-                    if model_obs and hasattr(model_obs, "end") and response is None:
-                        try:
+    with start_observation(
+        name="agent_run",
+        parent=parent_trace,
+        metadata={"backend": backend_name or "unknown", "model": model_name, "task": task},
+    ) as agent_obs:
+        for step_index in range(steps):
+            response = None
+            start_time = time.perf_counter()
+            attempt = 0
+            with start_observation(
+                name="model_completion",
+                parent=agent_obs,
+                as_type="generation",
+                model=model_name,
+                metadata={"model": model_name, "backend": backend_name, "step": step_index},
+            ) as model_obs:
+                while True:
+                    try:
+                        budgeted = _aggressive_compact_messages(messages) if attempt else _enforce_message_budget(messages)
+                        response = client.chat.completions.create(
+                            model=model_name,
+                            messages=cast(Any, budgeted),
+                            tools=cast(Any, tool_specs),
+                            tool_choice="required",
+                        )
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        if not _is_context_error(exc) or attempt:
                             model_obs.end(error=str(exc))
-                        except Exception:
-                            pass
-                    raise
-                attempt += 1
-                continue
-        latency_ms = (time.perf_counter() - start_time) * 1000
-        if model_obs and hasattr(model_obs, "end"):
+                            raise
+                        attempt += 1
+                        continue
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                usage_details = _usage_from_response(response)
+                if usage_details is None:
+                    raise RuntimeError("Cerebras response missing usage; provide usage_details explicitly or enable provider usage output.")
+                from .observability.cerebras_pricing import cost_details_for_usage
+
+                cost_details = cost_details_for_usage(model_name, usage_details)
+                model_obs.update(metadata={"latency_ms": latency_ms}, usage_details=usage_details, cost_details=cost_details)
+
+            msg = response.choices[0].message  # type: ignore[assignment]
+            tool_calls = getattr(msg, "tool_calls", None)
+            if not tool_calls:
+                agent_obs.end(error="missing_tool_call")
+                raise RuntimeError("Model failed to produce tool call")
+
+            call = tool_calls[0]
+            call_id = getattr(call, "id", None)
+            if not call_id:
+                agent_obs.end(error="missing_call_id")
+                raise RuntimeError("Tool call missing id")
             try:
-                model_obs.end(metadata={"latency_ms": latency_ms})
-            except Exception:
-                pass
+                raw_args = call.function.arguments or {}
+                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                tool_name = call.function.name
+                with start_observation(
+                    name=tool_name or "tool_call",
+                    parent=agent_obs,
+                    metadata={
+                        "backend": backend_name,
+                        "step": step_index,
+                        "tool": tool_name,
+                        "args": _truncate_for_metadata(parsed_args),
+                    },
+                ) as tool_obs:
+                    tool_start = time.perf_counter()
+                    result = dispatch_tool_call(tool_name, parsed_args)
+                    latency_ms = (time.perf_counter() - tool_start) * 1000
+                    observations.append({"tool": tool_name, "result": result})
+                    messages.append(build_tool_response(call_id, _compact_tool_content(result)))
+                    tool_obs.update(output={"result": _truncate_for_metadata(result)}, metadata={"latency_ms": latency_ms, "tool": tool_name, "step": step_index})
+            except Exception as exc:  # noqa: BLE001
+                tool_name = call.function.name or "unknown"
+                observations.append({"tool": tool_name, "error": str(exc)})
+                messages.append(build_tool_response(call_id, f"ERROR: {exc}"))
+                with start_observation(
+                    name=f"{tool_name}_error",
+                    parent=agent_obs,
+                    metadata={"backend": backend_name, "step": step_index, "tool": tool_name, "error": str(exc)},
+                ) as err_obs:
+                    err_obs.end(error=str(exc))
+            messages = _enforce_message_budget(messages)
 
-        msg = response.choices[0].message
-        tool_calls = getattr(msg, "tool_calls", None)
-        if not tool_calls:
-            if agent_obs and hasattr(agent_obs, "end"):
-                try:
-                    agent_obs.end(error="missing_tool_call")
-                except Exception:
-                    pass
-            raise RuntimeError("Model failed to produce tool call")
-
-        call = tool_calls[0]
-        call_id = getattr(call, "id", None)
-        if not call_id:
-            if agent_obs and hasattr(agent_obs, "end"):
-                try:
-                    agent_obs.end(error="missing_call_id")
-                except Exception:
-                    pass
-            raise RuntimeError("Tool call missing id")
-        try:
-            raw_args = call.function.arguments or {}
-            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            tool_name = call.function.name
-            tool_obs = start_span(agent_obs, tool_name or "tool_call", metadata={"backend": backend_name, "step": step_index, "tool": tool_name, "args": _truncate_for_metadata(parsed_args)})
-            tool_start = time.perf_counter()
-            result = dispatch_tool_call(tool_name, parsed_args)
-            latency_ms = (time.perf_counter() - tool_start) * 1000
-            observations.append({"tool": tool_name, "result": result})
-            messages.append(build_tool_response(call_id, _compact_tool_content(result)))
-            if tool_obs and hasattr(tool_obs, "end"):
-                try:
-                    tool_obs.end(output={"result": _truncate_for_metadata(result)}, metadata={"latency_ms": latency_ms, "tool": tool_name, "step": step_index})
-                except Exception:
-                    pass
-        except Exception as exc:  # noqa: BLE001
-            tool_name = call.function.name or "unknown"
-            observations.append({"tool": tool_name, "error": str(exc)})
-            messages.append(build_tool_response(call_id, f"ERROR: {exc}"))
-            err_obs = start_span(agent_obs, f"{tool_name}_error", metadata={"backend": backend_name, "step": step_index, "tool": tool_name, "error": str(exc)})
-            if err_obs and hasattr(err_obs, "end"):
-                try:
-                    err_obs.end(error=exc)
-                except Exception:
-                    pass
-        messages = _enforce_message_budget(messages)
-
-    if not observations:
-        if agent_obs and hasattr(agent_obs, "end"):
-            try:
-                agent_obs.end(error="no_observations")
-            except Exception:
-                pass
-        raise RuntimeError("Agent failed to call any tools")
-
-    if agent_obs and hasattr(agent_obs, "end"):
-        try:
-            agent_obs.end(metadata={"backend": backend_name, "model": model_name, "steps": steps, "observation_count": len(observations)})
-        except Exception:
-            pass
-    return {"observations": observations}
+        if not observations:
+            agent_obs.end(error="no_observations")
+            raise RuntimeError("Agent failed to call any tools")
+        agent_obs.update(
+            metadata={
+                "backend": backend_name,
+                "model": model_name,
+                "steps": steps,
+                "observation_count": len(observations),
+            }
+        )
+        return {"observations": observations}
 
 
 def _normalize_agent_result(raw: Mapping[str, object] | dict[str, object]) -> dict[str, object]:
@@ -363,34 +406,30 @@ def run_ic_iteration(
     backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
     tool_specs: list[OpenAITool] = backend.tool_specs
     system_prompt = _build_ic_system_prompt(tool_specs)
-    backend_obs = start_span(parent_trace, "iterative_context", metadata={"backend": "iterative_context", "repo": repo, "symbol": symbol})
-    try:
-        raw = run_agent(
-            agent_task,
-            steps=steps,
-            tool_specs=tool_specs,
-            dispatch_tool_call=backend.dispatch,
-            system_prompt=system_prompt,
-            parent_trace=backend_obs,
-            backend_name="iterative_context",
-        )
-    except Exception as exc:  # noqa: BLE001
-        raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-        if backend_obs and hasattr(backend_obs, "end"):
-            try:
-                backend_obs.end(error=exc)
-            except Exception:
-                pass
-    normalized = _normalize_agent_result(raw)
-    nc_val = normalized.get("node_count", 0)
-    node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-    emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count, data_type="NUMERIC")
-    if backend_obs and hasattr(backend_obs, "end"):
+    with start_observation(
+        name="iterative_context",
+        parent=parent_trace,
+        metadata={"backend": "iterative_context", "repo": repo, "symbol": symbol},
+    ) as backend_obs:
         try:
-            backend_obs.end(metadata={"node_count": normalized.get("node_count", 0)})
-        except Exception:
-            pass
-    return normalized
+            raw = run_agent(
+                agent_task,
+                steps=steps,
+                tool_specs=tool_specs,
+                dispatch_tool_call=backend.dispatch,
+                system_prompt=system_prompt,
+                parent_trace=backend_obs,
+                backend_name="iterative_context",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
+            backend_obs.end(error=str(exc))
+        normalized = _normalize_agent_result(raw)
+        nc_val = normalized.get("node_count", 0)
+        node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
+        emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count, data_type="NUMERIC")
+        backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
+        return normalized
 
 
 def run_jc_iteration(
@@ -410,31 +449,27 @@ def run_jc_iteration(
     backend = JCodeMunchBackend(repo=repo)
     tool_specs: list[OpenAITool] = backend.tool_specs
     system_prompt = _build_jc_system_prompt(tool_specs)
-    backend_obs = start_span(parent_trace, "jcodemunch", metadata={"backend": "jcodemunch", "repo": repo, "symbol": symbol})
-    try:
-        raw = run_agent(
-            agent_task,
-            steps=steps,
-            tool_specs=tool_specs,
-            dispatch_tool_call=backend.dispatch,
-            system_prompt=system_prompt,
-            parent_trace=backend_obs,
-            backend_name="jcodemunch",
-        )
-    except Exception as exc:  # noqa: BLE001
-        raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-        if backend_obs and hasattr(backend_obs, "end"):
-            try:
-                backend_obs.end(error=exc)
-            except Exception:
-                pass
-    normalized = _normalize_agent_result(raw)
-    nc_val = normalized.get("node_count", 0)
-    node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-    emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count, data_type="NUMERIC")
-    if backend_obs and hasattr(backend_obs, "end"):
+    with start_observation(
+        name="jcodemunch",
+        parent=parent_trace,
+        metadata={"backend": "jcodemunch", "repo": repo, "symbol": symbol},
+    ) as backend_obs:
         try:
-            backend_obs.end(metadata={"node_count": normalized.get("node_count", 0)})
-        except Exception:
-            pass
-    return normalized
+            raw = run_agent(
+                agent_task,
+                steps=steps,
+                tool_specs=tool_specs,
+                dispatch_tool_call=backend.dispatch,
+                system_prompt=system_prompt,
+                parent_trace=backend_obs,
+                backend_name="jcodemunch",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
+            backend_obs.end(error=str(exc))
+        normalized = _normalize_agent_result(raw)
+        nc_val = normalized.get("node_count", 0)
+        node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
+        emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count, data_type="NUMERIC")
+        backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
+        return normalized
