@@ -7,7 +7,7 @@ from typing import Any, Mapping
 from .observability.langfuse import get_tracing_openai_client, record_score, start_span
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
-from .utils.prompt_models import WriterPromptContext
+from .prompts.prompt_models import WriterPromptContext
 from .utils.template_loader import render_prompt_template
 
 _client: Any | None = None

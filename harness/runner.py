@@ -11,7 +11,7 @@ from .tools.backends.jc_backend import JCodeMunchBackend
 from .tools.mcp_adapter import serialize_tool_result_for_model
 from .utils.env import get_cerebras_api_key, get_runner_model
 from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
-from .utils.prompt_models import SystemPromptContext
+from .prompts.prompt_models import SystemPromptContext
 from .utils.template_loader import render_prompt_template
 
 _MAX_TOTAL_MESSAGE_CHARS = 24000
