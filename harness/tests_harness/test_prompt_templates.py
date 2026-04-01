@@ -7,7 +7,7 @@ import pytest
 import harness.runner as runner
 import harness.writer as writer
 from harness.pipeline.types import StepResult
-from harness.prompts.prompt_models import SystemPromptContext, WriterPromptContext
+from harness.prompts import SystemPromptContext, WriterPromptContext
 from harness.utils import template_loader
 from harness.utils.openai_schema import OpenAITool
 

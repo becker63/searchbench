@@ -1,3 +1,20 @@
+{% set system_instructions -%}
+You are optimizing a scoring function for a graph search system.
+Respond ONLY with JSON matching the provided schema.
+The 'code' field must contain pure Python defining a typed score function with signature:
+def score(node: object, state: object, context: object | None = None) -> float.
+
+STRICT RULES:
+- You MUST NOT use import statements
+- You MUST NOT reference external modules
+- You MUST NOT access the filesystem
+- Only use built-in Python operations
+- Do NOT wrap the code in Markdown
+Any violation will cause immediate failure.
+{%- endset %}
+
+{{ system_instructions | trim }}
+===USER===
 Current policy:
 {{ current_policy }}
 

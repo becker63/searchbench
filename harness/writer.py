@@ -7,7 +7,7 @@ from typing import Any, Mapping
 from .observability.langfuse import get_tracing_openai_client, record_score, start_span
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
-from .prompts.prompt_models import WriterPromptContext
+from .prompts import WriterPromptContext
 from .utils.template_loader import render_prompt_template
 
 _client: Any | None = None
@@ -112,7 +112,10 @@ def _render_writer_prompt(
         tests=tests,
         scoring_context=scoring_context,
     )
-    return render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
+    rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
+    if "===USER===" not in rendered:
+        rendered = f"===USER===\n{rendered}"
+    return rendered
 
 
 def generate_policy(
@@ -160,6 +163,7 @@ def generate_policy(
     for attempt in range(3):
         attempt_obs = start_span(writer_obs, f"writer_attempt_{attempt}", metadata={"attempt": attempt, "model": model})
         try:
+            system_content, user_content = prompt_content.split("===USER===", 1)
             response = client.chat.completions.create(
                 model=model,
                 response_format={
@@ -179,23 +183,11 @@ def generate_policy(
                 messages=[
                     {
                         "role": "system",
-                        "content": (
-                            "You are optimizing a scoring function for a graph search system. "
-                            "Respond ONLY with JSON matching the provided schema. "
-                            "The 'code' field must contain pure Python defining a typed score function with signature "
-                            "def score(node: object, state: object, context: object | None = None) -> float.\n"
-                            "STRICT RULES:\n"
-                            "- You MUST NOT use import statements\n"
-                            "- You MUST NOT reference external modules\n"
-                            "- You MUST NOT access the filesystem\n"
-                            "- Only use built-in Python operations\n"
-                            "- Do NOT wrap the code in Markdown\n"
-                            "Any violation will cause immediate failure."
-                        ),
+                        "content": system_content.strip(),
                     },
                     {
                         "role": "user",
-                        "content": prompt_content,
+                        "content": user_content.strip(),
                     },
                 ],
             )
