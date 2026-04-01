@@ -1,19 +1,28 @@
+def _get_attr(obj: object, name: str, default: object = None) -> object:
+    """Safely retrieve an attribute.
+    Returns ``default`` if the attribute lookup fails.
+    """
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
 def score(node: object, state: object, context: object | None = None) -> float:
     """Deterministic scoring function.
 
     Parameters
     ----------
     node: object
-        The graph node, expected to have ``state``, ``id`` and optional ``tokens`` attributes.
+        Expected to have ``state``, ``id`` and optional ``tokens`` attributes.
     state: object
-        Graph‑like object providing ``in_degree`` and ``out_degree`` callables.
+        Expected to provide ``in_degree`` and ``out_degree`` callables.
     context: object | None, optional
-        Optional additional context; if it provides a numeric ``scale`` attribute it will be applied.
+        If provided and contains a numeric ``scale`` attribute, the total is multiplied by it.
     """
-    # Safely extract node attributes.
-    n_state = getattr(node, "state", None)
-    n_id = getattr(node, "id", None)
-    tokens = getattr(node, "tokens", None)
+    n_state = _get_attr(node, "state")
+    n_id = _get_attr(node, "id")
+    tokens = _get_attr(node, "tokens")
 
     total: float = 0.0
 
@@ -26,8 +35,8 @@ def score(node: object, state: object, context: object | None = None) -> float:
     # Degree contribution.
     if n_id is not None:
         degree = 0
-        in_func = getattr(state, "in_degree", None)
-        out_func = getattr(state, "out_degree", None)
+        in_func = _get_attr(state, "in_degree")
+        out_func = _get_attr(state, "out_degree")
         if callable(in_func):
             try:
                 val = in_func(n_id)
@@ -50,7 +59,7 @@ def score(node: object, state: object, context: object | None = None) -> float:
 
     # Optional scaling from context.
     if context is not None:
-        scale = getattr(context, "scale", None)
+        scale = _get_attr(context, "scale")
         if isinstance(scale, (int, float)):
             total *= float(scale)
 

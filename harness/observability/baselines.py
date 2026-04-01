@@ -9,7 +9,7 @@ from typing import Mapping, Sequence, cast
 from pydantic import BaseModel, Field
 
 from .datasets import DatasetItem, normalize_dataset_item
-from .langfuse import record_score, start_span
+from .langfuse import emit_score, record_score, start_span
 from ..scorer import score
 from ..utils.repo_targets import resolve_repo_target
 
@@ -108,8 +108,21 @@ def compute_baseline_for_item(
     )
     jc_result = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
     metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result))
+    trace_id = getattr(trace, "id", None)
+    dataset_run_id = getattr(parent_trace, "id", None)
     for name, value in metrics.items():
         record_score(trace, f"baseline.{name}", value)
+        data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
+        score_id = f"{trace_id}-baseline.{name}" if trace_id else None
+        emit_score(
+            name=f"baseline.{name}",
+            value=float(value) if isinstance(value, bool) else value,
+            data_type=data_type,
+            trace_id=trace_id,
+            observation_id=None,
+            dataset_run_id=dataset_run_id,
+            score_id=score_id,
+        )
     if trace and hasattr(trace, "end"):
         try:
             trace.end(metadata={"jc_nodes": metrics.get("jc_nodes", 0)})

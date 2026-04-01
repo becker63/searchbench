@@ -2,16 +2,47 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Mapping, Protocol, Any
 
 
 @dataclass
 class StepResult:
+    """
+    Canonical pipeline step result used across pipeline and loop.
+    """
+
     name: str
     success: bool
     stdout: str
     stderr: str
     exit_code: int
+
+    @classmethod
+    def from_mapping(cls, step: Mapping[str, Any] | Any) -> "StepResult":
+        if isinstance(step, Mapping):
+            name = str(step.get("name") or "")
+            success = bool(step.get("success", False))
+            exit_code_val = step.get("exit_code")
+            exit_code = int(exit_code_val) if isinstance(exit_code_val, int) else 0
+            stdout = str(step.get("stdout") or "")
+            stderr = str(step.get("stderr") or "")
+            return cls(name=name, success=success, stdout=stdout, stderr=stderr, exit_code=exit_code)
+        name = getattr(step, "name", "") or ""
+        success = bool(getattr(step, "success", False))
+        exit_code_val = getattr(step, "exit_code", 0)
+        exit_code = int(exit_code_val) if isinstance(exit_code_val, int) else 0
+        stdout = str(getattr(step, "stdout", "") or "")
+        stderr = str(getattr(step, "stderr", "") or "")
+        return cls(name=name, success=success, stdout=stdout, stderr=stderr, exit_code=exit_code)
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "success": self.success,
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+        }
 
 
 class Step(Protocol):

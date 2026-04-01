@@ -11,6 +11,7 @@ from .tools.backends.jc_backend import JCodeMunchBackend
 from .tools.mcp_adapter import serialize_tool_result_for_model
 from .utils.env import get_cerebras_api_key, get_runner_model
 from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
+from .utils.template_loader import render_prompt_template
 
 _MAX_TOTAL_MESSAGE_CHARS = 24000
 _MAX_TOOL_CONTENT_CHARS = 4000
@@ -164,35 +165,13 @@ def _truncate_for_metadata(payload: object, limit: int = 2000) -> object:
 
 def _build_ic_system_prompt(tool_specs: list[OpenAITool]) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
-    return (
-        "You are exploring a codebase using a graph-based system.\n"
-        "Available tools:\n"
-        f"{_format_available_tools(tool_names)}\n\n"
-        "Guidelines:\n"
-        "- Always expand after resolving\n"
-        "- Prefer expand over repeated resolve\n"
-        "- Do not attempt file-level inspection unless necessary\n"
-        "- Focus on graph traversal\n"
-        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
-        "- Always start by calling a tool. Never respond with text.\n"
-        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
-    )
+    return render_prompt_template("ic_system.jinja", {"available_tools": _format_available_tools(tool_names)})
 
 
 def _build_jc_system_prompt(tool_specs: list[OpenAITool]) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
     tools_section = _format_available_tools(tool_names)
-    return (
-        "You are exploring a codebase using tool calls.\n"
-        "Available tools:\n"
-        f"{tools_section}\n\n"
-        "Guidelines:\n"
-        "- Use the available tools to locate and inspect symbols and files\n"
-        "- Avoid redundant calls\n"
-        "- You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.\n"
-        "- Always start by calling a tool. Never respond with text.\n"
-        "- You must call MCP tools using the provided tool interface. Do not output text.\n"
-    )
+    return render_prompt_template("jc_system.jinja", {"available_tools": tools_section})
 
 
 def _make_client():

@@ -7,6 +7,7 @@ dependencies = [
     "iterative-context", # 👈 local workspace dep
     "jcodemunch-mcp",
     "langfuse>=2.50.6",
+    "Jinja2>=3.1.4",
     "openai>=2.29.0",
     "pydantic>=2",
     "rich", # nice CLI/logging
@@ -15,6 +16,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "python-statemachine>=3.0.0",
     "mcp>=1.26.0",
+    "statemachine>=0.1",
 ]
 
 [tool.uv.sources]

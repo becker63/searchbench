@@ -13,29 +13,55 @@ from harness.loop_types import (
     PreparedTasks,
     RepairContext,
     RepairMachineModel,
-    PipelineStepResult,
 )
 from harness.pipeline.types import StepResult
 
 
 def _make_deps(**overrides) -> LoopDependencies:
-    defaults = dict(
-        prepare_iteration_tasks=lambda task, trace: PreparedTasks(
-            base_task=task, resolved_repo_path=None, jc_repo_id=None
-        ),
-        evaluate_policy_on_item=lambda ic_task, baseline, iteration_span=None, iteration_index=None: EvaluationResult(
-            metrics={"score": 1.0}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="policy"
-        ),
-        build_iteration_feedback=lambda evaluation, prev_score, prev_classified, repo_root: FeedbackPackage(
-            tests="", scoring_context="", comparison_summary=None, feedback={"score": 1.0}, feedback_str="", guidance_hint="hint", diff_str="", diff_hint=""
-        ),
-        attempt_policy_generation=lambda **kwargs: ("policy", None),
-        run_policy_pipeline=lambda pipeline, repo_root, repair_obs=None: (
-            [PipelineStepResult(name="step", success=True, exit_code=0, stdout="", stderr="")],
-            [StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")],
-            True,
-        ),
-        finalize_successful_policy=lambda **kwargs: (
+    def prepare_iteration_tasks(task: Mapping[str, object], trace: object | None = None) -> PreparedTasks:
+        return PreparedTasks(base_task=task, resolved_repo_path=None, jc_repo_id=None)
+
+    def evaluate_policy_on_item(
+        ic_task: Mapping[str, object],
+        baseline,
+        iteration_span: object | None = None,
+        iteration_index: int | None = None,
+    ) -> EvaluationResult:
+        return EvaluationResult(
+            metrics={"score": 1.0},
+            ic_result={},
+            jc_result={},
+            jc_metrics={},
+            comparison_summary=None,
+            policy_code="policy",
+        )
+
+    def build_iteration_feedback(
+        evaluation: EvaluationResult,
+        prev_score: float | None,
+        prev_classified: dict[str, object] | None,
+        repo_root: Path,
+    ) -> FeedbackPackage:
+        return FeedbackPackage(
+            tests="",
+            scoring_context="",
+            comparison_summary=None,
+            feedback={"score": 1.0},
+            feedback_str="",
+            guidance_hint="hint",
+            diff_str="",
+            diff_hint="",
+        )
+
+    def attempt_policy_generation(**kwargs) -> tuple[str | None, str | None]:
+        return ("policy", None)
+
+    def run_policy_pipeline(pipeline: object, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], list[StepResult], bool]:
+        result = StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")
+        return [result], [result], True
+
+    def finalize_successful_policy(**kwargs) -> tuple[str, dict[str, object]]:
+        return (
             "policy",
             {
                 "repair_attempts": 0,
@@ -43,9 +69,23 @@ def _make_deps(**overrides) -> LoopDependencies:
                 "accepted_policy_source": "post_pipeline_disk",
                 "accepted_policy_changed_by_pipeline": False,
             },
-        ),
-        finalize_failed_repair=lambda **kwargs: ("", "policy"),
-        classify_results=lambda results: {},
+        )
+
+    def finalize_failed_repair(**kwargs) -> tuple[str, str]:
+        return ("", "policy")
+
+    def classify_results(results: Sequence[StepResult]) -> dict[str, object]:
+        return {}
+
+    deps = LoopDependencies(
+        prepare_iteration_tasks=prepare_iteration_tasks,
+        evaluate_policy_on_item=evaluate_policy_on_item,
+        build_iteration_feedback=build_iteration_feedback,
+        attempt_policy_generation=attempt_policy_generation,
+        run_policy_pipeline=run_policy_pipeline,
+        finalize_successful_policy=finalize_successful_policy,
+        finalize_failed_repair=finalize_failed_repair,
+        classify_results=classify_results,
         format_pipeline_failure_context=lambda *a, **k: "",
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
@@ -55,33 +95,75 @@ def _make_deps(**overrides) -> LoopDependencies:
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),
     )
-    defaults.update(overrides)
-    return LoopDependencies(**defaults)
+    for key, val in overrides.items():
+        setattr(deps, key, val)
+    return deps
 
 
-def _make_evaluation(**overrides) -> EvaluationResult:
-    defaults = dict(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="policy")
-    defaults.update(overrides)
-    return EvaluationResult(**defaults)
-
-
-def _make_feedback(**overrides) -> FeedbackPackage:
-    defaults = dict(tests="", scoring_context="", comparison_summary=None, feedback={}, feedback_str="", guidance_hint="", diff_str="", diff_hint="")
-    defaults.update(overrides)
-    return FeedbackPackage(**defaults)
-
-
-def _make_repair_ctx(deps, *, max_repair_attempts=3, **overrides) -> RepairContext:
-    defaults = dict(
-        repo_root=Path("."),
-        evaluation=_make_evaluation(),
-        feedback=_make_feedback(),
-        max_repair_attempts=max_repair_attempts,
-        parent_trace=None,
-        writer_model="model",
+def _make_evaluation(
+    *,
+    metrics: dict[str, object] | None = None,
+    ic_result: Mapping[str, object] | None = None,
+    jc_result: Mapping[str, object] | None = None,
+    jc_metrics: Mapping[str, object] | None = None,
+    comparison_summary: str | None = None,
+    policy_code: str = "policy",
+    success: bool = True,
+    error: str | None = None,
+) -> EvaluationResult:
+    return EvaluationResult(
+        metrics=metrics or {},
+        ic_result=ic_result or {},
+        jc_result=jc_result or {},
+        jc_metrics=jc_metrics or {},
+        comparison_summary=comparison_summary,
+        policy_code=policy_code,
+        success=success,
+        error=error,
     )
-    defaults.update(overrides)
-    return RepairContext(**defaults)
+
+
+def _make_feedback(
+    *,
+    tests: str = "",
+    scoring_context: str = "",
+    comparison_summary: str | None = None,
+    feedback: dict[str, object] | None = None,
+    feedback_str: str = "",
+    guidance_hint: str = "",
+    diff_str: str = "",
+    diff_hint: str = "",
+) -> FeedbackPackage:
+    return FeedbackPackage(
+        tests=tests,
+        scoring_context=scoring_context,
+        comparison_summary=comparison_summary,
+        feedback=feedback or {},
+        feedback_str=feedback_str,
+        guidance_hint=guidance_hint,
+        diff_str=diff_str,
+        diff_hint=diff_hint,
+    )
+
+
+def _make_repair_ctx(
+    deps: LoopDependencies,
+    *,
+    max_repair_attempts: int = 3,
+    repo_root: Path | None = None,
+    evaluation: EvaluationResult | None = None,
+    feedback: FeedbackPackage | None = None,
+    parent_trace=None,
+    writer_model: str | None = "model",
+) -> RepairContext:
+    return RepairContext(
+        repo_root=repo_root or Path("."),
+        evaluation=evaluation or _make_evaluation(),
+        feedback=feedback or _make_feedback(),
+        max_repair_attempts=max_repair_attempts,
+        parent_trace=parent_trace,
+        writer_model=writer_model,
+    )
 
 
 def test_optimization_machine_success_path():
@@ -105,7 +187,7 @@ def test_repair_machine_retries_until_exhaustion():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         attempts.append(1)
         result = StepResult(name="step", success=False, exit_code=1, stdout="", stderr="boom")
-        return [PipelineStepResult.from_mapping(result)], [result], False
+        return [result], [result], False
 
     def finalize_failed_repair(*, metadata: dict[str, object], pipeline_results: Sequence[Mapping[str, object]], classified: Mapping[str, object], **kwargs):
         metadata["pipeline_feedback"] = classified
@@ -137,9 +219,9 @@ def test_repair_succeeds_on_second_attempt():
         pipeline_calls.append(1)
         if len(pipeline_calls) == 1:
             result = StepResult(name="ruff", success=False, exit_code=1, stdout="", stderr="lint error")
-            return [PipelineStepResult.from_mapping(result)], [result], False
+            return [result], [result], False
         result = StepResult(name="ruff", success=True, exit_code=0, stdout="", stderr="")
-        return [PipelineStepResult.from_mapping(result)], [result], True
+        return [result], [result], True
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
@@ -175,7 +257,7 @@ def test_pipeline_mutation_returns_on_disk_policy():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         disk_policy[0] = "formatted_policy"
         result = StepResult(name="ruff_fix", success=True, exit_code=0, stdout="", stderr="")
-        return [PipelineStepResult.from_mapping(result)], [result], True
+        return [result], [result], True
 
     deps = _make_deps(
         write_policy=write_policy,
@@ -208,7 +290,7 @@ def test_warning_only_steps_do_not_fail():
             StepResult(name="pytest_iterative_context", success=False, stdout="warning", stderr="", exit_code=0),
             StepResult(name="ruff_fix", success=False, stdout="notice", stderr="", exit_code=0),
         ]
-        pipeline_results = [PipelineStepResult.from_mapping(r) for r in results]
+        pipeline_results = results
         return pipeline_results, results, True
 
     deps = _make_deps(
@@ -237,7 +319,7 @@ def test_warning_only_steps_do_not_fail():
 def test_nonzero_exit_still_fails():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         result = StepResult(name="pytest_iterative_context", success=False, stdout="", stderr="test failed", exit_code=1)
-        return [PipelineStepResult.from_mapping(result)], [result], False
+        return [result], [result], False
 
     def finalize_failed_repair(*, metadata, pipeline_results, classified, **kwargs):
         metadata["pipeline_feedback"] = classified
@@ -261,7 +343,7 @@ def test_nonzero_exit_still_fails():
 def test_failed_candidate_not_marked_accepted():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         result = StepResult(name="ruff_fix", success=False, stdout="", stderr="lint", exit_code=1)
-        return [PipelineStepResult.from_mapping(result)], [result], False
+        return [result], [result], False
 
     def finalize_failed_repair(*, metadata, pipeline_results, classified, **kwargs):
         metadata["pipeline_feedback"] = classified
@@ -375,21 +457,24 @@ def test_repair_span_metadata_correct_across_retries():
             self.metadata = metadata
 
         def end(self, **kwargs: object) -> None:
-            span_events.append(("close", dict(kwargs.get("metadata", {}))))
+            meta = kwargs.get("metadata", {})
+            meta_dict = {str(k): v for k, v in (meta.items() if isinstance(meta, Mapping) else [])}
+            span_events.append(("close", meta_dict))
 
     def tracking_start_span(parent, name, **kwargs):
         meta = kwargs.get("metadata", {})
-        span = FakeSpan(name, meta)
-        span_events.append(("open", {"name": name, **meta}))
+        meta_dict = {str(k): v for k, v in (meta.items() if isinstance(meta, Mapping) else [])}
+        span = FakeSpan(name, meta_dict)
+        span_events.append(("open", {"name": name, **meta_dict}))
         return span
 
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         pipeline_calls.append(1)
         if len(pipeline_calls) == 1:
             result = StepResult(name="ruff", success=False, exit_code=1, stdout="", stderr="err")
-            return [PipelineStepResult.from_mapping(result)], [result], False
+            return [result], [result], False
         result = StepResult(name="ruff", success=True, exit_code=0, stdout="", stderr="")
-        return [PipelineStepResult.from_mapping(result)], [result], True
+        return [result], [result], True
 
     deps = _make_deps(
         start_span=tracking_start_span,

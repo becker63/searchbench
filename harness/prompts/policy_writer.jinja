@@ -1,0 +1,43 @@
+Current policy:
+{{ current_policy }}
+
+Validation context:
+{{ failure_context }}
+
+Structured feedback:
+{{ feedback_text }}
+
+Baseline comparison:
+{{ comparison_summary }}
+
+Guidance:
+{{ guidance_hint }}
+
+{{ diff_str }}
+
+Diff guidance:
+{{ diff_hint }}
+
+Tests (source of truth, do not modify):
+{{ tests }}
+
+Scoring interface + examples (STRICT CONTRACT):
+{{ scoring_context }}
+
+Validation requirements:
+- score MUST have type annotations on all parameters and return float
+- Target signature: def score(node: object, state: object, context: object | None = None) -> float
+- Code MUST be valid under BasedPyright
+
+Instructions:
+- Fix errors in order of priority:
+  1. TYPE ERRORS
+  2. LINT ERRORS
+  3. TEST FAILURES
+- Do NOT attempt to optimize until all tests pass
+- MUST define a typed score function used by the harness that returns a float
+- MUST be deterministic
+- MUST NOT import external libraries
+- MUST operate only on provided node/state data
+
+Return ONLY the JSON object specified by the schema.

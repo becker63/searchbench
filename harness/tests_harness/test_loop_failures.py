@@ -32,6 +32,7 @@ def _common_stubs(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "start_span", lambda *a, **k: DummySpan("span"))
     monkeypatch.setattr(loop, "record_score", lambda *a, **k: None)
     monkeypatch.setattr(loop, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(loop, "emit_score", lambda *a, **k: None)
 
 
 def test_pipeline_failure_appends_history(monkeypatch, tmp_path):

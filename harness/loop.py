@@ -8,7 +8,7 @@ from typing import Any
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
-from .observability.langfuse import flush_langfuse, record_score, start_span, start_trace
+from .observability.langfuse import emit_score, flush_langfuse, record_score, start_span, start_trace
 from .observability.baselines import BaselineSnapshot, baseline_metrics_from_jc
 from .pipeline import classify_results, default_pipeline
 from .pipeline.types import StepResult
@@ -20,7 +20,6 @@ from .loop_types import (
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
-    PipelineStepResult,
     PreparedTasks,
 )
 from .policy_loader import load_policy
@@ -223,9 +222,21 @@ def evaluate_policy_on_item(
     metrics_map.setdefault("iteration_regression", False)
     metrics_map["jc_baseline_metrics"] = dict(jc_metrics) if isinstance(jc_metrics, Mapping) else {}
     metrics_map["comparison"] = comparison
+    trace_id = getattr(iteration_span, "id", None)
     for name, value in metrics_map.items():
         if isinstance(value, (int, float, bool)):
             record_score(iteration_span, f"metrics.{name}", float(value))
+            data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
+            score_id = f"{trace_id}-metrics.{name}" if trace_id else None
+            emit_score(
+                name=f"metrics.{name}",
+                value=float(value) if isinstance(value, bool) else value,
+                data_type=data_type,
+                trace_id=trace_id,
+                observation_id=getattr(iteration_span, "id", None),
+                dataset_run_id=None,
+                score_id=score_id,
+            )
 
     policy_code = _read_policy()
     return EvaluationResult(
@@ -311,13 +322,36 @@ def attempt_policy_generation(
         return None, str(e)
 
 
-def run_policy_pipeline(pipeline, repo_root: Path, repair_obs: object | None = None) -> tuple[list[PipelineStepResult], list[StepResult], bool]:
-    step_results = pipeline.run(repo_root, observation=repair_obs)
-    raw_results = list(step_results)
-    pipeline_results = [PipelineStepResult.from_mapping(r) for r in raw_results]
-    normalized_results = pipeline_results or [PipelineStepResult.from_mapping(r) for r in raw_results]
-    pipeline_success = all(_step_succeeded(r.to_mapping()) for r in normalized_results)
-    return pipeline_results, raw_results, pipeline_success
+def run_policy_pipeline(pipeline, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], list[StepResult], bool]:
+    raw_results = list(pipeline.run(repo_root, observation=repair_obs))
+    step_results = [StepResult.from_mapping(step) for step in raw_results]
+    trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
+    observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
+    dataset_run_id = getattr(repair_obs, "dataset_run_id", None) if repair_obs is not None else None
+    for step in step_results:
+        data_type = "NUMERIC"
+        score_id = f"{observation_id or trace_id}-pipeline.{step.name}.exit_code" if (observation_id or trace_id) else None
+        emit_score(
+            name=f"pipeline.{step.name}.exit_code",
+            value=step.exit_code,
+            data_type=data_type,
+            trace_id=trace_id,
+            observation_id=observation_id,
+            dataset_run_id=dataset_run_id,
+            score_id=score_id,
+        )
+        pass_score_id = f"{observation_id or trace_id}-pipeline.{step.name}.passed" if (observation_id or trace_id) else None
+        emit_score(
+            name=f"pipeline.{step.name}.passed",
+            value=int(step.success),
+            data_type="BOOLEAN",
+            trace_id=trace_id,
+            observation_id=observation_id,
+            dataset_run_id=dataset_run_id,
+            score_id=pass_score_id,
+        )
+    pipeline_success = all(_step_succeeded(r.to_mapping()) for r in step_results)
+    return step_results, raw_results, pipeline_success
 
 
 def finalize_successful_policy(

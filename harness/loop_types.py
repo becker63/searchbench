@@ -62,50 +62,11 @@ class FeedbackPackage(BaseModel):
     diff_hint: str
 
 
-class PipelineStepResult(BaseModel):
-    """Structured view of a pipeline step result."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    name: str
-    success: bool
-    exit_code: int | None
-    stdout: str
-    stderr: str
-
-    @classmethod
-    def from_mapping(cls, step: Mapping[str, object] | object) -> "PipelineStepResult":
-        if isinstance(step, Mapping):
-            name = str(step.get("name") or "")
-            success = bool(step.get("success", False))
-            exit_code = step.get("exit_code")
-            exit_code_val = int(exit_code) if isinstance(exit_code, int) else None
-            stdout = str(step.get("stdout") or "")
-            stderr = str(step.get("stderr") or "")
-            return cls(name=name, success=success, exit_code=exit_code_val, stdout=stdout, stderr=stderr)
-        name = getattr(step, "name", "") or ""
-        success = bool(getattr(step, "success", False))
-        exit_code_val = getattr(step, "exit_code", None)
-        exit_code_val = int(exit_code_val) if isinstance(exit_code_val, int) else None
-        stdout = str(getattr(step, "stdout", "") or "")
-        stderr = str(getattr(step, "stderr", "") or "")
-        return cls(name=name, success=success, exit_code=exit_code_val, stdout=stdout, stderr=stderr)
-
-    def to_mapping(self) -> dict[str, object]:
-        return {
-            "name": self.name,
-            "success": self.success,
-            "exit_code": self.exit_code,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-        }
-
-
 class RepairOutcome(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     policy: str
-    pipeline_results: list[PipelineStepResult]
+    pipeline_results: list[StepResult]
     success: bool
     attempts_used: int
     metadata: dict[str, object]
@@ -163,7 +124,7 @@ class LoopDependencies(BaseModel):
     evaluate_policy_on_item: Callable[[Mapping[str, object], "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
     build_iteration_feedback: Callable[[EvaluationResult, float | None, dict[str, object] | None, Path], FeedbackPackage]
     attempt_policy_generation: Callable[..., tuple[str | None, str | None]]
-    run_policy_pipeline: Callable[..., tuple[list[PipelineStepResult], list[StepResult], bool]]
+    run_policy_pipeline: Callable[..., tuple[list[StepResult], list[StepResult], bool]]
     finalize_successful_policy: Callable[..., tuple[str, dict[str, object]]]
     finalize_failed_repair: Callable[..., tuple[str, str]]
     classify_results: Callable[[Sequence[StepResult]], Mapping[str, object]]
@@ -190,7 +151,7 @@ class RepairContext(BaseModel):
     last_classified: Mapping[str, object] | None = None
     attempts_used: int = 0
     metadata: dict[str, object] = Field(default_factory=dict)
-    pipeline_results: list[PipelineStepResult] = Field(default_factory=list)
+    pipeline_results: list[StepResult] = Field(default_factory=list)
     success: bool = False
     pipeline_passed: bool = False
     candidate_code: str | None = None

@@ -86,6 +86,40 @@ def record_score(handle: Any | None, name: str, value: float | int | bool, metad
         return
 
 
+def emit_score(
+    *,
+    name: str,
+    value: float | int | bool | str,
+    data_type: str | None = None,
+    trace_id: str | None = None,
+    observation_id: str | None = None,
+    dataset_run_id: str | None = None,
+    config_id: str | None = None,
+    comment: str | None = None,
+    score_id: str | None = None,
+) -> None:
+    """
+    Submit a score via Langfuse SDK using hosted run identifiers.
+    """
+    client = get_langfuse_client()
+    if not client or not hasattr(client, "create_score"):
+        raise RuntimeError("Langfuse client unavailable for scoring")
+    payload: dict[str, object] = {
+        "name": name,
+        "value": value,
+        "data_type": data_type,
+        "trace_id": trace_id,
+        "observation_id": observation_id,
+        "dataset_run_id": dataset_run_id,
+        "config_id": config_id,
+        "comment": comment,
+        "score_id": score_id,
+    }
+    cleaned = {k: v for k, v in payload.items() if v is not None}
+    client_any = cast(Any, client)
+    client_any.create_score(**cleaned)  # type: ignore[arg-type]
+
+
 def flush_langfuse() -> None:
     client = get_langfuse_client()
     if not client:
@@ -103,5 +137,6 @@ __all__ = [
     "start_trace",
     "start_span",
     "record_score",
+    "emit_score",
     "flush_langfuse",
 ]

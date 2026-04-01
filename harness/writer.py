@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import time
 import json
+import time
 from typing import Any, Mapping
 
 from .observability.langfuse import get_tracing_openai_client, record_score, start_span
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
+from .utils.template_loader import render_prompt_template
 
 _client: Any | None = None
+_WRITER_TEMPLATE = "policy_writer.jinja"
 
 
 def _get_client():
@@ -84,6 +86,36 @@ def _ensure_valid_policy_code(code: str) -> str:
     return cleaned
 
 
+def _render_writer_prompt(
+    *,
+    current_policy: str,
+    failure_context: str,
+    feedback_str: str,
+    feedback: Mapping[str, object],
+    comparison_summary: str | None,
+    guidance_hint: str,
+    diff_str: str,
+    diff_hint: str,
+    tests: str,
+    scoring_context: str,
+) -> str:
+    feedback_text = feedback_str if feedback_str else str(feedback)
+    return render_prompt_template(
+        _WRITER_TEMPLATE,
+        {
+            "current_policy": current_policy,
+            "failure_context": failure_context,
+            "feedback_text": feedback_text,
+            "comparison_summary": comparison_summary or "N/A",
+            "guidance_hint": guidance_hint,
+            "diff_str": diff_str,
+            "diff_hint": diff_hint,
+            "tests": tests,
+            "scoring_context": scoring_context,
+        },
+    )
+
+
 def generate_policy(
     feedback: dict[str, Any],
     current_policy: str,
@@ -114,6 +146,18 @@ def generate_policy(
     response = None
     record_score(writer_obs, "writer.policy_generated", False)
     record_score(writer_obs, "writer.policy_compiled", False)
+    prompt_content = _render_writer_prompt(
+        current_policy=current_policy,
+        failure_context=failure_context,
+        feedback_str=str(feedback_str),
+        feedback=feedback,
+        comparison_summary=comparison_summary,
+        guidance_hint=guidance_hint,
+        diff_str=diff_str,
+        diff_hint=diff_hint,
+        tests=tests,
+        scoring_context=scoring_context,
+    )
     for attempt in range(3):
         attempt_obs = start_span(writer_obs, f"writer_attempt_{attempt}", metadata={"attempt": attempt, "model": model})
         try:
@@ -121,63 +165,38 @@ def generate_policy(
                 model=model,
                 response_format={
                     "type": "json_schema",
-                "json_schema": {
-                    "name": "policy_code",
-                    "schema": {
-                        "type": "object",
-                        "properties": {"code": {"type": "string"}},
-                        "required": ["code"],
-                        "additionalProperties": False,
+                    "json_schema": {
+                        "name": "policy_code",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"code": {"type": "string"}},
+                            "required": ["code"],
+                            "additionalProperties": False,
+                        },
+                        "strict": True,
                     },
-                    "strict": True,
                 },
-            },
-            max_completion_tokens=completion_tokens,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are optimizing a scoring function for a graph search system. "
-                        "Respond ONLY with JSON matching the provided schema. "
-                        "The 'code' field must contain pure Python defining a typed score function with signature "
-                        "def score(node: object, state: object, context: object | None = None) -> float.\n"
-                        "STRICT RULES:\n"
-                        "- You MUST NOT use import statements\n"
-                        "- You MUST NOT reference external modules\n"
-                        "- You MUST NOT access the filesystem\n"
-                        "- Only use built-in Python operations\n"
+                max_completion_tokens=completion_tokens,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are optimizing a scoring function for a graph search system. "
+                            "Respond ONLY with JSON matching the provided schema. "
+                            "The 'code' field must contain pure Python defining a typed score function with signature "
+                            "def score(node: object, state: object, context: object | None = None) -> float.\n"
+                            "STRICT RULES:\n"
+                            "- You MUST NOT use import statements\n"
+                            "- You MUST NOT reference external modules\n"
+                            "- You MUST NOT access the filesystem\n"
+                            "- Only use built-in Python operations\n"
                             "- Do NOT wrap the code in Markdown\n"
                             "Any violation will cause immediate failure."
                         ),
                     },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Current policy:\n{current_policy}\n\n"
-                        f"Validation context:\n{failure_context}\n\n"
-                        f"Structured feedback:\n{feedback_str or feedback}\n\n"
-                        f"Baseline comparison:\n{comparison_summary or 'N/A'}\n\n"
-                        f"Guidance:\n{guidance_hint}\n\n"
-                        f"{diff_str}\n\n"
-                        f"Diff guidance:\n{diff_hint}\n\n"
-                        f"Tests (source of truth, do not modify):\n{tests}\n\n"
-                        f"Scoring interface + examples (STRICT CONTRACT):\n{scoring_context}\n\n"
-                        "Validation requirements:\n"
-                        "- score MUST have type annotations on all parameters and return float\n"
-                        "- Target signature: def score(node: object, state: object, context: object | None = None) -> float\n"
-                        "- Code MUST be valid under BasedPyright\n\n"
-                        "Instructions:\n"
-                        "- Fix errors in order of priority:\n"
-                        "  1. TYPE ERRORS\n"
-                        "  2. LINT ERRORS\n"
-                        "  3. TEST FAILURES\n\n"
-                        "- Do NOT attempt to optimize until all tests pass\n"
-                        "- MUST define a typed score function used by the harness that returns a float\n"
-                        "- MUST be deterministic\n"
-                        "- MUST NOT import external libraries\n"
-                        "- MUST operate only on provided node/state data\n\n"
-                        "Return ONLY the JSON object specified by the schema.\n"
-                    ),
+                    {
+                        "role": "user",
+                        "content": prompt_content,
                     },
                 ],
             )
