@@ -86,9 +86,6 @@ def _stub_deps() -> LoopDependencies:
     ) -> str:
         return ""
 
-    def _record_score(handle: object | None, name: str, value: float, metadata: dict[str, object] | None = None) -> None:
-        return None
-
     return LoopDependencies(
         prepare_iteration_tasks=_prepare,
         evaluate_policy_on_item=_evaluate_policy_on_item,
@@ -102,7 +99,6 @@ def _stub_deps() -> LoopDependencies:
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        record_score=_record_score,
         start_span=lambda *a, **k: None,
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),

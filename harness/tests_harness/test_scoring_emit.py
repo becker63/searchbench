@@ -7,6 +7,7 @@ import pytest
 import harness.loop as loop_module
 from harness.pipeline.types import StepResult
 from harness.observability import langfuse as langfuse_module
+from harness.observability import score_emitter
 
 
 class DummyPipeline:
@@ -51,4 +52,4 @@ def test_run_policy_pipeline_emits_step_scores(monkeypatch):
 def test_emit_score_surfaces_missing_client(monkeypatch):
     monkeypatch.setattr(langfuse_module, "get_langfuse_client", lambda: None)
     with pytest.raises(RuntimeError):
-        langfuse_module.emit_score(name="metric", value=1.0, trace_id="t1")
+        score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")

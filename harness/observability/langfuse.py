@@ -4,40 +4,20 @@ from typing import Any, Mapping, Optional, cast
 
 from langfuse import Langfuse
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
-from pydantic import BaseModel, ConfigDict
 
 from ..utils.env import get_langfuse_env
 
 _client: Optional[Langfuse] = None
 
 
-class ScorePayload(BaseModel):
-    """Strict payload for Langfuse score emission."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    value: float | int | bool | str
-    data_type: str | None = None
-    trace_id: str | None = None
-    observation_id: str | None = None
-    dataset_run_id: str | None = None
-    config_id: str | None = None
-    comment: str | None = None
-    score_id: str | None = None
-
-
 def get_langfuse_client() -> Optional[Langfuse]:
     global _client  # noqa: PLW0603
     env = get_langfuse_env()
-    if not env.get("enabled", True):
-        _client = None
-        return None
-    if _client is not None:
-        return _client
     public, secret = env.get("public_key"), env.get("secret_key")
     if not isinstance(public, str) or not isinstance(secret, str) or not public or not secret:
-        return None
+        raise RuntimeError("Langfuse credentials are required (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)")
+    if _client is not None:
+        return _client
     base_url_val = env.get("base_url")
     env_val = env.get("environment")
     host: Optional[str] = base_url_val if isinstance(base_url_val, str) else None
@@ -51,6 +31,7 @@ def get_langfuse_client() -> Optional[Langfuse]:
         )
     except Exception:
         _client = None
+        raise
     return _client
 
 
@@ -60,91 +41,28 @@ def is_langfuse_enabled() -> bool:
 
 def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
     """
-    Prefer Langfuse's OpenAI integration, but fall back to vanilla client if unavailable.
+    Require Langfuse's OpenAI integration for tracing.
     """
-    try:
-        return LangfuseOpenAI(base_url=base_url, api_key=api_key)
-    except Exception:
-        from openai import OpenAI  # local import to avoid import-time side effects
-
-        return OpenAI(base_url=base_url, api_key=api_key)
+    return LangfuseOpenAI(base_url=base_url, api_key=api_key)
 
 
 def start_trace(name: str, metadata: Mapping[str, object] | None = None, input: object | None = None) -> Any | None:
     client = get_langfuse_client()
-    if not client:
-        return None
-    try:
-        client_any = cast(Any, client)
-        return client_any.trace(name=name, metadata=dict(metadata) if metadata else None, input=input)
-    except Exception:
-        return None
+    client_any = cast(Any, client)
+    return client_any.trace(name=name, metadata=dict(metadata) if metadata else None, input=input)
 
 
 def start_span(parent: Any | None, name: str, metadata: Mapping[str, object] | None = None, input: object | None = None) -> Any | None:
     if parent is None:
         return start_trace(name=name, metadata=metadata, input=input)
-    try:
-        if hasattr(parent, "span"):
-            return parent.span(name=name, metadata=dict(metadata) if metadata else None, input=input)
-    except Exception:
-        return None
-    return None
-
-
-def record_score(handle: Any | None, name: str, value: float | int | bool, metadata: Mapping[str, object] | None = None) -> None:
-    if handle is None:
-        return
-    try:
-        scorer = getattr(handle, "score", None)
-        if scorer:
-            scorer(name=name, value=float(value), metadata=dict(metadata) if metadata else None)
-    except Exception:
-        return
-
-
-def emit_score(
-    *,
-    name: str,
-    value: float | int | bool | str,
-    data_type: str | None = None,
-    trace_id: str | None = None,
-    observation_id: str | None = None,
-    dataset_run_id: str | None = None,
-    config_id: str | None = None,
-    comment: str | None = None,
-    score_id: str | None = None,
-) -> None:
-    """
-    Submit a score via Langfuse SDK using hosted run identifiers.
-    """
-    client = get_langfuse_client()
-    if not client or not hasattr(client, "create_score"):
-        raise RuntimeError("Langfuse client unavailable for scoring")
-    payload = ScorePayload(
-        name=name,
-        value=value,
-        data_type=data_type,
-        trace_id=trace_id,
-        observation_id=observation_id,
-        dataset_run_id=dataset_run_id,
-        config_id=config_id,
-        comment=comment,
-        score_id=score_id,
-    )
-    cleaned = payload.model_dump(exclude_none=True)
-    client_any = cast(Any, client)
-    client_any.create_score(**cleaned)  # type: ignore[arg-type]
+    if hasattr(parent, "span"):
+        return parent.span(name=name, metadata=dict(metadata) if metadata else None, input=input)
+    raise RuntimeError("Parent trace/span missing 'span' method")
 
 
 def flush_langfuse() -> None:
     client = get_langfuse_client()
-    if not client:
-        return
-    try:
-        client.flush()
-    except Exception:
-        return
+    client.flush()
 
 
 __all__ = [
@@ -153,8 +71,5 @@ __all__ = [
     "get_tracing_openai_client",
     "start_trace",
     "start_span",
-    "record_score",
-    "emit_score",
     "flush_langfuse",
-    "ScorePayload",
 ]

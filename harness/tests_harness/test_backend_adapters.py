@@ -214,6 +214,13 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
     monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve", {"symbol": "foo"}))
+    class Span:
+        id = "span"
+
+        def score(self, name: str, value: float, metadata=None):
+            pass
+
+    monkeypatch.setattr(runner, "start_span", lambda *a, **k: Span())
 
     result = cast(dict[str, Any], runner.run_ic_iteration({"symbol": "s", "repo": str(tmp_path)}, score_fn=lambda n, s: 1.0, steps=1))
     assert result["node_count"] == 2
@@ -240,6 +247,13 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
     monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_symbols", {"query": "foo"}))
+    class Span:
+        id = "span"
+
+        def score(self, name: str, value: float, metadata=None):
+            pass
+
+    monkeypatch.setattr(runner, "start_span", lambda *a, **k: Span())
 
     result = cast(dict[str, Any], runner.run_jc_iteration({"symbol": "s", "repo": str(tmp_path)}, steps=1))
     assert result["node_count"] == 0

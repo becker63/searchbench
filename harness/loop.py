@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
+import json
 from typing import TYPE_CHECKING, Protocol, Callable, cast
 from pathlib import Path
 from typing import Any
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
-from .observability.langfuse import emit_score, flush_langfuse, record_score, start_span, start_trace
+from .observability.langfuse import flush_langfuse, start_span, start_trace
 from .observability.baselines import BaselineSnapshot, baseline_metrics_from_jc
+from .observability.score_emitter import emit_score, emit_score_for_handle
 from .pipeline import PipelineClassification, classify_results, default_pipeline
 from .pipeline.types import StepResult
 from .loop_machine import OptimizationStateMachine
@@ -187,7 +189,12 @@ def evaluate_policy_on_item(
             "score": -10.0,
             "error": f"policy_import_error: {str(e)}",
         }
-        record_score(iteration_span, "metrics.score", _as_float(metrics_map.get("score", 0.0)))
+        emit_score_for_handle(
+            iteration_span,
+            name="metrics.score",
+            value=_as_float(metrics_map.get("score", 0.0)),
+            data_type="NUMERIC",
+        )
         return EvaluationResult(
             metrics=metrics_map,
             ic_result={},
@@ -226,16 +233,13 @@ def evaluate_policy_on_item(
     trace_id = getattr(iteration_span, "id", None)
     for name, value in metrics_map.items():
         if isinstance(value, (int, float, bool)):
-            record_score(iteration_span, f"metrics.{name}", float(value))
             data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
             score_id = f"{trace_id}-metrics.{name}" if trace_id else None
-            emit_score(
+            emit_score_for_handle(
+                iteration_span,
                 name=f"metrics.{name}",
                 value=float(value) if isinstance(value, bool) else value,
                 data_type=data_type,
-                trace_id=trace_id,
-                observation_id=getattr(iteration_span, "id", None),
-                dataset_run_id=None,
                 score_id=score_id,
             )
 
@@ -423,7 +427,6 @@ def _build_dependencies() -> LoopDependencies:
         read_policy=_read_policy,
         write_policy=_write_policy,
         get_writer_model=get_writer_model,
-        record_score=record_score,
         start_span=start_span,
         find_repo_root=find_repo_root,
         default_pipeline=default_pipeline,

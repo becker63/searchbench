@@ -99,7 +99,6 @@ def _make_deps(**overrides) -> LoopDependencies:
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        record_score=lambda *a, **k: None,
         start_span=lambda *a, **k: None,
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),

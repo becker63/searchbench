@@ -18,7 +18,11 @@ class DummySpan:
 
 def test_run_ic_iteration_emits_scores(monkeypatch):
     scores: list[tuple[str, float]] = []
-    monkeypatch.setattr(runner, "record_score", lambda span, name, value, metadata=None: scores.append((name, float(value))))
+    monkeypatch.setattr(
+        runner,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: scores.append((kwargs.get("name"), float(kwargs.get("value", 0.0)))),
+    )
     monkeypatch.setattr(runner, "start_span", lambda *a, **k: DummySpan("span"))
     monkeypatch.setattr(runner, "run_agent", lambda *a, **k: {"observations": [{"tool": "t", "result": {"graph": {"nodes": [1, 2]}}}]})
     monkeypatch.setattr(
@@ -64,7 +68,11 @@ def test_writer_records_policy_events(monkeypatch):
 
     monkeypatch.setattr(writer, "_get_client", fake_client)
     monkeypatch.setattr(writer, "start_span", lambda *a, **k: DummySpan("writer"))
-    monkeypatch.setattr(writer, "record_score", lambda obs, name, value, metadata=None: attempt_scores.append((name, float(value))))
+    monkeypatch.setattr(
+        writer,
+        "emit_score_for_handle",
+        lambda obs, **kwargs: attempt_scores.append((kwargs.get("name"), float(kwargs.get("value", 0.0)))),
+    )
 
     result = writer.generate_policy(
         feedback={"a": 1},
@@ -111,6 +119,7 @@ def test_run_agent_truncates_tool_content(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
+    monkeypatch.setattr(runner, "start_span", lambda *a, **k: type("S", (), {"id": "span", "end": lambda self, **kw: None})())
     long_result = "X" * (runner._MAX_TOOL_CONTENT_CHARS * 2)
     observations = runner.run_agent(
         {"symbol": "s", "repo": "r"},
@@ -163,6 +172,7 @@ def test_run_agent_retries_on_context_error(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
+    monkeypatch.setattr(runner, "start_span", lambda *a, **k: type("S", (), {"id": "span", "end": lambda self, **kw: None})())
     result = runner.run_agent(
         {"symbol": "s", "repo": "r"},
         steps=1,

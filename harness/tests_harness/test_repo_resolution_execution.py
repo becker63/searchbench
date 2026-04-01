@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from harness.observability import baselines, experiments
+from harness.observability.runner_integration import HostedRunItemResult, HostedRunResult
 from harness import loop, runner
 from harness.loop_types import IterationRecord
 
@@ -18,6 +19,16 @@ def test_baseline_resolves_repo(monkeypatch, tmp_path):
     repo_dir.mkdir()
     monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
     monkeypatch.setattr(runner, "run_jc_iteration", fake_run_jc_iteration)
+    class Span:
+        id = "span"
+
+        def end(self, **kwargs):
+            pass
+
+        def score(self, name: str, value: float, metadata=None):
+            pass
+
+    monkeypatch.setattr(baselines, "start_span", lambda *a, **k: Span())
     snap = baselines.compute_baseline_for_item(
         baselines.normalize_dataset_item({"id": "item1", "repo": "small", "symbol": "s", "metadata": {}})
     )
@@ -37,13 +48,26 @@ def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
     repo_dir.mkdir()
     monkeypatch.setenv("TEST_REPO_MEDIUM", str(repo_dir))
     monkeypatch.setattr(experiments, "run_loop", fake_run_loop)
+    item_payload = baselines.normalize_dataset_item({"id": "item3", "repo": "medium", "symbol": "s", "metadata": {}})
+
+    def fake_hosted(*args, **kwargs):
+        task_fn = kwargs["task_fn"]
+        class Span:
+            id = "span"
+            def score(self, name: str, value: float, metadata=None):
+                pass
+        output = task_fn(item_payload.model_dump(), Span())
+        hosted_item = HostedRunItemResult(item=item_payload.model_dump(), output=output)
+        return HostedRunResult(items=[hosted_item])
+
+    monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_hosted)
     baselines_bundle: Any = baselines.make_baseline_bundle(
         [baselines.BaselineSnapshot(repo="medium", symbol="s", jc_result={}, jc_metrics={}, item_id="item2")]
     )
     experiments._run_ic_optimizations(  # type: ignore[attr-defined,arg-type]
         [baselines.normalize_dataset_item({"id": "item3", "repo": "medium", "symbol": "s", "metadata": {}})],
         baselines_bundle,
-        dataset_name=None,
+        dataset_name="medium",
         dataset_version=None,
         iterations=1,
         hosted=False,
@@ -91,7 +115,7 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "find_repo_root", lambda: tmp_path)
     monkeypatch.setattr(loop, "start_trace", lambda *a, **k: DummySpan("trace"))
     monkeypatch.setattr(loop, "start_span", lambda *a, **k: DummySpan("span"))
-    monkeypatch.setattr(loop, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(loop, "emit_score", lambda *a, **k: None)
     monkeypatch.setattr(loop, "flush_langfuse", lambda: None)
 
     loop.run_loop({"symbol": "s", "repo": str(repo_dir)}, iterations=1)

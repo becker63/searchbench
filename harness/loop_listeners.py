@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 
 from statemachine import State
 
 from .loop_types import IterationRecord, LoopDependencies
+from .observability.score_emitter import emit_score_for_handle
 
 
 def _safe_end_span(span: object | None, **kwargs: object) -> None:
@@ -135,11 +137,27 @@ class OptimizationTracingListener:
         handle: object | None,
         record: IterationRecord,
     ) -> None:
-        deps: LoopDependencies = cast(LoopDependencies, machine.deps)  # type: ignore[attr-defined]
         score_meta: dict[str, object] = {"iteration": record.iteration}
+        comment: str | None = None
+        try:
+            comment = json.dumps(score_meta)
+        except Exception:
+            comment = str(score_meta)
         if record.pipeline_passed is not None:
-            deps.record_score(handle, "pipeline_passed", bool(record.pipeline_passed), score_meta)
+            emit_score_for_handle(
+                handle,
+                name="pipeline_passed",
+                value=bool(record.pipeline_passed),
+                data_type="BOOLEAN",
+                comment=comment,
+            )
         for key in ("score", "coverage_delta", "tool_error_rate"):
             value = record.metrics.get(key)
             if isinstance(value, (int, float, bool)):
-                deps.record_score(handle, f"metrics.{key}", float(value), score_meta)
+                emit_score_for_handle(
+                    handle,
+                    name=f"metrics.{key}",
+                    value=float(value),
+                    data_type="NUMERIC" if not isinstance(value, bool) else "BOOLEAN",
+                    comment=comment,
+                )

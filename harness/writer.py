@@ -4,7 +4,8 @@ import json
 import time
 from typing import Any, Mapping
 
-from .observability.langfuse import get_tracing_openai_client, record_score, start_span
+from .observability.langfuse import get_tracing_openai_client, start_span
+from .observability.score_emitter import emit_score_for_handle
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from .prompts import WriterPromptContext
@@ -146,8 +147,8 @@ def generate_policy(
     completion_tokens = model_budget.completion_reserve
     writer_obs = start_span(parent_trace, "policy_writer", metadata={"model": model})
     response = None
-    record_score(writer_obs, "writer.policy_generated", False)
-    record_score(writer_obs, "writer.policy_compiled", False)
+    emit_score_for_handle(writer_obs, name="writer.policy_generated", value=False, data_type="BOOLEAN")
+    emit_score_for_handle(writer_obs, name="writer.policy_compiled", value=False, data_type="BOOLEAN")
     prompt_content = _render_writer_prompt(
         current_policy=current_policy,
         failure_context=failure_context,
@@ -215,7 +216,13 @@ def generate_policy(
     try:
         raw_code = _extract_policy_code(response)
         code = _ensure_valid_policy_code(raw_code)
-        record_score(writer_obs, "writer.policy_compiled", True, metadata={"model": model})
+        emit_score_for_handle(
+            writer_obs,
+            name="writer.policy_compiled",
+            value=True,
+            data_type="BOOLEAN",
+            comment=json.dumps({"model": model}),
+        )
     except Exception as exc:  # noqa: BLE001
         if writer_obs and hasattr(writer_obs, "end"):
             try:
@@ -223,7 +230,13 @@ def generate_policy(
             except Exception:
                 pass
         raise
-    record_score(writer_obs, "writer.policy_generated", True, metadata={"model": model})
+    emit_score_for_handle(
+        writer_obs,
+        name="writer.policy_generated",
+        value=True,
+        data_type="BOOLEAN",
+        comment=json.dumps({"model": model}),
+    )
     if writer_obs and hasattr(writer_obs, "end"):
         try:
             writer_obs.end(metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})

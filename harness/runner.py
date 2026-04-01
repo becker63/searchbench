@@ -5,7 +5,8 @@ import time
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from .observability.langfuse import record_score, start_span, get_tracing_openai_client
+from .observability.langfuse import start_span, get_tracing_openai_client
+from .observability.score_emitter import emit_score_for_handle
 from .tools.backends.ic_backend import IterativeContextBackend
 from .tools.backends.jc_backend import JCodeMunchBackend
 from .tools.mcp_adapter import serialize_tool_result_for_model
@@ -383,7 +384,7 @@ def run_ic_iteration(
     normalized = _normalize_agent_result(raw)
     nc_val = normalized.get("node_count", 0)
     node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-    record_score(backend_obs, "ic.node_count", node_count)
+    emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count, data_type="NUMERIC")
     if backend_obs and hasattr(backend_obs, "end"):
         try:
             backend_obs.end(metadata={"node_count": normalized.get("node_count", 0)})
@@ -430,7 +431,7 @@ def run_jc_iteration(
     normalized = _normalize_agent_result(raw)
     nc_val = normalized.get("node_count", 0)
     node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-    record_score(backend_obs, "jc.node_count", node_count)
+    emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count, data_type="NUMERIC")
     if backend_obs and hasattr(backend_obs, "end"):
         try:
             backend_obs.end(metadata={"node_count": normalized.get("node_count", 0)})

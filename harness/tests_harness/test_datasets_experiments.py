@@ -30,7 +30,7 @@ def test_fetch_dataset_items_from_client(monkeypatch):
 def test_run_hosted_jc_baseline_experiment(monkeypatch):
     items = [datasets.normalize_dataset_item({"repo": "r", "symbol": "s"})]
     monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
-    monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(experiments, "emit_score_for_handle", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "compute_baseline_for_item", lambda *a, **k: BaselineSnapshot(repo="r", symbol="s", jc_result={}, jc_metrics={}))
 
@@ -51,7 +51,7 @@ def test_run_hosted_jc_baseline_experiment(monkeypatch):
 def test_run_hosted_ic_optimization_experiment(monkeypatch):
     items = [datasets.normalize_dataset_item({"repo": "r", "symbol": "s"})]
     monkeypatch.setattr(experiments, "fetch_dataset_items", lambda name, version=None: items)
-    monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(experiments, "emit_score_for_handle", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [IterationRecord(iteration=0, metrics={"score": 2.0})])
     monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "resolved-path")
@@ -96,7 +96,7 @@ def test_run_ic_optimization_uses_provided_baseline(monkeypatch):
         raise AssertionError("Should not recompute baseline")
 
     monkeypatch.setattr(experiments, "run_hosted_jc_baseline_experiment", fail_run_baseline)
-    monkeypatch.setattr(experiments, "record_score", lambda *a, **k: None)
+    monkeypatch.setattr(experiments, "emit_score_for_handle", lambda *a, **k: None)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(experiments, "run_loop", lambda *a, **k: [IterationRecord(iteration=0, metrics={"score": 1.0})])
     monkeypatch.setattr(experiments, "resolve_repo_target", lambda ref: "/tmp/resolved-r")

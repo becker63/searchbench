@@ -47,7 +47,6 @@ def get_langfuse_env() -> dict[str, str | bool | None]:
     Centralized Langfuse environment access to avoid scattered lookups.
     """
     return {
-        "enabled": getenv_bool("LANGFUSE_ENABLED", default=True),
         "public_key": getenv("LANGFUSE_PUBLIC_KEY"),
         "secret_key": getenv("LANGFUSE_SECRET_KEY"),
         "base_url": getenv("LANGFUSE_BASE_URL"),

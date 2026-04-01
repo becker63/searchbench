@@ -142,7 +142,6 @@ class LoopDependencies(BaseModel):
     read_policy: Callable[[], str]
     write_policy: Callable[[str], None]
     get_writer_model: Callable[[], str | None]
-    record_score: Callable[[object, str, float, dict[str, object] | None], None]
     start_span: Callable[..., object | None]
     find_repo_root: Callable[[], Path]
     default_pipeline: Callable[[], object]

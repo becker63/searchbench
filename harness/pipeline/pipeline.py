@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Iterable, List
 from pathlib import Path
 
-from ..observability.langfuse import start_span, record_score
+from ..observability.langfuse import start_span
+from ..observability.score_emitter import emit_score_for_handle
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
 from .types import PipelineClassification, Step, StepResult
 
@@ -21,8 +22,20 @@ class Pipeline:
             # Enforce success semantics based solely on exit status.
             result.success = result.exit_code == 0
             results.append(result)
-            record_score(step_obs, "exit_code", result.exit_code, metadata={"step": step.name})
-            record_score(step_obs, "pipeline_pass", result.success, metadata={"step": step.name})
+            emit_score_for_handle(
+                step_obs,
+                name="exit_code",
+                value=result.exit_code,
+                data_type="NUMERIC",
+                comment=f"step={step.name}",
+            )
+            emit_score_for_handle(
+                step_obs,
+                name="pipeline_pass",
+                value=result.success,
+                data_type="BOOLEAN",
+                comment=f"step={step.name}",
+            )
             terminated = self.fail_fast and result.exit_code != 0
             if step_obs and hasattr(step_obs, "end"):
                 step_obs.end(
