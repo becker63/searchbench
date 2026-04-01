@@ -53,3 +53,19 @@ def test_emit_score_surfaces_missing_client(monkeypatch):
     monkeypatch.setattr(langfuse_module, "get_langfuse_client", lambda: None)
     with pytest.raises(RuntimeError):
         score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
+
+
+def test_emit_score_accepts_session_only(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class DummyClient:
+        def create_score(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(langfuse_module, "get_langfuse_client", lambda: DummyClient())
+    score_emitter.emit_score(name="metric", value=1.0, session_id="session-123")
+
+    assert calls
+    emitted = calls[0]
+    assert emitted["session_id"] == "session-123"
+    assert "trace_id" not in emitted

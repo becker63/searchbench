@@ -115,6 +115,7 @@ class LoopContext(BaseModel):
 
     task: dict[str, object]
     iterations: int
+    session_id: str | None = None
     baseline_snapshot: "BaselineSnapshot | None" = None
     run_trace: object | None
     history: list[IterationRecord] = Field(default_factory=list)

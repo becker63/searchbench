@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Mapping, Sequence
 
+from ..loop import run_loop
+from ..loop_types import iteration_record_to_public_dict
+from ..scorer import score
+from ..utils.repo_targets import resolve_repo_target
 from .baselines import (
     BaselineBundle,
     BaselineSnapshot,
@@ -13,15 +17,13 @@ from .baselines import (
 )
 from .datasets import DatasetItem, fetch_dataset_items, normalize_dataset_item
 from .langfuse import flush_langfuse
-from .score_emitter import emit_score_for_handle
 from .runner_integration import HostedRunResult, run_hosted_dataset_experiment
-from ..loop import run_loop
-from ..loop_types import iteration_record_to_public_dict
-from ..scorer import score
-from ..utils.repo_targets import resolve_repo_target
+from .score_emitter import emit_score_for_handle
 
 
-def _build_bundle_from_hosted(run: HostedRunResult, snapshots: list[BaselineSnapshot]) -> BaselineBundle:
+def _build_bundle_from_hosted(
+    run: HostedRunResult, snapshots: list[BaselineSnapshot]
+) -> BaselineBundle:
     return make_baseline_bundle(
         snapshots,
         dataset_name=run.dataset_name,
@@ -33,8 +35,12 @@ def _build_bundle_from_hosted(run: HostedRunResult, snapshots: list[BaselineSnap
     )
 
 
-def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> BaselineBundle:
-    def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
+def run_hosted_jc_baseline_experiment(
+    name: str, version: str | None = None
+) -> BaselineBundle:
+    def _run_item(
+        item: Mapping[str, object], parent_trace: object | None = None
+    ) -> Mapping[str, object]:
         dataset_item = normalize_dataset_item(item)
         snapshot = compute_baseline_for_item(
             dataset_item,
@@ -55,17 +61,15 @@ def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> 
     for entry in hosted.items:
         if entry.output and "baseline" in entry.output:
             try:
-                snapshots.append(BaselineSnapshot.model_validate(entry.output["baseline"]))
+                snapshots.append(
+                    BaselineSnapshot.model_validate(entry.output["baseline"])
+                )
             except Exception:
                 continue
     if not snapshots:
         raise RuntimeError("Hosted baseline experiment returned no results")
     flush_langfuse()
     return _build_bundle_from_hosted(hosted, snapshots)
-
-
-def run_local_jc_baseline_experiment(dataset: Mapping[str, object]) -> BaselineBundle:
-    raise RuntimeError("Local JC baseline experiments are no longer supported; use hosted experiments via Langfuse.")
 
 
 def _run_ic_optimizations(
@@ -79,18 +83,29 @@ def _run_ic_optimizations(
     results: list[dict[str, object]] = []
     indexed = index_baselines(baselines)
 
-    def _run_item(item: Mapping[str, object], parent_trace: object | None = None) -> Mapping[str, object]:
+    def _run_item(
+        item: Mapping[str, object], parent_trace: object | None = None
+    ) -> Mapping[str, object]:
         normalized_item = normalize_dataset_item(item)
         resolved_repo = resolve_repo_target(normalized_item.repo)
-        baseline = resolve_baseline(list(indexed.values()), normalized_item) or require_baseline(baselines, normalized_item)
+        baseline = resolve_baseline(
+            list(indexed.values()), normalized_item
+        ) or require_baseline(baselines, normalized_item)
         task = normalized_item.model_dump()
         task["repo"] = resolved_repo
-        history = run_loop(task, iterations=iterations, parent_trace=parent_trace, baseline_snapshot=baseline)
+        history = run_loop(
+            task,
+            iterations=iterations,
+            parent_trace=parent_trace,
+            baseline_snapshot=baseline,
+        )
         last_record = history[-1] if history else None
         last_dict: Mapping[str, object] = (
             iteration_record_to_public_dict(last_record) if last_record else {}
         )
-        metrics = score({"iterative_context": last_dict, "jcodemunch": baseline.jc_result})
+        metrics = score(
+            {"iterative_context": last_dict, "jcodemunch": baseline.jc_result}
+        )
         for name, value in metrics.items():
             if isinstance(value, (int, float, bool)):
                 emit_score_for_handle(
@@ -112,7 +127,10 @@ def _run_ic_optimizations(
         dataset_version=dataset_version,
         experiment_name="ic_optimization",
         task_fn=_run_item,
-        metadata={"run_kind": "ic_optimization", "baseline_run_id": baselines.baseline_run_id},
+        metadata={
+            "run_kind": "ic_optimization",
+            "baseline_run_id": baselines.baseline_run_id,
+        },
     )
     for entry in hosted_result.items:
         if entry.output:
@@ -132,15 +150,19 @@ def run_hosted_ic_optimization_experiment(
 ) -> list[dict[str, object]]:
     items = fetch_dataset_items(name=name, version=version)
     if baselines is None and not recompute_baselines:
-        raise ValueError("Baselines bundle required for optimization; set recompute_baselines=True to compute.")
-    bundle = baselines if baselines is not None else run_hosted_jc_baseline_experiment(name, version=version)
-    return _run_ic_optimizations(items, bundle, dataset_name=name, dataset_version=version, iterations=iterations, hosted=True)
-
-
-def run_local_ic_optimization_experiment(
-    dataset: Mapping[str, object],
-    iterations: int = 5,
-    baselines: BaselineBundle | None = None,
-    recompute_baselines: bool = False,
-) -> list[dict[str, object]]:
-    raise RuntimeError("Local IC optimization is no longer supported; use hosted Langfuse experiments")
+        raise ValueError(
+            "Baselines bundle required for optimization; set recompute_baselines=True to compute."
+        )
+    bundle = (
+        baselines
+        if baselines is not None
+        else run_hosted_jc_baseline_experiment(name, version=version)
+    )
+    return _run_ic_optimizations(
+        items,
+        bundle,
+        dataset_name=name,
+        dataset_version=version,
+        iterations=iterations,
+        hosted=True,
+    )

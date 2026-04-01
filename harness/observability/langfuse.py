@@ -46,17 +46,38 @@ def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
     return LangfuseOpenAI(base_url=base_url, api_key=api_key)
 
 
-def start_trace(name: str, metadata: Mapping[str, object] | None = None, input: object | None = None) -> Any | None:
+def start_trace(
+    name: str,
+    metadata: Mapping[str, object] | None = None,
+    input: object | None = None,
+    session_id: str | None = None,
+) -> Any | None:
     client = get_langfuse_client()
     client_any = cast(Any, client)
-    return client_any.trace(name=name, metadata=dict(metadata) if metadata else None, input=input)
+    return client_any.trace(
+        name=name,
+        metadata=dict(metadata) if metadata else None,
+        input=input,
+        session_id=session_id,
+    )
 
 
-def start_span(parent: Any | None, name: str, metadata: Mapping[str, object] | None = None, input: object | None = None) -> Any | None:
+def start_span(
+    parent: Any | None,
+    name: str,
+    metadata: Mapping[str, object] | None = None,
+    input: object | None = None,
+    session_id: str | None = None,
+) -> Any | None:
     if parent is None:
-        return start_trace(name=name, metadata=metadata, input=input)
+        return start_trace(name=name, metadata=metadata, input=input, session_id=session_id)
     if hasattr(parent, "span"):
-        return parent.span(name=name, metadata=dict(metadata) if metadata else None, input=input)
+        return parent.span(
+            name=name,
+            metadata=dict(metadata) if metadata else None,
+            input=input,
+            session_id=session_id,
+        )
     raise RuntimeError("Parent trace/span missing 'span' method")
 
 

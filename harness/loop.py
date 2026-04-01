@@ -52,6 +52,12 @@ def _as_float(value: Any) -> float:
         return 0.0
 
 
+def _session_id_from(handle: object | None, default: str | None = None) -> str | None:
+    if handle is None:
+        return default
+    return getattr(handle, "session_id", default)
+
+
 def _read_policy(path: Path = _POLICY_PATH) -> str:
     return path.read_text(encoding="utf-8")
 
@@ -148,7 +154,12 @@ def prepare_iteration_tasks(task: dict[str, object], parent_trace: object | None
     index_obs: SupportsSpan | None = None
     if isinstance(repo_path_val, str):
         try:
-            index_obs = start_span(parent_trace, "index_repo", metadata={"repo": repo_path_val})
+            index_obs = start_span(
+                parent_trace,
+                "index_repo",
+                metadata={"repo": repo_path_val},
+                session_id=_session_id_from(parent_trace),
+            )
             result = index_folder(repo_path_val)
             repo_id = str(result["repo"])
             jc_repo_id = repo_id
@@ -174,7 +185,12 @@ def evaluate_policy_on_item(
     """Load current policy, execute IC iteration, and compute metrics."""
     policy_load_obs = None
     try:
-        policy_load_obs = start_span(iteration_span, "policy_load", metadata={"iteration": iteration_index})
+        policy_load_obs = start_span(
+            iteration_span,
+            "policy_load",
+            metadata={"iteration": iteration_index},
+            session_id=_session_id_from(iteration_span),
+        )
         score_fn = load_policy()
         if policy_load_obs and hasattr(policy_load_obs, "end"):
             policy_load_obs.end(metadata={"status": "loaded"})
@@ -230,6 +246,7 @@ def evaluate_policy_on_item(
     metrics_map["jc_baseline_metrics"] = dict(jc_metrics)
     metrics_map["comparison"] = comparison
     trace_id = getattr(iteration_span, "id", None)
+    session_id_val = _session_id_from(iteration_span)
     for name, value in metrics_map.items():
         if isinstance(value, (int, float, bool)):
             data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
@@ -240,6 +257,7 @@ def evaluate_policy_on_item(
                 value=float(value) if isinstance(value, bool) else value,
                 data_type=data_type,
                 score_id=score_id,
+                session_id=session_id_val,
             )
 
     policy_code = _read_policy()
@@ -341,6 +359,7 @@ def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_o
     trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
     observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
     dataset_run_id = getattr(repair_obs, "dataset_run_id", None) if repair_obs is not None else None
+    session_id_val = getattr(repair_obs, "session_id", None) if repair_obs is not None else None
     for step in step_results:
         data_type = "NUMERIC"
         score_id = f"{observation_id or trace_id}-pipeline.{step.name}.exit_code" if (observation_id or trace_id) else None
@@ -351,6 +370,7 @@ def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_o
             trace_id=trace_id,
             observation_id=observation_id,
             dataset_run_id=dataset_run_id,
+            session_id=session_id_val,
             score_id=score_id,
         )
         pass_score_id = f"{observation_id or trace_id}-pipeline.{step.name}.passed" if (observation_id or trace_id) else None
@@ -361,6 +381,7 @@ def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_o
             trace_id=trace_id,
             observation_id=observation_id,
             dataset_run_id=dataset_run_id,
+            session_id=session_id_val,
             score_id=pass_score_id,
         )
     pipeline_success = all(_step_succeeded(r) for r in step_results)
@@ -437,12 +458,17 @@ def run_loop(
     iterations: int = 5,
     parent_trace: object | None = None,
     baseline_snapshot: BaselineSnapshot | None = None,
+    session_id: str | None = None,
 ) -> list[IterationRecord]:
     """
     Closed-loop optimizer: execute, score, rewrite policy, repeat.
     """
     root_meta = {"task": dict(task), "iterations": iterations}
-    run_trace = start_span(parent_trace, "run_loop", metadata=root_meta, input=task) if parent_trace else start_trace("run_loop", metadata=root_meta, input=task)
+    run_trace = (
+        start_span(parent_trace, "run_loop", metadata=root_meta, input=task, session_id=session_id)
+        if parent_trace
+        else start_trace("run_loop", metadata=root_meta, input=task, session_id=session_id)
+    )
     baseline_model = (
         BaselineSnapshot.model_validate(baseline_snapshot)
         if isinstance(baseline_snapshot, Mapping)
@@ -451,6 +477,7 @@ def run_loop(
     context = LoopContext(
         task=dict(task),
         iterations=iterations,
+        session_id=session_id,
         baseline_snapshot=baseline_model,
         run_trace=run_trace,
     )
