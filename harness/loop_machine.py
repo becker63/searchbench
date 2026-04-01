@@ -215,7 +215,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             self.raise_("pipeline_exhausted")  # type: ignore[call-arg]
 
     # Helpers -------------------------------------------------------------
-    def _format_failure(self, pipeline_results: list[StepResult], writer_error, attempt: int) -> str:
+    def _format_failure(self, pipeline_results: list[StepResult], writer_error: str | None, attempt: int) -> str:
         return self.deps.format_pipeline_failure_context(
             pipeline_results,
             self.context.last_classified,
@@ -288,18 +288,27 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             )
             self.model.prep_ok = self.context.prepared_tasks is not None
         except Exception:
+            self.context.prepared_tasks = None
             self.model.prep_ok = False
+        if self.context.prepared_tasks is None and isinstance(self.context.task, dict):
+            repo_val = self.context.task.get("repo")
+            resolved_repo = repo_val if isinstance(repo_val, str) else None
+            self.context.prepared_tasks = PreparedTasks(
+                base_task=dict(self.context.task), resolved_repo_path=resolved_repo, jc_repo_id=None
+            )
+            self.model.prep_ok = True
 
     # Evaluation ----------------------------------------------------------
-    def on_enter_evaluating(self, event, state) -> None:  # noqa: ANN001
+    def on_enter_evaluating(self, event: object, state: State) -> None:
         self.model.current_evaluation = None
         self.model.current_repair_outcome = None
-        if self.context.prepared_tasks is None:
+        prepared_tasks = getattr(self.context, "prepared_tasks", None)
+        if prepared_tasks is None:
             self.model.current_evaluation = None
             self.raise_("evaluation_done")  # type: ignore[call-arg]
             return
 
-        ic_task, jc_task = self.context.prepared_tasks.build_iteration_tasks()
+        ic_task, _ = prepared_tasks.build_iteration_tasks()
         self.model.current_evaluation = self.deps.evaluate_policy_on_item(
             ic_task,
             self.context.baseline_snapshot,
@@ -309,7 +318,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         self.raise_("evaluation_done")  # type: ignore[call-arg]
 
     # Repair --------------------------------------------------------------
-    def on_enter_repairing(self, event, state) -> None:  # noqa: ANN001
+    def on_enter_repairing(self, event: object, state: State) -> None:
         evaluation = self.model.current_evaluation
         if evaluation is None:
             self.model.current_repair_outcome = None
@@ -330,7 +339,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         self.raise_("repair_done")  # type: ignore[call-arg]
 
     # Acceptance / recording ---------------------------------------------
-    def on_enter_accepted_round(self, event, state) -> None:  # noqa: ANN001
+    def on_enter_accepted_round(self, event: object, state: State) -> None:
         evaluation = self.model.current_evaluation
         repair_outcome = self.model.current_repair_outcome
 
@@ -401,9 +410,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         record = IterationRecord(
             iteration=iteration,
             metrics=metrics_map,
-            pipeline_passed=repair_outcome.success
-            if repair_outcome and isinstance(repair_outcome.success, bool)
-            else None,
+            pipeline_passed=repair_outcome.success if repair_outcome else None,
             pipeline_feedback=pipeline_feedback,
             repair_attempts=repair_attempts_val
             if isinstance(repair_attempts_val, int)
@@ -479,8 +486,6 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         self, steps: Sequence[StepResult]
     ) -> StepResult | None:
         for step in steps:
-            if isinstance(step.exit_code, int) and step.exit_code != 0:
-                return step
-            if step.exit_code is None and step.success is False:
+            if step.exit_code != 0:
                 return step
         return None

@@ -35,8 +35,8 @@ def _require_str(mapping: dict[str, Any], key: str) -> str:
 def _tool_names_from_specs(tool_specs: list[OpenAITool]) -> list[str]:
     names: list[str] = []
     for spec in tool_specs:
-        func = spec.get("function") if isinstance(spec, Mapping) else None
-        name = func.get("name") if isinstance(func, Mapping) else None
+        func = spec.get("function") if isinstance(spec, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
+        name = func.get("name") if isinstance(func, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
         if isinstance(name, str):
             names.append(name)
     return names
@@ -192,7 +192,7 @@ def run_agent(
     tool_specs: list[OpenAITool],
     dispatch_tool_call: Callable[[str, dict[str, Any]], Any],
     system_prompt: str,
-    parent_trace=None,
+    parent_trace: object | None = None,
     backend_name: str | None = None,
     model: str | None = None,
 ) -> dict[str, object]:
@@ -348,7 +348,7 @@ def run_ic_iteration(
     task: dict[str, object],
     score_fn: Callable[..., float],
     steps: int = 5,
-    parent_trace=None,
+    parent_trace: object | None = None,
 ):
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
@@ -395,7 +395,7 @@ def run_ic_iteration(
 def run_jc_iteration(
     task: dict[str, object],
     steps: int = 5,
-    parent_trace=None,
+    parent_trace: object | None = None,
 ):
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")

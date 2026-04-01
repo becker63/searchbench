@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional, cast
 
 from langfuse import Langfuse
-from langfuse.openai import OpenAI as LangfuseOpenAI
+from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
 from pydantic import BaseModel, ConfigDict
 
 from ..utils.env import get_langfuse_env

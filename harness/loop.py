@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, Callable, cast
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +73,7 @@ def _clean_policy_code(code: str) -> str:
     return code.strip()
 
 
-def _hash_tests_dir(repo_root: Path) -> str:
+def _hash_tests_dir(repo_root: Path) -> str:  # pyright: ignore[reportUnusedFunction]
     tests_path = repo_root / "iterative-context" / "tests"
     hasher = hashlib.sha256()
     if not tests_path.exists():
@@ -98,7 +98,7 @@ def _tool_call_stats(bucket: Mapping[str, object] | None) -> tuple[int, int]:
 
 
 def _step_succeeded(step: StepResult) -> bool:
-    return step.exit_code == 0 if step.exit_code is not None else bool(step.success)
+    return step.exit_code == 0
 
 
 def _first_failed_step(steps: Sequence[StepResult]) -> StepResult | None:
@@ -129,26 +129,38 @@ def _format_pipeline_failure_context(
     )
 
 
-def prepare_iteration_tasks(task: dict[str, object], parent_trace=None) -> PreparedTasks:
+class SupportsPipelineRun(Protocol):
+    def run(self, repo_root: Path, observation: object | None = None) -> list[StepResult]:
+        ...
+
+
+class SupportsSpan(Protocol):
+    def end(self, **kwargs: object) -> None:
+        ...
+
+
+def prepare_iteration_tasks(task: dict[str, object], parent_trace: object | None = None) -> PreparedTasks:
     """Resolve repo paths and index JC repo once for the run."""
-    repo_path = task.get("repo")
-    resolved_repo_path = repo_path if isinstance(repo_path, str) else None
+    repo_path_val = task.get("repo")
+    resolved_repo_path = repo_path_val if isinstance(repo_path_val, str) else None
     jc_repo_id: str | None = None
-    index_obs = None
-    if isinstance(repo_path, str):
+    index_obs: SupportsSpan | None = None
+    if isinstance(repo_path_val, str):
         try:
-            index_obs = start_span(parent_trace, "index_repo", metadata={"repo": repo_path})
-            result = index_folder(repo_path)
-            repo_id = result["repo"]
+            index_obs = start_span(parent_trace, "index_repo", metadata={"repo": repo_path_val})
+            result = index_folder(repo_path_val)
+            repo_id = str(result["repo"])
             jc_repo_id = repo_id
-            if index_obs and hasattr(index_obs, "end"):
+            if index_obs:
                 index_obs.end(metadata={"repo": repo_id})
         except Exception as e:  # noqa: BLE001
-            if index_obs is not None and hasattr(index_obs, "end"):
+            if index_obs:
                 try:
                     index_obs.end(error=e)
                 except Exception:
                     pass
+    if resolved_repo_path is None:
+        raise RuntimeError("Task missing repo")
     return PreparedTasks(base_task=dict(task), resolved_repo_path=resolved_repo_path, jc_repo_id=jc_repo_id)
 
 
@@ -187,11 +199,12 @@ def evaluate_policy_on_item(
             error=str(metrics_map.get("error")),
         )
 
-    ic_result = run_ic_iteration(dict(ic_task), score_fn, parent_trace=iteration_span)
-    jc_result = baseline_snapshot.jc_result if baseline_snapshot is not None else {}
-    jc_metrics = baseline_snapshot.jc_metrics if baseline_snapshot is not None else {}
-    if not isinstance(jc_metrics, Mapping):
-        jc_metrics = baseline_metrics_from_jc(jc_result if isinstance(jc_result, Mapping) else {})
+    ic_runner = cast(Callable[..., dict[str, object]], run_ic_iteration)
+    ic_result = ic_runner(dict(ic_task), score_fn, parent_trace=iteration_span)
+    jc_result: dict[str, object] = dict(baseline_snapshot.jc_result) if baseline_snapshot is not None else {}
+    jc_metrics: dict[str, object] = dict(baseline_snapshot.jc_metrics) if baseline_snapshot is not None else {}
+    if not jc_metrics:
+        jc_metrics = {k: float(v) for k, v in baseline_metrics_from_jc(jc_result).items()}
 
     combined_result = {"iterative_context": ic_result, "jcodemunch": jc_result}
     metrics_map: dict[str, object] = dict(score(combined_result))
@@ -200,15 +213,15 @@ def evaluate_policy_on_item(
         metrics_map["error"] = "no_tool_usage"
 
     total_ic, errors_ic = _tool_call_stats(ic_result)
-    total_jc, errors_jc = _tool_call_stats(jc_result if isinstance(jc_result, Mapping) else {})
+    total_jc, errors_jc = _tool_call_stats(jc_result)
     total_calls = total_ic + total_jc
     total_errors = errors_ic + errors_jc
     metrics_map["tool_error_rate"] = (total_errors / total_calls) if total_calls else 0.0
     metrics_map["no_tool_usage"] = total_ic == 0
-    comparison = build_comparison(metrics_map, jc_metrics if isinstance(jc_metrics, Mapping) else {})
+    comparison = build_comparison(metrics_map, jc_metrics)
     comparison_summary = format_comparison_summary(comparison)
     metrics_map.setdefault("iteration_regression", False)
-    metrics_map["jc_baseline_metrics"] = dict(jc_metrics) if isinstance(jc_metrics, Mapping) else {}
+    metrics_map["jc_baseline_metrics"] = dict(jc_metrics)
     metrics_map["comparison"] = comparison
     trace_id = getattr(iteration_span, "id", None)
     for name, value in metrics_map.items():
@@ -230,8 +243,8 @@ def evaluate_policy_on_item(
     return EvaluationResult(
         metrics=metrics_map,
         ic_result=ic_result,
-        jc_result=jc_result if isinstance(jc_result, Mapping) else {},
-        jc_metrics=jc_metrics if isinstance(jc_metrics, Mapping) else {},
+        jc_result=jc_result,
+        jc_metrics=jc_metrics,
         comparison_summary=comparison_summary,
         policy_code=policy_code,
     )
@@ -291,11 +304,12 @@ def attempt_policy_generation(
     comparison_summary: str | None,
     failure_context_str: str | None,
     repair_attempt: int,
-    parent_trace=None,
+    parent_trace: object | None = None,
     pipeline_feedback: PipelineClassification | None = None,
 ) -> tuple[str | None, str | None]:
     try:
-        new_code = generate_policy(
+        generator = cast(Callable[..., str], generate_policy)
+        new_code = generator(
             feedback={
                 **feedback,
                 **({"pipeline_feedback": pipeline_feedback.model_dump()} if pipeline_feedback else {}),
@@ -318,8 +332,8 @@ def attempt_policy_generation(
         return None, str(e)
 
 
-def run_policy_pipeline(pipeline, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
-    raw_results = list(pipeline.run(repo_root, observation=repair_obs))
+def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
+    raw_results: list[object] = list(pipeline.run(repo_root, observation=repair_obs))
     step_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in raw_results]
     trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
     observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
@@ -355,7 +369,7 @@ def finalize_successful_policy(
     new_code: str,
     attempts_used: int,
     max_repair_attempts: int,
-    repair_obs=None,
+    repair_obs: object | None = None,
 ) -> tuple[str, AcceptedPolicyMeta]:
     final_policy = _read_policy()
     meta = AcceptedPolicyMeta(
@@ -460,4 +474,23 @@ def run_loop(
             except Exception:
                 pass
         flush_langfuse()
+    if not history:
+        repo_root = find_repo_root()
+        pipeline = default_pipeline()
+        pipeline_results, pipeline_success = run_policy_pipeline(pipeline, repo_root)
+        classified = classify_results(pipeline_results)
+        failed_step = _first_failed_step(pipeline_results)
+        record = IterationRecord(
+            iteration=0,
+            metrics={},
+            pipeline_passed=pipeline_success,
+            pipeline_feedback=classified,
+            failed_step=failed_step.name if failed_step else "pipeline_failed",
+            failed_exit_code=failed_step.exit_code if failed_step else None,
+            failed_summary=(failed_step.stderr or failed_step.stdout) if failed_step else None,
+            repair_attempts=_MAX_POLICY_REPAIRS,
+            max_policy_repairs=_MAX_POLICY_REPAIRS,
+            writer_error="writer_failed" if not pipeline_success else None,
+        )
+        history = [record]
     return history

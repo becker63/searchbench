@@ -89,7 +89,7 @@ def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetIt
     except Exception:
         raw_items = []
     items: list[DatasetItem] = []
-    for idx, item in enumerate(raw_items):
+    for item in raw_items:
         if isinstance(item, Mapping):
             task_meta = cast(Mapping[str, object], item)
             input_section = task_meta.get("input")
@@ -101,7 +101,7 @@ def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetIt
                 continue
             meta = task_meta.get("metadata")
             meta_map: Mapping[str, object] = input_section if isinstance(input_section, Mapping) else {}
-            if isinstance(meta, Mapping):
+            if isinstance(meta, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]
                 meta_map = meta
             try:
                 mapped = map_task_to_dataset_item({"repo": repo, "symbol": symbol, **{str(k): v for k, v in meta_map.items()}})

@@ -85,7 +85,7 @@ def compute_baseline_for_item(
     item: DatasetItem,
     dataset_name: str | None = None,
     dataset_version: str | None = None,
-    parent_trace=None,
+    parent_trace: object | None = None,
 ) -> BaselineSnapshot:
     from ..runner import run_jc_iteration  # local import to avoid circular dependency
 
@@ -134,7 +134,7 @@ def compute_baseline_for_item(
         item_id=normalized.id,
         repo=normalized.repo,
         symbol=normalized.symbol,
-        jc_result=cast(dict[str, object], jc_result),
+        jc_result=dict(jc_result),
         jc_metrics=metrics,
         trace_id=getattr(trace, "id", None),
         experiment_run_id=getattr(parent_trace, "id", None),

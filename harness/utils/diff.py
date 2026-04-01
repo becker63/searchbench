@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Set, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from harness.pipeline.types import PipelineClassification
+from typing import Dict, Set
 
 
 @dataclass
@@ -28,11 +25,14 @@ def extract_failure_keys(classified: Dict[str, object] | object) -> Set[str]:
         type_err = lint_err = test_err = ""
 
     keys: Set[str] = set()
-    if isinstance(type_err, str) and type_err:
+    type_err_str = type_err if isinstance(type_err, str) else ""
+    lint_err_str = lint_err if isinstance(lint_err, str) else ""
+    test_err_str = test_err if isinstance(test_err, str) else ""
+    if type_err_str:
         keys.add("type")
-    if isinstance(lint_err, str) and lint_err:
+    if lint_err_str:
         keys.add("lint")
-    if isinstance(test_err, str) and test_err:
+    if test_err_str:
         keys.add("tests")
     return keys
 

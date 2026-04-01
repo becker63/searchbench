@@ -121,6 +121,7 @@ class LoopContext(BaseModel):
     prepared_tasks: PreparedTasks | None = None
     prev_score: float | None = None
     prev_classified: PipelineClassification | None = None
+    last_classified: PipelineClassification | None = None
     current_iteration: int = 0
 
 

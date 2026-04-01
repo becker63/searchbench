@@ -13,7 +13,7 @@ class Pipeline:
         self.steps: List[Step] = list(steps)
         self.fail_fast: bool = fail_fast
 
-    def run(self, repo_root: Path, observation=None) -> List[StepResult]:
+    def run(self, repo_root: Path, observation: object | None = None) -> List[StepResult]:
         results: List[StepResult] = []
         for step in self.steps:
             step_obs = start_span(observation, name=step.name, metadata={"cwd": str(repo_root)})

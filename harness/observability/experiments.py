@@ -107,7 +107,7 @@ def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> 
 
 
 def run_local_jc_baseline_experiment(dataset: Mapping[str, object]) -> BaselineBundle:
-    items_raw = dataset.get("items") if isinstance(dataset, Mapping) else []
+    items_raw = dataset.get("items")
     items_seq = items_raw if isinstance(items_raw, Sequence) else []
     filtered_items = [normalize_dataset_item(entry) for entry in items_seq if isinstance(entry, Mapping)]
     name_val = dataset.get("name") if isinstance(dataset, Mapping) else "local"
@@ -218,10 +218,10 @@ def run_local_ic_optimization_experiment(
     if isinstance(dataset, Dataset):
         ds = dataset
     else:
-        items_raw = dataset.get("items") if isinstance(dataset, Mapping) else []
+        items_raw = dataset.get("items")
         items_seq = items_raw if isinstance(items_raw, Sequence) else []
         filtered_items = [normalize_dataset_item(entry) for entry in items_seq if isinstance(entry, Mapping)]
-        name_val = dataset.get("name") if isinstance(dataset, Mapping) else "local"
+        name_val = dataset.get("name")
         ds = Dataset(name=str(name_val or "local"), items=filtered_items)
     ds_items: list[DatasetItem] = list(ds.entries)
     bundle = baselines if baselines is not None else _run_local_jc_baselines(ds_items, dataset_name=ds.name, dataset_version=None)

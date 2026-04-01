@@ -125,7 +125,7 @@ def generate_policy(
     diff_str: str,
     diff_hint: str,
     comparison_summary: str | None = None,
-    parent_trace=None,
+    parent_trace: object | None = None,
     failure_context: str | None = None,
     repair_attempt: int = 0,
 ) -> str:

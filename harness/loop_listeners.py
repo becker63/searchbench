@@ -7,7 +7,7 @@ from statemachine import State
 from .loop_types import IterationRecord, LoopDependencies
 
 
-def _safe_end_span(span: object | None, **kwargs) -> None:
+def _safe_end_span(span: object | None, **kwargs: object) -> None:
     """Best-effort guard for Langfuse span termination."""
     if span is None or not hasattr(span, "end"):
         return
@@ -39,15 +39,15 @@ class RepairTracingListener:
                 metadata={"attempt": ctx.attempts_used},
             )
 
-    def on_enter_retrying(self, event: object, state: State, event_data, **kwargs) -> None:
+    def on_enter_retrying(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
         machine = cast(Any, getattr(event_data, "machine", None))
         self._end_attempt(machine, status="retrying")
 
-    def on_enter_candidate_valid(self, event: object, state: State, event_data, **kwargs) -> None:
+    def on_enter_candidate_valid(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
         machine = cast(Any, getattr(event_data, "machine", None))
         self._end_attempt(machine, status="passed")
 
-    def on_enter_repair_exhausted(self, event: object, state: State, event_data, **kwargs) -> None:
+    def on_enter_repair_exhausted(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
         machine = cast(Any, getattr(event_data, "machine", None))
         self._end_attempt(machine, status="failed")
 
@@ -69,7 +69,7 @@ class OptimizationTracingListener:
     def __init__(self) -> None:
         self._last_recorded_iteration: int | None = None
 
-    def on_enter_evaluating(self, event: object, state: State, event_data, **kwargs) -> None:
+    def on_enter_evaluating(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
         machine = cast(Any, getattr(event_data, "machine", None))
         ctx = machine.model.context  # type: ignore[attr-defined]
         if ctx.prepared_tasks is None:
@@ -87,15 +87,15 @@ class OptimizationTracingListener:
             },
         )
 
-    def on_exit_accepted_round(self, event: object, state: State, event_data, **kwargs) -> None:
+    def on_exit_accepted_round(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
         machine = cast(Any, getattr(event_data, "machine", None))
         self._finalize_iteration(machine, status="complete")
 
-    def on_enter_completed(self, event: object, state: State, event_data, **kwargs) -> None:
+    def on_enter_completed(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
         machine = cast(Any, getattr(event_data, "machine", None))
         self._finalize_iteration(machine, status="completed")
 
-    def on_enter_failed(self, event: object, state: State, event_data, **kwargs) -> None:
+    def on_enter_failed(self, event: object, state: State, event_data: object, **kwargs: object) -> None:
         machine = cast(Any, getattr(event_data, "machine", None))
         self._finalize_iteration(machine, status="failed")
 
@@ -136,7 +136,7 @@ class OptimizationTracingListener:
         record: IterationRecord,
     ) -> None:
         deps: LoopDependencies = cast(LoopDependencies, machine.deps)  # type: ignore[attr-defined]
-        score_meta = {"iteration": record.iteration}
+        score_meta: dict[str, object] = {"iteration": record.iteration}
         if record.pipeline_passed is not None:
             deps.record_score(handle, "pipeline_passed", bool(record.pipeline_passed), score_meta)
         for key in ("score", "coverage_delta", "tool_error_rate"):

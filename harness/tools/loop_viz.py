@@ -38,16 +38,20 @@ def _stub_deps() -> LoopDependencies:
         diff_hint="",
     )
 
-    return LoopDependencies(
-        prepare_iteration_tasks=_prepare,
-        evaluate_policy_on_item=lambda *a, **k: dummy_eval,
-        build_iteration_feedback=lambda *a, **k: dummy_feedback,
-        attempt_policy_generation=lambda **kwargs: ("policy", None),
-        run_policy_pipeline=lambda pipeline, repo_root, repair_obs=None: (
-            [StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")],
-            True,
-        ),
-        finalize_successful_policy=lambda **kwargs: (
+    def _evaluate_policy_on_item(*args: object, **kwargs: object) -> EvaluationResult:
+        return dummy_eval
+
+    def _build_iteration_feedback(*args: object, **kwargs: object) -> FeedbackPackage:
+        return dummy_feedback
+
+    def _attempt_policy_generation(**kwargs: object) -> tuple[str | None, str | None]:
+        return ("policy", None)
+
+    def _run_policy_pipeline(pipeline: object, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
+        return ([StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")], True)
+
+    def _finalize_successful_policy(**kwargs: object) -> tuple[str, AcceptedPolicyMeta]:
+        return (
             "policy",
             AcceptedPolicyMeta(
                 accepted_policy_source=None,
@@ -55,21 +59,44 @@ def _stub_deps() -> LoopDependencies:
                 repair_attempts=0,
                 max_policy_repairs=1,
             ),
-        ),
-        finalize_failed_repair=lambda **kwargs: FailedRepairDetails(
+        )
+
+    def _finalize_failed_repair(**kwargs: object) -> FailedRepairDetails:
+        return FailedRepairDetails(
             failure_context="ctx",
             policy_code="policy",
             failed_step=None,
             failed_exit_code=None,
             failed_summary=None,
             error="pipeline_failed",
-        ),
+        )
+
+    def _format_pf_ctx(
+        pipeline_results: list[StepResult],
+        classified: PipelineClassification | None,
+        writer_error: str | None,
+        model_name: str | None,
+        attempt: int,
+    ) -> str:
+        return ""
+
+    def _record_score(handle: object | None, name: str, value: float, metadata: dict[str, object] | None = None) -> None:
+        return None
+
+    return LoopDependencies(
+        prepare_iteration_tasks=_prepare,
+        evaluate_policy_on_item=_evaluate_policy_on_item,
+        build_iteration_feedback=_build_iteration_feedback,
+        attempt_policy_generation=_attempt_policy_generation,
+        run_policy_pipeline=_run_policy_pipeline,
+        finalize_successful_policy=_finalize_successful_policy,
+        finalize_failed_repair=_finalize_failed_repair,
         classify_results=lambda results: PipelineClassification(),
-        format_pipeline_failure_context=lambda *a, **k: "",
+        format_pipeline_failure_context=_format_pf_ctx,
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        record_score=lambda *a, **k: None,
+        record_score=_record_score,
         start_span=lambda *a, **k: None,
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),
@@ -97,7 +124,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     return repair_chart, opt_chart
 
 
-def _render(machine, fmt: str) -> str:
+def _render(machine: object, fmt: str) -> str:
     if fmt == "mermaid":
         return f"{machine:mermaid}"
     if fmt == "dot":
