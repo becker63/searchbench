@@ -5,7 +5,7 @@ from typing import Any, Callable, Mapping, cast
 
 from pydantic import BaseModel, Field
 
-from .langfuse import get_langfuse_client, start_span, start_trace
+from .langfuse import get_langfuse_client
 
 
 class HostedRunItemResult(BaseModel):

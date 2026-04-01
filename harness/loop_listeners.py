@@ -5,7 +5,7 @@ from typing import Any, cast
 
 from statemachine import State
 
-from .loop_types import IterationRecord, LoopDependencies
+from .loop_types import IterationRecord
 from .observability.score_emitter import emit_score_for_handle
 
 

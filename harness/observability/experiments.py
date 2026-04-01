@@ -11,7 +11,7 @@ from .baselines import (
     require_baseline,
     resolve_baseline,
 )
-from .datasets import Dataset, DatasetItem, fetch_dataset_items, normalize_dataset_item
+from .datasets import DatasetItem, fetch_dataset_items, normalize_dataset_item
 from .langfuse import flush_langfuse
 from .score_emitter import emit_score_for_handle
 from .runner_integration import HostedRunResult, run_hosted_dataset_experiment
@@ -65,13 +65,7 @@ def run_hosted_jc_baseline_experiment(name: str, version: str | None = None) -> 
 
 
 def run_local_jc_baseline_experiment(dataset: Mapping[str, object]) -> BaselineBundle:
-    items_raw = dataset.get("items")
-    items_seq = items_raw if isinstance(items_raw, Sequence) else []
-    filtered_items = [normalize_dataset_item(entry) for entry in items_seq if isinstance(entry, Mapping)]
-    name_val = dataset.get("name") if isinstance(dataset, Mapping) else "local"
-    ds = Dataset(name=str(name_val or "local"), items=filtered_items)
-    ds_items: list[DatasetItem] = list(ds.entries)
-    return _run_local_jc_baselines(ds_items, dataset_name=ds.name, dataset_version=None)
+    raise RuntimeError("Local JC baseline experiments are no longer supported; use hosted experiments via Langfuse.")
 
 
 def _run_ic_optimizations(

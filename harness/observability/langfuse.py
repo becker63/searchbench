@@ -62,6 +62,8 @@ def start_span(parent: Any | None, name: str, metadata: Mapping[str, object] | N
 
 def flush_langfuse() -> None:
     client = get_langfuse_client()
+    if client is None:
+        raise RuntimeError("Langfuse client unavailable for flush")
     client.flush()
 
 

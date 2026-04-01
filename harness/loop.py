@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-import json
 from typing import TYPE_CHECKING, Protocol, Callable, cast
 from pathlib import Path
 from typing import Any
