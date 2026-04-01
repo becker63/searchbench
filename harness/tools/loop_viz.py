@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Mapping
+
+# Ensure the repository root (parent of the harness package) is on sys.path when executed as a script.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from harness.loop_machine import OptimizationStateMachine, RepairStateMachine
 from harness.loop_types import (
@@ -125,12 +131,23 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
 
 
 def _render(machine: object, fmt: str) -> str:
+    # python-statemachine exposes a private graph builder; use it to support multiple formats.
+    graph = machine._graph()  # type: ignore[attr-defined]
     if fmt == "mermaid":
-        return f"{machine:mermaid}"
+        try:
+            return f"{machine:mermaid}"
+        except Exception:
+            return graph.to_string()  # type: ignore[attr-defined]
     if fmt == "dot":
-        return f"{machine:dot}"
+        try:
+            return f"{machine:dot}"
+        except Exception:
+            return graph.to_string()  # type: ignore[attr-defined]
     if fmt == "md":
-        return f"{machine:md}"
+        try:
+            return f"{machine:md}"
+        except Exception:
+            return graph.to_string()  # type: ignore[attr-defined]
     raise ValueError(f"Unsupported format: {fmt}")
 
 
@@ -145,10 +162,16 @@ def render_state_machines(fmt: str = "mermaid", machine: str = "both", output: P
     if fmt == "png":
         if output is None:
             raise ValueError("PNG output requires --output path")
-        for name, chart in targets:
-            path = output if machine != "both" else output.with_name(f"{output.stem}_{name}{output.suffix}")
+        for idx, (name, chart) in enumerate(targets):
+            if machine == "both" and idx > 0:
+                path = output.with_name(f"{output.stem}_{name}{output.suffix}")
+            else:
+                path = output
             graph = chart._graph()  # type: ignore[attr-defined]
-            graph.write_png(str(path))
+            try:
+                graph.write_png(str(path))
+            except FileNotFoundError as exc:
+                raise RuntimeError("Graphviz 'dot' executable is required for PNG output") from exc
         return
 
     rendered = []

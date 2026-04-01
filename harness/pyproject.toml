@@ -17,6 +17,7 @@ dependencies = [
     "python-statemachine>=3.0.0",
     "mcp>=1.26.0",
     "statemachine>=0.1",
+    "pydot>=2.0.0",
 ]
 
 [tool.uv.sources]
