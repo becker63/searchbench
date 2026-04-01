@@ -23,6 +23,7 @@ from .loop_types import (
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
+    PreparedTasks,
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
