@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Protocol, Any
+from typing import Any, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
-@dataclass
-class StepResult:
+class StepResult(BaseModel):
     """
     Canonical pipeline step result used across pipeline and loop.
     """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     name: str
     success: bool
@@ -18,32 +20,37 @@ class StepResult:
     exit_code: int
 
     @classmethod
-    def from_mapping(cls, step: Mapping[str, Any] | Any) -> "StepResult":
-        if isinstance(step, Mapping):
-            name = str(step.get("name") or "")
-            success = bool(step.get("success", False))
-            exit_code_val = step.get("exit_code")
-            exit_code = int(exit_code_val) if isinstance(exit_code_val, int) else 0
-            stdout = str(step.get("stdout") or "")
-            stderr = str(step.get("stderr") or "")
-            return cls(name=name, success=success, stdout=stdout, stderr=stderr, exit_code=exit_code)
-        name = getattr(step, "name", "") or ""
-        success = bool(getattr(step, "success", False))
-        exit_code_val = getattr(step, "exit_code", 0)
-        exit_code = int(exit_code_val) if isinstance(exit_code_val, int) else 0
-        stdout = str(getattr(step, "stdout", "") or "")
-        stderr = str(getattr(step, "stderr", "") or "")
-        return cls(name=name, success=success, stdout=stdout, stderr=stderr, exit_code=exit_code)
+    def from_external(cls, step: object) -> "StepResult":
+        """Validate and coerce external step payloads."""
+        if isinstance(step, BaseModel):
+            return cls.model_validate(step.model_dump())
+        if isinstance(step, dict):
+            return cls.model_validate(step)
+        data: dict[str, Any] = {}
+        allowed_fields = {"name", "success", "stdout", "stderr", "exit_code"}
+        extras: set[str] = set()
+        for field in allowed_fields:
+            if hasattr(step, field):
+                data[field] = getattr(step, field)
+        if hasattr(step, "__dict__"):
+            extras = set(getattr(step, "__dict__", {}).keys()) - allowed_fields
+        if extras:
+            raise ValueError(f"Unexpected fields in step payload: {sorted(extras)}")
+        return cls.model_validate(data)
 
     def to_mapping(self) -> dict[str, object]:
-        return {
-            "name": self.name,
-            "success": self.success,
-            "exit_code": self.exit_code,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-        }
+        return self.model_dump()
 
+
+class PipelineClassification(BaseModel):
+    """Typed classification of pipeline outcomes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type_errors: str = ""
+    lint_errors: str = ""
+    test_failures: str = ""
+    passed: list[str] = Field(default_factory=list)
 
 class Step(Protocol):
     name: str

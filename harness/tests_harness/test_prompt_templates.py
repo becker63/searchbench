@@ -6,6 +6,8 @@ import pytest
 
 import harness.runner as runner
 import harness.writer as writer
+from harness.pipeline.types import StepResult
+from harness.utils.prompt_models import SystemPromptContext, WriterPromptContext
 from harness.utils import template_loader
 from harness.utils.openai_schema import OpenAITool
 
@@ -55,3 +57,40 @@ def test_runner_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
     jc_prompt = runner._build_jc_system_prompt(tools)
     assert "inspect_file" in ic_prompt
     assert "inspect_file" in jc_prompt
+
+
+def test_writer_prompt_validation_rejects_extra_fields():
+    with pytest.raises(Exception):
+        WriterPromptContext.model_validate(
+            {
+                "current_policy": "code",
+                "failure_context": "",
+                "feedback_text": "fb",
+                "comparison_summary": "N/A",
+                "guidance_hint": "hint",
+                "diff_str": "",
+                "diff_hint": "",
+                "tests": "",
+                "scoring_context": "",
+                "extra_field": "nope",
+            }
+        )
+
+
+def test_step_result_rejects_extra_fields():
+    with pytest.raises(Exception):
+        StepResult.model_validate(
+            {
+                "name": "x",
+                "success": True,
+                "stdout": "",
+                "stderr": "",
+                "exit_code": 0,
+                "unexpected": "nope",
+            }
+        )
+
+
+def test_system_prompt_context_requires_available_tools():
+    with pytest.raises(Exception):
+        SystemPromptContext.model_validate({"available_tools": ""})

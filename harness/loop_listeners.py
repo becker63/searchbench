@@ -57,8 +57,8 @@ class RepairTracingListener:
         metadata: dict[str, object] = {"status": status, "attempt": attempt_index}
         if ctx.pipeline_passed is False:
             metadata["pipeline_passed"] = False
-        if ctx.metadata.get("error"):
-            metadata["error"] = ctx.metadata["error"]
+        if getattr(ctx, "error", None):
+            metadata["error"] = ctx.error  # type: ignore[attr-defined]
         _safe_end_span(ctx.repair_observation, metadata=metadata)
         ctx.repair_observation = None
 

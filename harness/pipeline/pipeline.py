@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Dict
+from typing import Iterable, List
 from pathlib import Path
 
 from ..observability.langfuse import start_span, record_score
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
-from .types import Step, StepResult
+from .types import PipelineClassification, Step, StepResult
 
 
 class Pipeline:
@@ -59,46 +59,39 @@ def summarize_results(results: List[StepResult]) -> str:
     return summary
 
 
-def classify_results(results: List[StepResult]) -> Dict[str, object]:
-    out: Dict[str, object] = {
-        "type_errors": "",
-        "lint_errors": "",
-        "test_failures": "",
-        "passed": [],
-    }
+def classify_results(results: List[StepResult]) -> PipelineClassification:
+    out = PipelineClassification()
     for r in results:
         failed = r.exit_code != 0
         if not failed:
-            passed_list = out["passed"]
-            if isinstance(passed_list, list):
-                passed_list.append(r.name)
+            out.passed.append(r.name)
             continue
 
         stderr = (r.stderr or "").strip()
         if r.name == "basedpyright":
-            out["type_errors"] = stderr
+            out.type_errors = stderr
         elif r.name == "ruff_fix":
-            out["lint_errors"] = stderr
+            out.lint_errors = stderr
         elif "pytest" in r.name:
-            out["test_failures"] = stderr
+            out.test_failures = stderr
     return out
 
 
-def format_structured_feedback(classified: Dict[str, object], max_chars: int = 4000) -> str:
+def format_structured_feedback(classified: PipelineClassification, max_chars: int = 4000) -> str:
     parts: list[str] = []
 
-    type_err = classified.get("type_errors")
-    lint_err = classified.get("lint_errors")
-    test_err = classified.get("test_failures")
-    passed = classified.get("passed")
+    type_err = classified.type_errors
+    lint_err = classified.lint_errors
+    test_err = classified.test_failures
+    passed = classified.passed
 
-    if isinstance(type_err, str) and type_err:
+    if type_err:
         parts.append("## TYPE ERRORS (must fix first)\n" + type_err)
-    if isinstance(lint_err, str) and lint_err:
+    if lint_err:
         parts.append("## LINT ERRORS\n" + lint_err)
-    if isinstance(test_err, str) and test_err:
+    if test_err:
         parts.append("## TEST FAILURES\n" + test_err)
-    if isinstance(passed, list) and passed:
+    if passed:
         parts.append("## PASSED STEPS\n" + ", ".join(passed))
 
     joined = "\n\n".join(parts)
@@ -107,11 +100,11 @@ def format_structured_feedback(classified: Dict[str, object], max_chars: int = 4
     return joined
 
 
-def infer_action_hint(classified: Dict[str, object]) -> str:
-    if isinstance(classified.get("type_errors"), str) and classified.get("type_errors"):
+def infer_action_hint(classified: PipelineClassification) -> str:
+    if classified.type_errors:
         return "Fix type errors first. Do not attempt logic changes until types pass."
-    if isinstance(classified.get("lint_errors"), str) and classified.get("lint_errors"):
+    if classified.lint_errors:
         return "Fix lint/style issues. Ensure valid Python syntax."
-    if isinstance(classified.get("test_failures"), str) and classified.get("test_failures"):
+    if classified.test_failures:
         return "Tests are failing. Adjust scoring logic to satisfy invariants."
     return "All checks passed. Improve score."

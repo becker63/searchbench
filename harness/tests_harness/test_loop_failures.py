@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from harness import loop
+from harness.pipeline.types import PipelineClassification
 
 
 class DummySpan:
@@ -37,7 +38,7 @@ def _common_stubs(monkeypatch, tmp_path):
 
 def test_pipeline_failure_appends_history(monkeypatch, tmp_path):
     _common_stubs(monkeypatch, tmp_path)
-    monkeypatch.setattr(loop, "classify_results", lambda results: {"lint_errors": "missing"})
+    monkeypatch.setattr(loop, "classify_results", lambda results: PipelineClassification(lint_errors="missing"))
     monkeypatch.setattr(loop, "compute_diff", lambda *a, **k: type("D", (), {"regression": False})())
     monkeypatch.setattr(loop, "format_diff", lambda diff: "diff")
     monkeypatch.setattr(loop, "interpret_diff", lambda diff: "hint")
@@ -57,7 +58,7 @@ def test_pipeline_failure_appends_history(monkeypatch, tmp_path):
     assert len(history) == 1
     entry = history[0]
     assert entry.pipeline_passed is False
-    assert entry.pipeline_feedback == {"lint_errors": "missing"}
+    assert entry.pipeline_feedback and entry.pipeline_feedback.lint_errors == "missing"
     assert entry.failed_step == "ruff_fail"
     assert entry.failed_exit_code == 1
     assert entry.failed_summary == "ruff stderr"
@@ -66,7 +67,7 @@ def test_pipeline_failure_appends_history(monkeypatch, tmp_path):
 
 def test_pipeline_failure_with_writer_error(monkeypatch, tmp_path):
     _common_stubs(monkeypatch, tmp_path)
-    monkeypatch.setattr(loop, "classify_results", lambda results: {"type_errors": "bad"})
+    monkeypatch.setattr(loop, "classify_results", lambda results: PipelineClassification(type_errors="bad"))
     monkeypatch.setattr(loop, "compute_diff", lambda *a, **k: type("D", (), {"regression": False})())
     monkeypatch.setattr(loop, "format_diff", lambda diff: "diff")
     monkeypatch.setattr(loop, "interpret_diff", lambda diff: "hint")

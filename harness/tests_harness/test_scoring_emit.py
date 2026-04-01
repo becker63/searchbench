@@ -35,8 +35,8 @@ def test_run_policy_pipeline_emits_step_scores(monkeypatch):
         trace_id = "trace1"
         dataset_run_id = "dsrun1"
 
-    emitted, raw, success = loop_module.run_policy_pipeline(pipeline, Path("."), repair_obs=Obs())
-    assert emitted == raw == results
+    emitted, success = loop_module.run_policy_pipeline(pipeline, Path("."), repair_obs=Obs())
+    assert emitted == results
     assert success is False
     names = {c["name"] for c in calls}
     assert "pipeline.ruff.exit_code" in names

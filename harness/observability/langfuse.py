@@ -4,10 +4,27 @@ from typing import Any, Mapping, Optional, cast
 
 from langfuse import Langfuse
 from langfuse.openai import OpenAI as LangfuseOpenAI
+from pydantic import BaseModel, ConfigDict
 
 from ..utils.env import get_langfuse_env
 
 _client: Optional[Langfuse] = None
+
+
+class ScorePayload(BaseModel):
+    """Strict payload for Langfuse score emission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: float | int | bool | str
+    data_type: str | None = None
+    trace_id: str | None = None
+    observation_id: str | None = None
+    dataset_run_id: str | None = None
+    config_id: str | None = None
+    comment: str | None = None
+    score_id: str | None = None
 
 
 def get_langfuse_client() -> Optional[Langfuse]:
@@ -104,18 +121,18 @@ def emit_score(
     client = get_langfuse_client()
     if not client or not hasattr(client, "create_score"):
         raise RuntimeError("Langfuse client unavailable for scoring")
-    payload: dict[str, object] = {
-        "name": name,
-        "value": value,
-        "data_type": data_type,
-        "trace_id": trace_id,
-        "observation_id": observation_id,
-        "dataset_run_id": dataset_run_id,
-        "config_id": config_id,
-        "comment": comment,
-        "score_id": score_id,
-    }
-    cleaned = {k: v for k, v in payload.items() if v is not None}
+    payload = ScorePayload(
+        name=name,
+        value=value,
+        data_type=data_type,
+        trace_id=trace_id,
+        observation_id=observation_id,
+        dataset_run_id=dataset_run_id,
+        config_id=config_id,
+        comment=comment,
+        score_id=score_id,
+    )
+    cleaned = payload.model_dump(exclude_none=True)
     client_any = cast(Any, client)
     client_any.create_score(**cleaned)  # type: ignore[arg-type]
 
@@ -139,4 +156,5 @@ __all__ = [
     "record_score",
     "emit_score",
     "flush_langfuse",
+    "ScorePayload",
 ]

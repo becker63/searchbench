@@ -25,3 +25,13 @@ jcodemunch-mcp = { workspace = true }
 
 [tool.basedpyright]
 extraPaths = [".."]
+typeCheckingMode = "strict"
+strictListInference = true
+strictDictionaryInference = true
+strictParameterNoneValue = true
+reportImplicitOptional = "error"
+reportUnknownParameterType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownVariableType = "error"
+reportUnknownMemberType = "error"
+reportMissingTypeStubs = "none"

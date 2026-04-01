@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from harness.pipeline.pipeline import classify_results, format_structured_feedback, infer_action_hint
-from harness.pipeline.types import StepResult
+from harness.pipeline.types import PipelineClassification, StepResult
 
 
 def test_basedpyright_warning_not_classified_as_failure():
@@ -15,7 +15,8 @@ def test_basedpyright_warning_not_classified_as_failure():
         )
     ]
     classified = classify_results(results)
-    assert classified["type_errors"] == ""
+    assert isinstance(classified, PipelineClassification)
+    assert classified.type_errors == ""
     feedback = format_structured_feedback(classified)
     assert "TYPE ERRORS" not in feedback
     assert infer_action_hint(classified) == "All checks passed. Improve score."
@@ -32,7 +33,8 @@ def test_pytest_warning_not_classified_as_failure():
         )
     ]
     classified = classify_results(results)
-    assert classified["test_failures"] == ""
+    assert isinstance(classified, PipelineClassification)
+    assert classified.test_failures == ""
     feedback = format_structured_feedback(classified)
     assert "TEST FAILURES" not in feedback
     assert infer_action_hint(classified) == "All checks passed. Improve score."
@@ -49,8 +51,8 @@ def test_ruff_warning_not_classified_as_failure():
         )
     ]
     classified = classify_results(results)
-    assert classified["lint_errors"] == ""
+    assert isinstance(classified, PipelineClassification)
+    assert classified.lint_errors == ""
     feedback = format_structured_feedback(classified)
     assert "LINT ERRORS" not in feedback
     assert infer_action_hint(classified) == "All checks passed. Improve score."
-

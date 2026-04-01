@@ -7,6 +7,7 @@ from typing import Any, Mapping
 from .observability.langfuse import get_tracing_openai_client, record_score, start_span
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
+from .utils.prompt_models import WriterPromptContext
 from .utils.template_loader import render_prompt_template
 
 _client: Any | None = None
@@ -100,20 +101,18 @@ def _render_writer_prompt(
     scoring_context: str,
 ) -> str:
     feedback_text = feedback_str if feedback_str else str(feedback)
-    return render_prompt_template(
-        _WRITER_TEMPLATE,
-        {
-            "current_policy": current_policy,
-            "failure_context": failure_context,
-            "feedback_text": feedback_text,
-            "comparison_summary": comparison_summary or "N/A",
-            "guidance_hint": guidance_hint,
-            "diff_str": diff_str,
-            "diff_hint": diff_hint,
-            "tests": tests,
-            "scoring_context": scoring_context,
-        },
+    context = WriterPromptContext(
+        current_policy=current_policy,
+        failure_context=failure_context,
+        feedback_text=feedback_text,
+        comparison_summary=comparison_summary or "N/A",
+        guidance_hint=guidance_hint,
+        diff_str=diff_str,
+        diff_hint=diff_hint,
+        tests=tests,
+        scoring_context=scoring_context,
     )
+    return render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
 
 
 def generate_policy(

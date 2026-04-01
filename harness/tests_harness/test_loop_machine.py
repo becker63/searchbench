@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping
 
 from harness.loop_machine import OptimizationStateMachine, RepairStateMachine
 from harness.loop_types import (
+    AcceptedPolicyMeta,
     FeedbackPackage,
     EvaluationResult,
+    FailedRepairDetails,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
@@ -14,12 +16,12 @@ from harness.loop_types import (
     RepairContext,
     RepairMachineModel,
 )
-from harness.pipeline.types import StepResult
+from harness.pipeline.types import PipelineClassification, StepResult
 
 
 def _make_deps(**overrides) -> LoopDependencies:
     def prepare_iteration_tasks(task: Mapping[str, object], trace: object | None = None) -> PreparedTasks:
-        return PreparedTasks(base_task=task, resolved_repo_path=None, jc_repo_id=None)
+        return PreparedTasks(base_task=dict(task), resolved_repo_path=None, jc_repo_id=None)
 
     def evaluate_policy_on_item(
         ic_task: Mapping[str, object],
@@ -39,7 +41,7 @@ def _make_deps(**overrides) -> LoopDependencies:
     def build_iteration_feedback(
         evaluation: EvaluationResult,
         prev_score: float | None,
-        prev_classified: dict[str, object] | None,
+        prev_classified,
         repo_root: Path,
     ) -> FeedbackPackage:
         return FeedbackPackage(
@@ -56,26 +58,33 @@ def _make_deps(**overrides) -> LoopDependencies:
     def attempt_policy_generation(**kwargs) -> tuple[str | None, str | None]:
         return ("policy", None)
 
-    def run_policy_pipeline(pipeline: object, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], list[StepResult], bool]:
+    def run_policy_pipeline(pipeline: object, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
         result = StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")
-        return [result], [result], True
+        return [result], True
 
-    def finalize_successful_policy(**kwargs) -> tuple[str, dict[str, object]]:
+    def finalize_successful_policy(**kwargs) -> tuple[str, AcceptedPolicyMeta]:
         return (
             "policy",
-            {
-                "repair_attempts": 0,
-                "max_policy_repairs": 1,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": False,
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=False,
+                repair_attempts=0,
+                max_policy_repairs=1,
+            ),
         )
 
-    def finalize_failed_repair(**kwargs) -> tuple[str, str]:
-        return ("", "policy")
+    def finalize_failed_repair(**kwargs) -> FailedRepairDetails:
+        return FailedRepairDetails(
+            failure_context="",
+            policy_code="policy",
+            failed_step=None,
+            failed_exit_code=None,
+            failed_summary=None,
+            error="pipeline_failed",
+        )
 
-    def classify_results(results: Sequence[StepResult]) -> dict[str, object]:
-        return {}
+    def classify_results(results: list[StepResult]):
+        return PipelineClassification()
 
     deps = LoopDependencies(
         prepare_iteration_tasks=prepare_iteration_tasks,
@@ -187,19 +196,22 @@ def test_repair_machine_retries_until_exhaustion():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         attempts.append(1)
         result = StepResult(name="step", success=False, exit_code=1, stdout="", stderr="boom")
-        return [result], [result], False
+        return [result], False
 
-    def finalize_failed_repair(*, metadata: dict[str, object], pipeline_results: Sequence[Mapping[str, object]], classified: Mapping[str, object], **kwargs):
-        metadata["pipeline_feedback"] = classified
-        metadata["failed_step"] = pipeline_results[0].get("name")
-        metadata["failed_exit_code"] = pipeline_results[0].get("exit_code")
-        metadata["failed_summary"] = "boom"
-        return ("ctx", "policy")
+    def finalize_failed_repair(*, pipeline_results, classified, **kwargs):
+        return FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="boom",
+            error="pipeline_failed",
+        )
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
         finalize_failed_repair=finalize_failed_repair,
-        classify_results=lambda results: {"test_failures": "boom"},
+        classify_results=lambda results: PipelineClassification(test_failures="boom"),
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=2)
     repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
@@ -207,7 +219,7 @@ def test_repair_machine_retries_until_exhaustion():
     outcome = machine.run()
     assert outcome.success is False
     assert outcome.attempts_used == 2
-    assert outcome.metadata.get("pipeline_feedback") == {"test_failures": "boom"}
+    assert outcome.pipeline_feedback and outcome.pipeline_feedback.test_failures == "boom"
     state = getattr(machine, "current_state")
     assert getattr(state, "id", None) == machine.repair_exhausted.id  # type: ignore[attr-defined]
 
@@ -219,22 +231,29 @@ def test_repair_succeeds_on_second_attempt():
         pipeline_calls.append(1)
         if len(pipeline_calls) == 1:
             result = StepResult(name="ruff", success=False, exit_code=1, stdout="", stderr="lint error")
-            return [result], [result], False
+            return [result], False
         result = StepResult(name="ruff", success=True, exit_code=0, stdout="", stderr="")
-        return [result], [result], True
+        return [result], True
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
-        classify_results=lambda results: {"lint_errors": "bad"},
-        finalize_failed_repair=lambda *, metadata, pipeline_results, classified, **kwargs: ("ctx", "policy"),
+        classify_results=lambda results: PipelineClassification(lint_errors="bad"),
+        finalize_failed_repair=lambda *, pipeline_results, classified, **kwargs: FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="lint error",
+            error="pipeline_failed",
+        ),
         finalize_successful_policy=lambda **kwargs: (
             "policy",
-            {
-                "repair_attempts": 1,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": False,
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=False,
+                repair_attempts=1,
+                max_policy_repairs=3,
+            ),
         ),
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=3)
@@ -243,7 +262,7 @@ def test_repair_succeeds_on_second_attempt():
     outcome = machine.run()
     assert outcome.success is True
     assert outcome.attempts_used == 2
-    assert outcome.metadata.get("repair_attempts") == 1
+    assert outcome.repair_attempts_reported == 1
 
 
 def test_pipeline_mutation_returns_on_disk_policy():
@@ -257,7 +276,7 @@ def test_pipeline_mutation_returns_on_disk_policy():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         disk_policy[0] = "formatted_policy"
         result = StepResult(name="ruff_fix", success=True, exit_code=0, stdout="", stderr="")
-        return [result], [result], True
+        return [result], True
 
     deps = _make_deps(
         write_policy=write_policy,
@@ -265,12 +284,12 @@ def test_pipeline_mutation_returns_on_disk_policy():
         run_policy_pipeline=run_policy_pipeline,
         finalize_successful_policy=lambda **kwargs: (
             disk_policy[0],
-            {
-                "repair_attempts": 0,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": disk_policy[0] != kwargs.get("new_code", ""),
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=disk_policy[0] != kwargs.get("new_code", ""),
+                repair_attempts=0,
+                max_policy_repairs=3,
+            ),
         ),
     )
     repair_ctx = _make_repair_ctx(deps)
@@ -279,8 +298,8 @@ def test_pipeline_mutation_returns_on_disk_policy():
     outcome = machine.run()
     assert outcome.success is True
     assert outcome.policy == "formatted_policy"
-    assert outcome.metadata.get("accepted_policy_source") == "post_pipeline_disk"
-    assert outcome.metadata.get("accepted_policy_changed_by_pipeline") is True
+    assert outcome.accepted_policy_source == "post_pipeline_disk"
+    assert outcome.accepted_policy_changed_by_pipeline is True
 
 
 def test_warning_only_steps_do_not_fail():
@@ -291,18 +310,18 @@ def test_warning_only_steps_do_not_fail():
             StepResult(name="ruff_fix", success=False, stdout="notice", stderr="", exit_code=0),
         ]
         pipeline_results = results
-        return pipeline_results, results, True
+        return pipeline_results, True
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
         finalize_successful_policy=lambda **kwargs: (
             "policy",
-            {
-                "repair_attempts": 0,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": False,
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=False,
+                repair_attempts=0,
+                max_policy_repairs=3,
+            ),
         ),
     )
     repair_ctx = _make_repair_ctx(deps)
@@ -311,24 +330,29 @@ def test_warning_only_steps_do_not_fail():
     outcome = machine.run()
     assert outcome.success is True
     assert outcome.attempts_used == 1
-    assert outcome.metadata.get("repair_attempts") == 0
-    assert not outcome.metadata.get("pipeline_feedback")
-    assert outcome.metadata.get("failed_step") is None
+    assert outcome.repair_attempts_reported == 0
+    assert not outcome.pipeline_feedback
+    assert outcome.failed_step is None
 
 
 def test_nonzero_exit_still_fails():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         result = StepResult(name="pytest_iterative_context", success=False, stdout="", stderr="test failed", exit_code=1)
-        return [result], [result], False
+        return [result], False
 
-    def finalize_failed_repair(*, metadata, pipeline_results, classified, **kwargs):
-        metadata["pipeline_feedback"] = classified
-        metadata["error"] = "pipeline_failed"
-        return ("ctx", "policy")
+    def finalize_failed_repair(*, pipeline_results, classified, **kwargs):
+        return FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="test failed",
+            error="pipeline_failed",
+        )
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
-        classify_results=lambda results: {"test_failures": "boom"},
+        classify_results=lambda results: PipelineClassification(test_failures="boom"),
         finalize_failed_repair=finalize_failed_repair,
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=2)
@@ -337,22 +361,27 @@ def test_nonzero_exit_still_fails():
     outcome = machine.run()
     assert outcome.success is False
     assert outcome.attempts_used == 2
-    assert outcome.metadata.get("pipeline_feedback") == {"test_failures": "boom"}
+    assert outcome.pipeline_feedback and outcome.pipeline_feedback.test_failures == "boom"
 
 
 def test_failed_candidate_not_marked_accepted():
     def run_policy_pipeline(pipeline, repo_root, repair_obs=None):
         result = StepResult(name="ruff_fix", success=False, stdout="", stderr="lint", exit_code=1)
-        return [result], [result], False
+        return [result], False
 
-    def finalize_failed_repair(*, metadata, pipeline_results, classified, **kwargs):
-        metadata["pipeline_feedback"] = classified
-        metadata["error"] = "pipeline_failed"
-        return ("ctx", "policy")
+    def finalize_failed_repair(*, pipeline_results, classified, **kwargs):
+        return FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="lint",
+            error="pipeline_failed",
+        )
 
     deps = _make_deps(
         run_policy_pipeline=run_policy_pipeline,
-        classify_results=lambda results: {"lint_errors": "missing"},
+        classify_results=lambda results: PipelineClassification(lint_errors="missing"),
         finalize_failed_repair=finalize_failed_repair,
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=2)
@@ -360,8 +389,8 @@ def test_failed_candidate_not_marked_accepted():
     machine = RepairStateMachine(repair_model)
     outcome = machine.run()
     assert outcome.success is False
-    assert "accepted_policy_source" not in outcome.metadata
-    assert "accepted_policy_changed_by_pipeline" not in outcome.metadata
+    assert outcome.accepted_policy_source is None
+    assert outcome.accepted_policy_changed_by_pipeline is None
 
 
 def test_score_metrics_propagation_into_iteration_record():
@@ -389,12 +418,12 @@ def test_post_pipeline_metadata_propagates_into_accepted_policy():
     deps = _make_deps(
         finalize_successful_policy=lambda **kwargs: (
             "formatted_policy",
-            {
-                "repair_attempts": 0,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": True,
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=True,
+                repair_attempts=0,
+                max_policy_repairs=3,
+            ),
         ),
     )
     model = OptimizationMachineModel(
@@ -472,23 +501,30 @@ def test_repair_span_metadata_correct_across_retries():
         pipeline_calls.append(1)
         if len(pipeline_calls) == 1:
             result = StepResult(name="ruff", success=False, exit_code=1, stdout="", stderr="err")
-            return [result], [result], False
+            return [result], False
         result = StepResult(name="ruff", success=True, exit_code=0, stdout="", stderr="")
-        return [result], [result], True
+        return [result], True
 
     deps = _make_deps(
         start_span=tracking_start_span,
         run_policy_pipeline=run_policy_pipeline,
-        classify_results=lambda results: {"lint_errors": "bad"},
-        finalize_failed_repair=lambda *, metadata, pipeline_results, classified, **kwargs: ("ctx", "policy"),
+        classify_results=lambda results: PipelineClassification(lint_errors="bad"),
+        finalize_failed_repair=lambda *, pipeline_results, classified, **kwargs: FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=pipeline_results[0].name,
+            failed_exit_code=pipeline_results[0].exit_code,
+            failed_summary="err",
+            error="pipeline_failed",
+        ),
         finalize_successful_policy=lambda **kwargs: (
             "policy",
-            {
-                "repair_attempts": 1,
-                "max_policy_repairs": 3,
-                "accepted_policy_source": "post_pipeline_disk",
-                "accepted_policy_changed_by_pipeline": False,
-            },
+            AcceptedPolicyMeta(
+                accepted_policy_source="post_pipeline_disk",
+                accepted_policy_changed_by_pipeline=False,
+                repair_attempts=1,
+                max_policy_repairs=3,
+            ),
         ),
     )
     repair_ctx = _make_repair_ctx(deps, max_repair_attempts=3)

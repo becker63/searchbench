@@ -6,6 +6,8 @@ from typing import Mapping
 
 from harness.loop_machine import OptimizationStateMachine, RepairStateMachine
 from harness.loop_types import (
+    AcceptedPolicyMeta,
+    FailedRepairDetails,
     EvaluationResult,
     FeedbackPackage,
     LoopContext,
@@ -15,14 +17,14 @@ from harness.loop_types import (
     RepairContext,
     RepairMachineModel,
 )
-from harness.pipeline.types import StepResult
+from harness.pipeline.types import PipelineClassification, StepResult
 
 
 def _stub_deps() -> LoopDependencies:
     """Minimal dependency set for chart rendering (no side effects)."""
 
     def _prepare(task: Mapping[str, object], trace: object | None = None) -> PreparedTasks:
-        return PreparedTasks(base_task=task, resolved_repo_path=None, jc_repo_id=None)
+        return PreparedTasks(base_task=dict(task), resolved_repo_path=None, jc_repo_id=None)
 
     dummy_eval = EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="")
     dummy_feedback = FeedbackPackage(
@@ -43,12 +45,26 @@ def _stub_deps() -> LoopDependencies:
         attempt_policy_generation=lambda **kwargs: ("policy", None),
         run_policy_pipeline=lambda pipeline, repo_root, repair_obs=None: (
             [StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")],
-            [StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")],
             True,
         ),
-        finalize_successful_policy=lambda **kwargs: ("policy", {}),
-        finalize_failed_repair=lambda **kwargs: ("ctx", "policy"),
-        classify_results=lambda results: {},
+        finalize_successful_policy=lambda **kwargs: (
+            "policy",
+            AcceptedPolicyMeta(
+                accepted_policy_source=None,
+                accepted_policy_changed_by_pipeline=None,
+                repair_attempts=0,
+                max_policy_repairs=1,
+            ),
+        ),
+        finalize_failed_repair=lambda **kwargs: FailedRepairDetails(
+            failure_context="ctx",
+            policy_code="policy",
+            failed_step=None,
+            failed_exit_code=None,
+            failed_summary=None,
+            error="pipeline_failed",
+        ),
+        classify_results=lambda results: PipelineClassification(),
         format_pipeline_failure_context=lambda *a, **k: "",
         read_policy=lambda: "policy",
         write_policy=lambda code: None,

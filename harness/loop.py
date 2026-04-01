@@ -10,11 +10,13 @@ from jcodemunch_mcp.tools.index_folder import index_folder
 
 from .observability.langfuse import emit_score, flush_langfuse, record_score, start_span, start_trace
 from .observability.baselines import BaselineSnapshot, baseline_metrics_from_jc
-from .pipeline import classify_results, default_pipeline
+from .pipeline import PipelineClassification, classify_results, default_pipeline
 from .pipeline.types import StepResult
 from .loop_machine import OptimizationStateMachine
 from .loop_types import (
+    AcceptedPolicyMeta,
     EvaluationResult,
+    FailedRepairDetails,
     FeedbackPackage,
     IterationRecord,
     LoopContext,
@@ -95,53 +97,39 @@ def _tool_call_stats(bucket: Mapping[str, object] | None) -> tuple[int, int]:
     return len(observations), errors
 
 
-def _step_succeeded(step: Mapping[str, object]) -> bool:
-    if "exit_code" in step and isinstance(step["exit_code"], int):
-        return step["exit_code"] == 0
-    success_val = step.get("success")
-    return bool(success_val)
+def _step_succeeded(step: StepResult) -> bool:
+    return step.exit_code == 0 if step.exit_code is not None else bool(step.success)
 
 
-def _first_failed_step(steps: Sequence[Mapping[str, object] | object]) -> Mapping[str, object] | None:
-    def _as_mapping(step: object) -> Mapping[str, object] | None:
-        if isinstance(step, Mapping):
-            return step
-        if step is None:
-            return None
-        data: dict[str, object] = {}
-        for key in ("name", "success", "stdout", "stderr", "exit_code"):
-            if hasattr(step, key):
-                data[key] = getattr(step, key)
-        return data if data else None
-
+def _first_failed_step(steps: Sequence[StepResult]) -> StepResult | None:
     for step in steps:
-        step_mapping = _as_mapping(step)
-        if not step_mapping:
-            continue
-        if not _step_succeeded(step_mapping):
-            return step_mapping
+        if not _step_succeeded(step):
+            return step
     return None
 
 
 def _format_pipeline_failure_context(
-    pipeline_results: list[Mapping[str, object]],
-    classified: Mapping[str, object] | None,
+    pipeline_results: list[StepResult],
+    classified: PipelineClassification | None,
     writer_error: str | None,
     model_name: str | None,
     repair_attempt: int,
 ) -> str:
     failed_step = _first_failed_step(pipeline_results)
+    pipeline_dump = [step.model_dump() for step in pipeline_results]
+    classified_dump = classified.model_dump() if classified else None
+    failed_dump = failed_step.model_dump() if failed_step else None
     return pack_failure_context(
-        pipeline_results,
-        classified,
-        failed_step,
+        pipeline_dump,
+        classified_dump,
+        failed_dump,
         writer_error,
         model_name,
         repair_attempt=repair_attempt,
     )
 
 
-def prepare_iteration_tasks(task: Mapping[str, object], parent_trace=None) -> PreparedTasks:
+def prepare_iteration_tasks(task: dict[str, object], parent_trace=None) -> PreparedTasks:
     """Resolve repo paths and index JC repo once for the run."""
     repo_path = task.get("repo")
     resolved_repo_path = repo_path if isinstance(repo_path, str) else None
@@ -252,7 +240,7 @@ def evaluate_policy_on_item(
 def build_iteration_feedback(
     evaluation: EvaluationResult,
     prev_score: float | None,
-    prev_classified: dict[str, object] | None,
+    prev_classified: PipelineClassification | None,
     repo_root: Path,
 ) -> FeedbackPackage:
     """Package evaluation outputs into writer-facing inputs."""
@@ -266,7 +254,12 @@ def build_iteration_feedback(
     diff_hint = ""
     if prev_score is not None and prev_classified is not None:
         try:
-            diff = compute_diff(prev_score, _as_float(evaluation.metrics.get("score", 0.0)), prev_classified, prev_classified)
+            diff = compute_diff(
+                prev_score,
+                _as_float(evaluation.metrics.get("score", 0.0)),
+                prev_classified.model_dump(),
+                prev_classified.model_dump(),
+            )
             diff_str = format_diff(diff)
             diff_hint = interpret_diff(diff)
         except Exception:
@@ -299,11 +292,14 @@ def attempt_policy_generation(
     failure_context_str: str | None,
     repair_attempt: int,
     parent_trace=None,
-    pipeline_feedback: Mapping[str, object] | None = None,
+    pipeline_feedback: PipelineClassification | None = None,
 ) -> tuple[str | None, str | None]:
     try:
         new_code = generate_policy(
-            feedback={**feedback, **({"pipeline_feedback": pipeline_feedback} if pipeline_feedback else {})},
+            feedback={
+                **feedback,
+                **({"pipeline_feedback": pipeline_feedback.model_dump()} if pipeline_feedback else {}),
+            },
             current_policy=initial_policy,
             tests=tests,
             scoring_context=scoring_context,
@@ -322,9 +318,9 @@ def attempt_policy_generation(
         return None, str(e)
 
 
-def run_policy_pipeline(pipeline, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], list[StepResult], bool]:
+def run_policy_pipeline(pipeline, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
     raw_results = list(pipeline.run(repo_root, observation=repair_obs))
-    step_results = [StepResult.from_mapping(step) for step in raw_results]
+    step_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in raw_results]
     trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
     observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
     dataset_run_id = getattr(repair_obs, "dataset_run_id", None) if repair_obs is not None else None
@@ -350,8 +346,8 @@ def run_policy_pipeline(pipeline, repo_root: Path, repair_obs: object | None = N
             dataset_run_id=dataset_run_id,
             score_id=pass_score_id,
         )
-    pipeline_success = all(_step_succeeded(r.to_mapping()) for r in step_results)
-    return step_results, raw_results, pipeline_success
+    pipeline_success = all(_step_succeeded(r) for r in step_results)
+    return step_results, pipeline_success
 
 
 def finalize_successful_policy(
@@ -360,43 +356,43 @@ def finalize_successful_policy(
     attempts_used: int,
     max_repair_attempts: int,
     repair_obs=None,
-) -> tuple[str, dict[str, object]]:
+) -> tuple[str, AcceptedPolicyMeta]:
     final_policy = _read_policy()
-    metadata: dict[str, object] = {
-        "repair_attempts": attempts_used - 1,
-        "max_policy_repairs": max_repair_attempts,
-        "accepted_policy_source": "post_pipeline_disk",
-        "accepted_policy_changed_by_pipeline": final_policy != new_code,
-    }
-    return final_policy, metadata
+    meta = AcceptedPolicyMeta(
+        accepted_policy_source="post_pipeline_disk",
+        accepted_policy_changed_by_pipeline=final_policy != new_code,
+        repair_attempts=attempts_used - 1,
+        max_policy_repairs=max_repair_attempts,
+    )
+    return final_policy, meta
 
 
 def finalize_failed_repair(
     *,
-    metadata: dict[str, object],
-    pipeline_results: list[Mapping[str, object]],
-    classified: Mapping[str, object],
+    pipeline_results: list[StepResult],
+    classified: PipelineClassification,
     writer_model: str | None,
     attempts_used: int,
-) -> tuple[str, str]:
+    writer_error: str | None,
+) -> FailedRepairDetails:
     failed_step = _first_failed_step(pipeline_results)
+    failed_summary = None
     if failed_step:
-        metadata["failed_step"] = failed_step.get("name")
-        metadata["failed_exit_code"] = failed_step.get("exit_code")
-        stderr = failed_step.get("stderr")
-        stdout = failed_step.get("stdout")
-        text = ""
-        if isinstance(stderr, str) and stderr.strip():
-            text = stderr.strip()
-        elif isinstance(stdout, str) and stdout.strip():
-            text = stdout.strip()
-        metadata["failed_summary"] = text[:_MAX_FAILURE_SUMMARY_CHARS]
-    metadata["pipeline_feedback"] = classified
-    metadata["error"] = "pipeline_failed"
-    writer_err_val = metadata.get("writer_error")
-    writer_err_str = str(writer_err_val) if writer_err_val is not None else None
-    failure_context_str = _format_pipeline_failure_context(pipeline_results, classified, writer_err_str, writer_model, attempts_used)
-    return failure_context_str, _read_policy()
+        stderr = failed_step.stderr
+        stdout = failed_step.stdout
+        text = stderr.strip() if stderr.strip() else stdout.strip()
+        failed_summary = text[:_MAX_FAILURE_SUMMARY_CHARS] if text else None
+    failure_context_str = _format_pipeline_failure_context(
+        pipeline_results, classified, writer_error, writer_model, attempts_used
+    )
+    return FailedRepairDetails(
+        failure_context=failure_context_str,
+        policy_code=_read_policy(),
+        failed_step=failed_step.name if failed_step else None,
+        failed_exit_code=failed_step.exit_code if failed_step else None,
+        failed_summary=failed_summary,
+        error="pipeline_failed",
+    )
 
 
 def _build_dependencies() -> LoopDependencies:
@@ -437,7 +433,7 @@ def run_loop(
         else baseline_snapshot
     )
     context = LoopContext(
-        task=task,
+        task=dict(task),
         iterations=iterations,
         baseline_snapshot=baseline_model,
         run_trace=run_trace,

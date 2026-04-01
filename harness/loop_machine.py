@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping, Sequence, cast
+from typing import Any, Sequence, cast
 
 from statemachine import State, StateChart
 from statemachine.event import BoundEvent
@@ -27,7 +27,7 @@ from .loop_types import (
     RepairMachineModel,
     RepairOutcome,
 )
-from .pipeline.types import StepResult
+from .pipeline.types import PipelineClassification, StepResult
 
 
 class RepairStateMachine(StateChart[RepairMachineModel]):
@@ -84,18 +84,27 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             else min(attempts_used, self.context.max_repair_attempts)
         )
         self.context.attempts_used = final_attempts
-        self.context.metadata["repair_attempts"] = (
+        self.context.repair_attempts_reported = (
             max(0, final_attempts - 1)
             if self.context.pipeline_passed
             else self.context.max_repair_attempts
         )
-        self.context.metadata["max_policy_repairs"] = self.context.max_repair_attempts
+        self.context.max_policy_repairs_reported = self.context.max_repair_attempts
         return RepairOutcome(
             policy=self.deps.read_policy(),
             pipeline_results=self.context.pipeline_results,
             success=self.context.pipeline_passed,
             attempts_used=final_attempts,
-            metadata=self.context.metadata,
+            pipeline_feedback=self.context.pipeline_feedback or self.context.last_classified,
+            writer_error=self.context.writer_error,
+            error=self.context.error,
+            failed_step=self.context.failed_step,
+            failed_exit_code=self.context.failed_exit_code,
+            failed_summary=self.context.failed_summary,
+            accepted_policy_source=self.context.accepted_policy_source,
+            accepted_policy_changed_by_pipeline=self.context.accepted_policy_changed_by_pipeline,
+            repair_attempts_reported=self.context.repair_attempts_reported,
+            max_policy_repairs=self.context.max_policy_repairs_reported,
         )
 
     # Writer/pipeline execution ------------------------------------------
@@ -120,7 +129,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             if ctx.attempts_used > 0
             else ctx.feedback.guidance_hint
         )
-        if ctx.last_classified and ctx.last_classified.get("type_errors"):
+        if ctx.last_classified and ctx.last_classified.type_errors:
             guidance += " Fix all type errors and ensure parameters are annotated; avoid unknown types."
 
         new_code, writer_error = deps.attempt_policy_generation(
@@ -136,11 +145,12 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             failure_context_str=ctx.failure_context,
             repair_attempt=ctx.attempts_used,
             parent_trace=ctx.repair_observation,
-            pipeline_feedback=ctx.last_classified,
+            pipeline_feedback=ctx.last_classified.model_dump() if ctx.last_classified else None,
         )
 
         if new_code is None:
-            ctx.metadata["writer_error"] = writer_error
+            ctx.writer_error = writer_error
+            ctx.error = writer_error or "writer_failed"
             ctx.attempts_used += 1
             ctx.failure_context = self._format_failure(
                 [], writer_error, ctx.attempts_used
@@ -159,7 +169,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
     def _run_pipeline(self) -> None:
         ctx = self.context
         deps = self.deps
-        pipeline_results, raw_results, pipeline_success = deps.run_policy_pipeline(
+        pipeline_results, pipeline_success = deps.run_policy_pipeline(
             ctx.pipeline or deps.default_pipeline(),
             ctx.repo_root,
             repair_obs=ctx.repair_observation,
@@ -176,19 +186,29 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                 repair_obs=ctx.repair_observation,
             )
             ctx.candidate_code = final_policy
-            ctx.metadata.update(success_meta)
+            ctx.accepted_policy_source = success_meta.accepted_policy_source
+            ctx.accepted_policy_changed_by_pipeline = success_meta.accepted_policy_changed_by_pipeline
+            ctx.repair_attempts_reported = success_meta.repair_attempts
+            ctx.max_policy_repairs_reported = success_meta.max_policy_repairs
             self.raise_("pipeline_passed")  # type: ignore[call-arg]
             return
 
-        classified = deps.classify_results(raw_results)
+        classified = deps.classify_results(pipeline_results)
         ctx.last_classified = classified
-        ctx.failure_context, ctx.evaluation.policy_code = deps.finalize_failed_repair(
-            metadata=ctx.metadata,
-            pipeline_results=[step.to_mapping() for step in pipeline_results],
+        ctx.pipeline_feedback = classified
+        failure_details = deps.finalize_failed_repair(
+            pipeline_results=pipeline_results,
             classified=classified,
             writer_model=ctx.writer_model,
             attempts_used=ctx.attempts_used,
+            writer_error=ctx.writer_error,
         )
+        ctx.failure_context = failure_details.failure_context
+        ctx.evaluation.policy_code = failure_details.policy_code
+        ctx.failed_step = failure_details.failed_step
+        ctx.failed_exit_code = failure_details.failed_exit_code
+        ctx.failed_summary = failure_details.failed_summary
+        ctx.error = failure_details.error
         if self._attempts_remaining():
             self.raise_("pipeline_retryable_failure")  # type: ignore[call-arg]
         else:
@@ -197,7 +217,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
     # Helpers -------------------------------------------------------------
     def _format_failure(self, pipeline_results: list[StepResult], writer_error, attempt: int) -> str:
         return self.deps.format_pipeline_failure_context(
-            [step.to_mapping() for step in pipeline_results],
+            pipeline_results,
             self.context.last_classified,
             writer_error,
             self.context.writer_model,
@@ -332,12 +352,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             self.context.prev_score = (
                 float(score_val) if isinstance(score_val, (int, float)) else None
             )
-            self.context.prev_classified = {
-                "type_errors": "",
-                "lint_errors": "",
-                "test_failures": "",
-                "passed": [],
-            }
+            self.context.prev_classified = PipelineClassification()
 
         self.context.current_iteration += 1
         self.raise_("advance")  # type: ignore[call-arg]
@@ -371,51 +386,34 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         evaluation: EvaluationResult,
         repair_outcome: RepairOutcome | None,
     ) -> IterationRecord:
-        metadata = dict(repair_outcome.metadata) if repair_outcome else {}
         metrics_map = dict(evaluation.metrics)
-        metrics_map.update(metadata)
-        pipeline_feedback = metadata.get("pipeline_feedback")
-        pipeline_feedback_map = pipeline_feedback if isinstance(pipeline_feedback, Mapping) else None
-        if pipeline_feedback_map is None and isinstance(metrics_map.get("pipeline_feedback"), Mapping):
-            pipeline_feedback_map = metrics_map.get("pipeline_feedback")  # type: ignore[assignment]
-        if pipeline_feedback_map is None and getattr(self.model, "current_repair_outcome", None):
-            maybe_outcome = getattr(self.model, "current_repair_outcome", None)
-            if maybe_outcome and isinstance(maybe_outcome.metadata.get("pipeline_feedback"), Mapping):
-                pipeline_feedback_map = maybe_outcome.metadata.get("pipeline_feedback")  # type: ignore[assignment]
-        if pipeline_feedback_map is None and getattr(self.context, "last_classified", None):
-            if isinstance(self.context.last_classified, Mapping):
-                pipeline_feedback_map = self.context.last_classified  # type: ignore[assignment]
-        repair_attempts_val = metadata.get("repair_attempts")
-        max_repairs_val = metadata.get("max_policy_repairs")
-        error_val = metadata.get("error")
-        writer_err_val = metadata.get("writer_error")
-        if writer_err_val is None and getattr(self.model, "current_repair_outcome", None):
-            writer_err_val = getattr(self.model.current_repair_outcome, "metadata", {}).get("writer_error")  # type: ignore[index]
-        if writer_err_val is None and isinstance(metrics_map.get("writer_error"), str):
-            writer_err_val = metrics_map.get("writer_error")
-        failed_step_val = metadata.get("failed_step")
-        failed_exit_code_val = metadata.get("failed_exit_code")
-        failed_summary_val = metadata.get("failed_summary")
+        pipeline_feedback = (
+            repair_outcome.pipeline_feedback if repair_outcome else self.context.last_classified
+        )
+        repair_attempts_val = (
+            repair_outcome.repair_attempts_reported if repair_outcome else None
+        )
+        max_repairs_val = (
+            repair_outcome.max_policy_repairs if repair_outcome else self.max_policy_repairs
+        )
+        error_val = repair_outcome.error if repair_outcome else None
+        writer_err_val = repair_outcome.writer_error if repair_outcome else None
         record = IterationRecord(
             iteration=iteration,
             metrics=metrics_map,
             pipeline_passed=repair_outcome.success
             if repair_outcome and isinstance(repair_outcome.success, bool)
             else None,
-            pipeline_feedback=pipeline_feedback_map,
+            pipeline_feedback=pipeline_feedback,
             repair_attempts=repair_attempts_val
             if isinstance(repair_attempts_val, int)
             else (repair_outcome.attempts_used if repair_outcome else None),
-            max_policy_repairs=max_repairs_val
-            if isinstance(max_repairs_val, int)
-            else self.max_policy_repairs,
+            max_policy_repairs=max_repairs_val if isinstance(max_repairs_val, int) else self.max_policy_repairs,
             error=error_val if isinstance(error_val, str) else None,
             writer_error=writer_err_val if isinstance(writer_err_val, str) else None,
-            failed_step=str(failed_step_val) if isinstance(failed_step_val, str) else None,
-            failed_exit_code=int(failed_exit_code_val) if isinstance(failed_exit_code_val, int) else None,
-            failed_summary=str(failed_summary_val)
-            if isinstance(failed_summary_val, str)
-            else None,
+            failed_step=repair_outcome.failed_step if repair_outcome else None,
+            failed_exit_code=repair_outcome.failed_exit_code if repair_outcome else None,
+            failed_summary=repair_outcome.failed_summary if repair_outcome else None,
         )
         failed_step = (
             self._first_failed_step(repair_outcome.pipeline_results)
@@ -427,14 +425,10 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             record.failed_exit_code = failed_step.exit_code
             record.failed_summary = failed_step.stderr or failed_step.stdout
         if repair_outcome and repair_outcome.success:
-            source_val = metadata.get("accepted_policy_source")
-            changed_val = metadata.get("accepted_policy_changed_by_pipeline")
             record.accepted_policy = AcceptedPolicy(
                 code=repair_outcome.policy,
-                source=source_val if isinstance(source_val, str) else None,
-                changed_by_pipeline=changed_val
-                if isinstance(changed_val, bool)
-                else None,
+                source=repair_outcome.accepted_policy_source,
+                changed_by_pipeline=repair_outcome.accepted_policy_changed_by_pipeline,
                 repair_attempts=record.repair_attempts or repair_outcome.attempts_used,
                 max_policy_repairs=record.max_policy_repairs or self.max_policy_repairs,
             )
@@ -452,17 +446,16 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         outcome = getattr(self.model, "current_repair_outcome", None)
         if outcome and pipeline_val is False:
             if getattr(outcome, "pipeline_results", None):
-                classified = self.deps.classify_results(outcome.pipeline_results)
-                if isinstance(classified, Mapping):
-                    record.pipeline_feedback = record.pipeline_feedback or classified
+                classified = outcome.pipeline_feedback or self.deps.classify_results(outcome.pipeline_results)
+                record.pipeline_feedback = record.pipeline_feedback or classified
                 failed_step = self._first_failed_step(outcome.pipeline_results)
                 if failed_step:
                     record.failed_step = record.failed_step or failed_step.name
                     record.failed_exit_code = record.failed_exit_code or failed_step.exit_code
                     record.failed_summary = record.failed_summary or failed_step.stderr or failed_step.stdout
         if pipeline_val is False:
-            classified = self.deps.classify_results(getattr(outcome, "pipeline_results", []) if outcome else [])
-            if isinstance(classified, Mapping):
+            if outcome and getattr(outcome, "pipeline_results", None):
+                classified = outcome.pipeline_feedback or self.deps.classify_results(outcome.pipeline_results)
                 record.pipeline_feedback = classified
             if record.failed_step is None:
                 if outcome and getattr(outcome, "pipeline_results", None):
@@ -473,22 +466,11 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
                         record.failed_summary = failed_step.stderr or failed_step.stdout
                 if record.failed_step is None:
                     record.failed_step = "pipeline_failed"
-        if record.pipeline_feedback is None and outcome:
-            meta_pf = getattr(outcome, "metadata", {}).get("pipeline_feedback", None)  # type: ignore[index]
-            if isinstance(meta_pf, Mapping):
-                record.pipeline_feedback = meta_pf
-            elif getattr(outcome, "pipeline_results", None):
-                classified = self.deps.classify_results(outcome.pipeline_results)
-                if isinstance(classified, Mapping):
-                    record.pipeline_feedback = classified
         if record.pipeline_feedback is None and outcome and getattr(outcome, "pipeline_results", None):
-            classified = self.deps.classify_results(outcome.pipeline_results)
-            if isinstance(classified, Mapping):
-                record.pipeline_feedback = classified
+            record.pipeline_feedback = self.deps.classify_results(outcome.pipeline_results)
         if record.writer_error is None and outcome:
-            meta_writer_err = getattr(outcome, "metadata", {}).get("writer_error", None)  # type: ignore[index]
-            if isinstance(meta_writer_err, str):
-                record.writer_error = meta_writer_err
+            if isinstance(outcome.writer_error, str):
+                record.writer_error = outcome.writer_error
             elif getattr(outcome, "success", None) is False:
                 record.writer_error = "writer_failed"
         self.context.history.append(record)

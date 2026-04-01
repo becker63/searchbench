@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Set
+from typing import Dict, Set, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from harness.pipeline.types import PipelineClassification
 
 
 @dataclass
@@ -12,13 +15,24 @@ class DiffSummary:
     regression: bool
 
 
-def extract_failure_keys(classified: Dict[str, object]) -> Set[str]:
+def extract_failure_keys(classified: Dict[str, object] | object) -> Set[str]:
+    if hasattr(classified, "type_errors"):
+        type_err = getattr(classified, "type_errors", "")
+        lint_err = getattr(classified, "lint_errors", "")
+        test_err = getattr(classified, "test_failures", "")
+    elif isinstance(classified, dict):
+        type_err = classified.get("type_errors")
+        lint_err = classified.get("lint_errors")
+        test_err = classified.get("test_failures")
+    else:
+        type_err = lint_err = test_err = ""
+
     keys: Set[str] = set()
-    if isinstance(classified.get("type_errors"), str) and classified["type_errors"]:
+    if isinstance(type_err, str) and type_err:
         keys.add("type")
-    if isinstance(classified.get("lint_errors"), str) and classified["lint_errors"]:
+    if isinstance(lint_err, str) and lint_err:
         keys.add("lint")
-    if isinstance(classified.get("test_failures"), str) and classified["test_failures"]:
+    if isinstance(test_err, str) and test_err:
         keys.add("tests")
     return keys
 
@@ -26,8 +40,8 @@ def extract_failure_keys(classified: Dict[str, object]) -> Set[str]:
 def compute_diff(
     prev_score: float,
     curr_score: float,
-    prev_classified: Dict[str, object],
-    curr_classified: Dict[str, object],
+    prev_classified: Dict[str, object] | object,
+    curr_classified: Dict[str, object] | object,
 ) -> DiffSummary:
     prev_keys = extract_failure_keys(prev_classified)
     curr_keys = extract_failure_keys(curr_classified)

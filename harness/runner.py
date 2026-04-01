@@ -11,6 +11,7 @@ from .tools.backends.jc_backend import JCodeMunchBackend
 from .tools.mcp_adapter import serialize_tool_result_for_model
 from .utils.env import get_cerebras_api_key, get_runner_model
 from .utils.openai_schema import OpenAITool, build_tool_response, validate_tools
+from .utils.prompt_models import SystemPromptContext
 from .utils.template_loader import render_prompt_template
 
 _MAX_TOTAL_MESSAGE_CHARS = 24000
@@ -165,13 +166,15 @@ def _truncate_for_metadata(payload: object, limit: int = 2000) -> object:
 
 def _build_ic_system_prompt(tool_specs: list[OpenAITool]) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
-    return render_prompt_template("ic_system.jinja", {"available_tools": _format_available_tools(tool_names)})
+    context = SystemPromptContext(available_tools=_format_available_tools(tool_names))
+    return render_prompt_template("ic_system.jinja", context.model_dump())
 
 
 def _build_jc_system_prompt(tool_specs: list[OpenAITool]) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
     tools_section = _format_available_tools(tool_names)
-    return render_prompt_template("jc_system.jinja", {"available_tools": tools_section})
+    context = SystemPromptContext(available_tools=tools_section)
+    return render_prompt_template("jc_system.jinja", context.model_dump())
 
 
 def _make_client():

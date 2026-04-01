@@ -9,7 +9,7 @@ from .pipeline import (
     infer_action_hint,
 )
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
-from .types import StepResult
+from .types import StepResult, PipelineClassification
 
 __all__ = [
     "Pipeline",
@@ -19,6 +19,7 @@ __all__ = [
     "format_structured_feedback",
     "infer_action_hint",
     "StepResult",
+    "PipelineClassification",
     "RuffFixStep",
     "BasedPyrightStep",
     "PytestStep",
