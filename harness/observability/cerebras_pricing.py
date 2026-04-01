@@ -63,10 +63,11 @@ def cost_details_for_usage(model: str | None, usage_details: dict[str, object] |
     if not model or not usage_details:
         return None
     price_entry = None
-    for entry in CEREBRAS_PRICING:
-        import re
+    import re
 
-        if re.search(entry["match_pattern"], model, flags=re.IGNORECASE):
+    for entry in CEREBRAS_PRICING:
+        pattern = entry["match_pattern"]
+        if isinstance(pattern, str) and re.search(pattern, model, flags=re.IGNORECASE):
             price_entry = entry
             break
     if not price_entry:
@@ -114,15 +115,16 @@ def sync_cerebras_models(client: object | None = None) -> None:
         raise RuntimeError("Langfuse client does not expose api.models.list/delete; cannot upsert models.")
 
     # Upsert: fetch existing model ids by name, delete, then recreate with current patterns/prices.
-    existing_by_name: dict[str, str] = {}
+    existing_by_name: dict[str, str | None] = {}
     try:
         page = 1
         while True:
             res = list_fn(page=page, limit=100)
             for model in getattr(res, "data", []) or []:
-                name = getattr(model, "model_name", None)
-                if isinstance(name, str):
-                    existing_by_name[name] = getattr(model, "id", None)
+                name_val = getattr(model, "model_name", None)
+                model_id_val = getattr(model, "id", None)
+                if isinstance(name_val, str):
+                    existing_by_name[name_val] = str(model_id_val) if model_id_val is not None else None
             meta = getattr(res, "meta", None)
             if not meta or getattr(meta, "page", 1) >= getattr(meta, "total_pages", 1):
                 break
@@ -131,11 +133,12 @@ def sync_cerebras_models(client: object | None = None) -> None:
         existing_by_name = {}
 
     for model_def in pricing_payload():
-        name = model_def["model_name"]
+        name_val = model_def.get("model_name")
+        name = str(name_val) if name_val is not None else ""
         existing_id = existing_by_name.get(name)
         if existing_id:
             try:
-                delete_fn(id=existing_id)
+                delete_fn(id=str(existing_id))
             except Exception:
                 # best-effort; continue to create if delete fails
                 pass

@@ -15,7 +15,7 @@ from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from .prompts import WriterPromptContext
 from .utils.template_loader import render_prompt_template
-from .runner import _usage_from_response  # reuse usage mapping for OpenAI-style responses
+from .runner import _usage_from_response  # reuse usage mapping for OpenAI-style responses  # pyright: ignore[reportPrivateUsage]
 
 _client: Any | None = None
 _WRITER_TEMPLATE = "policy_writer.jinja"

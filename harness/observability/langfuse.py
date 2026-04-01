@@ -110,8 +110,8 @@ def start_root_observation(
     """
     Start a root observation as the current observation.
     """
-    client = get_langfuse_client()
-    with client.start_as_current_observation(
+    client_any: Any = get_langfuse_client()
+    with client_any.start_as_current_observation(
         as_type=as_type,
         name=name,
         input=input,
