@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-from typing import Mapping
 
 # Ensure the repository root (parent of the harness package) is on sys.path when executed as a script.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -24,14 +23,15 @@ from harness.loop import (
     RepairContext,
     RepairMachineModel,
 )
+from harness.loop.loop_types import TaskPayload
 from harness.pipeline.types import PipelineClassification, StepResult
 
 
 def _stub_deps() -> LoopDependencies:
     """Minimal dependency set for chart rendering (no side effects)."""
 
-    def _prepare(task: Mapping[str, object], trace: object | None = None) -> PreparedTasks:
-        return PreparedTasks(base_task=dict(task), resolved_repo_path=None, jc_repo_id=None)
+    def _prepare(task: TaskPayload, trace: object | None = None) -> PreparedTasks:
+        return PreparedTasks(base_task=task, resolved_repo_path=task.repo, jc_repo_id=None)
 
     dummy_eval = EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="")
     dummy_feedback = FeedbackPackage(
@@ -54,7 +54,7 @@ def _stub_deps() -> LoopDependencies:
     def _attempt_policy_generation(**kwargs: object) -> tuple[str | None, str | None]:
         return ("policy", None)
 
-    def _run_policy_pipeline(pipeline: object, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
+    def _run_policy_pipeline(pipeline: object, repo_root: Path, repair_obs: object | None = None, allow_no_parent: bool = False) -> tuple[list[StepResult], bool]:
         return ([StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")], True)
 
     def _finalize_successful_policy(**kwargs: object) -> tuple[str, AcceptedPolicyMeta]:
@@ -121,7 +121,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
     repair_chart = RepairStateMachine(repair_model)
 
-    loop_ctx = LoopContext(task={}, iterations=1, baseline_snapshot=None, run_trace=None)
+    loop_ctx = LoopContext(task=TaskPayload(symbol="dummy", repo="repo"), iterations=1, baseline_snapshot=None, run_trace=None)
     opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
     opt_chart = OptimizationStateMachine(opt_model)
     return repair_chart, opt_chart

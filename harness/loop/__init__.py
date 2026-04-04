@@ -24,8 +24,8 @@ from .loop import (  # noqa: E402
     emit_score_for_handle,
     load_policy,
     run_policy_pipeline,
-    run_ic_iteration,
 )
+from .runner_agent import run_ic_iteration
 from .loop_machine import OptimizationStateMachine, RepairStateMachine
 from .loop_types import (
     AcceptedPolicy,

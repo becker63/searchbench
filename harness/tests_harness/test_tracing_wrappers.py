@@ -3,9 +3,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 import pytest
 
-from harness import runner, writer
-
-ORIGINAL_USAGE_FROM_RESPONSE = runner._usage_from_response
+from harness.loop import runner_agent as runner
+from harness.loop import agent_common
+from harness import writer
 
 
 class DummySpan:
@@ -13,6 +13,15 @@ class DummySpan:
         self.name = name
         self.ended: list[dict[str, object]] = []
         self.scores: list[tuple[str, float]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def start_observation(self, **kwargs):
+        return self
 
     def end(self, **kwargs):
         self.ended.append(kwargs)
@@ -43,7 +52,8 @@ def test_run_ic_iteration_emits_scores(monkeypatch):
         lambda repo, score_fn: type("B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}})(),
     )
 
-    result = runner.run_ic_iteration({"symbol": "s", "repo": "r"}, score_fn=lambda n, s, c=None: 1.0, steps=1)
+    parent = object()
+    result = runner.run_ic_iteration({"symbol": "s", "repo": "r"}, score_fn=lambda n, s, c=None: 1.0, steps=1, parent_trace=parent)
     assert result["node_count"] == 2
     assert ("ic.node_count", 2.0) in scores
 
@@ -111,7 +121,7 @@ def test_writer_records_policy_events(monkeypatch):
         diff_str="",
         diff_hint="",
         comparison_summary="IC vs JC summary",
-        parent_trace=None,
+        parent_trace=DummySpan("parent"),
     )
     assert "def score" in result
     assert ("writer.policy_compiled", 1.0) in attempt_scores
@@ -277,7 +287,7 @@ def test_run_agent_truncates_tool_content(monkeypatch):
         tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
         dispatch_tool_call=lambda *a, **k: long_result,
         system_prompt="sys",
-        parent_trace=None,
+        parent_trace=object(),
         backend_name="test",
     )
     assert observations["observations"]
@@ -335,8 +345,8 @@ def test_run_agent_retries_on_context_error(monkeypatch):
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
     patched_usage = lambda resp: {"input": 1, "output": 1, "total": 2}
-    monkeypatch.setattr(runner, "_usage_from_response", patched_usage)
-    monkeypatch.setitem(runner.run_agent.__globals__, "_usage_from_response", patched_usage)
+    monkeypatch.setattr(agent_common, "usage_from_response", patched_usage)
+    monkeypatch.setitem(runner.run_agent.__globals__, "usage_from_response", patched_usage)
     @contextmanager
     def span_cm():
         yield type("S", (), {"id": "span", "end": lambda self, **kw: None, "update": lambda self, **kw: None})()
@@ -348,7 +358,7 @@ def test_run_agent_retries_on_context_error(monkeypatch):
         tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
         dispatch_tool_call=lambda *a, **k: {},
         system_prompt="sys",
-        parent_trace=None,
+        parent_trace=object(),
         backend_name="test",
     )
     assert len(completions.calls) == 2
@@ -366,7 +376,7 @@ def test_usage_from_response_maps_openai_fields():
     class DummyResponse:
         usage = DummyUsage()
 
-    mapped = ORIGINAL_USAGE_FROM_RESPONSE(DummyResponse())
+    mapped = agent_common.usage_from_response(DummyResponse())
     assert mapped is not None
     assert mapped["input"] == 10
     assert mapped["output"] == 5
@@ -399,7 +409,8 @@ def test_run_agent_requires_usage(monkeypatch):
             self.chat = type("Chat", (), {"completions": DummyCompletions()})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
-    monkeypatch.setattr(runner, "_usage_from_response", lambda resp: None)
+    monkeypatch.setattr(agent_common, "usage_from_response", lambda resp: None)
+    monkeypatch.setitem(runner.run_agent.__globals__, "usage_from_response", lambda resp: None)
 
     @contextmanager
     def span_cm():
@@ -414,6 +425,6 @@ def test_run_agent_requires_usage(monkeypatch):
             tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
             dispatch_tool_call=lambda *a, **k: {},
             system_prompt="sys",
-            parent_trace=None,
+            parent_trace=object(),
             backend_name="test",
         )

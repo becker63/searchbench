@@ -6,7 +6,7 @@ No session creation; reacts to machine events only.
 """
 
 import json
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 from statemachine import State
 
@@ -20,7 +20,12 @@ def _safe_end_span(span: object | None, **kwargs: object) -> None:
     if span is None or not hasattr(span, "end"):
         return
     try:
-        cast(Any, span).end(**kwargs)
+        end_kwargs: dict[str, object] = {}
+        metadata = kwargs.pop("metadata", None)
+        if isinstance(metadata, Mapping):
+            end_kwargs.update(dict(metadata))
+        end_kwargs.update(kwargs)
+        cast(Any, span).end(**end_kwargs)
     except Exception:
         pass
 
@@ -157,7 +162,7 @@ class OptimizationTracingListener:
                 data_type="BOOLEAN",
                 comment=comment,
             )
-        for key in ("score", "coverage_delta", "tool_error_rate"):
+        for key in ("score",):
             value = record.metrics.get(key)
             if isinstance(value, (int, float, bool)):
                 emit_score_for_handle(

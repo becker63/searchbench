@@ -9,11 +9,14 @@ import argparse
 from pathlib import Path
 from typing import Any, Mapping
 
-from harness.entrypoints import (
+from harness.observability.requests import (
     AdHocOptimizationRequest,
     HostedICOptimizationRequest,
     HostedJCBaselineRequest,
 )
+from harness.localization.eval import build_file_localization_eval_record
+from harness.localization.materializer import RepoMaterializationRequest
+from harness.localization.models import LCATaskIdentity, LCAPrediction, LCAGold
 from harness.loop import IterationRecord, run_loop
 from harness.observability.baselines import BaselineBundle, load_baseline_bundle, save_baseline_bundle
 from harness.observability.experiments import (
@@ -38,6 +41,18 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Searchbench Langfuse-first runner")
     parser.add_argument("--dataset", help="Langfuse dataset name")
     parser.add_argument("--version", help="Langfuse dataset version")
+    parser.add_argument(
+        "--mode",
+        choices=["adhoc", "jc-baseline", "ic-optimize", "lca-bug-localization"],
+        help="Runner mode",
+    )
+    parser.add_argument("--lca-config", help="LCA dataset config (py/java/kt)")
+    parser.add_argument("--lca-split", help="LCA dataset split (dev/train/test)")
+    parser.add_argument("--repo-owner", help="Repository owner for LCA eval")
+    parser.add_argument("--repo-name", help="Repository name for LCA eval")
+    parser.add_argument("--base-sha", help="Base SHA (bug-reproducible snapshot) for LCA eval")
+    parser.add_argument("--issue-url", help="Issue URL for LCA eval")
+    parser.add_argument("--pull-url", help="Pull URL for LCA eval")
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--jc-baseline", action="store_true", help="Run JC baseline experiment (hosted dataset)")
     parser.add_argument("--ic-optimize", action="store_true", help="Run IC optimization experiment (hosted dataset)")
@@ -59,6 +74,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     try:
+        mode = args.mode
         if args.dataset and args.jc_baseline:
             print(f"[RUN] Hosted JC baseline experiment: {args.dataset}")
             scope = args.session_scope or "item"
@@ -94,6 +110,8 @@ def main(argv: list[str] | None = None) -> None:
             )
             results = run_hosted_ic_optimization_experiment(ic_req)
             print(f"[RUN] Optimization items completed: {len(results)}")
+        elif mode == "lca-bug-localization":
+            _run_lca_stub(args)
         else:
             repo_ref = args.repo or "small"
             resolved_repo = resolve_repo_target(repo_ref)
@@ -133,6 +151,60 @@ def main(argv: list[str] | None = None) -> None:
                     print(f"[RUN] Last error: {last_error}")
     finally:
         flush_langfuse()
+
+
+def _run_lca_stub(args: argparse.Namespace) -> None:
+    """
+    Phase-1 stub for LCA bug localization mode.
+    No dataset loading or repo materialization is performed.
+    Emits user-visible logs for repo preparation steps.
+    """
+    dataset = args.dataset or "unspecified-dataset"
+    config = args.lca_config or "unspecified-config"
+    split = args.lca_split or "unspecified-split"
+    repo_owner = args.repo_owner or "unknown-owner"
+    repo_name = args.repo_name or "unknown-repo"
+    base_sha = args.base_sha or "unknown-base-sha"
+    issue_url = args.issue_url
+    pull_url = args.pull_url
+
+    print("[LCA] Starting LCA bug-localization (stub mode, no execution)")
+    print(f"[LCA] Dataset: name={dataset}, config={config}, split={split}")
+    print(f"[LCA] Repo: {repo_owner}/{repo_name} @ base_sha={base_sha}")
+
+    materialize_req = RepoMaterializationRequest(
+        dataset_name=dataset,
+        dataset_config=config,
+        dataset_split=split,
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        base_sha=base_sha,
+    )
+
+    # User-visible repo prep logs (stub; no fetch/extract/checkout performed)
+    print("[LCA][repo] resolve repo target")
+    print("[LCA][repo] cache lookup: not attempted (phase 1 stub)")
+    print("[LCA][repo] download/fetch: not attempted (phase 1 stub)")
+    print("[LCA][repo] extract/materialize: not attempted (phase 1 stub)")
+    print("[LCA][repo] checkout base_sha: not attempted (phase 1 stub)")
+    print("[LCA][repo] ready path: not available (phase 1 stub)")
+
+    # Build identity and a placeholder eval record to show contract; no scoring executed.
+    identity = LCATaskIdentity(
+        dataset_name=materialize_req.dataset_name,
+        dataset_config=materialize_req.dataset_config,
+        dataset_split=materialize_req.dataset_split,
+        repo_owner=materialize_req.repo_owner,
+        repo_name=materialize_req.repo_name,
+        base_sha=materialize_req.base_sha,
+        issue_url=issue_url,
+        pull_url=pull_url,
+    )
+    placeholder_pred = LCAPrediction(predicted_files=[])
+    placeholder_gold = LCAGold(changed_files=[])
+    record = build_file_localization_eval_record(identity, placeholder_pred, placeholder_gold, evidence=None, repo_path=None)
+    print("[LCA] Canonical eval record shape (stub, empty data):")
+    print(record)
 
 
 if __name__ == "__main__":

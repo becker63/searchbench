@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from harness.observability import baselines, experiments
-from harness.observability.runner_integration import HostedRunItemResult, HostedRunResult
-from harness import loop, runner
+from harness.observability.experiments import HostedRunItemResult, HostedRunResult
+from harness import loop
+from harness.loop import runner_agent as runner
 from harness.loop import IterationRecord
 
 
@@ -22,6 +23,15 @@ def test_baseline_resolves_repo(monkeypatch, tmp_path):
     class Span:
         id = "span"
 
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def start_observation(self, **kwargs):
+            return self
+
         def end(self, **kwargs):
             pass
 
@@ -29,6 +39,7 @@ def test_baseline_resolves_repo(monkeypatch, tmp_path):
             pass
 
     monkeypatch.setattr(baselines, "start_observation", lambda *a, **k: Span())
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: Span())
     snap = baselines.compute_baseline_for_item(
         baselines.normalize_dataset_item({"id": "item1", "repo": "small", "symbol": "s", "metadata": {}})
     )

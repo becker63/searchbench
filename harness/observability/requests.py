@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from .observability.baselines import BaselineBundle
-from .observability.session_policy import SessionConfig
+from .baselines import BaselineBundle
+from .session_policy import SessionConfig
 
 
 class AdHocOptimizationRequest(BaseModel):

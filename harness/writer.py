@@ -15,7 +15,7 @@ from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from .prompts import WriterPromptContext
 from .utils.template_loader import render_prompt_template
-from .runner import _usage_from_response  # reuse usage mapping for OpenAI-style responses  # pyright: ignore[reportPrivateUsage]
+from .loop.agent_common import usage_from_response  # reuse usage mapping for OpenAI-style responses  # pyright: ignore[reportPrivateUsage]
 
 _client: Any | None = None
 _WRITER_TEMPLATE = "policy_writer.jinja"
@@ -29,6 +29,21 @@ def _get_client():
             raise RuntimeError("Missing CEREBRAS_API_KEY in environment")
         _client = get_tracing_openai_client(base_url="https://api.cerebras.ai/v1", api_key=api_key)
     return _client, get_writer_model()
+
+
+def _require_parent(parent_trace: object | None) -> object:
+    if parent_trace is None:
+        raise RuntimeError("Parent span required for writer tracing")
+    return parent_trace
+
+
+def _safe_update(span: object | None, **kwargs: object) -> None:
+    updater = getattr(span, "update", None)
+    if callable(updater):
+        try:
+            updater(**kwargs)
+        except Exception:
+            pass
 
 
 def _extract_policy_code(response: Any) -> str:
@@ -142,6 +157,7 @@ def generate_policy(
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
+    parent_span = _require_parent(parent_trace)
     client, model = _get_client()
     if client is None or not hasattr(client, "chat"):
         raise RuntimeError("Writer client is not available")
@@ -165,7 +181,7 @@ def generate_policy(
     )
     with start_observation(
         name="policy_writer",
-        parent=parent_trace,
+        parent=parent_span,
         metadata={"model": model},
     ) as writer_obs:
         response = None
@@ -210,23 +226,28 @@ def generate_policy(
                         ],
                     )
                     latency_ms = (time.perf_counter() - start_time) * 1000
-                    usage_details = _usage_from_response(response)
+                    usage_details = usage_from_response(response)
                     if usage_details is None:
                         raise RuntimeError("Cerebras response missing usage; provide usage_details explicitly or enable provider usage output.")
                     from .observability.cerebras_pricing import cost_details_for_usage
 
                     cost_details = cost_details_for_usage(model, usage_details) if usage_details else None
-                    attempt_obs.update(
+                    _safe_update(
+                        attempt_obs,
                         metadata={"model": model, "attempt": attempt, "latency_ms": latency_ms},
                         usage_details=usage_details,
                         cost_details=cost_details,
                     )
                     break
                 except Exception as e:  # noqa: BLE001
-                    attempt_obs.end(error=e)
+                    end_fn = getattr(attempt_obs, "end", None)
+                    if callable(end_fn):
+                        end_fn(error=e)
                     time.sleep(2 * (attempt + 1))
         else:
-            writer_obs.end(error="writer_failed")
+            end_fn = getattr(writer_obs, "end", None)
+            if callable(end_fn):
+                end_fn(error="writer_failed")
             raise RuntimeError("Writer failed after retries")
 
         try:
@@ -249,5 +270,5 @@ def generate_policy(
             data_type="BOOLEAN",
             comment=json.dumps({"model": model}),
         )
-        writer_obs.update(metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
+        _safe_update(writer_obs, metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
         return code

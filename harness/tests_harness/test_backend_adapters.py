@@ -9,7 +9,7 @@ from typing import Any, cast
 import pytest
 from mcp.types import TextContent, Tool
 
-from harness import runner
+from harness.loop import runner_agent as runner
 from harness.tools.backends.ic_backend import IterativeContextBackend
 from harness.tools.backends.jc_backend import JCodeMunchBackend
 from harness.tools.mcp_adapter import (
@@ -244,7 +244,15 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
-    result = cast(dict[str, Any], runner.run_ic_iteration({"symbol": "s", "repo": str(tmp_path)}, score_fn=lambda n, s: 1.0, steps=1))
+    result = cast(
+        dict[str, Any],
+        runner.run_ic_iteration(
+            {"symbol": "s", "repo": str(tmp_path)},
+            score_fn=lambda n, s: 1.0,
+            steps=1,
+            parent_trace=object(),
+        ),
+    )
     assert result["node_count"] == 2
     first_obs = cast(dict[str, Any], result["observations"][0])
     payload = cast(dict[str, Any], first_obs["result"])
@@ -287,7 +295,14 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
-    result = cast(dict[str, Any], runner.run_jc_iteration({"symbol": "s", "repo": str(tmp_path)}, steps=1))
+    result = cast(
+        dict[str, Any],
+        runner.run_jc_iteration(
+            {"symbol": "s", "repo": str(tmp_path)},
+            steps=1,
+            parent_trace=object(),
+        ),
+    )
     assert result["node_count"] == 0
     first_obs = cast(dict[str, Any], result["observations"][0])
     assert first_obs["result"] == {"called": "search_symbols", "args": {"query": "foo"}}

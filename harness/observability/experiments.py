@@ -5,11 +5,11 @@ Application/experiment boundary: hosted JC baseline and IC optimization wrappers
 Accept normalized inputs or typed requests; do not embed CLI or leaf logic.
 """
 
-from typing import Mapping, Sequence
+import time
+from typing import Any, Callable, Mapping, Sequence, cast
 
-from ..entrypoints import HostedICOptimizationRequest, HostedJCBaselineRequest
+from .requests import HostedICOptimizationRequest, HostedJCBaselineRequest
 from ..loop import iteration_record_to_public_dict, run_loop
-from ..scorer import score
 from ..utils.repo_targets import resolve_repo_target
 from .baselines import (
     BaselineBundle,
@@ -22,9 +22,86 @@ from .baselines import (
 )
 from .datasets import DatasetItem, fetch_dataset_items, normalize_dataset_item
 from .langfuse import flush_langfuse, propagate_context
-from .runner_integration import HostedRunResult, run_hosted_dataset_experiment
-from .score_emitter import emit_score_for_handle
+from .langfuse import get_langfuse_client
+from pydantic import BaseModel, Field
 from .session_policy import SessionConfig, resolve_session_id
+
+
+class HostedRunItemResult(BaseModel):
+    item: Mapping[str, object]
+    output: Mapping[str, object] | dict[str, object] | None = None
+    trace_id: str | None = None
+
+
+class HostedRunResult(BaseModel):
+    run_id: str | None = None
+    run_name: str | None = None
+    dataset_name: str | None = None
+    dataset_version: str | None = None
+    items: list[HostedRunItemResult] = Field(default_factory=list)
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+def _normalize_items(raw_items: Any) -> list[HostedRunItemResult]:
+    normalized: list[HostedRunItemResult] = []
+    if not isinstance(raw_items, list):
+        return normalized
+    for entry in raw_items:
+        if isinstance(entry, Mapping):
+            item = cast(Mapping[str, object], entry.get("item") or entry.get("input") or {})
+            output = cast(Mapping[str, object] | dict[str, object] | None, entry.get("output") or entry.get("result"))
+            trace_id = cast(str | None, entry.get("trace_id") or entry.get("traceId") or entry.get("id"))
+            normalized.append(HostedRunItemResult(item=item, output=output, trace_id=trace_id))
+        else:
+            try:
+                item_val = cast(Mapping[str, object], getattr(entry, "item", {}) or getattr(entry, "input", {}) or {})
+                output_val = cast(Mapping[str, object] | dict[str, object] | None, getattr(entry, "output", None) or getattr(entry, "result", None))
+                trace_val = cast(str | None, getattr(entry, "trace_id", None) or getattr(entry, "traceId", None) or getattr(entry, "id", None))
+                normalized.append(HostedRunItemResult(item=item_val, output=output_val, trace_id=trace_val))
+            except Exception:
+                continue
+    return normalized
+
+
+def run_hosted_dataset_experiment(
+    dataset_name: str,
+    dataset_version: str | None,
+    experiment_name: str,
+    task_fn: Callable[[Mapping[str, object], object | None], Mapping[str, object] | dict[str, object]],
+    evaluators: list[object] | None = None,
+    run_evaluators: list[object] | None = None,
+    metadata: Mapping[str, object] | None = None,
+    max_concurrency: int | None = None,
+) -> HostedRunResult:
+    client = get_langfuse_client()
+    run_name = f"{experiment_name}-{int(time.time())}"
+    client_any = cast(Any, client)
+    dataset = client_any.get_dataset(name=dataset_name, version=dataset_version)
+    run_kwargs: dict[str, Any] = {
+        "name": experiment_name,
+        "run_name": run_name,
+        "task": task_fn,
+        "metadata": dict(metadata) if metadata else None,
+    }
+    if evaluators is not None:
+        run_kwargs["evaluators"] = evaluators
+    if run_evaluators is not None:
+        run_kwargs["run_evaluators"] = run_evaluators
+    if max_concurrency is not None:
+        run_kwargs["max_concurrency"] = max_concurrency
+    result = cast(Any, dataset).run_experiment(**run_kwargs)
+    run_id = cast(str | None, getattr(result, "id", None) or getattr(result, "run_id", None))
+    items_raw = getattr(result, "items", None) or getattr(result, "item_results", None)
+    hosted_result = HostedRunResult(
+        run_id=run_id,
+        run_name=run_name,
+        dataset_name=dataset_name,
+        dataset_version=dataset_version,
+        items=_normalize_items(items_raw),
+        metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})},
+    )
+    flush_langfuse()
+    return hosted_result
 
 
 def _build_bundle_from_hosted(
@@ -137,21 +214,7 @@ def _run_ic_optimizations(
                 baseline_snapshot=baseline,
                 session_id=resolved_session,
             )
-        last_record = history[-1] if history else None
-        last_dict: Mapping[str, object] = (
-            iteration_record_to_public_dict(last_record) if last_record else {}
-        )
-        metrics = score(
-            {"iterative_context": last_dict, "jcodemunch": baseline.jc_result}
-        )
-        for name, value in metrics.items():
-            if isinstance(value, (int, float, bool)):
-                emit_score_for_handle(
-                    parent_trace,
-                    name=f"ic_opt.{name}",
-                    value=float(value),
-                    data_type="BOOLEAN" if isinstance(value, bool) else "NUMERIC",
-                )
+        metrics: Mapping[str, object] = {}
         history_dicts = [iteration_record_to_public_dict(r) for r in history]
         return {
             "item": normalized_item.model_dump(),

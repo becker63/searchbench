@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-import harness.runner as runner
+import harness.loop.runner_agent as runner
 import harness.writer as writer
 from harness.pipeline.types import StepResult
 from harness.prompts import SystemPromptContext, WriterPromptContext

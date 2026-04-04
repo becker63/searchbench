@@ -19,8 +19,10 @@ class Pipeline:
         self.steps: List[Step] = list(steps)
         self.fail_fast: bool = fail_fast
 
-    def run(self, repo_root: Path, observation: object | None = None) -> List[StepResult]:
+    def run(self, repo_root: Path, observation: object | None = None, allow_no_parent: bool = False) -> List[StepResult]:
         results: List[StepResult] = []
+        if observation is None and not allow_no_parent:
+            raise RuntimeError("Parent span required for pipeline tracing; provide observation or set allow_no_parent=True to disable tracing")
         for step in self.steps:
             with start_observation(
                 name=step.name,

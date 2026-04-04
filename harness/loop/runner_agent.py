@@ -1,0 +1,573 @@
+from __future__ import annotations
+
+"""
+Agent execution and backend orchestration for iterative-context and jcodemunch flows.
+Kept within the localization-first repo shape; no legacy top-level runner wrapper.
+"""
+
+import json
+from collections.abc import Mapping
+from typing import Any, Callable, cast
+
+from harness.observability.langfuse import get_tracing_openai_client, start_observation
+from harness.observability.score_emitter import emit_score_for_handle
+from harness.prompts import SystemPromptContext
+from harness.tools.backends.ic_backend import IterativeContextBackend
+from harness.tools.backends.jc_backend import JCodeMunchBackend
+from harness.tools.mcp_adapter import serialize_tool_result_for_model
+from harness.utils.env import get_cerebras_api_key, get_runner_model
+from harness.utils.openai_schema import OpenAITool, validate_tools
+from harness.utils.template_loader import render_prompt_template
+from pydantic import BaseModel, Field
+
+from .agent_common import usage_from_response
+
+_MAX_TOTAL_MESSAGE_CHARS = 24000
+_MAX_TOOL_CONTENT_CHARS = 4000
+_MAX_SYSTEM_CHARS = 4000
+_MAX_USER_CHARS = 4000
+_HISTORY_LIMIT = 3
+_AGGRESSIVE_TOTAL_CHARS = 12000
+_AGGRESSIVE_TOOL_CONTENT_CHARS = 1200
+_AGGRESSIVE_SYSTEM_CHARS = 1500
+_AGGRESSIVE_USER_CHARS = 1500
+
+
+class AgentTask(BaseModel):
+    symbol: str
+    repo: str
+    symbol_id: str
+    raw_symbol: str
+    extra: dict[str, object] = Field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "symbol": self.symbol,
+            "repo": self.repo,
+            "symbol_id": self.symbol_id,
+            "raw_symbol": self.raw_symbol,
+        }
+        payload.update(self.extra)
+        return payload
+
+
+def _require_str(mapping: dict[str, Any], key: str) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"task must include a non-empty string for '{key}'")
+    return value
+
+
+def _require_parent(parent: object | None, owner: str = "runner agent") -> object:
+    if parent is None:
+        raise RuntimeError(f"Parent span required for {owner} tracing")
+    return parent
+
+
+def _tool_names_from_specs(tool_specs: list[OpenAITool]) -> list[str]:
+    names: list[str] = []
+    for spec in tool_specs:
+        func = spec.get("function") if isinstance(spec, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
+        name = func.get("name") if isinstance(func, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
+        if isinstance(name, str):
+            names.append(name)
+    return names
+
+
+def _format_available_tools(tool_names: list[str]) -> str:
+    if not tool_names:
+        return "- none"
+    return "\n".join(f"- {name}" for name in tool_names)
+
+
+def _truncate_text(text: str, max_length: int, keep_tail: int = 400) -> str:
+    if max_length <= 0:
+        return ""
+    if len(text) <= max_length:
+        return text
+    tail = min(keep_tail, max_length // 4)
+    head = max_length - tail - 24  # padding for marker
+    if head < 0:
+        head = max_length
+        tail = 0
+    truncated = text[:head]
+    suffix = text[-tail:] if tail > 0 else ""
+    removed = len(text) - len(truncated) - len(suffix)
+    marker = f"...[truncated {removed} chars]..."
+    return f"{truncated}{marker}{suffix}"[:max_length]
+
+
+def _compact_tool_content(result: Any, limit: int = _MAX_TOOL_CONTENT_CHARS) -> str:
+    serialized = serialize_tool_result_for_model(result)
+    if not isinstance(serialized, str):
+        serialized = str(serialized)
+    return _truncate_text(serialized, limit)
+
+
+def _message_content_length(msg: Mapping[str, object]) -> int:
+    content = msg.get("content")
+    try:
+        if isinstance(content, str):
+            return len(content)
+        return len(json.dumps(content))
+    except Exception:
+        return len(str(content))
+
+
+def _enforce_message_budget(
+    messages: list[dict[str, object]],
+    max_total_chars: int = _MAX_TOTAL_MESSAGE_CHARS,
+    max_tool_content: int = _MAX_TOOL_CONTENT_CHARS,
+    max_system_chars: int = _MAX_SYSTEM_CHARS,
+    max_user_chars: int = _MAX_USER_CHARS,
+    keep_last_n_tools: int = _HISTORY_LIMIT,
+) -> list[dict[str, object]]:
+    trimmed: list[dict[str, object]] = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        new_msg = dict(msg)
+        if isinstance(content, str):
+            if role == "system":
+                new_msg["content"] = _truncate_text(content, max_system_chars)
+            elif role == "user":
+                new_msg["content"] = _truncate_text(content, max_user_chars)
+            elif role == "tool":
+                new_msg["content"] = _truncate_text(content, max_tool_content)
+        trimmed.append(new_msg)
+
+    if len(trimmed) <= 2:
+        return trimmed
+
+    system_msg = trimmed[0]
+    user_msg = trimmed[1]
+    tool_msgs = trimmed[2:]
+    total_len = _message_content_length(system_msg) + _message_content_length(user_msg)
+
+    kept_tools: list[dict[str, object]] = []
+    for msg in reversed(tool_msgs):
+        if len(kept_tools) >= keep_last_n_tools:
+            break
+        kept_tools.append(msg)
+        total_len += _message_content_length(msg)
+        if total_len >= max_total_chars:
+            break
+
+    kept_tools.reverse()
+    compacted = [system_msg, user_msg] + kept_tools
+
+    total_len = sum(_message_content_length(m) for m in compacted)
+    if total_len > max_total_chars:
+        compacted[0]["content"] = _truncate_text(str(compacted[0].get("content", "")), max_system_chars // 2)
+        compacted[1]["content"] = _truncate_text(str(compacted[1].get("content", "")), max_user_chars // 2)
+        for idx, msg in enumerate(compacted[2:], start=2):
+            msg_content = str(msg.get("content", ""))
+            compacted[idx]["content"] = _truncate_text(msg_content, max_tool_content // 2)
+    return compacted
+
+
+def _aggressive_compact_messages(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+    return _enforce_message_budget(
+        messages,
+        max_total_chars=_AGGRESSIVE_TOTAL_CHARS,
+        max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS,
+        max_system_chars=_AGGRESSIVE_SYSTEM_CHARS,
+        max_user_chars=_AGGRESSIVE_USER_CHARS,
+        keep_last_n_tools=1,
+    )
+
+
+def _is_context_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if "context" in msg and "length" in msg:
+        return True
+    if "reduce the length" in msg or "too long" in msg:
+        return True
+    status = getattr(exc, "status_code", None)
+    return status == 400 and ("length" in msg or "context" in msg)
+
+
+def _truncate_for_metadata(payload: object, limit: int = 2000) -> object:
+    try:
+        serialized = json.dumps(payload)
+        if len(serialized) <= limit:
+            return payload
+        return f"{serialized[: limit - 4]}..."
+    except Exception:
+        text = str(payload)
+        return f"{text[: limit - 4]}..." if len(text) > limit else payload
+
+
+def _make_client(model_override: str | None = None) -> tuple[Any, str]:
+    api_key = get_cerebras_api_key()
+    if not api_key:
+        raise RuntimeError("CEREBRAS_API_KEY is required for runner agent client")
+    model_name = model_override or get_runner_model()
+    return get_tracing_openai_client(base_url="https://api.cerebras.ai/v1", api_key=api_key), model_name
+
+
+def _build_ic_system_prompt(tool_specs: list[OpenAITool], aggressive: bool = False) -> str:
+    tool_names = _tool_names_from_specs(tool_specs)
+    ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
+    return render_prompt_template("ic_system.jinja", ctx.model_dump())
+
+
+def _build_jc_system_prompt(tool_specs: list[OpenAITool]) -> str:
+    tool_names = _tool_names_from_specs(tool_specs)
+    ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
+    return render_prompt_template("jc_system.jinja", ctx.model_dump())
+
+
+def _build_model_messages(agent_task: dict[str, object], tool_specs: list[OpenAITool], system_prompt: str) -> list[dict[str, object]]:
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"Here is your task (model: {get_runner_model()}):\n{json.dumps(agent_task, indent=2)}",
+        },
+    ]
+    validate_tools(tool_specs)
+    return messages
+
+
+def _collect_tool_results(
+    observations: list[dict[str, object]],
+    dispatch_tool_call: Callable[[str, dict[str, Any]], object],
+    budget_limit: int,
+    parent_trace: object | None = None,
+) -> list[dict[str, object]]:
+    parent_span = _require_parent(parent_trace, owner="toolcall")
+    total_chars = sum(_message_content_length(obs) for obs in observations)
+    if total_chars > budget_limit:
+        observations = _aggressive_compact_messages(observations)
+    tool_calls = [obs["tool_call"] for obs in observations if isinstance(obs, Mapping) and "tool_call" in obs]
+    new_results = []
+    for call in tool_calls:
+        call_map: Mapping[str, object] | None = call if isinstance(call, Mapping) else None
+        if call_map is None:
+            func = getattr(call, "function", None)
+            name = getattr(func, "name", None) or getattr(call, "name", None)
+            arguments = getattr(func, "arguments", None) or getattr(call, "arguments", None)
+            call_map = {"name": name, "id": getattr(call, "id", None), "arguments": arguments} if name else None
+        if not isinstance(call_map, Mapping):
+            continue
+        name = call_map.get("name")
+        arguments = call_map.get("arguments")
+        if name:
+            arg_map = arguments if isinstance(arguments, dict) else {}
+            if isinstance(arguments, str):
+                try:
+                    loaded_args = json.loads(arguments)
+                    if isinstance(loaded_args, dict):
+                        arg_map = loaded_args
+                except Exception:
+                    pass
+            with start_observation(name=f"toolcall.{name}", parent=parent_span, metadata={"tool": name}) as tool_obs:
+                result = dispatch_tool_call(name, arg_map)
+                new_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_map.get("id"),
+                        "name": name,
+                        "content": _compact_tool_content(result),
+                        "result": result,
+                    }
+                )
+                tool_obs.update(output=_truncate_for_metadata(result))
+    return new_results
+
+
+def _make_retry_messages(agent_task: dict[str, object], observations: list[dict[str, object]], system_prompt: str, aggressive: bool) -> list[dict[str, object]]:
+    if aggressive:
+        return _aggressive_compact_messages(_build_model_messages(agent_task, [], system_prompt) + observations)
+    return _enforce_message_budget(_build_model_messages(agent_task, [], system_prompt) + observations)
+
+
+def _apply_tool_results(observations: list[dict[str, object]], tool_results: list[dict[str, object]], system_prompt: str) -> list[dict[str, object]]:
+    if not tool_results:
+        return observations
+    new_obs = []
+    for obs in observations:
+        new_obs.append(obs)
+        if obs.get("role") == "assistant" and obs.get("tool_calls"):
+            new_obs.extend(tool_results)
+    return _enforce_message_budget(
+        _build_model_messages({"placeholder": True}, [], system_prompt) + new_obs,
+        max_total_chars=_AGGRESSIVE_TOTAL_CHARS,
+        max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS,
+        max_system_chars=_AGGRESSIVE_SYSTEM_CHARS,
+        max_user_chars=_AGGRESSIVE_USER_CHARS,
+        keep_last_n_tools=1,
+    )
+
+
+def _collect_usage_details(response: Any) -> dict[str, object] | None:
+    usage_details = usage_from_response(response)
+    if not usage_details:
+        return None
+    model = getattr(response, "model", None)
+    if isinstance(model, str):
+        usage_details["model"] = model
+    return usage_details
+
+
+def run_agent(
+    agent_task: dict[str, object],
+    steps: int,
+    tool_specs: list[OpenAITool],
+    dispatch_tool_call: Callable[[str, dict[str, Any]], object],
+    system_prompt: str,
+    parent_trace: object | None = None,
+    backend_name: str | None = None,
+):
+    parent_span = _require_parent(parent_trace, owner=backend_name or "runner agent")
+    client, model = _make_client()
+    messages = _build_model_messages(agent_task, tool_specs, system_prompt)
+    observations: list[dict[str, object]] = []
+
+    for step in range(steps):
+        with start_observation(
+            name="agent_step",
+            parent=parent_span,
+            metadata={"step": step, "model": model, "backend": backend_name or "unknown"},
+        ) as obs:
+            tool_results = _collect_tool_results(
+                observations,
+                dispatch_tool_call=dispatch_tool_call,
+                budget_limit=_MAX_TOTAL_MESSAGE_CHARS,
+                parent_trace=obs,
+            )
+            if tool_results:
+                observations.extend(tool_results)
+            messages = _apply_tool_results(observations, tool_results, system_prompt)
+            try:
+                completion = client.chat.completions.create(
+                    messages=messages,
+                    model=model,
+                    temperature=0.2,
+                    tools=tool_specs,
+                    tool_choice="auto" if tool_specs else None,
+                    response_format={"type": "json_object"},
+                    extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not _is_context_error(exc):
+                    raise
+                retry_messages = _make_retry_messages(agent_task, observations, system_prompt, aggressive=True)
+                completion = client.chat.completions.create(
+                    messages=retry_messages,
+                    model=model,
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                    extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
+                )
+            choice = completion.choices[0]
+            usage_details = _collect_usage_details(completion)
+            if usage_details:
+                obs.update(usage_details=usage_details)
+            else:
+                raise RuntimeError("Agent response missing usage details")
+            message_obj = getattr(choice, "message", None)
+            if isinstance(message_obj, Mapping):
+                response_message = dict(message_obj)
+            else:
+                tool_calls_attr = getattr(message_obj, "tool_calls", None)
+                content_attr = getattr(message_obj, "content", None)
+                response_message = {}
+                if tool_calls_attr is not None:
+                    response_message["tool_calls"] = tool_calls_attr
+                if content_attr is not None:
+                    response_message["content"] = content_attr
+            tool_calls = response_message.get("tool_calls")
+            if tool_calls:
+                tool_results = _collect_tool_results(
+                    observations=[{"tool_call": call} for call in tool_calls if isinstance(call, (Mapping, object))],
+                    dispatch_tool_call=dispatch_tool_call,
+                    budget_limit=_MAX_TOTAL_MESSAGE_CHARS,
+                    parent_trace=obs,
+                )
+                if tool_results:
+                    observations.extend(tool_results)
+                observations.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": tool_calls,
+                        "content": response_message.get("content") or "",
+                    }
+                )
+                messages = _apply_tool_results(observations, tool_results, system_prompt)
+                continue
+            else:
+                try:
+                    response_json = json.loads(response_message.get("content") or "{}")
+                except json.JSONDecodeError as exc:  # noqa: BLE001
+                    response_json = {"error": f"invalid json: {exc}"}
+                obs.update(output=_truncate_for_metadata(response_json))
+                observations.append({"role": "assistant", "content": response_json})
+                break
+    return {"observations": observations}
+
+
+def run_agent_with_retry(
+    agent_task: dict[str, object],
+    steps: int,
+    tool_specs: list[OpenAITool],
+    dispatch_tool_call: Callable[[str, dict[str, Any]], object],
+    system_prompt: str,
+    parent_trace: object | None = None,
+    backend_name: str | None = None,
+):
+    parent_span = _require_parent(parent_trace, owner=backend_name or "runner agent")
+    try:
+        return run_agent(
+            agent_task,
+            steps,
+            tool_specs,
+            dispatch_tool_call,
+            system_prompt,
+            parent_trace=parent_span,
+            backend_name=backend_name,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if not _is_context_error(exc):
+            raise
+        retry_messages = _make_retry_messages(agent_task, [], system_prompt, aggressive=True)
+        client, model = _make_client()
+        completion = client.chat.completions.create(
+            messages=retry_messages,
+            model=model,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
+        )
+        choice = completion.choices[0]
+        response_message = dict(choice.message) if hasattr(choice, "message") else {}
+        try:
+            response_json = json.loads(response_message.get("content") or "{}")
+        except json.JSONDecodeError as parse_exc:  # noqa: BLE001
+            response_json = {"error": f"invalid json: {parse_exc}"}
+        return {"observations": [{"role": "assistant", "content": response_json}]}
+
+
+def _normalize_agent_result(raw: Any) -> dict[str, object]:
+    observations_raw = raw.get("observations") if isinstance(raw, Mapping) else []
+    observations = observations_raw if isinstance(observations_raw, list) else []
+
+    def _latest_graph_node_count() -> int:
+        for latest in reversed(observations):
+            if not isinstance(latest, Mapping):
+                continue
+            result = latest.get("result")
+            if not isinstance(result, Mapping):
+                continue
+            full_graph = result.get("full_graph")
+            if isinstance(full_graph, Mapping):
+                nodes = full_graph.get("nodes")
+                if isinstance(nodes, list):
+                    return len(nodes)
+            graph = result.get("graph")
+            if isinstance(graph, Mapping):
+                nodes = graph.get("nodes")
+                if isinstance(nodes, list):
+                    return len(nodes)
+        return 0
+
+    normalized: dict[str, object] = {
+        "observations": observations,
+        "node_count": _latest_graph_node_count(),
+        "raw": raw,
+    }
+    if isinstance(raw, dict) and "error" in raw:
+        normalized["error"] = raw["error"]
+    return normalized
+
+
+def run_ic_iteration(
+    task: dict[str, object],
+    score_fn: Callable[..., float],
+    steps: int = 5,
+    parent_trace: object | None = None,
+):
+    parent_span = _require_parent(parent_trace, owner="iterative_context")
+    symbol = _require_str(task, "symbol")
+    repo = _require_str(task, "repo")
+    agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+    agent_task = agent_task_model.to_payload()
+
+    backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
+    tool_specs: list[OpenAITool] = backend.tool_specs
+    system_prompt = _build_ic_system_prompt(tool_specs)
+    with start_observation(
+        name="iterative_context",
+        parent=parent_span,
+        metadata={"backend": "iterative_context", "repo": repo, "symbol": symbol},
+    ) as backend_obs:
+        try:
+            raw = run_agent(
+                agent_task,
+                steps=steps,
+                tool_specs=tool_specs,
+                dispatch_tool_call=backend.dispatch,
+                system_prompt=system_prompt,
+                parent_trace=backend_obs,
+                backend_name="iterative_context",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
+            backend_obs.end(error=str(exc))
+        normalized = _normalize_agent_result(raw)
+        nc_val = normalized.get("node_count", 0)
+        node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
+        emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count, data_type="NUMERIC")
+        backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
+        return normalized
+
+
+def run_jc_iteration(
+    task: dict[str, object],
+    steps: int = 5,
+    parent_trace: object | None = None,
+):
+    parent_span = _require_parent(parent_trace, owner="jcodemunch")
+    symbol = _require_str(task, "symbol")
+    repo = _require_str(task, "repo")
+    agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+    agent_task = agent_task_model.to_payload()
+
+    backend = JCodeMunchBackend(repo=repo)
+    tool_specs: list[OpenAITool] = backend.tool_specs
+    system_prompt = _build_jc_system_prompt(tool_specs)
+    with start_observation(
+        name="jcodemunch",
+        parent=parent_span,
+        metadata={"backend": "jcodemunch", "repo": repo, "symbol": symbol},
+    ) as backend_obs:
+        try:
+            raw = run_agent(
+                agent_task,
+                steps=steps,
+                tool_specs=tool_specs,
+                dispatch_tool_call=backend.dispatch,
+                system_prompt=system_prompt,
+                parent_trace=backend_obs,
+                backend_name="jcodemunch",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
+            backend_obs.end(error=str(exc))
+        normalized = _normalize_agent_result(raw)
+        nc_val = normalized.get("node_count", 0)
+        node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
+        emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count, data_type="NUMERIC")
+        backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
+        return normalized
+
+
+__all__ = [
+    "run_ic_iteration",
+    "run_jc_iteration",
+    "run_agent",
+    "run_agent_with_retry",
+    "_build_ic_system_prompt",
+    "_build_jc_system_prompt",
+]

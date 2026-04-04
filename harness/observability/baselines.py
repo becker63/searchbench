@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field
 from .datasets import DatasetItem, normalize_dataset_item
 from .langfuse import start_observation
 from .score_emitter import emit_score_for_handle
-from ..scorer import score
 from ..utils.repo_targets import resolve_repo_target
 
 
@@ -63,13 +62,7 @@ def _snapshot_key(snapshot: BaselineSnapshot) -> str:
 
 
 def baseline_metrics_from_jc(jc_result: Mapping[str, object]) -> dict[str, float]:
-    combined = {"iterative_context": {"observations": []}, "jcodemunch": jc_result}
-    metrics = score(combined)
-    numeric_metrics: dict[str, float] = {}
-    for k, v in metrics.items():
-        if isinstance(v, (int, float, bool)):
-            numeric_metrics[k] = float(v)
-    return numeric_metrics
+    return {"score": 0.0}
 
 
 def index_baselines(bundle: BaselineBundle | Sequence[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
@@ -88,7 +81,7 @@ def compute_baseline_for_item(
     dataset_version: str | None = None,
     parent_trace: object | None = None,
 ) -> BaselineSnapshot:
-    from ..runner import run_jc_iteration  # local import to avoid circular dependency
+    from ..loop.runner_agent import run_jc_iteration  # local import to avoid circular dependency
 
     normalized = normalize_dataset_item(item)
     repo_ref = normalized.repo

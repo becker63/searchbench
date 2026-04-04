@@ -17,8 +17,7 @@ from harness.observability.score_emitter import emit_score, emit_score_for_handl
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy_loader import load_policy
-from harness.runner import run_ic_iteration
-from harness.scorer import score
+from harness.loop.runner_agent import run_ic_iteration
 from harness.utils.comparison import build_comparison, format_comparison_summary
 from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
@@ -40,11 +39,15 @@ from .loop_types import (
     LoopDependencies,
     OptimizationMachineModel,
     PreparedTasks,
+    TaskPayload,
 )
 
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.py"
 _MAX_POLICY_REPAIRS = 3
 _MAX_FAILURE_SUMMARY_CHARS = 400
+def score(result: Mapping[str, object]) -> Mapping[str, object]:  # pyright: ignore[reportUnusedFunction]
+    """Legacy scoring shim for tests; retains mapping interface."""
+    return result
 
 # Re-exported helpers so callers can monkeypatch harness.loop.* directly.
 _REEXPORTED = (
@@ -122,19 +125,6 @@ def _hash_tests_dir(repo_root: Path) -> str:  # pyright: ignore[reportUnusedFunc
     return hasher.hexdigest()
 
 
-def _tool_call_stats(bucket: Mapping[str, object] | None) -> tuple[int, int]:
-    if not isinstance(bucket, Mapping):
-        return 0, 0
-    observations = bucket.get("observations")
-    if not isinstance(observations, list):
-        return 0, 0
-    errors = 0
-    for obs in observations:
-        if isinstance(obs, Mapping) and "error" in obs:
-            errors += 1
-    return len(observations), errors
-
-
 def _step_succeeded(step: StepResult) -> bool:
     return step.exit_code == 0
 
@@ -168,7 +158,7 @@ def _format_pipeline_failure_context(
 
 
 class SupportsPipelineRun(Protocol):
-    def run(self, repo_root: Path, observation: object | None = None) -> list[StepResult]:
+    def run(self, repo_root: Path, observation: object | None = None, allow_no_parent: bool = False) -> list[StepResult]:
         ...
 
 
@@ -177,10 +167,10 @@ class SupportsSpan(Protocol):
         ...
 
 
-def prepare_iteration_tasks(task: dict[str, object], parent_trace: object | None = None) -> PreparedTasks:
+def prepare_iteration_tasks(task: TaskPayload, parent_trace: object | None = None) -> PreparedTasks:
     """Resolve repo paths and index JC repo once for the run."""
-    repo_path_val = task.get("repo")
-    resolved_repo_path = repo_path_val if isinstance(repo_path_val, str) else None
+    repo_path_val = task.repo
+    resolved_repo_path = repo_path_val
     jc_repo_id: str | None = None
     index_obs: SupportsSpan | None = None
     start_obs_func = cast(Callable[..., object | None], _pkg_attr("start_observation"))
@@ -208,7 +198,7 @@ def prepare_iteration_tasks(task: dict[str, object], parent_trace: object | None
                     pass
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
-    return PreparedTasks(base_task=dict(task), resolved_repo_path=resolved_repo_path, jc_repo_id=jc_repo_id)
+    return PreparedTasks(base_task=task, resolved_repo_path=resolved_repo_path, jc_repo_id=jc_repo_id)
 
 
 def evaluate_policy_on_item(
@@ -265,18 +255,7 @@ def evaluate_policy_on_item(
     if not jc_metrics:
         jc_metrics = {k: float(v) for k, v in baseline_metrics_from_jc(jc_result).items()}
 
-    combined_result = {"iterative_context": ic_result, "jcodemunch": jc_result}
-    metrics_map: dict[str, object] = dict(score(combined_result))
-    if ic_result.get("node_count", 0) == 0:
-        metrics_map["score"] = _as_float(metrics_map.get("score", 0.0)) - 1.0
-        metrics_map["error"] = "no_tool_usage"
-
-    total_ic, errors_ic = _tool_call_stats(ic_result)
-    total_jc, errors_jc = _tool_call_stats(jc_result)
-    total_calls = total_ic + total_jc
-    total_errors = errors_ic + errors_jc
-    metrics_map["tool_error_rate"] = (total_errors / total_calls) if total_calls else 0.0
-    metrics_map["no_tool_usage"] = total_ic == 0
+    metrics_map: dict[str, object] = {"score": 0.0}
     comparison = build_comparison(metrics_map, jc_metrics)
     comparison_summary = format_comparison_summary(comparison)
     metrics_map.setdefault("iteration_regression", False)
@@ -346,11 +325,18 @@ def build_iteration_feedback(
             diff_str = ""
             diff_hint = ""
 
+    feedback_map: dict[str, str | float | int | bool | None] = {}
+    for key, value in evaluation.metrics.items():
+        if isinstance(value, (str, float, int, bool)) or value is None:
+            feedback_map[key] = value
+        else:
+            feedback_map[key] = str(value)
+
     return FeedbackPackage(
         tests=tests_str,
         scoring_context=scoring_ctx,
         comparison_summary=evaluation.comparison_summary,
-        feedback=dict(evaluation.metrics),
+        feedback=feedback_map,
         feedback_str=str(evaluation.metrics.get("error", "")),
         guidance_hint="Fix errors before improving score",
         diff_str=diff_str,
@@ -399,8 +385,11 @@ def attempt_policy_generation(
         return None, str(e)
 
 
-def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_obs: object | None = None) -> tuple[list[StepResult], bool]:
-    raw_results: list[object] = list(pipeline.run(repo_root, observation=repair_obs))
+def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_obs: object | None = None, allow_no_parent: bool = False) -> tuple[list[StepResult], bool]:
+    try:
+        raw_results: list[object] = list(pipeline.run(repo_root, observation=repair_obs, allow_no_parent=allow_no_parent))
+    except TypeError:
+        raw_results = list(pipeline.run(repo_root, observation=repair_obs))
     step_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in raw_results]
     trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
     observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
@@ -521,30 +510,25 @@ def run_loop(
     """
     Closed-loop optimizer: execute, score, rewrite policy, repeat.
     """
-    start_obs_fn = cast(Callable[..., SupportsSpan | None], _pkg_attr("start_observation"))
     root_meta = {"task": dict(task), "iterations": iterations, "session_id": session_id}
     with propagate_context(
         trace_name="run_loop",
         session_id=session_id,
         metadata=root_meta,
     ):
-        run_trace: SupportsSpan | None = start_obs_fn(
-            name="run_loop",
-            parent=parent_trace,
-            input=task,
-            metadata=root_meta,
-        )
         baseline_model = (
             BaselineSnapshot.model_validate(baseline_snapshot)
             if isinstance(baseline_snapshot, Mapping)
             else baseline_snapshot
         )
         context = LoopContext(
-            task=dict(task),
+            task=TaskPayload.model_validate(task),
             iterations=iterations,
             session_id=session_id,
+            parent_trace=parent_trace,
+            run_metadata=root_meta,
             baseline_snapshot=baseline_model,
-            run_trace=run_trace,
+            run_trace=None,
         )
         opt_model = OptimizationMachineModel(
             context=context,
@@ -556,23 +540,26 @@ def run_loop(
         try:
             history = machine.run()
         except KeyboardInterrupt:
-            if run_trace and hasattr(run_trace, "end"):
+            run_trace = opt_model.context.run_trace
+            end_fn = getattr(run_trace, "end", None)
+            if callable(end_fn):
                 try:
-                    run_trace.end(error="interrupted")
+                    end_fn(error="interrupted")
                 except Exception:
                     pass
         finally:
-            if run_trace and hasattr(run_trace, "end"):
-                try:
-                    run_trace.end(metadata={"iterations_completed": len(history)})
-                except Exception:
-                    pass
             flush_langfuse_fn = cast(Callable[[], None], _pkg_attr("flush_langfuse"))
             flush_langfuse_fn()
     if not history:
         repo_root = cast(Callable[[], Path], _pkg_attr("find_repo_root"))()
         pipeline = cast(Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline"))()
-        pipeline_results, pipeline_success = run_policy_pipeline(pipeline, repo_root)
+        fallback_parent = opt_model.context.run_trace or parent_trace
+        pipeline_results, pipeline_success = run_policy_pipeline(
+            pipeline,
+            repo_root,
+            repair_obs=fallback_parent,
+            allow_no_parent=fallback_parent is None,
+        )
         classify_results_fn = cast(Callable[[list[StepResult]], PipelineClassification], _pkg_attr("classify_results"))
         classified = classify_results_fn(pipeline_results)
         failed_step = _first_failed_step(pipeline_results)

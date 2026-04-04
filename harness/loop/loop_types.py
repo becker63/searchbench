@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -11,18 +11,32 @@ if TYPE_CHECKING:
     from harness.observability.baselines import BaselineSnapshot
 
 
+MetricValue = int | float | bool
+MetricsMap = Mapping[str, object]
+
+
+class TaskPayload(BaseModel):
+    """Normalized task payload passed into loop/runner agents."""
+
+    model_config = ConfigDict(extra="allow")
+
+    symbol: str
+    repo: str
+
+
 class PreparedTasks(BaseModel):
     """Resolved IC/JC tasks for a single iteration."""
 
     model_config = ConfigDict(extra="forbid")
 
-    base_task: dict[str, object]
+    base_task: TaskPayload
     resolved_repo_path: str | None
     jc_repo_id: str | None
 
     def build_iteration_tasks(self) -> tuple[dict[str, object], dict[str, object]]:
-        ic_task = dict(self.base_task)
-        jc_task = dict(self.base_task)
+        base = self.base_task.model_dump()
+        ic_task = dict(base)
+        jc_task = dict(base)
         if self.resolved_repo_path is not None:
             ic_task["repo"] = self.resolved_repo_path
         if self.jc_repo_id is not None:
@@ -37,10 +51,10 @@ class EvaluationResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    metrics: dict[str, object]
+    metrics: MetricsMap
     ic_result: dict[str, object]
     jc_result: dict[str, object]
-    jc_metrics: dict[str, object]
+    jc_metrics: MetricsMap
     comparison_summary: str | None
     policy_code: str
     success: bool = True
@@ -55,7 +69,7 @@ class FeedbackPackage(BaseModel):
     tests: str
     scoring_context: str
     comparison_summary: str | None
-    feedback: dict[str, object]
+    feedback: dict[str, str | float | int | bool | None]
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -97,7 +111,7 @@ class IterationRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     iteration: int
-    metrics: dict[str, object]
+    metrics: MetricsMap
     pipeline_passed: bool | None = None
     pipeline_feedback: PipelineClassification | None = None
     failed_step: str | None = None
@@ -113,9 +127,11 @@ class IterationRecord(BaseModel):
 class LoopContext(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
-    task: dict[str, object]
+    task: TaskPayload
     iterations: int
     session_id: str | None = None
+    parent_trace: object | None = None
+    run_metadata: Mapping[str, object] | None = None
     baseline_snapshot: "BaselineSnapshot | None" = None
     run_trace: object | None
     history: list[IterationRecord] = Field(default_factory=list)
@@ -131,7 +147,7 @@ class LoopDependencies(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    prepare_iteration_tasks: Callable[[dict[str, object], object | None], PreparedTasks]
+    prepare_iteration_tasks: Callable[[TaskPayload, object | None], PreparedTasks]
     evaluate_policy_on_item: Callable[[dict[str, object], "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
     build_iteration_feedback: Callable[[EvaluationResult, float | None, PipelineClassification | None, Path], FeedbackPackage]
     attempt_policy_generation: Callable[..., tuple[str | None, str | None]]

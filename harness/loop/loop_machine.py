@@ -21,7 +21,7 @@ if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
 
 from harness.pipeline.types import PipelineClassification, StepResult
 
-from .loop_listeners import OptimizationTracingListener, RepairTracingListener
+from .loop_listeners import OptimizationTracingListener, RepairTracingListener, _safe_end_span as safe_end_span  # pyright: ignore[reportPrivateUsage]
 from .loop_types import (
     AcceptedPolicy,
     EvaluationResult,
@@ -34,6 +34,7 @@ from .loop_types import (
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
+    TaskPayload,
 )
 
 
@@ -264,6 +265,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         return self.model.max_policy_repairs
 
     def __init__(self, model: OptimizationMachineModel):
+        self._ensure_run_trace(model)
         super().__init__(
             model=model,
             listeners=[
@@ -273,9 +275,14 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
 
     # Entry point ---------------------------------------------------------
     def run(self) -> list[IterationRecord]:
-        self._prepare_context()
-        self.raise_("prepare")  # type: ignore[call-arg]
-        return self.context.history
+        status: str | None = None
+        try:
+            self._prepare_context()
+            self.raise_("prepare")  # type: ignore[call-arg]
+            status = getattr(self.current_state, "id", None)
+            return self.context.history
+        finally:
+            self._finalize_run_trace(status=status)
 
     # Guards --------------------------------------------------------------
     def prep_ready(self) -> bool:
@@ -287,6 +294,30 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
     def has_more_iterations(self) -> bool:
         return self.context.current_iteration + 1 < self.context.iterations
 
+    # Run root ------------------------------------------------------------
+    def _ensure_run_trace(self, model: OptimizationMachineModel) -> None:
+        ctx = model.context
+        if ctx.run_trace is not None:
+            return
+        start_obs = model.deps.start_observation
+        meta = ctx.run_metadata or {"iterations": ctx.iterations, "task": dict(ctx.task)}
+        ctx.run_trace = start_obs(
+            name="run_loop",
+            parent=ctx.parent_trace,
+            input=ctx.task,
+            metadata=meta,
+        )
+
+    def _finalize_run_trace(self, status: str | None) -> None:
+        span = self.context.run_trace
+        if span is None:
+            return
+        metadata: dict[str, object] = {"iterations_completed": len(self.context.history)}
+        if status:
+            metadata["status"] = status
+        safe_end_span(span, metadata=metadata)
+        self.context.run_trace = None
+
     # Preparation ---------------------------------------------------------
     def _prepare_context(self) -> None:
         try:
@@ -297,11 +328,16 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         except Exception:
             self.context.prepared_tasks = None
             self.model.prep_ok = False
-        if self.context.prepared_tasks is None and isinstance(self.context.task, dict):
-            repo_val = self.context.task.get("repo")
+        if self.context.prepared_tasks is None:
+            base_task = (
+                self.context.task
+                if isinstance(self.context.task, TaskPayload)
+                else TaskPayload.model_validate(self.context.task)
+            )
+            repo_val = base_task.repo
             resolved_repo = repo_val if isinstance(repo_val, str) else None
             self.context.prepared_tasks = PreparedTasks(
-                base_task=dict(self.context.task), resolved_repo_path=resolved_repo, jc_repo_id=None
+                base_task=base_task, resolved_repo_path=resolved_repo, jc_repo_id=None
             )
             self.model.prep_ok = True
 

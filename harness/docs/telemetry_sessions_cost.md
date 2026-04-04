@@ -25,3 +25,11 @@
 - Defaults: ad hoc CLI → run-scope; hosted dataset experiments → item-scope (with optional deterministic fallback).
 - Children inherit session_id from the propagated context; avoid overwriting mid-run.
 - Session-only scores are allowed by passing `session_id` directly to the emitter; otherwise use observation handles to keep grouping.
+
+## Tracing ownership (listener-owned)
+
+- Run/root spans are created once by orchestration bootstrap/listener layers before state machine execution; entrypoints may nest under an external parent but do not create iteration/repair roots.
+- Iteration/repair spans and high-level metrics are listener/state-machine owned; `loop.py` remains wiring-only and does not create tracing policy or roots.
+- Leaf modules (`loop/runner_agent.py`, `writer.py`, pipeline helpers, baselines) emit child spans only; they require a parent span and must fail/guard rather than create new roots unless an explicit, documented no-op is chosen.
+- Allowed leaf spans: writer attempts, backend/model/tool calls, usage/cost/latency, pipeline steps, baseline items — all attached to provided parents.
+- Disallowed patterns: leaf-created roots, competing iteration/repair spans, split ownership of high-level scores, silent root creation when no parent is provided.

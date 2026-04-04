@@ -14,6 +14,15 @@ class DummySpan:
         self.ended: list[dict[str, object]] = []
         self.scores: list[tuple[str, float]] = []
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def start_observation(self, **kwargs):
+        return self
+
     def end(self, **kwargs):
         self.ended.append(kwargs)
 
@@ -91,7 +100,7 @@ def _base_inputs() -> BaseInputs:
         "diff_str": "",
         "diff_hint": "",
         "comparison_summary": "IC vs JC summary",
-        "parent_trace": None,
+        "parent_trace": DummySpan(),
     }
 
 

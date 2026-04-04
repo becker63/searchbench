@@ -4,11 +4,8 @@ from typing import Mapping
 
 DEFAULT_WEIGHTS: dict[str, float] = {
     "score": 1.0,
-    "coverage_delta": 1.0,
     "ic_nodes": 0.2,
     "jc_nodes": 0.2,
-    "tool_error_rate": -0.5,
-    "pipeline_passed": 1.0,
 }
 
 
