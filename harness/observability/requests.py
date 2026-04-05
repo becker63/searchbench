@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+from enum import Enum
+
 from pydantic import BaseModel, ConfigDict
 
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 
 from .session_policy import SessionConfig
+
+
+class LocalizationDatasetSource(str, Enum):
+    """Dataset source options for hosted/localized runs."""
+
+    LANGFUSE = "langfuse"
+    HUGGINGFACE = "huggingface"
 
 
 class LocalizationAdHocRequest(BaseModel):
@@ -17,6 +26,7 @@ class LocalizationAdHocRequest(BaseModel):
     gold: LCAGold
     repo: str | None = None
     session: SessionConfig | None = None
+    dataset_source: LocalizationDatasetSource = LocalizationDatasetSource.LANGFUSE
 
     def to_task(self) -> LCATask:
         return LCATask(identity=self.identity, context=self.context, gold=self.gold, repo=self.repo)
@@ -32,6 +42,7 @@ class HostedLocalizationBaselineRequest(BaseModel):
     dataset_config: str | None = None
     dataset_split: str | None = None
     session: SessionConfig | None = None
+    dataset_source: LocalizationDatasetSource = LocalizationDatasetSource.LANGFUSE
 
 
 class HostedLocalizationRunRequest(BaseModel):
@@ -44,3 +55,4 @@ class HostedLocalizationRunRequest(BaseModel):
     dataset_config: str | None = None
     dataset_split: str | None = None
     session: SessionConfig | None = None
+    dataset_source: LocalizationDatasetSource = LocalizationDatasetSource.LANGFUSE

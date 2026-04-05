@@ -8,6 +8,7 @@ from typing import Callable, Mapping, Sequence
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.localization.executor import run_localization_task
+from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
 from harness.localization.models import (
     LCATask,
     LocalizationDatasetInfo,
@@ -40,6 +41,7 @@ class BaselineSnapshot(BaseModel):
     experiment_run_id: str | None = None
     evidence: LocalizationEvidence | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
+    materialization: RepoMaterializationResult | None = None
 
 
 class BaselineBundle(BaseModel):
@@ -66,6 +68,8 @@ def compute_baseline_for_task(
     dataset_version: str | None = None,
     parent_trace: object | None = None,
     runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
+    dataset_source: str | None = None,
+    materializer: RepoMaterializer | None = None,
 ) -> BaselineSnapshot:
     with start_observation(
         name="localization_baseline_item",
@@ -78,7 +82,9 @@ def compute_baseline_for_task(
             "identity": task.task_id,
         },
     ) as trace:
-        prediction, metrics, evidence, materialization = run_localization_task(task, parent_trace=trace, runner=runner)
+        prediction, metrics, evidence, materialization = run_localization_task(
+            task, dataset_source=dataset_source, materializer=materializer, parent_trace=trace, runner=runner
+        )
         telemetry = build_localization_telemetry(
             task.identity,
             metrics=metrics,
@@ -118,7 +124,9 @@ def compute_baseline_for_task(
             metadata={
                 "telemetry": telemetry.model_dump(exclude_none=True),
                 "run_kind": "localization_baseline",
+                "dataset_source": getattr(parent_trace, "metadata", {}).get("dataset_source") if parent_trace else None,
             },
+            materialization=materialization,
         )
 
 

@@ -5,7 +5,11 @@ from typing import Any, cast
 
 from pydantic import BaseModel, Field
 
+import logging
+
 from harness.localization.models import LCATask, normalize_lca_task
+from harness.observability.requests import LocalizationDatasetSource
+from harness.observability.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
 
 from .langfuse import get_langfuse_client
 
@@ -86,6 +90,43 @@ def fetch_localization_dataset(
         except Exception:
             continue
     return tasks
+
+
+def fetch_localization_dataset_from_source(
+    source: LocalizationDatasetSource,
+    name: str,
+    version: str | None = None,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+    token: str | None = None,
+) -> list[LCATask]:
+    """
+    Branching loader that supports Langfuse (default) and Hugging Face sources.
+    """
+    if source == LocalizationDatasetSource.HUGGINGFACE:
+        try:
+            return fetch_hf_localization_dataset(
+                name,
+                dataset_config=dataset_config,
+                dataset_split=dataset_split,
+                revision=version,
+                token=token,
+            )
+        except HFDatasetLoadError:
+            logging.exception(
+                "HF dataset load failed",
+                extra={
+                    "dataset": name,
+                    "dataset_config": dataset_config,
+                    "dataset_split": dataset_split,
+                    "dataset_version": version,
+                    "dataset_source": source.value,
+                },
+            )
+            raise
+        except Exception as exc:
+            raise HFDatasetLoadError(f"HF dataset load failed unexpectedly: {exc}", category="load") from exc
+    return fetch_localization_dataset(name=name, version=version, dataset_config=dataset_config, dataset_split=dataset_split)
 
 
 def local_dataset(

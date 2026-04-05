@@ -31,19 +31,42 @@ class RepoMaterializationResult(BaseModel):
 
     local_path: Optional[Path] = None
     cache_hit: Optional[bool] = None
-    downloaded: Optional[bool] = None
-    extracted: Optional[bool] = None
-    checked_out: Optional[bool] = None
+    cache_validated: Optional[bool] = None
+    mirror_fetched: Optional[bool] = None
+    worktree_created: Optional[bool] = None
+    checkout_verified: Optional[bool] = None
     logs: list[str] = []
+    events: list[str] = []
 
     def describe_mapping(self) -> str:
         """
         Human-readable description of how the repo was mapped/materialized.
         """
         return (
-            f"path={self.local_path}, cache_hit={self.cache_hit}, "
-            f"downloaded={self.downloaded}, extracted={self.extracted}, checked_out={self.checked_out}"
+            f"path={self.local_path}, cache_hit={self.cache_hit}, cache_validated={self.cache_validated}, "
+            f"mirror_fetched={self.mirror_fetched}, worktree_created={self.worktree_created}, "
+            f"checkout_verified={self.checkout_verified}"
         )
+
+    def summary(self) -> str:
+        """
+        Concise human-readable summary for CLI/logs.
+        """
+        path = str(self.local_path) if self.local_path else "unset"
+        status_parts = []
+        if self.cache_hit is not None:
+            status_parts.append(f"cache_hit={self.cache_hit}")
+        if self.cache_validated is not None:
+            status_parts.append(f"cache_validated={self.cache_validated}")
+        if self.mirror_fetched is not None:
+            status_parts.append(f"mirror_fetched={self.mirror_fetched}")
+        if self.worktree_created is not None:
+            status_parts.append(f"worktree_created={self.worktree_created}")
+        if self.checkout_verified is not None:
+            status_parts.append(f"checkout_verified={self.checkout_verified}")
+        status = ", ".join(status_parts) if status_parts else "status=unknown"
+        log_tail = f"; logs={self.logs[-1]}" if self.logs else ""
+        return f"{path} ({status}){log_tail}"
 
 
 class RepoMaterializer(Protocol):

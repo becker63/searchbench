@@ -284,6 +284,7 @@ class LocalizationTelemetryEnvelope(BaseModel):
 
     identity: str
     dataset: LocalizationDatasetInfo
+    dataset_source: Optional[str] = None
     repo: LocalizationRepoInfo
     metrics: LocalizationMetrics
     changed_files_count: Optional[int] = None

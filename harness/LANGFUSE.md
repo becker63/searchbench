@@ -13,12 +13,14 @@
 
 ## Datasets
 - `fetch_localization_dataset(name, version=None, dataset_config=None, dataset_split=None)` pulls hosted localization tasks.
+- `fetch_localization_dataset_from_source(source, name, version=None, dataset_config=None, dataset_split=None)` supports Langfuse (default) or Hugging Face (`JetBrains-Research/lca-bug-localization`), using typed `LocalizationDatasetSource`. HF loader supports config/split/revision and surfaces failure categories (auth/missing/schema/load).
 - `local_dataset(name, items, ...)` converts local task dicts to `LCATask` instances (normalizes identity/context/gold).
 - Items must include localization identity fields and changed_files; symbol fields are ignored.
 
 ## Baselines & Experiments (Localization-first)
 - Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, metrics, repo metadata, and trace/run ids.
 - Hosted localization baselines/experiments use the documented SDK via `run_hosted_localization_baseline` / `run_hosted_localization_experiment`.
+- Hosted runs accept dataset_source; Langfuse remains default; Hugging Face path uses HF loader and HF repo materializer, emitting dataset source and materialization events in telemetry and stdout summaries.
 - Local runs use `run_localization_task` to materialize, predict, and score; hosted runs emit dataset run ids and telemetry.
 - Cost/usage: Cerebras generations must include `model` and usage (OpenAI-style prompt/completion/total). If the provider omits usage, supply it explicitly; do not emit zeroed usage. Costs are inferred via Langfuse model definitions.
 

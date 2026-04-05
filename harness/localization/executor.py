@@ -39,6 +39,7 @@ def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> R
 
 def run_localization_task(
     task: LCATask,
+    dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
@@ -86,7 +87,12 @@ def run_localization_task(
             "base_sha": task.identity.base_sha,
         },
     ) as trace:
-        materialization_result = _materialize_repo(task, materializer)
+        try:
+            materialization_result = _materialize_repo(task, materializer)
+        except Exception as exc:
+            # Surface materialization failures with category hint if available
+            hint = getattr(exc, "category", None)
+            raise RuntimeError(f"Materialization failed ({hint or 'materialization'}): {exc}") from exc
         repo_path: Path | None = materialization_result.local_path if materialization_result else None
         if repo_path is None and task.repo:
             repo_path = Path(task.repo).expanduser()
@@ -106,6 +112,7 @@ def run_localization_task(
             task.identity,
             metrics=eval_record.metrics,
             changed_files_count=len(task.gold.normalized_changed_files()),
+            dataset_source=dataset_source,
             repo_language=task.context.repo_language,
             repo_license=task.context.repo_license,
             evidence=task.evidence,

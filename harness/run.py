@@ -5,17 +5,25 @@ Localization-first CLI entrypoint: parse arguments, build typed requests, and ru
 """
 
 import argparse
+import logging
 from pathlib import Path
 from typing import Any
 
 from harness.localization.executor import run_localization_task
 from harness.localization.models import LCAContext, LCAGold, LCATaskIdentity
+from harness.localization.hf_materializer import HuggingFaceRepoMaterializer
 from harness.observability.baselines import load_baseline_bundle, save_baseline_bundle
 from harness.observability.experiments import (
     run_hosted_localization_baseline,
     run_hosted_localization_experiment,
 )
-from harness.observability.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest, LocalizationAdHocRequest
+from harness.observability.requests import (
+    HostedLocalizationBaselineRequest,
+    HostedLocalizationRunRequest,
+    LocalizationAdHocRequest,
+    LocalizationDatasetSource,
+)
+from harness.observability.hf_lca import HFDatasetLoadError
 from harness.observability.session_policy import SessionConfig, resolve_session_id
 from harness.observability.langfuse import flush_langfuse
 
@@ -32,6 +40,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--version", help="Dataset version")
     parser.add_argument("--config", dest="dataset_config", help="Dataset config (e.g., py/java/kt)")
     parser.add_argument("--split", dest="dataset_split", help="Dataset split (e.g., dev/train/test)")
+    parser.add_argument(
+        "--dataset-source",
+        choices=[source.value for source in LocalizationDatasetSource],
+        default=LocalizationDatasetSource.LANGFUSE.value,
+        help="Dataset source: langfuse (default) or huggingface",
+    )
     parser.add_argument("--repo-owner", required=False, help="Repository owner for LCA eval")
     parser.add_argument("--repo-name", required=False, help="Repository name for LCA eval")
     parser.add_argument("--base-sha", required=False, help="Base SHA (bug-reproducible snapshot) for LCA eval")
@@ -56,6 +70,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Allow deterministic fallback session id generation at entrypoints",
     )
     return parser.parse_args(argv)
+
+
+def _print_mat_summary(prefix: str, identity: Any, materialization: Any) -> None:
+    if materialization:
+        print(f"[MAT] {prefix} {identity}: {materialization.summary()}")
+
+
+def _fmt_identity(identity: Any) -> str:
+    if isinstance(identity, dict):
+        return str(identity.get("id") or identity.get("task_id") or identity.get("repo") or identity)
+    return str(identity)
 
 
 def _build_identity(args: argparse.Namespace) -> LCATaskIdentity:
@@ -88,6 +113,9 @@ def _load_baseline(path: str | None):
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    logging.basicConfig(level=logging.INFO)
+    dataset_source = LocalizationDatasetSource(args.dataset_source)
+    materializer = HuggingFaceRepoMaterializer() if dataset_source == LocalizationDatasetSource.HUGGINGFACE else None
     session_cfg = SessionConfig(
         session_id=args.session_id,
         session_scope=(args.session_scope or ("item" if args.mode != "localization-single" else "run")),  # type: ignore[arg-type]
@@ -105,12 +133,16 @@ def main(argv: list[str] | None = None) -> None:
                 dataset_config=args.dataset_config,
                 dataset_split=args.dataset_split,
                 session=session_cfg,
+                dataset_source=dataset_source,
             )
-            bundle = run_hosted_localization_baseline(req)
+            bundle = run_hosted_localization_baseline(req, materializer=materializer)
             if args.baseline_path:
                 save_baseline_bundle(bundle, Path(args.baseline_path))
                 print(f"[RUN] Baseline bundle saved to {args.baseline_path}")
             print(f"[RUN] Baselines computed: {len(bundle.items)}")
+            if dataset_source == LocalizationDatasetSource.HUGGINGFACE:
+                for snap in bundle.items:
+                    _print_mat_summary("baseline", snap.identity, snap.materialization)
         elif args.mode == "localization-experiment":
             if not args.dataset:
                 raise ValueError("--dataset is required for localization-experiment")
@@ -121,9 +153,13 @@ def main(argv: list[str] | None = None) -> None:
                 dataset_config=args.dataset_config,
                 dataset_split=args.dataset_split,
                 session=session_cfg,
+                dataset_source=dataset_source,
             )
-            results = run_hosted_localization_experiment(req)
+            results = run_hosted_localization_experiment(req, materializer=materializer)
             print(f"[RUN] Localization items completed: {len(results.items)}")
+            if dataset_source == LocalizationDatasetSource.HUGGINGFACE:
+                for item in results.items:
+                    _print_mat_summary("experiment", _fmt_identity(item.task.get("identity")), item.materialization)
         else:
             identity = _build_identity(args)
             gold = LCAGold(changed_files=args.changed_files or [])
@@ -137,13 +173,31 @@ def main(argv: list[str] | None = None) -> None:
                 repo_license=None,
                 repo_stars=None,
             )
-            req = LocalizationAdHocRequest(identity=identity, context=context, gold=gold, repo=args.repo_path, session=session_cfg)
+            req = LocalizationAdHocRequest(
+                identity=identity,
+                context=context,
+                gold=gold,
+                repo=args.repo_path,
+                session=session_cfg,
+                dataset_source=dataset_source,
+            )
             resolved_session = resolve_session_id(session_cfg, run_id=identity.task_id)
             print(f"[RUN] Ad hoc localization run for {identity.repo_owner}/{identity.repo_name}@{identity.base_sha}")
-            prediction, metrics, _evidence, _materialization = run_localization_task(req.to_task())
+            prediction, metrics, _evidence, materialization = run_localization_task(
+                req.to_task(), dataset_source=dataset_source.value, materializer=materializer
+            )
             print(f"[RUN] Prediction: {prediction.predicted_files}")
             print(f"[RUN] Metrics: {metrics.model_dump()}")
             print(f"[RUN] Session: {resolved_session}")
+            if materialization:
+                _print_mat_summary("single", identity.task_id, materialization)
+    except HFDatasetLoadError as exc:
+        print(f"[ERROR] HF dataset load failed (category={exc.category}): {exc}")
+        raise
+    except RuntimeError as exc:
+        # Surface materialization failures or other runtime issues
+        print(f"[ERROR] {exc}")
+        raise
     finally:
         flush_langfuse()
 
