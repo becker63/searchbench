@@ -251,6 +251,7 @@ class EvaluationResult(BaseModel):
     policy_code: str
     success: bool = True
     error: str | None = None
+    control_score: float | None = None
 
 
 class FeedbackPackage(BaseModel):

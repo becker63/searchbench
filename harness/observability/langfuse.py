@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Mapping, Optional
+from types import TracebackType
+from typing import Any, Mapping, Optional, cast
 
 from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
@@ -185,7 +186,8 @@ def start_root_observation(
     )
     start_fn = getattr(client_any, "start_as_current_observation", None)
     if callable(start_fn):
-        with start_fn(**envelope.to_start_kwargs()) as observation:
+        start_ctx = cast(Any, start_fn)(**envelope.to_start_kwargs())
+        with start_ctx as observation:
             yield observation
     else:
         # Fallback for stubbed clients in tests.
@@ -200,10 +202,18 @@ def start_root_observation(
             def __enter__(self):
                 return self
 
-            def __exit__(self, exc_type, exc, tb):
+            def __exit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
                 return False
 
             def end(self, **kwargs: object) -> None:
+                return None
+
+            def update(self, **kwargs: object) -> None:
                 return None
 
         obs = _DummyObs()
@@ -256,7 +266,8 @@ def start_observation(
     """
     Convenience wrapper to start a root or child observation based on parent presence.
     """
-    if parent is None:
+    parent_ctx = parent if parent is not None and hasattr(parent, "start_observation") else None
+    if parent_ctx is None:
         with start_root_observation(
             name,
             as_type=as_type,
@@ -268,7 +279,7 @@ def start_observation(
             yield observation
     else:
         with start_child_observation(
-            parent,
+            parent_ctx,
             name,
             as_type=as_type,
             input=input,

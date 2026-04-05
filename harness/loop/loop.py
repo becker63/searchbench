@@ -19,7 +19,7 @@ from harness.observability.langfuse import (
     propagate_context,
     start_observation,
 )
-from harness.observability.score_emitter import emit_score, emit_score_for_handle
+from harness.observability.score_emitter import emit_score
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy_loader import load_policy
@@ -33,10 +33,10 @@ from harness.utils.type_loader import (
     load_scoring_types,
 )
 from harness.writer import generate_policy
-from harness.localization.models import LCAGold, LCAPrediction
-from harness.localization.scoring import score_file_localization
+from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 
 if TYPE_CHECKING:
+    from harness.localization.evaluation_backend import LocalizationEvaluationRequest
     from harness.observability.baselines import BaselineSnapshot
 
 from .loop_machine import OptimizationStateMachine
@@ -58,7 +58,6 @@ from .loop_types import (
     OptimizationMachineModel,
     PreparedTasks,
     RunMetadata,
-    ScalarMetrics,
     TaskPayload,
     format_failure_context_payload,
 )
@@ -66,11 +65,6 @@ from .loop_types import (
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.py"
 _MAX_POLICY_REPAIRS = 3
 _MAX_FAILURE_SUMMARY_CHARS = 400
-
-
-def score(result: Mapping[str, object]) -> Mapping[str, object]:  # pyright: ignore[reportUnusedFunction]
-    """Legacy scoring shim for tests; retains mapping interface."""
-    return result
 
 
 # Re-exported helpers so callers can monkeypatch harness.loop.* directly.
@@ -97,6 +91,33 @@ _REEXPORTED = (
 )
 
 
+def evaluate_localization_batch(req: "LocalizationEvaluationRequest"):
+    """
+    Thin wrapper to keep monkeypatching stable while avoiding import cycles.
+    """
+    from harness.localization.evaluation_backend import evaluate_localization_batch as _evaluate_localization_batch
+
+    return _evaluate_localization_batch(req)
+
+
+def LocalizationEvaluationRequest(*args, **kwargs):
+    """
+    Lazy proxy for the evaluation request model so tests can monkeypatch the symbol on this module.
+    """
+    from harness.localization.evaluation_backend import LocalizationEvaluationRequest as _LocalizationEvaluationRequest
+
+    return _LocalizationEvaluationRequest(*args, **kwargs)
+
+
+def score(node: object, state: object, context: object | None = None) -> float:
+    """
+    Delegate to policy.score while keeping a stable harness.loop.* attribute for tests/monkeypatching.
+    """
+    from harness.policy import score as _policy_score
+
+    return _policy_score(node, state, context)
+
+
 def _pkg_attr(name: str) -> object:
     # Access via package to pick up monkeypatching on harness.loop
     pkg = import_module("harness.loop")
@@ -108,12 +129,6 @@ def _as_float(value: Any) -> float:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0.0
-
-
-def _session_id_from(handle: object | None, default: str | None = None) -> str | None:
-    if handle is None:
-        return default
-    return getattr(handle, "session_id", default)
 
 
 def _read_policy(path: Path = _POLICY_PATH) -> str:
@@ -251,100 +266,80 @@ def evaluate_policy_on_item(
     iteration_span: object | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
-    """Load current policy, execute IC iteration, and compute localization metrics."""
-    start_obs_func = cast(
-        Callable[..., SupportsSpan | None], _pkg_attr("start_observation")
+    """Execute localization evaluation via the shared LCA evaluation backend."""
+    lca_task = LCATask(
+        identity=LCATaskIdentity(
+            dataset_name=ic_task.identity.dataset_name,
+            dataset_config=ic_task.identity.dataset_config,
+            dataset_split=ic_task.identity.dataset_split,
+            repo_owner=ic_task.identity.repo_owner,
+            repo_name=ic_task.identity.repo_name,
+            base_sha=ic_task.identity.base_sha,
+            issue_url=ic_task.identity.issue_url,
+            pull_url=ic_task.identity.pull_url,
+        ),
+        context=LCAContext.model_validate(ic_task.context.model_dump()),
+        gold=LCAGold(changed_files=list(ic_task.changed_files)),
+        repo=ic_task.repo,
     )
-    load_policy_fn = cast(Callable[[], Callable[..., object]], _pkg_attr("load_policy"))
-    run_ic_iteration_fn = cast(
-        Callable[..., Mapping[str, object]], _pkg_attr("run_ic_iteration")
+    eval_req = LocalizationEvaluationRequest(
+        tasks=[lca_task],
+        dataset_source=None,
+        materializer=None,
+        parent_trace=iteration_span,
     )
-    policy_load_obs: SupportsSpan | None = None
-    try:
-        policy_load_obs = start_obs_func(
-            name="policy_load",
-            parent=iteration_span,
-            metadata={"iteration": iteration_index},
-        )
-        loaded_policy_fn = load_policy_fn()
-        if policy_load_obs and hasattr(policy_load_obs, "end"):
-            policy_load_obs.end(metadata={"status": "loaded"})
-    except ImportError as e:
-        if policy_load_obs is not None:
-            try:
-                policy_load_obs.end(error=e)
-            except Exception:
-                pass
-        error_metrics: ScalarMetrics = {
+    eval_result = evaluate_localization_batch(eval_req)
+    if eval_result.failure:
+        failure_metrics: dict[str, float | int | bool | None] = {
             "score": -10.0,
+            "iteration_regression": False,
         }
-        emit_score_for_handle(
-            iteration_span,
-            name="metrics.score",
-            value=_as_float(error_metrics.get("score", 0.0)),
-            data_type="NUMERIC",
-        )
         return EvaluationResult(
-            metrics=EvaluationMetrics.model_validate(error_metrics),
+            metrics=EvaluationMetrics.model_validate(failure_metrics),
             ic_result=ICResult(entries=[]),
             jc_result=JCResult(entries=[]),
             jc_metrics=EvaluationMetrics(),
             comparison_summary=None,
             policy_code="",
             success=False,
-            error=f"policy_import_error: {str(e)}",
+            error=f"{getattr(eval_result.failure.category, 'value', eval_result.failure.category)}: {eval_result.failure.message}",
         )
-
-    ic_runner = cast(Callable[..., dict[str, object]], run_ic_iteration_fn)
-    ic_result_map = ic_runner(
-        ic_task.model_dump(), loaded_policy_fn, parent_trace=iteration_span
+    if not eval_result.items:
+        empty_metrics: dict[str, float | int | bool | None] = {
+            "score": -10.0,
+            "iteration_regression": False,
+        }
+        return EvaluationResult(
+            metrics=EvaluationMetrics.model_validate(empty_metrics),
+            ic_result=ICResult(entries=[]),
+            jc_result=JCResult(entries=[]),
+            jc_metrics=EvaluationMetrics(),
+            comparison_summary=None,
+            policy_code="",
+            success=False,
+            error="evaluation_failed: no_results",
     )
-    predicted_files_raw = []
-    if isinstance(ic_result_map, Mapping):
-        predicted_files_raw = ic_result_map.get("predicted_files", [])
-    predicted_files = [str(p) for p in predicted_files_raw if isinstance(p, str)]
-    gold = LCAGold(changed_files=ic_task.changed_files)
-    metrics_obj = score_file_localization(LCAPrediction(predicted_files=predicted_files), gold)
-    metrics_map: dict[str, float | int | bool | None] = {
-        "score": metrics_obj.score,
-        "iteration_regression": False,
-        "precision": metrics_obj.precision,
-        "recall": metrics_obj.recall,
-        "hit": metrics_obj.hit,
-    }
-    trace_id = getattr(iteration_span, "id", None)
-    session_id_val = _session_id_from(iteration_span)
-    for name, value in metrics_map.items():
-        if not isinstance(value, (int, float, bool)):
-            continue
-        num_val = cast(float | int | bool, value)
-        data_type = "BOOLEAN" if isinstance(num_val, bool) else "NUMERIC"
-        score_id = f"{trace_id}-metrics.{name}" if trace_id else None
-        emit_score_for_handle(
-            iteration_span,
-            name=f"metrics.{name}",
-            value=float(num_val) if isinstance(num_val, bool) else num_val,
-            data_type=data_type,
-            score_id=score_id,
-            session_id=session_id_val,
-        )
-
-    policy_code = _read_policy()
+    task_result = eval_result.items[0]
+    metrics_obj = task_result.metrics
+    machine_score_val = eval_result.machine_score if eval_result.machine_score is not None else metrics_obj.score
     additional_metrics = [
         {"name": "precision", "value": metrics_obj.precision},
         {"name": "recall", "value": metrics_obj.recall},
         {"name": "hit", "value": metrics_obj.hit},
+        {"name": "f1", "value": metrics_obj.f1},
     ]
     eval_metrics = EvaluationMetrics.model_validate(
         {"score": metrics_obj.score, "iteration_regression": False, "additional_metrics": additional_metrics}
     )
+    ic_result_map = {"predicted_files": task_result.prediction}
     return EvaluationResult(
         metrics=eval_metrics,
         ic_result=ICResult.model_validate(ic_result_map),
         jc_result=JCResult(entries=[]),
         jc_metrics=EvaluationMetrics(),
         comparison_summary=None,
-        policy_code=policy_code,
+        policy_code=_read_policy(),
+        control_score=machine_score_val,
     )
 
 

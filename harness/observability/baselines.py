@@ -7,11 +7,10 @@ from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.localization.executor import run_localization_task
+from harness.localization.evaluation_backend import LocalizationEvaluationRequest, evaluate_localization_batch
 from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
 from harness.localization.models import (
     LCATask,
-    LocalizationDatasetInfo,
     LocalizationEvidence,
     LocalizationGold,
     LocalizationMetrics,
@@ -82,9 +81,24 @@ def compute_baseline_for_task(
             "identity": task.task_id,
         },
     ) as trace:
-        prediction, metrics, evidence, materialization = run_localization_task(
-            task, dataset_source=dataset_source, materializer=materializer, parent_trace=trace, runner=runner
+        eval_result = evaluate_localization_batch(
+            LocalizationEvaluationRequest(
+                tasks=[task],
+                dataset_source=dataset_source,
+                materializer=materializer,
+                parent_trace=trace,
+                runner=runner,
+            )
         )
+        if eval_result.failure or not eval_result.items:
+            category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
+            message = eval_result.failure.message if eval_result.failure else "baseline_evaluation_failed"
+            raise RuntimeError(f"Baseline evaluation failed ({category}): {message}")
+        task_result = eval_result.items[0]
+        prediction = LocalizationPrediction(predicted_files=task_result.prediction)
+        metrics = task_result.metrics
+        evidence = task_result.evidence
+        materialization = task_result.materialization
         telemetry = build_localization_telemetry(
             task.identity,
             metrics=metrics,

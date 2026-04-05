@@ -51,3 +51,39 @@ def test_require_baseline_errors_when_missing():
         assert "task_id" in str(exc)
     else:
         raise AssertionError("Expected ValueError for missing baseline")
+
+
+def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    task = _task(str(repo_dir))
+    calls = []
+
+    from harness.localization.evaluation_backend import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+    from harness.localization.models import LocalizationMetrics, LocalizationPrediction
+
+    def fake_backend(req):
+        calls.append(req)
+        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+        return LocalizationEvaluationResult(
+            aggregate_score=1.0,
+            aggregate_metrics=metrics,
+            machine_score=1.0,
+            items=[
+                LocalizationEvaluationTaskResult(
+                    task=task,
+                    metrics=metrics,
+                    prediction=["a.py"],
+                    evidence=None,
+                    materialization=None,
+                    trace_id=None,
+                )
+            ],
+            failure=None,
+        )
+
+    monkeypatch.setattr(baselines, "evaluate_localization_batch", fake_backend)
+    snap = baselines.compute_baseline_for_task(task, dataset_version="v1", runner=None)
+    assert calls
+    assert snap.metrics.score == 1.0
+    assert snap.prediction.predicted_files == ["a.py"]

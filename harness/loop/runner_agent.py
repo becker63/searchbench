@@ -548,6 +548,27 @@ def _normalize_agent_result(raw: Any) -> dict[str, object]:
     return normalized
 
 
+def _coerce_observations(value: object) -> list[dict[str, object]]:
+    """
+    Ensure observations are stored as a list of dicts for downstream consumers and type safety.
+    Non-mapping entries are discarded because they cannot be serialized consistently.
+    """
+    observations: list[dict[str, object]] = []
+    if isinstance(value, list):
+        for obs in value:
+            if isinstance(obs, Mapping):
+                observations.append(dict(obs))
+    return observations
+
+
+def _coerce_node_count(value: object) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
 def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tuple[list[str], str | None]:
     """
     Emergency-only fallback: try to extract predicted_files from assistant content when finalization fails.
@@ -755,27 +776,28 @@ def run_ic_iteration(
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
             backend_obs.end(error=str(exc))
         normalized = _normalize_agent_result(raw)
-        nc_val = normalized.get("node_count", 0)
-        node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-        emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
+        observations = _coerce_observations(normalized.get("observations"))
+        node_count_val = _coerce_node_count(normalized.get("node_count"))
+        node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
+        emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count_metric, data_type="NUMERIC")
+        backend_obs.update(metadata={"node_count": node_count_val or 0})
 
     try:
-        final = _finalize_localization(agent_task, normalized.get("observations", []), parent_trace=parent_span)
+        final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
     except (json.JSONDecodeError, ValidationError) as exc:
         predicted_files, reasoning = _extract_localization_prediction(normalized)
         final = LocalizationRunnerResult(
             predicted_files=predicted_files,
             reasoning=reasoning,
-            observations=normalized.get("observations", []),
-            node_count=normalized.get("node_count"),
+            observations=observations,
+            node_count=node_count_val,
             raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
             source="fallback",
         )
     if not final.observations:
-        final.observations = normalized.get("observations", [])
+        final.observations = observations
     if final.node_count is None:
-        final.node_count = normalized.get("node_count")
+        final.node_count = node_count_val
     return final.model_dump()
 
 
@@ -821,27 +843,28 @@ def run_jc_iteration(
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
             backend_obs.end(error=str(exc))
         normalized = _normalize_agent_result(raw)
-        nc_val = normalized.get("node_count", 0)
-        node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-        emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
+        observations = _coerce_observations(normalized.get("observations"))
+        node_count_val = _coerce_node_count(normalized.get("node_count"))
+        node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
+        emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count_metric, data_type="NUMERIC")
+        backend_obs.update(metadata={"node_count": node_count_val or 0})
 
     try:
-        final = _finalize_localization(agent_task, normalized.get("observations", []), parent_trace=parent_span)
+        final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
     except (json.JSONDecodeError, ValidationError) as exc:
         predicted_files, reasoning = _extract_localization_prediction(normalized)
         final = LocalizationRunnerResult(
             predicted_files=predicted_files,
             reasoning=reasoning,
-            observations=normalized.get("observations", []),
-            node_count=normalized.get("node_count"),
+            observations=observations,
+            node_count=node_count_val,
             raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
             source="fallback",
         )
     if not final.observations:
-        final.observations = normalized.get("observations", [])
+        final.observations = observations
     if final.node_count is None:
-        final.node_count = normalized.get("node_count")
+        final.node_count = node_count_val
     return final.model_dump()
 
 

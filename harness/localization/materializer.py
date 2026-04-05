@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Optional, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
@@ -69,6 +69,7 @@ class RepoMaterializationResult(BaseModel):
         return f"{path} ({status}){log_tail}"
 
 
+@runtime_checkable
 class RepoMaterializer(Protocol):
     """
     Abstract interface for materializing a repository at base_sha.

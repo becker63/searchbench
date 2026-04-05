@@ -35,3 +35,10 @@
 - Baseline (HF): `python run.py --mode localization-baseline --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --config py --split dev`
 - Experiment (HF): `python run.py --mode localization-experiment --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --config java --split test`
 - Single (HF-backed requires repo materializer): `python run.py --mode localization-single --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --repo-owner ... --repo-name ... --base-sha ...`
+
+## Shared Evaluation Backend (Machine + Hosted)
+- A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.
+- The optimization/repair state machine invokes the backend through the evaluation hook (`evaluate_policy_on_item`) under a machine-owned evaluation span; LCA backend opens child task/materialization spans.
+- Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they continue to emit localization-native metrics and outputs.
+- Machine-facing scores use explicit `machine_score` semantics: by default `machine_score == aggregate_score`; derivation policies may select precision/recall/f1/hit while raw localization metrics remain canonical (`predicted_files` vs `changed_files`, F1/score).
+- Rollback should be treated as an implementation revert/emergency only, not a co-equal path; the shared backend remains the canonical evaluation route.

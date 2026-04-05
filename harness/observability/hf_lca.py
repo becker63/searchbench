@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Iterable, List, Mapping, Sequence
 
 from harness.localization.models import LCATask, normalize_lca_task
 
@@ -19,7 +19,7 @@ class HFDatasetLoadError(RuntimeError):
         self.category = category
 
 
-def _require_dependency() -> object:
+def _require_dependency() -> Any:
     """
     Import the HF datasets library lazily to avoid mandatory networked deps in hermetic runs.
     """

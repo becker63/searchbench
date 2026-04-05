@@ -9,7 +9,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from harness.localization.executor import run_localization_task
+from harness.localization.evaluation_backend import (
+    LocalizationEvaluationRequest,
+    evaluate_localization_batch as _evaluate_localization_batch,
+)
 from harness.localization.models import LCAContext, LCAGold, LCATaskIdentity
 from harness.localization.hf_materializer import HuggingFaceRepoMaterializer
 from harness.observability.baselines import load_baseline_bundle, save_baseline_bundle
@@ -26,6 +29,13 @@ from harness.observability.requests import (
 from harness.observability.hf_lca import HFDatasetLoadError
 from harness.observability.session_policy import SessionConfig, resolve_session_id
 from harness.observability.langfuse import flush_langfuse
+
+
+def evaluate_localization_batch(req: LocalizationEvaluationRequest):
+    """
+    Thin wrapper to keep monkeypatch targets stable for tests while deferring import cycles.
+    """
+    return _evaluate_localization_batch(req)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -102,7 +112,7 @@ def _build_identity(args: argparse.Namespace) -> LCATaskIdentity:
     )
 
 
-def _load_baseline(path: str | None):
+def _load_baseline(path: str | None):  # pyright: ignore[reportUnusedFunction]
     if not path:
         return None
     p = Path(path)
@@ -181,16 +191,26 @@ def main(argv: list[str] | None = None) -> None:
                 session=session_cfg,
                 dataset_source=dataset_source,
             )
-            resolved_session = resolve_session_id(session_cfg, run_id=identity.task_id)
+            resolved_session = resolve_session_id(session_cfg, run_id=identity.task_id())
             print(f"[RUN] Ad hoc localization run for {identity.repo_owner}/{identity.repo_name}@{identity.base_sha}")
-            prediction, metrics, _evidence, materialization = run_localization_task(
-                req.to_task(), dataset_source=dataset_source.value, materializer=materializer
+            eval_result = evaluate_localization_batch(
+                LocalizationEvaluationRequest(
+                    tasks=[req.to_task()],
+                    dataset_source=dataset_source.value,
+                    materializer=materializer,
+                    parent_trace=None,
+                )
             )
-            print(f"[RUN] Prediction: {prediction.predicted_files}")
-            print(f"[RUN] Metrics: {metrics.model_dump()}")
+            if eval_result.failure or not eval_result.items:
+                category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
+                message = eval_result.failure.message if eval_result.failure else "evaluation_failed"
+                raise RuntimeError(f"Localization evaluation failed ({category}): {message}")
+            task_result = eval_result.items[0]
+            print(f"[RUN] Prediction: {task_result.prediction}")
+            print(f"[RUN] Metrics: {task_result.metrics.model_dump()}")
             print(f"[RUN] Session: {resolved_session}")
-            if materialization:
-                _print_mat_summary("single", identity.task_id, materialization)
+            if task_result.materialization:
+                _print_mat_summary("single", identity.task_id, task_result.materialization)
     except HFDatasetLoadError as exc:
         print(f"[ERROR] HF dataset load failed (category={exc.category}): {exc}")
         raise

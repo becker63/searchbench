@@ -4,14 +4,11 @@ from typing import Mapping
 
 from pydantic import BaseModel, Field
 
-from harness.localization.executor import run_localization_task
+from harness.localization.evaluation_backend import LocalizationEvaluationRequest, evaluate_localization_batch
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
 from harness.localization.materializer import RepoMaterializationResult, RepoMaterializer
 from harness.observability.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
-from harness.observability.datasets import (
-    fetch_localization_dataset_from_source,
-    normalize_localization_task,
-)
+from harness.observability.datasets import fetch_localization_dataset_from_source
 from harness.observability.langfuse import flush_langfuse, propagate_context
 from harness.observability.session_policy import resolve_session_id
 
@@ -102,16 +99,32 @@ def run_hosted_localization_experiment(req: HostedLocalizationRunRequest, materi
         },
     ) as trace:
         for task in tasks:
-            prediction, metrics, _evidence, mat = run_localization_task(
-                task, dataset_source=req.dataset_source.value, materializer=materializer, parent_trace=trace
+            if isinstance(task, Mapping):
+                task_payload: Mapping[str, object] = task
+            elif hasattr(task, "model_dump"):
+                task_payload = task.model_dump()
+            else:
+                raise RuntimeError("Localization task must be a mapping or Pydantic model")
+            eval_result = evaluate_localization_batch(
+                LocalizationEvaluationRequest(
+                    tasks=[task],
+                    dataset_source=req.dataset_source.value,
+                    materializer=materializer,
+                    parent_trace=trace,
+                )
             )
+            if eval_result.failure or not eval_result.items:
+                category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
+                message = eval_result.failure.message if eval_result.failure else "experiment_evaluation_failed"
+                raise RuntimeError(f"Experiment evaluation failed ({category}): {message}")
+            task_result = eval_result.items[0]
             results.append(
                 LocalizationRunItemResult(
-                    task=normalize_lca_task(task).model_dump(),
-                    metrics=metrics,
-                    prediction=prediction.predicted_files,
+                    task=normalize_lca_task(task_payload).model_dump(),
+                    metrics=task_result.metrics,
+                    prediction=task_result.prediction,
                     trace_id=getattr(trace, "id", None),
-                    materialization=mat,
+                    materialization=task_result.materialization,
                 )
             )
     flush_langfuse()

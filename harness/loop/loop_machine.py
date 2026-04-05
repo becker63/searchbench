@@ -358,12 +358,37 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             return
 
         iteration_tasks = prepared_tasks.build_iteration_tasks()
-        self.model.current_evaluation = self.deps.evaluate_policy_on_item(
-            iteration_tasks.ic_task,
-            self.context.baseline_snapshot,
-            self.model.current_iteration_span,
-            self.context.current_iteration,
-        )
+        eval_span = None
+        try:
+            eval_span = self.deps.start_observation(
+                name="localization_evaluation",
+                parent=self.model.current_iteration_span,
+                metadata={
+                    "iteration": self.context.current_iteration,
+                    "task": iteration_tasks.ic_task.identity.task_id(),
+                },
+            )
+        except Exception:
+            eval_span = self.model.current_iteration_span
+        try:
+            self.model.current_evaluation = self.deps.evaluate_policy_on_item(
+                iteration_tasks.ic_task,
+                self.context.baseline_snapshot,
+                eval_span,
+                self.context.current_iteration,
+            )
+            if eval_span is not None and hasattr(eval_span, "end"):
+                try:
+                    cast(Any, eval_span).end(metadata={"status": "ok"})
+                except Exception:
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            if eval_span is not None and hasattr(eval_span, "end"):
+                try:
+                    cast(Any, eval_span).end(error=exc)
+                except Exception:
+                    pass
+            raise
         self.raise_("evaluation_done")  # type: ignore[call-arg]
 
     # Repair --------------------------------------------------------------

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import List, Mapping, Optional, Sequence
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -388,6 +388,7 @@ def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str
 
     issue_title = str(data.get("issue_title") or data.get("title") or "")
     issue_body = str(data.get("issue_body") or data.get("body") or "")
+    repo_stars_val = data.get("repo_stars")
     context = LCAContext(
         issue_title=issue_title,
         issue_body=issue_body,
@@ -397,7 +398,7 @@ def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str
         repo_language=str(data.get("repo_language")) if data.get("repo_language") else None,
         repo_languages=_as_list(data.get("repo_languages") or []),
         repo_license=str(data.get("repo_license")) if data.get("repo_license") else None,
-        repo_stars=int(data.get("repo_stars")) if isinstance(data.get("repo_stars"), (int, float)) else None,
+        repo_stars=int(repo_stars_val) if isinstance(repo_stars_val, (int, float)) else None,
     )
 
     changed_files_raw = data.get("changed_files") or data.get("gold") or []

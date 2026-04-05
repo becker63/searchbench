@@ -114,10 +114,10 @@ class AgentTaskPayload(BaseModel):
             identity_val = value.get("identity")
             context_val = value.get("context")
             normalized_identity = (
-                identity_val.model_dump() if hasattr(identity_val, "model_dump") else identity_val
+                identity_val.model_dump() if identity_val is not None and hasattr(identity_val, "model_dump") else identity_val
             )
             normalized_context = (
-                context_val.model_dump() if hasattr(context_val, "model_dump") else context_val
+                context_val.model_dump() if context_val is not None and hasattr(context_val, "model_dump") else context_val
             )
             return {
                 **value,

@@ -46,7 +46,9 @@ docs/
   telemetry_sessions_cost.md
 localization/
   __init__.py
+  errors.py
   eval.py
+  evaluation_backend.py
   executor.py
   hf_materializer.py
   materializer.py
@@ -90,16 +92,21 @@ tests_harness/
   test_baselines.py
   test_cerebras_pricing.py
   test_datasets.py
+  test_executor_helpers.py
+  test_experiments_backend.py
   test_failure_context_budget.py
   test_filesystem_guard.py
   test_hf_loader.py
   test_hf_materializer.py
   test_hf_network_optin.py
+  test_localization_evaluation_backend.py
   test_localization.py
+  test_loop_machine_control_score.py
   test_loop_state_machine_min.py
   test_loop_viz.py
   test_model_strictness.py
   test_observability.py
+  test_pipeline_models.py
   test_pipeline_steps_scope.py
   test_pipeline_warning_semantics.py
   test_policy_loader.py
@@ -107,6 +114,7 @@ tests_harness/
   test_pytest_scope.py
   test_repo_resolution_execution.py
   test_repo_targets.py
+  test_run_canonical_path.py
   test_session_policy.py
   test_subprocess_guard.py
   test_test_integrity.py
@@ -186,6 +194,13 @@ This section contains the contents of the repository's files.
 - Baseline (HF): `python run.py --mode localization-baseline --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --config py --split dev`
 - Experiment (HF): `python run.py --mode localization-experiment --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --config java --split test`
 - Single (HF-backed requires repo materializer): `python run.py --mode localization-single --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --repo-owner ... --repo-name ... --base-sha ...`
+
+## Shared Evaluation Backend (Machine + Hosted)
+- A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.
+- The optimization/repair state machine invokes the backend through the evaluation hook (`evaluate_policy_on_item`) under a machine-owned evaluation span; LCA backend opens child task/materialization spans.
+- Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they continue to emit localization-native metrics and outputs.
+- Machine-facing scores use explicit `machine_score` semantics: by default `machine_score == aggregate_score`; derivation policies may select precision/recall/f1/hit while raw localization metrics remain canonical (`predicted_files` vs `changed_files`, F1/score).
+- Rollback should be treated as an implementation revert/emergency only, not a co-equal path; the shared backend remains the canonical evaluation route.
 </file>
 
 <file path="docs/loop_viz.md">
@@ -244,9 +259,11 @@ By default both machines are rendered; use `--machine optimization` or `--machin
 
 - Run/root spans are created once by orchestration bootstrap/listener layers before state machine execution; entrypoints may nest under an external parent but do not create iteration/repair roots.
 - Iteration/repair spans and high-level metrics are listener/state-machine owned; `loop.py` remains wiring-only and does not create tracing policy or roots.
+- Evaluation spans are opened by the machine-owned evaluation hook (state-machine layer) and passed as parents to the shared LCA evaluation backend; LCA opens child dataset/task/materialization spans under that parent.
 - Leaf modules (`loop/runner_agent.py`, `writer.py`, pipeline helpers, baselines) emit child spans only; they require a parent span and must fail/guard rather than create new roots unless an explicit, documented no-op is chosen.
 - Allowed leaf spans: writer attempts, backend/model/tool calls, usage/cost/latency, pipeline steps, baseline items — all attached to provided parents.
 - Disallowed patterns: leaf-created roots, competing iteration/repair spans, split ownership of high-level scores, silent root creation when no parent is provided.
+- Shared evaluation backend is the canonical evaluation path for machine and hosted runs; tracing follows the machine-owned evaluation span → backend child spans layering.
 </file>
 
 <file path="localization/__init__.py">
@@ -257,6 +274,30 @@ from .scoring import file_localization_metrics, score_file_localization
 from .eval import build_file_localization_eval_record, localization_eval_identity
 from .materializer import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer
 from .telemetry import build_localization_telemetry
+</file>
+
+<file path="localization/errors.py">
+from __future__ import annotations
+
+from enum import Enum
+
+
+class LocalizationFailureCategory(str, Enum):
+    MATERIALIZATION = "materialization"
+    RUNNER = "runner"
+    SCORING = "scoring"
+    UNKNOWN = "unknown"
+
+
+class LocalizationEvaluationError(Exception):
+    """
+    Typed localization evaluation failure.
+    """
+
+    def __init__(self, category: LocalizationFailureCategory, message: str, task_id: str | None = None):
+        super().__init__(message)
+        self.category = category
+        self.task_id = task_id
 </file>
 
 <file path="localization/eval.py">
@@ -348,30 +389,186 @@ def build_file_localization_eval_record(
     )
 </file>
 
+<file path="localization/evaluation_backend.py">
+from __future__ import annotations
+
+from enum import Enum
+from statistics import mean
+from typing import Callable, Iterable, Mapping, Sequence
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from harness.localization.executor import run_localization_task
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
+from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
+from harness.localization.models import LCATask, LocalizationEvidence, LocalizationMetrics, normalize_lca_task
+
+LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]]
+
+# Allows tests or callers to inject a deterministic runner without touching core wiring.
+DEFAULT_LOCALIZATION_RUNNER: LocalizationRunner | None = None
+
+
+def _avg(values: Iterable[float]) -> float | None:
+    collected = [v for v in values if isinstance(v, (float, int))]
+    return mean(collected) if collected else None
+
+
+def _build_failure(category: LocalizationFailureCategory, message: str, task: LCATask | None) -> LocalizationEvaluationFailure:
+    return LocalizationEvaluationFailure(category=category, message=message, task_id=task.task_id if task else None)
+
+
+class MachineScorePolicy(str, Enum):
+    AGGREGATE = "aggregate"
+    PRECISION = "precision"
+    RECALL = "recall"
+    F1 = "f1"
+    HIT = "hit"
+
+
+class LocalizationEvaluationFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: LocalizationFailureCategory
+    message: str
+    task_id: str | None = None
+
+
+class LocalizationEvaluationTaskResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task: LCATask
+    metrics: LocalizationMetrics
+    prediction: list[str] = Field(default_factory=list)
+    evidence: LocalizationEvidence | None = None
+    materialization: RepoMaterializationResult | None = None
+    trace_id: str | None = None
+
+
+class LocalizationEvaluationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    aggregate_score: float | None
+    aggregate_metrics: LocalizationMetrics | None = None
+    machine_score: float | None = None
+    items: list[LocalizationEvaluationTaskResult] = Field(default_factory=list)
+    failure: LocalizationEvaluationFailure | None = None
+
+
+class LocalizationEvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]]
+    dataset_source: str | None = None
+    materializer: RepoMaterializer | None = None
+    parent_trace: object | None = None
+    runner: LocalizationRunner | None = None
+    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE
+
+
+def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> LocalizationEvaluationResult:
+    """
+    Shared localization evaluation backend used by the optimization/repair machine and hosted wrappers.
+    Executes each task via run_localization_task, aggregates scores, and returns typed results/failures.
+    """
+    tasks = [t if isinstance(t, LCATask) else normalize_lca_task(t) for t in req.tasks]
+    runner = req.runner or DEFAULT_LOCALIZATION_RUNNER
+    task_results: list[LocalizationEvaluationTaskResult] = []
+    for task in tasks:
+        try:
+            prediction, metrics, evidence, materialization = run_localization_task(
+                task,
+                dataset_source=req.dataset_source,
+                materializer=req.materializer,
+                parent_trace=req.parent_trace,
+                runner=runner,
+            )
+            task_results.append(
+                LocalizationEvaluationTaskResult(
+                    task=task,
+                    metrics=metrics,
+                    prediction=list(prediction.predicted_files),
+                    evidence=evidence,
+                    materialization=materialization,
+                    trace_id=getattr(req.parent_trace, "id", None),
+                )
+            )
+        except LocalizationEvaluationError as exc:
+            failure = _build_failure(exc.category, str(exc), task)
+            return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+        except Exception as exc:  # noqa: BLE001
+            failure = _build_failure(LocalizationFailureCategory.UNKNOWN, str(exc), task)
+            return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+
+    try:
+        aggregate_score = _avg([res.metrics.score for res in task_results])
+        aggregate_metrics = None
+        if task_results and aggregate_score is not None:
+            aggregate_metrics = LocalizationMetrics(
+                precision=_avg(res.metrics.precision for res in task_results) or 0.0,
+                recall=_avg(res.metrics.recall for res in task_results) or 0.0,
+                f1=_avg(res.metrics.f1 for res in task_results) or aggregate_score,
+                hit=_avg(res.metrics.hit for res in task_results) or 0.0,
+                score=aggregate_score,
+            )
+        machine_score = _derive_machine_score(
+            aggregate_score=aggregate_score,
+            aggregate_metrics=aggregate_metrics,
+            policy=req.machine_score_policy or MachineScorePolicy.AGGREGATE,
+        )
+        return LocalizationEvaluationResult(
+            aggregate_score=aggregate_score,
+            aggregate_metrics=aggregate_metrics,
+            machine_score=machine_score,
+            items=task_results,
+            failure=None,
+        )
+    except LocalizationEvaluationError as exc:
+        failure = _build_failure(exc.category, str(exc), None)
+        return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+    except Exception as exc:  # noqa: BLE001
+        failure = _build_failure(LocalizationFailureCategory.SCORING, str(exc), None)
+        return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+
+
+def _derive_machine_score(
+    *,
+    aggregate_score: float | None,
+    aggregate_metrics: LocalizationMetrics | None,
+    policy: MachineScorePolicy,
+) -> float | None:
+    if policy == MachineScorePolicy.AGGREGATE:
+        return aggregate_score
+    if aggregate_metrics is None:
+        return aggregate_score
+    if policy == MachineScorePolicy.PRECISION:
+        return aggregate_metrics.precision
+    if policy == MachineScorePolicy.RECALL:
+        return aggregate_metrics.recall
+    if policy == MachineScorePolicy.F1:
+        return aggregate_metrics.f1
+    if policy == MachineScorePolicy.HIT:
+        return aggregate_metrics.hit
+    raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, f"Unknown machine score policy: {policy}")
+</file>
+
 <file path="localization/executor.py">
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Mapping, Tuple
+from typing import Any, Callable, Mapping, Tuple, cast
 
 from harness.localization.eval import build_file_localization_eval_record
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materializer import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
     RepoMaterializer,
-    describe_repo_mapping,
 )
-from harness.localization.models import (
-    LCAGold,
-    LCAPrediction,
-    LCATask,
-    LocalizationEvidence,
-    LocalizationMetrics,
-)
+from harness.localization.models import LCAPrediction, LCATask, LocalizationEvidence, LocalizationMetrics
 from harness.localization.telemetry import build_localization_telemetry
 from harness.observability.langfuse import start_observation
 from harness.observability.score_emitter import emit_score_for_handle
-from harness.loop.runner_agent import run_ic_iteration
 
 
 def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> RepoMaterializationResult | None:
@@ -388,6 +585,122 @@ def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> R
     return materializer.materialize(request)
 
 
+def _resolve_repo_path(task: LCATask, materialization_result: RepoMaterializationResult | None) -> Path:
+    repo_path: Path | None = materialization_result.local_path if materialization_result else None
+    if repo_path is None and task.repo:
+        repo_path = Path(task.repo).expanduser()
+    if repo_path is None:
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.MATERIALIZATION,
+            "Localization task is missing a repo path; provide a materializer or task.repo",
+            task_id=task.task_id,
+        )
+    if not repo_path.exists():
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.MATERIALIZATION,
+            f"Localization repo path does not exist: {repo_path}",
+            task_id=task.task_id,
+        )
+    return repo_path
+
+
+def _run_runner(
+    task: LCATask,
+    repo_path: Path,
+    trace: object | None,
+    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None,
+) -> list[str]:
+    runner_fn = runner or _default_runner
+    try:
+        predicted_files, _runner_result = runner_fn(task, str(repo_path), trace)
+    except LocalizationEvaluationError:
+        raise
+    except Exception as exc:
+        raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, str(exc), task_id=task.task_id) from exc
+    if not predicted_files:
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.RUNNER,
+            "Localization runner produced no predicted_files",
+            task_id=task.task_id,
+        )
+    return predicted_files
+
+
+def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) -> tuple[list[str], Mapping[str, object] | None]:
+    from harness import loop as loop_pkg
+
+    run_ic_iteration_fn = getattr(loop_pkg, "run_ic_iteration")
+    result = run_ic_iteration_fn(
+        {
+            "identity": lca_task.identity.model_dump(),
+            "context": lca_task.context.model_dump(),
+            "repo": repo_path,
+        },
+        score_fn=None,
+        steps=5,
+        parent_trace=parent,
+    )
+    if not isinstance(result, Mapping):
+        raise RuntimeError("Localization runner returned an invalid result")
+    predicted = result.get("predicted_files")
+    if not isinstance(predicted, list):
+        raise RuntimeError("Localization runner produced no predicted_files")
+    predictions = [p for p in predicted if isinstance(p, str) and p.strip()]
+    if not predictions:
+        raise RuntimeError("Localization runner produced an empty predicted_files list")
+    return predictions, result
+
+
+def _score_task(task: LCATask, prediction: LCAPrediction, repo_path: Path) -> LocalizationMetrics:
+    try:
+        eval_record = build_file_localization_eval_record(
+            task.identity, prediction, task.gold, evidence=task.evidence, repo_path=repo_path
+        )
+        return eval_record.metrics
+    except LocalizationEvaluationError:
+        raise
+    except Exception as exc:
+        raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, str(exc), task_id=task.task_id) from exc
+
+
+def _emit_telemetry(
+    task: LCATask,
+    metrics: LocalizationMetrics,
+    evidence: LocalizationEvidence | None,
+    materialization: RepoMaterializationResult | None,
+    dataset_source: str | None,
+    trace: object | None,
+) -> None:
+    telemetry = build_localization_telemetry(
+        task.identity,
+        metrics=metrics,
+        changed_files_count=len(task.gold.normalized_changed_files()),
+        dataset_source=dataset_source,
+        repo_language=task.context.repo_language,
+        repo_license=task.context.repo_license,
+        evidence=evidence,
+        materialization_events=materialization.events if materialization else None,
+    )
+    dataset_run_id = getattr(trace, "id", None) if trace else None
+    for metric_name, metric_value in metrics.model_dump().items():
+        if metric_value is None:
+            continue
+        emit_score_for_handle(
+            trace,
+            name=f"localization.{metric_name}",
+            value=float(metric_value),
+            data_type="NUMERIC",
+            dataset_run_id=dataset_run_id,
+            score_id=f"{getattr(trace, 'id', None)}-localization.{metric_name}" if getattr(trace, "id", None) else None,
+        )
+    if trace:
+        try:
+            trace_any = cast(Any, trace)
+            trace_any.metadata = {**getattr(trace_any, "metadata", {}), "telemetry": telemetry.model_dump(exclude_none=True)}
+        except Exception:
+            pass
+
+
 def run_localization_task(
     task: LCATask,
     dataset_source: str | None = None,
@@ -396,34 +709,13 @@ def run_localization_task(
     runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
 ) -> Tuple[LCAPrediction, LocalizationMetrics, LocalizationEvidence | None, RepoMaterializationResult | None]:
     """
-    Execute a localization task end to end:
+    Execute a single localization task end to end (leaf helper):
     - materialize repo at base_sha (if a materializer is provided)
     - run the localization agent/backend to produce predicted_files
     - score using file-set localization metrics
-    - emit scores via Langfuse
+    - emit task-level telemetry
     Returns prediction, metrics, optional evidence, and materialization details.
     """
-
-    def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) -> tuple[list[str], Mapping[str, object] | None]:
-        result = run_ic_iteration(
-            {
-                "identity": lca_task.identity.model_dump(),
-                "context": lca_task.context.model_dump(),
-                "repo": repo_path,
-            },
-            score_fn=None,
-            steps=5,
-            parent_trace=parent,
-        )
-        if not isinstance(result, Mapping):
-            raise RuntimeError("Localization runner returned an invalid result")
-        predicted = result.get("predicted_files")
-        if not isinstance(predicted, list):
-            raise RuntimeError("Localization runner produced no predicted_files")
-        predictions = [p for p in predicted if isinstance(p, str) and p.strip()]
-        if not predictions:
-            raise RuntimeError("Localization runner produced an empty predicted_files list")
-        return predictions, result
 
     with start_observation(
         name="localization_task",
@@ -441,53 +733,20 @@ def run_localization_task(
         try:
             materialization_result = _materialize_repo(task, materializer)
         except Exception as exc:
-            # Surface materialization failures with category hint if available
-            hint = getattr(exc, "category", None)
-            raise RuntimeError(f"Materialization failed ({hint or 'materialization'}): {exc}") from exc
-        repo_path: Path | None = materialization_result.local_path if materialization_result else None
-        if repo_path is None and task.repo:
-            repo_path = Path(task.repo).expanduser()
-        if repo_path is not None and not repo_path.exists():
-            raise RuntimeError(f"Localization repo path does not exist: {repo_path}")
-        if repo_path is None:
-            raise RuntimeError("Localization task is missing a repo path; provide a materializer or task.repo")
-        runner_fn = runner or _default_runner
-        predicted_files, _runner_result = runner_fn(task, str(repo_path), trace)
-        if not predicted_files:
-            raise RuntimeError("Localization runner produced no predicted_files")
+            raise LocalizationEvaluationError(LocalizationFailureCategory.MATERIALIZATION, str(exc), task_id=task.task_id) from exc
+        repo_path = _resolve_repo_path(task, materialization_result)
+        predicted_files = _run_runner(task, repo_path, trace, runner)
         prediction = LCAPrediction(predicted_files=predicted_files)
-        eval_record = build_file_localization_eval_record(
-            task.identity, prediction, task.gold, evidence=task.evidence, repo_path=repo_path
-        )
-        telemetry = build_localization_telemetry(
-            task.identity,
-            metrics=eval_record.metrics,
-            changed_files_count=len(task.gold.normalized_changed_files()),
-            dataset_source=dataset_source,
-            repo_language=task.context.repo_language,
-            repo_license=task.context.repo_license,
+        metrics = _score_task(task, prediction, repo_path)
+        _emit_telemetry(
+            task=task,
+            metrics=metrics,
             evidence=task.evidence,
-            materialization_events=materialization_result.events if materialization_result else None,
+            materialization=materialization_result,
+            dataset_source=dataset_source,
+            trace=trace,
         )
-        dataset_run_id = getattr(parent_trace, "id", None)
-        for metric_name, metric_value in eval_record.metrics.model_dump().items():
-            if metric_value is None:
-                continue
-            emit_score_for_handle(
-                trace,
-                name=f"localization.{metric_name}",
-                value=float(metric_value),
-                data_type="NUMERIC",
-                dataset_run_id=dataset_run_id,
-                score_id=f"{trace.id}-localization.{metric_name}" if getattr(trace, "id", None) else None,
-            )
-        # surface telemetry in metadata for downstream consumers
-        if trace:
-            try:
-                trace.metadata = {**getattr(trace, "metadata", {}), "telemetry": telemetry.model_dump(exclude_none=True)}
-            except Exception:
-                pass
-        return prediction, eval_record.metrics, task.evidence, materialization_result
+        return prediction, metrics, task.evidence, materialization_result
 </file>
 
 <file path="localization/hf_materializer.py">
@@ -682,7 +941,7 @@ class _Lock:
         self.acquire()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None) -> None:
         self.release()
 
 
@@ -759,7 +1018,7 @@ def _pid_alive(pid: int) -> bool:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Optional, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
@@ -827,6 +1086,7 @@ class RepoMaterializationResult(BaseModel):
         return f"{path} ({status}){log_tail}"
 
 
+@runtime_checkable
 class RepoMaterializer(Protocol):
     """
     Abstract interface for materializing a repository at base_sha.
@@ -857,7 +1117,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import List, Mapping, Optional, Sequence
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -1243,6 +1503,7 @@ def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str
 
     issue_title = str(data.get("issue_title") or data.get("title") or "")
     issue_body = str(data.get("issue_body") or data.get("body") or "")
+    repo_stars_val = data.get("repo_stars")
     context = LCAContext(
         issue_title=issue_title,
         issue_body=issue_body,
@@ -1252,7 +1513,7 @@ def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str
         repo_language=str(data.get("repo_language")) if data.get("repo_language") else None,
         repo_languages=_as_list(data.get("repo_languages") or []),
         repo_license=str(data.get("repo_license")) if data.get("repo_license") else None,
-        repo_stars=int(data.get("repo_stars")) if isinstance(data.get("repo_stars"), (int, float)) else None,
+        repo_stars=int(repo_stars_val) if isinstance(repo_stars_val, (int, float)) else None,
     )
 
     changed_files_raw = data.get("changed_files") or data.get("gold") or []
@@ -1405,7 +1666,6 @@ from .loop import (  # noqa: E402
     _read_policy,
     _write_policy,
     emit_score,
-    emit_score_for_handle,
     evaluate_policy_on_item,
     index_folder,
     load_policy,
@@ -1444,7 +1704,6 @@ __all__ = [
     "_clean_policy_code",
     "index_folder",
     "emit_score",
-    "emit_score_for_handle",
     "load_policy",
     "run_policy_pipeline",
     "run_ic_iteration",
@@ -1600,10 +1859,10 @@ class AgentTaskPayload(BaseModel):
             identity_val = value.get("identity")
             context_val = value.get("context")
             normalized_identity = (
-                identity_val.model_dump() if hasattr(identity_val, "model_dump") else identity_val
+                identity_val.model_dump() if identity_val is not None and hasattr(identity_val, "model_dump") else identity_val
             )
             normalized_context = (
-                context_val.model_dump() if hasattr(context_val, "model_dump") else context_val
+                context_val.model_dump() if context_val is not None and hasattr(context_val, "model_dump") else context_val
             )
             return {
                 **value,
@@ -2151,12 +2410,37 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             return
 
         iteration_tasks = prepared_tasks.build_iteration_tasks()
-        self.model.current_evaluation = self.deps.evaluate_policy_on_item(
-            iteration_tasks.ic_task,
-            self.context.baseline_snapshot,
-            self.model.current_iteration_span,
-            self.context.current_iteration,
-        )
+        eval_span = None
+        try:
+            eval_span = self.deps.start_observation(
+                name="localization_evaluation",
+                parent=self.model.current_iteration_span,
+                metadata={
+                    "iteration": self.context.current_iteration,
+                    "task": iteration_tasks.ic_task.identity.task_id(),
+                },
+            )
+        except Exception:
+            eval_span = self.model.current_iteration_span
+        try:
+            self.model.current_evaluation = self.deps.evaluate_policy_on_item(
+                iteration_tasks.ic_task,
+                self.context.baseline_snapshot,
+                eval_span,
+                self.context.current_iteration,
+            )
+            if eval_span is not None and hasattr(eval_span, "end"):
+                try:
+                    cast(Any, eval_span).end(metadata={"status": "ok"})
+                except Exception:
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            if eval_span is not None and hasattr(eval_span, "end"):
+                try:
+                    cast(Any, eval_span).end(error=exc)
+                except Exception:
+                    pass
+            raise
         self.raise_("evaluation_done")  # type: ignore[call-arg]
 
     # Repair --------------------------------------------------------------
@@ -2587,6 +2871,7 @@ class EvaluationResult(BaseModel):
     policy_code: str
     success: bool = True
     error: str | None = None
+    control_score: float | None = None
 
 
 class FeedbackPackage(BaseModel):
@@ -2857,7 +3142,7 @@ from harness.observability.langfuse import (
     propagate_context,
     start_observation,
 )
-from harness.observability.score_emitter import emit_score, emit_score_for_handle
+from harness.observability.score_emitter import emit_score
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy_loader import load_policy
@@ -2871,10 +3156,10 @@ from harness.utils.type_loader import (
     load_scoring_types,
 )
 from harness.writer import generate_policy
-from harness.localization.models import LCAGold, LCAPrediction
-from harness.localization.scoring import score_file_localization
+from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 
 if TYPE_CHECKING:
+    from harness.localization.evaluation_backend import LocalizationEvaluationRequest
     from harness.observability.baselines import BaselineSnapshot
 
 from .loop_machine import OptimizationStateMachine
@@ -2896,7 +3181,6 @@ from .loop_types import (
     OptimizationMachineModel,
     PreparedTasks,
     RunMetadata,
-    ScalarMetrics,
     TaskPayload,
     format_failure_context_payload,
 )
@@ -2904,11 +3188,6 @@ from .loop_types import (
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.py"
 _MAX_POLICY_REPAIRS = 3
 _MAX_FAILURE_SUMMARY_CHARS = 400
-
-
-def score(result: Mapping[str, object]) -> Mapping[str, object]:  # pyright: ignore[reportUnusedFunction]
-    """Legacy scoring shim for tests; retains mapping interface."""
-    return result
 
 
 # Re-exported helpers so callers can monkeypatch harness.loop.* directly.
@@ -2935,6 +3214,33 @@ _REEXPORTED = (
 )
 
 
+def evaluate_localization_batch(req: "LocalizationEvaluationRequest"):
+    """
+    Thin wrapper to keep monkeypatching stable while avoiding import cycles.
+    """
+    from harness.localization.evaluation_backend import evaluate_localization_batch as _evaluate_localization_batch
+
+    return _evaluate_localization_batch(req)
+
+
+def LocalizationEvaluationRequest(*args, **kwargs):
+    """
+    Lazy proxy for the evaluation request model so tests can monkeypatch the symbol on this module.
+    """
+    from harness.localization.evaluation_backend import LocalizationEvaluationRequest as _LocalizationEvaluationRequest
+
+    return _LocalizationEvaluationRequest(*args, **kwargs)
+
+
+def score(node: object, state: object, context: object | None = None) -> float:
+    """
+    Delegate to policy.score while keeping a stable harness.loop.* attribute for tests/monkeypatching.
+    """
+    from harness.policy import score as _policy_score
+
+    return _policy_score(node, state, context)
+
+
 def _pkg_attr(name: str) -> object:
     # Access via package to pick up monkeypatching on harness.loop
     pkg = import_module("harness.loop")
@@ -2946,12 +3252,6 @@ def _as_float(value: Any) -> float:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0.0
-
-
-def _session_id_from(handle: object | None, default: str | None = None) -> str | None:
-    if handle is None:
-        return default
-    return getattr(handle, "session_id", default)
 
 
 def _read_policy(path: Path = _POLICY_PATH) -> str:
@@ -3089,100 +3389,80 @@ def evaluate_policy_on_item(
     iteration_span: object | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
-    """Load current policy, execute IC iteration, and compute localization metrics."""
-    start_obs_func = cast(
-        Callable[..., SupportsSpan | None], _pkg_attr("start_observation")
+    """Execute localization evaluation via the shared LCA evaluation backend."""
+    lca_task = LCATask(
+        identity=LCATaskIdentity(
+            dataset_name=ic_task.identity.dataset_name,
+            dataset_config=ic_task.identity.dataset_config,
+            dataset_split=ic_task.identity.dataset_split,
+            repo_owner=ic_task.identity.repo_owner,
+            repo_name=ic_task.identity.repo_name,
+            base_sha=ic_task.identity.base_sha,
+            issue_url=ic_task.identity.issue_url,
+            pull_url=ic_task.identity.pull_url,
+        ),
+        context=LCAContext.model_validate(ic_task.context.model_dump()),
+        gold=LCAGold(changed_files=list(ic_task.changed_files)),
+        repo=ic_task.repo,
     )
-    load_policy_fn = cast(Callable[[], Callable[..., object]], _pkg_attr("load_policy"))
-    run_ic_iteration_fn = cast(
-        Callable[..., Mapping[str, object]], _pkg_attr("run_ic_iteration")
+    eval_req = LocalizationEvaluationRequest(
+        tasks=[lca_task],
+        dataset_source=None,
+        materializer=None,
+        parent_trace=iteration_span,
     )
-    policy_load_obs: SupportsSpan | None = None
-    try:
-        policy_load_obs = start_obs_func(
-            name="policy_load",
-            parent=iteration_span,
-            metadata={"iteration": iteration_index},
-        )
-        loaded_policy_fn = load_policy_fn()
-        if policy_load_obs and hasattr(policy_load_obs, "end"):
-            policy_load_obs.end(metadata={"status": "loaded"})
-    except ImportError as e:
-        if policy_load_obs is not None:
-            try:
-                policy_load_obs.end(error=e)
-            except Exception:
-                pass
-        error_metrics: ScalarMetrics = {
+    eval_result = evaluate_localization_batch(eval_req)
+    if eval_result.failure:
+        failure_metrics: dict[str, float | int | bool | None] = {
             "score": -10.0,
+            "iteration_regression": False,
         }
-        emit_score_for_handle(
-            iteration_span,
-            name="metrics.score",
-            value=_as_float(error_metrics.get("score", 0.0)),
-            data_type="NUMERIC",
-        )
         return EvaluationResult(
-            metrics=EvaluationMetrics.model_validate(error_metrics),
+            metrics=EvaluationMetrics.model_validate(failure_metrics),
             ic_result=ICResult(entries=[]),
             jc_result=JCResult(entries=[]),
             jc_metrics=EvaluationMetrics(),
             comparison_summary=None,
             policy_code="",
             success=False,
-            error=f"policy_import_error: {str(e)}",
+            error=f"{getattr(eval_result.failure.category, 'value', eval_result.failure.category)}: {eval_result.failure.message}",
         )
-
-    ic_runner = cast(Callable[..., dict[str, object]], run_ic_iteration_fn)
-    ic_result_map = ic_runner(
-        ic_task.model_dump(), loaded_policy_fn, parent_trace=iteration_span
+    if not eval_result.items:
+        empty_metrics: dict[str, float | int | bool | None] = {
+            "score": -10.0,
+            "iteration_regression": False,
+        }
+        return EvaluationResult(
+            metrics=EvaluationMetrics.model_validate(empty_metrics),
+            ic_result=ICResult(entries=[]),
+            jc_result=JCResult(entries=[]),
+            jc_metrics=EvaluationMetrics(),
+            comparison_summary=None,
+            policy_code="",
+            success=False,
+            error="evaluation_failed: no_results",
     )
-    predicted_files_raw = []
-    if isinstance(ic_result_map, Mapping):
-        predicted_files_raw = ic_result_map.get("predicted_files", [])
-    predicted_files = [str(p) for p in predicted_files_raw if isinstance(p, str)]
-    gold = LCAGold(changed_files=ic_task.changed_files)
-    metrics_obj = score_file_localization(LCAPrediction(predicted_files=predicted_files), gold)
-    metrics_map: dict[str, float | int | bool | None] = {
-        "score": metrics_obj.score,
-        "iteration_regression": False,
-        "precision": metrics_obj.precision,
-        "recall": metrics_obj.recall,
-        "hit": metrics_obj.hit,
-    }
-    trace_id = getattr(iteration_span, "id", None)
-    session_id_val = _session_id_from(iteration_span)
-    for name, value in metrics_map.items():
-        if not isinstance(value, (int, float, bool)):
-            continue
-        num_val = cast(float | int | bool, value)
-        data_type = "BOOLEAN" if isinstance(num_val, bool) else "NUMERIC"
-        score_id = f"{trace_id}-metrics.{name}" if trace_id else None
-        emit_score_for_handle(
-            iteration_span,
-            name=f"metrics.{name}",
-            value=float(num_val) if isinstance(num_val, bool) else num_val,
-            data_type=data_type,
-            score_id=score_id,
-            session_id=session_id_val,
-        )
-
-    policy_code = _read_policy()
+    task_result = eval_result.items[0]
+    metrics_obj = task_result.metrics
+    machine_score_val = eval_result.machine_score if eval_result.machine_score is not None else metrics_obj.score
     additional_metrics = [
         {"name": "precision", "value": metrics_obj.precision},
         {"name": "recall", "value": metrics_obj.recall},
         {"name": "hit", "value": metrics_obj.hit},
+        {"name": "f1", "value": metrics_obj.f1},
     ]
     eval_metrics = EvaluationMetrics.model_validate(
         {"score": metrics_obj.score, "iteration_regression": False, "additional_metrics": additional_metrics}
     )
+    ic_result_map = {"predicted_files": task_result.prediction}
     return EvaluationResult(
         metrics=eval_metrics,
         ic_result=ICResult.model_validate(ic_result_map),
         jc_result=JCResult(entries=[]),
         jc_metrics=EvaluationMetrics(),
         comparison_summary=None,
-        policy_code=policy_code,
+        policy_code=_read_policy(),
+        control_score=machine_score_val,
     )
 
 
@@ -4085,6 +4365,27 @@ def _normalize_agent_result(raw: Any) -> dict[str, object]:
     return normalized
 
 
+def _coerce_observations(value: object) -> list[dict[str, object]]:
+    """
+    Ensure observations are stored as a list of dicts for downstream consumers and type safety.
+    Non-mapping entries are discarded because they cannot be serialized consistently.
+    """
+    observations: list[dict[str, object]] = []
+    if isinstance(value, list):
+        for obs in value:
+            if isinstance(obs, Mapping):
+                observations.append(dict(obs))
+    return observations
+
+
+def _coerce_node_count(value: object) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
 def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tuple[list[str], str | None]:
     """
     Emergency-only fallback: try to extract predicted_files from assistant content when finalization fails.
@@ -4292,27 +4593,28 @@ def run_ic_iteration(
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
             backend_obs.end(error=str(exc))
         normalized = _normalize_agent_result(raw)
-        nc_val = normalized.get("node_count", 0)
-        node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-        emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
+        observations = _coerce_observations(normalized.get("observations"))
+        node_count_val = _coerce_node_count(normalized.get("node_count"))
+        node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
+        emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count_metric, data_type="NUMERIC")
+        backend_obs.update(metadata={"node_count": node_count_val or 0})
 
     try:
-        final = _finalize_localization(agent_task, normalized.get("observations", []), parent_trace=parent_span)
+        final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
     except (json.JSONDecodeError, ValidationError) as exc:
         predicted_files, reasoning = _extract_localization_prediction(normalized)
         final = LocalizationRunnerResult(
             predicted_files=predicted_files,
             reasoning=reasoning,
-            observations=normalized.get("observations", []),
-            node_count=normalized.get("node_count"),
+            observations=observations,
+            node_count=node_count_val,
             raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
             source="fallback",
         )
     if not final.observations:
-        final.observations = normalized.get("observations", [])
+        final.observations = observations
     if final.node_count is None:
-        final.node_count = normalized.get("node_count")
+        final.node_count = node_count_val
     return final.model_dump()
 
 
@@ -4358,27 +4660,28 @@ def run_jc_iteration(
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
             backend_obs.end(error=str(exc))
         normalized = _normalize_agent_result(raw)
-        nc_val = normalized.get("node_count", 0)
-        node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
-        emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
+        observations = _coerce_observations(normalized.get("observations"))
+        node_count_val = _coerce_node_count(normalized.get("node_count"))
+        node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
+        emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count_metric, data_type="NUMERIC")
+        backend_obs.update(metadata={"node_count": node_count_val or 0})
 
     try:
-        final = _finalize_localization(agent_task, normalized.get("observations", []), parent_trace=parent_span)
+        final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
     except (json.JSONDecodeError, ValidationError) as exc:
         predicted_files, reasoning = _extract_localization_prediction(normalized)
         final = LocalizationRunnerResult(
             predicted_files=predicted_files,
             reasoning=reasoning,
-            observations=normalized.get("observations", []),
-            node_count=normalized.get("node_count"),
+            observations=observations,
+            node_count=node_count_val,
             raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
             source="fallback",
         )
     if not final.observations:
-        final.observations = normalized.get("observations", [])
+        final.observations = observations
     if final.node_count is None:
-        final.node_count = normalized.get("node_count")
+        final.node_count = node_count_val
     return final.model_dump()
 
 
@@ -4443,11 +4746,10 @@ from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.localization.executor import run_localization_task
+from harness.localization.evaluation_backend import LocalizationEvaluationRequest, evaluate_localization_batch
 from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
 from harness.localization.models import (
     LCATask,
-    LocalizationDatasetInfo,
     LocalizationEvidence,
     LocalizationGold,
     LocalizationMetrics,
@@ -4518,9 +4820,24 @@ def compute_baseline_for_task(
             "identity": task.task_id,
         },
     ) as trace:
-        prediction, metrics, evidence, materialization = run_localization_task(
-            task, dataset_source=dataset_source, materializer=materializer, parent_trace=trace, runner=runner
+        eval_result = evaluate_localization_batch(
+            LocalizationEvaluationRequest(
+                tasks=[task],
+                dataset_source=dataset_source,
+                materializer=materializer,
+                parent_trace=trace,
+                runner=runner,
+            )
         )
+        if eval_result.failure or not eval_result.items:
+            category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
+            message = eval_result.failure.message if eval_result.failure else "baseline_evaluation_failed"
+            raise RuntimeError(f"Baseline evaluation failed ({category}): {message}")
+        task_result = eval_result.items[0]
+        prediction = LocalizationPrediction(predicted_files=task_result.prediction)
+        metrics = task_result.metrics
+        evidence = task_result.evidence
+        materialization = task_result.materialization
         telemetry = build_localization_telemetry(
             task.identity,
             metrics=metrics,
@@ -4919,14 +5236,11 @@ from typing import Mapping
 
 from pydantic import BaseModel, Field
 
-from harness.localization.executor import run_localization_task
+from harness.localization.evaluation_backend import LocalizationEvaluationRequest, evaluate_localization_batch
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
 from harness.localization.materializer import RepoMaterializationResult, RepoMaterializer
 from harness.observability.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
-from harness.observability.datasets import (
-    fetch_localization_dataset_from_source,
-    normalize_localization_task,
-)
+from harness.observability.datasets import fetch_localization_dataset_from_source
 from harness.observability.langfuse import flush_langfuse, propagate_context
 from harness.observability.session_policy import resolve_session_id
 
@@ -5017,16 +5331,32 @@ def run_hosted_localization_experiment(req: HostedLocalizationRunRequest, materi
         },
     ) as trace:
         for task in tasks:
-            prediction, metrics, _evidence, mat = run_localization_task(
-                task, dataset_source=req.dataset_source.value, materializer=materializer, parent_trace=trace
+            if isinstance(task, Mapping):
+                task_payload: Mapping[str, object] = task
+            elif hasattr(task, "model_dump"):
+                task_payload = task.model_dump()
+            else:
+                raise RuntimeError("Localization task must be a mapping or Pydantic model")
+            eval_result = evaluate_localization_batch(
+                LocalizationEvaluationRequest(
+                    tasks=[task],
+                    dataset_source=req.dataset_source.value,
+                    materializer=materializer,
+                    parent_trace=trace,
+                )
             )
+            if eval_result.failure or not eval_result.items:
+                category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
+                message = eval_result.failure.message if eval_result.failure else "experiment_evaluation_failed"
+                raise RuntimeError(f"Experiment evaluation failed ({category}): {message}")
+            task_result = eval_result.items[0]
             results.append(
                 LocalizationRunItemResult(
-                    task=normalize_lca_task(task).model_dump(),
-                    metrics=metrics,
-                    prediction=prediction.predicted_files,
+                    task=normalize_lca_task(task_payload).model_dump(),
+                    metrics=task_result.metrics,
+                    prediction=task_result.prediction,
                     trace_id=getattr(trace, "id", None),
-                    materialization=mat,
+                    materialization=task_result.materialization,
                 )
             )
     flush_langfuse()
@@ -5037,7 +5367,7 @@ def run_hosted_localization_experiment(req: HostedLocalizationRunRequest, materi
 from __future__ import annotations
 
 import logging
-from typing import Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Iterable, List, Mapping, Sequence
 
 from harness.localization.models import LCATask, normalize_lca_task
 
@@ -5055,7 +5385,7 @@ class HFDatasetLoadError(RuntimeError):
         self.category = category
 
 
-def _require_dependency() -> object:
+def _require_dependency() -> Any:
     """
     Import the HF datasets library lazily to avoid mandatory networked deps in hermetic runs.
     """
@@ -5138,7 +5468,8 @@ def fetch_hf_localization_dataset(
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Mapping, Optional
+from types import TracebackType
+from typing import Any, Mapping, Optional, cast
 
 from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
@@ -5322,7 +5653,8 @@ def start_root_observation(
     )
     start_fn = getattr(client_any, "start_as_current_observation", None)
     if callable(start_fn):
-        with start_fn(**envelope.to_start_kwargs()) as observation:
+        start_ctx = cast(Any, start_fn)(**envelope.to_start_kwargs())
+        with start_ctx as observation:
             yield observation
     else:
         # Fallback for stubbed clients in tests.
@@ -5337,10 +5669,18 @@ def start_root_observation(
             def __enter__(self):
                 return self
 
-            def __exit__(self, exc_type, exc, tb):
+            def __exit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
                 return False
 
             def end(self, **kwargs: object) -> None:
+                return None
+
+            def update(self, **kwargs: object) -> None:
                 return None
 
         obs = _DummyObs()
@@ -5393,7 +5733,8 @@ def start_observation(
     """
     Convenience wrapper to start a root or child observation based on parent presence.
     """
-    if parent is None:
+    parent_ctx = parent if parent is not None and hasattr(parent, "start_observation") else None
+    if parent_ctx is None:
         with start_root_observation(
             name,
             as_type=as_type,
@@ -5405,7 +5746,7 @@ def start_observation(
             yield observation
     else:
         with start_child_observation(
-            parent,
+            parent_ctx,
             name,
             as_type=as_type,
             input=input,
@@ -6907,6 +7248,42 @@ def test_require_baseline_errors_when_missing():
         assert "task_id" in str(exc)
     else:
         raise AssertionError("Expected ValueError for missing baseline")
+
+
+def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    task = _task(str(repo_dir))
+    calls = []
+
+    from harness.localization.evaluation_backend import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+    from harness.localization.models import LocalizationMetrics, LocalizationPrediction
+
+    def fake_backend(req):
+        calls.append(req)
+        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+        return LocalizationEvaluationResult(
+            aggregate_score=1.0,
+            aggregate_metrics=metrics,
+            machine_score=1.0,
+            items=[
+                LocalizationEvaluationTaskResult(
+                    task=task,
+                    metrics=metrics,
+                    prediction=["a.py"],
+                    evidence=None,
+                    materialization=None,
+                    trace_id=None,
+                )
+            ],
+            failure=None,
+        )
+
+    monkeypatch.setattr(baselines, "evaluate_localization_batch", fake_backend)
+    snap = baselines.compute_baseline_for_task(task, dataset_version="v1", runner=None)
+    assert calls
+    assert snap.metrics.score == 1.0
+    assert snap.prediction.predicted_files == ["a.py"]
 </file>
 
 <file path="tests_harness/test_cerebras_pricing.py">
@@ -6981,6 +7358,137 @@ def test_normalize_localization_task_builds_identity_and_defaults():
     assert normalized.repo == "/tmp/repo"
     assert normalized.changed_files == ["a.py", "b.py"]
     assert normalized.identity.task_id().startswith("lca-bug-localization:")
+</file>
+
+<file path="tests_harness/test_executor_helpers.py">
+from __future__ import annotations
+
+import pytest
+from pathlib import Path
+
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
+from harness.localization.executor import (
+    _resolve_repo_path,
+    _run_runner,
+    _score_task,
+    run_localization_task,
+)
+from harness.localization.models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
+
+
+def _task(repo: Path) -> LCATask:
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    context = LCAContext(issue_title="bug", issue_body="body")
+    gold = LCAGold(changed_files=["a.py"])
+    return LCATask(identity=identity, context=context, gold=gold, repo=str(repo))
+
+
+def test_resolve_repo_path_missing(tmp_path):
+    task = _task(tmp_path / "missing")
+    with pytest.raises(LocalizationEvaluationError) as exc:
+        _resolve_repo_path(task, None)
+    assert exc.value.category == LocalizationFailureCategory.MATERIALIZATION
+
+
+def test_run_runner_failure_is_typed(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task = _task(repo)
+
+    def failing_runner(*_a, **_k):
+        raise RuntimeError("boom")
+
+    with pytest.raises(LocalizationEvaluationError) as exc:
+        _run_runner(task, repo, None, failing_runner)
+    assert exc.value.category == LocalizationFailureCategory.RUNNER
+
+
+def test_score_task_failure_is_typed(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task = _task(repo)
+
+    def bad_eval(*_a, **_k):
+        raise ValueError("score fail")
+
+    monkeypatch.setattr("harness.localization.executor.build_file_localization_eval_record", bad_eval)
+    with pytest.raises(LocalizationEvaluationError) as exc:
+        _score_task(task, LCAPrediction(predicted_files=["a.py"]), repo)
+    assert exc.value.category == LocalizationFailureCategory.SCORING
+</file>
+
+<file path="tests_harness/test_experiments_backend.py">
+from __future__ import annotations
+
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.observability import experiments
+
+
+def _task(repo: str) -> LCATask:
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    context = LCAContext(issue_title="bug", issue_body="body")
+    gold = LCAGold(changed_files=["a.py"])
+    return LCATask(identity=identity, context=context, gold=gold, repo=repo)
+
+
+def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
+    task = _task(str(tmp_path / "repo"))
+    calls = []
+
+    from harness.localization.evaluation_backend import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+    from harness.localization.models import LocalizationMetrics
+
+    def fake_backend(req):
+        calls.append(req)
+        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+        return LocalizationEvaluationResult(
+            aggregate_score=1.0,
+            aggregate_metrics=metrics,
+            machine_score=1.0,
+            items=[
+                LocalizationEvaluationTaskResult(
+                    task=task,
+                    metrics=metrics,
+                    prediction=["a.py"],
+                    evidence=None,
+                    materialization=None,
+                    trace_id=None,
+                )
+            ],
+            failure=None,
+        )
+
+    monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
+    monkeypatch.setattr(
+        experiments,
+        "_resolve_items",
+        lambda req: [task],
+    )
+    req = experiments.HostedLocalizationRunRequest(
+        dataset="d",
+        version="v1",
+        dataset_config="c",
+        dataset_split="s",
+        session=None,
+        dataset_source=experiments.HostedLocalizationRunRequest.model_fields["dataset_source"].default,
+    )
+    result = experiments.run_hosted_localization_experiment(req, materializer=None)
+    assert calls
+    assert result.items[0].prediction == ["a.py"]
 </file>
 
 <file path="tests_harness/test_failure_context_budget.py">
@@ -7323,6 +7831,208 @@ def test_hf_network_smoke_end_to_end(tmp_path):
     assert result.checkout_verified is True
 </file>
 
+<file path="tests_harness/test_localization_evaluation_backend.py">
+from __future__ import annotations
+
+from pathlib import Path
+
+from harness.localization.evaluation_backend import (
+    DEFAULT_LOCALIZATION_RUNNER,
+    LocalizationEvaluationRequest,
+    MachineScorePolicy,
+    evaluate_localization_batch,
+)
+from harness.localization.errors import LocalizationFailureCategory, LocalizationEvaluationError
+from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold, LCAPrediction, LocalizationMetrics
+from harness.loop.loop import evaluate_policy_on_item
+from harness.loop.loop_types import ICTaskPayload
+
+
+def _make_task(tmp_path: Path) -> LCATask:
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="owner",
+        repo_name="repo",
+        base_sha="abc",
+    )
+    context = LCAContext(issue_title="bug", issue_body="body")
+    gold = LCAGold(changed_files=["a.py"])
+    return LCATask(identity=identity, context=context, gold=gold, repo=str(tmp_path))
+
+
+def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
+    task = _make_task(tmp_path)
+
+    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
+        return ["a.py"], {}
+
+    monkeypatch.setattr(
+        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        stub_runner,
+        raising=False,
+    )
+    result = evaluate_localization_batch(
+        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+    )
+    assert result.failure is None
+    assert result.aggregate_score == 1.0
+    assert result.items and result.items[0].metrics.score == 1.0
+
+
+def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None:
+    task = _make_task(tmp_path)
+
+    def failing_runner(lca_task: LCATask, repo_path: str, parent: object | None):
+        raise RuntimeError("runner failed")
+
+    monkeypatch.setattr(
+        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        failing_runner,
+        raising=False,
+    )
+    result = evaluate_localization_batch(
+        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+    )
+    assert result.failure is not None
+    assert result.failure.category == LocalizationFailureCategory.RUNNER
+
+
+def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
+    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
+        return ["a.py"], {}
+
+    monkeypatch.setattr(
+        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        stub_runner,
+        raising=False,
+    )
+    monkeypatch.setattr("harness.loop.loop._read_policy", lambda: "policy", raising=False)
+    ic_task = ICTaskPayload(
+        identity=_make_task(tmp_path).identity,
+        context=_make_task(tmp_path).context,
+        repo=str(tmp_path),
+        changed_files=["a.py"],
+    )
+    eval_result = evaluate_policy_on_item(ic_task, None, None, 0)
+    assert eval_result.metrics.get("score") == 1.0
+    assert eval_result.ic_result.get("predicted_files") == ["a.py"]
+    assert eval_result.control_score == 1.0
+
+
+def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
+    task = _make_task(tmp_path)
+
+    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
+        return ["a.py"], {}
+
+    monkeypatch.setattr(
+        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        stub_runner,
+        raising=False,
+    )
+    result = evaluate_localization_batch(
+        LocalizationEvaluationRequest(tasks=[task], dataset_source="huggingface", materializer=None, parent_trace=None)
+    )
+    assert result.failure is None
+    assert result.aggregate_score == 1.0
+
+
+def test_machine_score_policy(monkeypatch, tmp_path) -> None:
+    task = _make_task(tmp_path)
+
+    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
+        return ["a.py"], {}
+
+    monkeypatch.setattr(
+        "harness.localization.evaluation_backend.run_localization_task",
+        lambda *a, **k: (
+            LCAPrediction(predicted_files=["a.py"]),
+            LocalizationMetrics(precision=0.5, recall=0.5, f1=0.5, hit=1.0, score=0.5),
+            None,
+            None,
+        ),
+        raising=False,
+    )
+    result = evaluate_localization_batch(
+        LocalizationEvaluationRequest(
+            tasks=[task],
+            dataset_source="test",
+            materializer=None,
+            parent_trace=None,
+            machine_score_policy=MachineScorePolicy.HIT,
+        )
+    )
+    assert result.failure is None
+    assert result.machine_score == 1.0
+    assert result.items[0].metrics.score == 0.5
+
+
+def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
+    task = _make_task(tmp_path)
+
+    def failing_runner(lca_task: LCATask, repo_path: str, parent: object | None):
+        raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "scoring failed")
+
+    monkeypatch.setattr(
+        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        failing_runner,
+        raising=False,
+    )
+    result = evaluate_localization_batch(
+        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+    )
+    assert result.failure is not None
+    assert result.failure.category == LocalizationFailureCategory.SCORING
+
+
+def test_machine_score_policy_failure_is_typed(monkeypatch, tmp_path) -> None:
+    task = _make_task(tmp_path)
+
+    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
+        return ["a.py"], {}
+
+    monkeypatch.setattr(
+        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        stub_runner,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "harness.localization.evaluation_backend._derive_machine_score",
+        lambda **kwargs: (_ for _ in ()).throw(LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "bad policy")),
+        raising=True,
+    )
+    result = evaluate_localization_batch(
+        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+    )
+    assert result.failure is not None
+    assert result.failure.category == LocalizationFailureCategory.SCORING
+
+
+def test_aggregate_metrics_failure_is_typed(monkeypatch, tmp_path) -> None:
+    task = _make_task(tmp_path)
+
+    class BadMetrics:
+        def __init__(self, *args, **kwargs):
+            raise ValueError("aggregate failed")
+
+    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
+        return ["a.py"], {}
+
+    monkeypatch.setattr(
+        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        stub_runner,
+        raising=False,
+    )
+    monkeypatch.setattr("harness.localization.evaluation_backend.LocalizationMetrics", BadMetrics, raising=False)
+    result = evaluate_localization_batch(
+        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+    )
+    assert result.failure is not None
+    assert result.failure.category == LocalizationFailureCategory.SCORING
+</file>
+
 <file path="tests_harness/test_localization.py">
 import pytest
 from pathlib import Path
@@ -7534,6 +8244,104 @@ def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
     assert captured
     assert "changed_files" not in captured[0]
     assert result.get("predicted_files") == ["src/app.py"]
+</file>
+
+<file path="tests_harness/test_loop_machine_control_score.py">
+from __future__ import annotations
+
+import pytest
+
+from harness.localization.evaluation_backend import LocalizationEvaluationResult, LocalizationEvaluationTaskResult, MachineScorePolicy
+from harness.localization.models import LocalizationMetrics, LCAContext, LCATaskIdentity, LCAGold, LCATask
+from harness.loop.loop import evaluate_policy_on_item
+from harness.loop.loop_types import ICTaskPayload
+
+
+def test_machine_uses_machine_score(monkeypatch, tmp_path):
+    ic_task = ICTaskPayload(
+        identity=LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ),
+        context=LCAContext(issue_title="bug", issue_body="body"),
+        repo=str(tmp_path),
+        changed_files=["a.py"],
+    )
+    metrics = LocalizationMetrics(precision=0.1, recall=0.1, f1=0.1, hit=0.0, score=0.1)
+    task_result = LocalizationEvaluationTaskResult(
+        task=LCATask(
+            identity=ic_task.identity,
+            context=ic_task.context,
+            gold=LCAGold(changed_files=["a.py"]),
+            repo=ic_task.repo,
+        ),
+        metrics=metrics,
+        prediction=["a.py"],
+    )
+    eval_result = LocalizationEvaluationResult(
+        aggregate_score=0.1,
+        aggregate_metrics=metrics,
+        machine_score=0.5,
+        items=[task_result],
+        failure=None,
+    )
+
+    def fake_backend(req):
+        return eval_result
+
+    monkeypatch.setattr("harness.loop.loop.evaluate_localization_batch", fake_backend)
+    result = evaluate_policy_on_item(ic_task, None, None, 0)
+    assert result.control_score == 0.5
+    assert result.metrics.get("score") == 0.1
+
+
+def test_machine_score_policy_changes_control(monkeypatch, tmp_path):
+    ic_task = ICTaskPayload(
+        identity=LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ),
+        context=LCAContext(issue_title="bug", issue_body="body"),
+        repo=str(tmp_path),
+        changed_files=["a.py"],
+    )
+    metrics = LocalizationMetrics(precision=0.2, recall=0.8, f1=0.32, hit=1.0, score=0.32)
+
+    def fake_backend(req):
+        return LocalizationEvaluationResult(
+            aggregate_score=metrics.score,
+            aggregate_metrics=metrics,
+            machine_score=metrics.hit if req.machine_score_policy == MachineScorePolicy.HIT else metrics.score,
+            items=[
+                LocalizationEvaluationTaskResult(
+                    task=LCATask(identity=ic_task.identity, context=ic_task.context, gold=LCAGold(changed_files=["a.py"]), repo=ic_task.repo),
+                    metrics=metrics,
+                    prediction=["a.py"],
+                )
+            ],
+            failure=None,
+        )
+
+    monkeypatch.setattr("harness.loop.loop.evaluate_localization_batch", fake_backend)
+
+    # Default policy uses aggregate (score)
+    res_default = evaluate_policy_on_item(ic_task, None, None, 0)
+    assert res_default.control_score == pytest.approx(metrics.score)
+    # Force HIT policy
+    from harness.localization.evaluation_backend import LocalizationEvaluationRequest
+
+    monkeypatch.setattr("harness.loop.loop.LocalizationEvaluationRequest", lambda **kwargs: LocalizationEvaluationRequest(machine_score_policy=MachineScorePolicy.HIT, **kwargs))
+    res_hit = evaluate_policy_on_item(ic_task, None, None, 0)
+    assert res_hit.control_score == pytest.approx(metrics.hit)
+    assert res_hit.metrics.get("score") == pytest.approx(metrics.score)
 </file>
 
 <file path="tests_harness/test_loop_state_machine_min.py">
@@ -8051,6 +8859,31 @@ def test_emit_score_for_handle_allows_dataset_only(monkeypatch):
     assert calls and calls[0]["dataset_run_id"] == "run123"
 </file>
 
+<file path="tests_harness/test_pipeline_models.py">
+from __future__ import annotations
+
+import pytest
+
+from harness.pipeline.types import StepResult
+
+
+def test_step_result_from_external_rejects_unknown_fields():
+    class External:
+        def __init__(self):
+            self.name = "step"
+            self.success = True
+            self.stdout = ""
+            self.stderr = ""
+            self.exit_code = 0
+            self.extra = "not-allowed"
+
+    with pytest.raises(ValueError):
+        StepResult.from_external(External())
+
+    with pytest.raises(Exception):
+        StepResult.model_validate({"name": "s", "success": True, "stdout": "", "stderr": "", "exit_code": 0, "extra": "x"})
+</file>
+
 <file path="tests_harness/test_pipeline_steps_scope.py">
 from pathlib import Path
 
@@ -8427,6 +9260,57 @@ def test_resolve_invalid_path_raises(tmp_path):
 def test_unknown_target():
     with pytest.raises(ValueError):
         repo_targets.resolve_repo_target("unknown_target")
+</file>
+
+<file path="tests_harness/test_run_canonical_path.py">
+from __future__ import annotations
+
+import sys
+
+from harness.localization.evaluation_backend import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+from harness.localization.models import LocalizationMetrics, LCATask
+import run as run_module
+
+
+def test_cli_single_routes_through_backend(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    calls = []
+
+    def fake_backend(req):
+        calls.append(req)
+        task = req.tasks[0] if req.tasks else LCATask.model_validate({})
+        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+        return LocalizationEvaluationResult(
+            aggregate_score=1.0,
+            aggregate_metrics=metrics,
+            machine_score=1.0,
+            items=[
+                LocalizationEvaluationTaskResult(
+                    task=task,
+                    metrics=metrics,
+                    prediction=["a.py"],
+                    evidence=None,
+                    materialization=None,
+                    trace_id=None,
+                )
+            ],
+            failure=None,
+        )
+
+    monkeypatch.setattr(run_module, "evaluate_localization_batch", fake_backend)
+    argv = [
+        "--mode",
+        "localization-single",
+        "--repo-path",
+        str(repo_dir),
+        "--changed-file",
+        "a.py",
+    ]
+    # Capture stdout to avoid polluting test output
+    monkeypatch.setattr(sys, "argv", ["run.py", *argv])
+    run_module.main(argv)
+    assert calls, "CLI single-task path should route through shared backend"
 </file>
 
 <file path="tests_harness/test_session_policy.py">
@@ -10567,7 +11451,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from harness.localization.executor import run_localization_task
+from harness.localization.evaluation_backend import (
+    LocalizationEvaluationRequest,
+    evaluate_localization_batch as _evaluate_localization_batch,
+)
 from harness.localization.models import LCAContext, LCAGold, LCATaskIdentity
 from harness.localization.hf_materializer import HuggingFaceRepoMaterializer
 from harness.observability.baselines import load_baseline_bundle, save_baseline_bundle
@@ -10584,6 +11471,13 @@ from harness.observability.requests import (
 from harness.observability.hf_lca import HFDatasetLoadError
 from harness.observability.session_policy import SessionConfig, resolve_session_id
 from harness.observability.langfuse import flush_langfuse
+
+
+def evaluate_localization_batch(req: LocalizationEvaluationRequest):
+    """
+    Thin wrapper to keep monkeypatch targets stable for tests while deferring import cycles.
+    """
+    return _evaluate_localization_batch(req)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -10660,7 +11554,7 @@ def _build_identity(args: argparse.Namespace) -> LCATaskIdentity:
     )
 
 
-def _load_baseline(path: str | None):
+def _load_baseline(path: str | None):  # pyright: ignore[reportUnusedFunction]
     if not path:
         return None
     p = Path(path)
@@ -10739,16 +11633,26 @@ def main(argv: list[str] | None = None) -> None:
                 session=session_cfg,
                 dataset_source=dataset_source,
             )
-            resolved_session = resolve_session_id(session_cfg, run_id=identity.task_id)
+            resolved_session = resolve_session_id(session_cfg, run_id=identity.task_id())
             print(f"[RUN] Ad hoc localization run for {identity.repo_owner}/{identity.repo_name}@{identity.base_sha}")
-            prediction, metrics, _evidence, materialization = run_localization_task(
-                req.to_task(), dataset_source=dataset_source.value, materializer=materializer
+            eval_result = evaluate_localization_batch(
+                LocalizationEvaluationRequest(
+                    tasks=[req.to_task()],
+                    dataset_source=dataset_source.value,
+                    materializer=materializer,
+                    parent_trace=None,
+                )
             )
-            print(f"[RUN] Prediction: {prediction.predicted_files}")
-            print(f"[RUN] Metrics: {metrics.model_dump()}")
+            if eval_result.failure or not eval_result.items:
+                category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
+                message = eval_result.failure.message if eval_result.failure else "evaluation_failed"
+                raise RuntimeError(f"Localization evaluation failed ({category}): {message}")
+            task_result = eval_result.items[0]
+            print(f"[RUN] Prediction: {task_result.prediction}")
+            print(f"[RUN] Metrics: {task_result.metrics.model_dump()}")
             print(f"[RUN] Session: {resolved_session}")
-            if materialization:
-                _print_mat_summary("single", identity.task_id, materialization)
+            if task_result.materialization:
+                _print_mat_summary("single", identity.task_id, task_result.materialization)
     except HFDatasetLoadError as exc:
         print(f"[ERROR] HF dataset load failed (category={exc.category}): {exc}")
         raise

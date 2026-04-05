@@ -1,26 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Mapping, Tuple
+from typing import Any, Callable, Mapping, Tuple, cast
 
 from harness.localization.eval import build_file_localization_eval_record
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materializer import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
     RepoMaterializer,
-    describe_repo_mapping,
 )
-from harness.localization.models import (
-    LCAGold,
-    LCAPrediction,
-    LCATask,
-    LocalizationEvidence,
-    LocalizationMetrics,
-)
+from harness.localization.models import LCAPrediction, LCATask, LocalizationEvidence, LocalizationMetrics
 from harness.localization.telemetry import build_localization_telemetry
 from harness.observability.langfuse import start_observation
 from harness.observability.score_emitter import emit_score_for_handle
-from harness.loop.runner_agent import run_ic_iteration
 
 
 def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> RepoMaterializationResult | None:
@@ -37,6 +30,122 @@ def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> R
     return materializer.materialize(request)
 
 
+def _resolve_repo_path(task: LCATask, materialization_result: RepoMaterializationResult | None) -> Path:
+    repo_path: Path | None = materialization_result.local_path if materialization_result else None
+    if repo_path is None and task.repo:
+        repo_path = Path(task.repo).expanduser()
+    if repo_path is None:
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.MATERIALIZATION,
+            "Localization task is missing a repo path; provide a materializer or task.repo",
+            task_id=task.task_id,
+        )
+    if not repo_path.exists():
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.MATERIALIZATION,
+            f"Localization repo path does not exist: {repo_path}",
+            task_id=task.task_id,
+        )
+    return repo_path
+
+
+def _run_runner(
+    task: LCATask,
+    repo_path: Path,
+    trace: object | None,
+    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None,
+) -> list[str]:
+    runner_fn = runner or _default_runner
+    try:
+        predicted_files, _runner_result = runner_fn(task, str(repo_path), trace)
+    except LocalizationEvaluationError:
+        raise
+    except Exception as exc:
+        raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, str(exc), task_id=task.task_id) from exc
+    if not predicted_files:
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.RUNNER,
+            "Localization runner produced no predicted_files",
+            task_id=task.task_id,
+        )
+    return predicted_files
+
+
+def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) -> tuple[list[str], Mapping[str, object] | None]:
+    from harness import loop as loop_pkg
+
+    run_ic_iteration_fn = getattr(loop_pkg, "run_ic_iteration")
+    result = run_ic_iteration_fn(
+        {
+            "identity": lca_task.identity.model_dump(),
+            "context": lca_task.context.model_dump(),
+            "repo": repo_path,
+        },
+        score_fn=None,
+        steps=5,
+        parent_trace=parent,
+    )
+    if not isinstance(result, Mapping):
+        raise RuntimeError("Localization runner returned an invalid result")
+    predicted = result.get("predicted_files")
+    if not isinstance(predicted, list):
+        raise RuntimeError("Localization runner produced no predicted_files")
+    predictions = [p for p in predicted if isinstance(p, str) and p.strip()]
+    if not predictions:
+        raise RuntimeError("Localization runner produced an empty predicted_files list")
+    return predictions, result
+
+
+def _score_task(task: LCATask, prediction: LCAPrediction, repo_path: Path) -> LocalizationMetrics:
+    try:
+        eval_record = build_file_localization_eval_record(
+            task.identity, prediction, task.gold, evidence=task.evidence, repo_path=repo_path
+        )
+        return eval_record.metrics
+    except LocalizationEvaluationError:
+        raise
+    except Exception as exc:
+        raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, str(exc), task_id=task.task_id) from exc
+
+
+def _emit_telemetry(
+    task: LCATask,
+    metrics: LocalizationMetrics,
+    evidence: LocalizationEvidence | None,
+    materialization: RepoMaterializationResult | None,
+    dataset_source: str | None,
+    trace: object | None,
+) -> None:
+    telemetry = build_localization_telemetry(
+        task.identity,
+        metrics=metrics,
+        changed_files_count=len(task.gold.normalized_changed_files()),
+        dataset_source=dataset_source,
+        repo_language=task.context.repo_language,
+        repo_license=task.context.repo_license,
+        evidence=evidence,
+        materialization_events=materialization.events if materialization else None,
+    )
+    dataset_run_id = getattr(trace, "id", None) if trace else None
+    for metric_name, metric_value in metrics.model_dump().items():
+        if metric_value is None:
+            continue
+        emit_score_for_handle(
+            trace,
+            name=f"localization.{metric_name}",
+            value=float(metric_value),
+            data_type="NUMERIC",
+            dataset_run_id=dataset_run_id,
+            score_id=f"{getattr(trace, 'id', None)}-localization.{metric_name}" if getattr(trace, "id", None) else None,
+        )
+    if trace:
+        try:
+            trace_any = cast(Any, trace)
+            trace_any.metadata = {**getattr(trace_any, "metadata", {}), "telemetry": telemetry.model_dump(exclude_none=True)}
+        except Exception:
+            pass
+
+
 def run_localization_task(
     task: LCATask,
     dataset_source: str | None = None,
@@ -45,34 +154,13 @@ def run_localization_task(
     runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
 ) -> Tuple[LCAPrediction, LocalizationMetrics, LocalizationEvidence | None, RepoMaterializationResult | None]:
     """
-    Execute a localization task end to end:
+    Execute a single localization task end to end (leaf helper):
     - materialize repo at base_sha (if a materializer is provided)
     - run the localization agent/backend to produce predicted_files
     - score using file-set localization metrics
-    - emit scores via Langfuse
+    - emit task-level telemetry
     Returns prediction, metrics, optional evidence, and materialization details.
     """
-
-    def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) -> tuple[list[str], Mapping[str, object] | None]:
-        result = run_ic_iteration(
-            {
-                "identity": lca_task.identity.model_dump(),
-                "context": lca_task.context.model_dump(),
-                "repo": repo_path,
-            },
-            score_fn=None,
-            steps=5,
-            parent_trace=parent,
-        )
-        if not isinstance(result, Mapping):
-            raise RuntimeError("Localization runner returned an invalid result")
-        predicted = result.get("predicted_files")
-        if not isinstance(predicted, list):
-            raise RuntimeError("Localization runner produced no predicted_files")
-        predictions = [p for p in predicted if isinstance(p, str) and p.strip()]
-        if not predictions:
-            raise RuntimeError("Localization runner produced an empty predicted_files list")
-        return predictions, result
 
     with start_observation(
         name="localization_task",
@@ -90,50 +178,17 @@ def run_localization_task(
         try:
             materialization_result = _materialize_repo(task, materializer)
         except Exception as exc:
-            # Surface materialization failures with category hint if available
-            hint = getattr(exc, "category", None)
-            raise RuntimeError(f"Materialization failed ({hint or 'materialization'}): {exc}") from exc
-        repo_path: Path | None = materialization_result.local_path if materialization_result else None
-        if repo_path is None and task.repo:
-            repo_path = Path(task.repo).expanduser()
-        if repo_path is not None and not repo_path.exists():
-            raise RuntimeError(f"Localization repo path does not exist: {repo_path}")
-        if repo_path is None:
-            raise RuntimeError("Localization task is missing a repo path; provide a materializer or task.repo")
-        runner_fn = runner or _default_runner
-        predicted_files, _runner_result = runner_fn(task, str(repo_path), trace)
-        if not predicted_files:
-            raise RuntimeError("Localization runner produced no predicted_files")
+            raise LocalizationEvaluationError(LocalizationFailureCategory.MATERIALIZATION, str(exc), task_id=task.task_id) from exc
+        repo_path = _resolve_repo_path(task, materialization_result)
+        predicted_files = _run_runner(task, repo_path, trace, runner)
         prediction = LCAPrediction(predicted_files=predicted_files)
-        eval_record = build_file_localization_eval_record(
-            task.identity, prediction, task.gold, evidence=task.evidence, repo_path=repo_path
-        )
-        telemetry = build_localization_telemetry(
-            task.identity,
-            metrics=eval_record.metrics,
-            changed_files_count=len(task.gold.normalized_changed_files()),
-            dataset_source=dataset_source,
-            repo_language=task.context.repo_language,
-            repo_license=task.context.repo_license,
+        metrics = _score_task(task, prediction, repo_path)
+        _emit_telemetry(
+            task=task,
+            metrics=metrics,
             evidence=task.evidence,
-            materialization_events=materialization_result.events if materialization_result else None,
+            materialization=materialization_result,
+            dataset_source=dataset_source,
+            trace=trace,
         )
-        dataset_run_id = getattr(parent_trace, "id", None)
-        for metric_name, metric_value in eval_record.metrics.model_dump().items():
-            if metric_value is None:
-                continue
-            emit_score_for_handle(
-                trace,
-                name=f"localization.{metric_name}",
-                value=float(metric_value),
-                data_type="NUMERIC",
-                dataset_run_id=dataset_run_id,
-                score_id=f"{trace.id}-localization.{metric_name}" if getattr(trace, "id", None) else None,
-            )
-        # surface telemetry in metadata for downstream consumers
-        if trace:
-            try:
-                trace.metadata = {**getattr(trace, "metadata", {}), "telemetry": telemetry.model_dump(exclude_none=True)}
-            except Exception:
-                pass
-        return prediction, eval_record.metrics, task.evidence, materialization_result
+        return prediction, metrics, task.evidence, materialization_result
