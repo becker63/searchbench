@@ -32,3 +32,12 @@ class SystemPromptContext(BaseModel):
         if not value or not value.strip():
             raise ValueError("available_tools must be non-empty")
         return value
+
+
+class BackendPromptContext(BaseModel):
+    """Explicit context for backend-specific prompts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: str
+    available_tools: str

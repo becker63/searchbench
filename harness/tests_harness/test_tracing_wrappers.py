@@ -344,7 +344,7 @@ def test_run_agent_retries_on_context_error(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
-    patched_usage = lambda resp: {"input": 1, "output": 1, "total": 2}
+    patched_usage = lambda resp: agent_common.UsageEnvelope.model_validate({"input": 1, "output": 1, "total": 2})
     monkeypatch.setattr(agent_common, "usage_from_response", patched_usage)
     monkeypatch.setitem(runner.run_agent.__globals__, "usage_from_response", patched_usage)
     @contextmanager
@@ -378,13 +378,14 @@ def test_usage_from_response_maps_openai_fields():
 
     mapped = agent_common.usage_from_response(DummyResponse())
     assert mapped is not None
-    assert mapped["input"] == 10
-    assert mapped["output"] == 5
-    assert mapped["total"] == 15
-    assert mapped["prompt_tokens_details.cached_tokens"] == 2
-    assert mapped["input_cached_tokens"] == 2
-    assert mapped["completion_tokens_details.reasoning_tokens"] == 3
-    assert mapped["output_reasoning_tokens"] == 3
+    flat = mapped.model_dump_flat()
+    assert flat["input"] == 10
+    assert flat["output"] == 5
+    assert flat["total"] == 15
+    assert flat["prompt_tokens_details.cached_tokens"] == 2
+    assert flat["input_cached_tokens"] == 2
+    assert flat["completion_tokens_details.reasoning_tokens"] == 3
+    assert flat["output_reasoning_tokens"] == 3
 
 
 def test_run_agent_requires_usage(monkeypatch):

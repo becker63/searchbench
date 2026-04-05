@@ -5,20 +5,35 @@ import inspect
 from pathlib import Path
 from typing import Callable, cast
 
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+
+class ScoreFunctionConfig(BaseModel):
+    """Typed adapter for policy score functions."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    score_fn: Callable[..., float]
+
 
 def adapt_score_fn(score_fn: Callable[..., float]) -> Callable[[object, object, object], float]:
-    sig = inspect.signature(score_fn)
+    try:
+        config = ScoreFunctionConfig(score_fn=score_fn)
+    except ValidationError as exc:
+        raise RuntimeError(f"Invalid score function: {exc}") from exc
+
+    sig = inspect.signature(config.score_fn)
     arity = len(sig.parameters)
+    if arity not in (1, 2, 3):
+        raise RuntimeError(f"Unsupported score function arity: expected 1-3, got {arity}")
 
     def wrapped(*call_args: object, **call_kwargs: object) -> float:
         node, state, context = (list(call_args) + [None, None, None])[:3]
         if arity == 3:
-            return float(score_fn(node, state, context))
+            return float(config.score_fn(node, state, context))
         if arity == 2:
-            return float(score_fn(node, state))
-        if arity == 1:
-            return float(score_fn(node))
-        return 0.0
+            return float(config.score_fn(node, state))
+        return float(config.score_fn(node))
 
     return wrapped
 

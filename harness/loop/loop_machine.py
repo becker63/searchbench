@@ -24,6 +24,7 @@ from harness.pipeline.types import PipelineClassification, StepResult
 from .loop_listeners import OptimizationTracingListener, RepairTracingListener, _safe_end_span as safe_end_span  # pyright: ignore[reportPrivateUsage]
 from .loop_types import (
     AcceptedPolicy,
+    EvaluationMetrics,
     EvaluationResult,
     FeedbackPackage,
     IterationRecord,
@@ -182,7 +183,8 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             ctx.repo_root,
             repair_obs=ctx.repair_observation,
         )
-        ctx.pipeline_results = pipeline_results
+        # Enforce canonical step result shape at the boundary.
+        ctx.pipeline_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in pipeline_results]
         ctx.pipeline_passed = pipeline_success
         ctx.attempts_used += 1
 
@@ -300,11 +302,15 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         if ctx.run_trace is not None:
             return
         start_obs = model.deps.start_observation
-        meta = ctx.run_metadata or {"iterations": ctx.iterations, "task": dict(ctx.task)}
+        meta = (
+            ctx.run_metadata.model_dump()
+            if ctx.run_metadata
+            else {"iterations": ctx.iterations, "task": ctx.task.model_dump()}
+        )
         ctx.run_trace = start_obs(
             name="run_loop",
             parent=ctx.parent_trace,
-            input=ctx.task,
+            input=ctx.task.model_dump(),
             metadata=meta,
         )
 
@@ -351,9 +357,9 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             self.raise_("evaluation_done")  # type: ignore[call-arg]
             return
 
-        ic_task, _ = prepared_tasks.build_iteration_tasks()
+        iteration_tasks = prepared_tasks.build_iteration_tasks()
         self.model.current_evaluation = self.deps.evaluate_policy_on_item(
-            ic_task,
+            iteration_tasks.ic_task,
             self.context.baseline_snapshot,
             self.model.current_iteration_span,
             self.context.current_iteration,
@@ -438,7 +444,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         evaluation: EvaluationResult,
         repair_outcome: RepairOutcome | None,
     ) -> IterationRecord:
-        metrics_map = dict(evaluation.metrics)
+        metrics_map = evaluation.metrics.as_map()
         pipeline_feedback = (
             repair_outcome.pipeline_feedback if repair_outcome else self.context.last_classified
         )
@@ -452,7 +458,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         writer_err_val = repair_outcome.writer_error if repair_outcome else None
         record = IterationRecord(
             iteration=iteration,
-            metrics=metrics_map,
+            metrics=EvaluationMetrics.model_validate(metrics_map),
             pipeline_passed=repair_outcome.success if repair_outcome else None,
             pipeline_feedback=pipeline_feedback,
             repair_attempts=repair_attempts_val

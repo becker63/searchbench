@@ -9,45 +9,68 @@ import hashlib
 from collections.abc import Mapping, Sequence
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Callable, Protocol, cast
+from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 
-from harness.observability.baselines import BaselineSnapshot, baseline_metrics_from_jc
-from harness.observability.langfuse import flush_langfuse, propagate_context, start_observation
+from jcodemunch_mcp.tools.index_folder import index_folder
+
+from harness.loop.runner_agent import run_ic_iteration
+from harness.observability.langfuse import (
+    flush_langfuse,
+    propagate_context,
+    start_observation,
+)
 from harness.observability.score_emitter import emit_score, emit_score_for_handle
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy_loader import load_policy
-from harness.loop.runner_agent import run_ic_iteration
 from harness.utils.comparison import build_comparison, format_comparison_summary
 from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
-from harness.utils.failure_context import pack_failure_context
 from harness.utils.repo_root import find_repo_root
 from harness.utils.test_loader import format_tests_for_prompt, load_tests
-from harness.utils.type_loader import format_scoring_context, load_scoring_examples, load_scoring_types
+from harness.utils.type_loader import (
+    format_scoring_context,
+    load_scoring_examples,
+    load_scoring_types,
+)
 from harness.writer import generate_policy
-from jcodemunch_mcp.tools.index_folder import index_folder
+
+if TYPE_CHECKING:
+    from harness.observability.baselines import BaselineSnapshot
 
 from .loop_machine import OptimizationStateMachine
 from .loop_types import (
     AcceptedPolicyMeta,
+    EvaluationMetrics,
     EvaluationResult,
     FailedRepairDetails,
+    FeedbackEntries,
+    FeedbackEntry,
     FeedbackPackage,
+    ICResult,
+    ICTaskPayload,
     IterationRecord,
+    JCResult,
+    JCTaskPayload,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
     PreparedTasks,
+    RunMetadata,
+    ScalarMetrics,
     TaskPayload,
+    format_failure_context_payload,
 )
 
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.py"
 _MAX_POLICY_REPAIRS = 3
 _MAX_FAILURE_SUMMARY_CHARS = 400
+
+
 def score(result: Mapping[str, object]) -> Mapping[str, object]:  # pyright: ignore[reportUnusedFunction]
     """Legacy scoring shim for tests; retains mapping interface."""
     return result
+
 
 # Re-exported helpers so callers can monkeypatch harness.loop.* directly.
 _REEXPORTED = (
@@ -143,38 +166,40 @@ def _format_pipeline_failure_context(
     model_name: str | None,
     repair_attempt: int,
 ) -> str:
-    failed_step = _first_failed_step(pipeline_results)
-    pipeline_dump = [step.model_dump() for step in pipeline_results]
-    classified_dump = classified.model_dump() if classified else None
-    failed_dump = failed_step.model_dump() if failed_step else None
-    return pack_failure_context(
-        pipeline_dump,
-        classified_dump,
-        failed_dump,
+    return format_failure_context_payload(
+        pipeline_results,
+        classified,
         writer_error,
         model_name,
-        repair_attempt=repair_attempt,
+        repair_attempt,
     )
 
 
 class SupportsPipelineRun(Protocol):
-    def run(self, repo_root: Path, observation: object | None = None, allow_no_parent: bool = False) -> list[StepResult]:
-        ...
+    def run(
+        self,
+        repo_root: Path,
+        observation: object | None = None,
+        allow_no_parent: bool = False,
+    ) -> list[StepResult]: ...
 
 
 class SupportsSpan(Protocol):
-    def end(self, **kwargs: object) -> None:
-        ...
+    def end(self, **kwargs: object) -> None: ...
 
 
-def prepare_iteration_tasks(task: TaskPayload, parent_trace: object | None = None) -> PreparedTasks:
+def prepare_iteration_tasks(
+    task: TaskPayload, parent_trace: object | None = None
+) -> PreparedTasks:
     """Resolve repo paths and index JC repo once for the run."""
     repo_path_val = task.repo
     resolved_repo_path = repo_path_val
     jc_repo_id: str | None = None
     index_obs: SupportsSpan | None = None
     start_obs_func = cast(Callable[..., object | None], _pkg_attr("start_observation"))
-    index_folder_fn = cast(Callable[[str], Mapping[str, object]], _pkg_attr("index_folder"))
+    index_folder_fn = cast(
+        Callable[[str], Mapping[str, object]], _pkg_attr("index_folder")
+    )
     if isinstance(repo_path_val, str):
         try:
             index_obs = cast(
@@ -198,19 +223,31 @@ def prepare_iteration_tasks(task: TaskPayload, parent_trace: object | None = Non
                     pass
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
-    return PreparedTasks(base_task=task, resolved_repo_path=resolved_repo_path, jc_repo_id=jc_repo_id)
+    ic_task = ICTaskPayload(symbol=task.symbol, repo=resolved_repo_path)
+    jc_task = JCTaskPayload(symbol=task.symbol, repo=jc_repo_id or resolved_repo_path)
+    return PreparedTasks(
+        base_task=task,
+        resolved_repo_path=resolved_repo_path,
+        jc_repo_id=jc_repo_id,
+        ic_task=ic_task,
+        jc_task=jc_task,
+    )
 
 
 def evaluate_policy_on_item(
-    ic_task: Mapping[str, object],
-    baseline_snapshot: BaselineSnapshot | None,
+    ic_task: ICTaskPayload,
+    baseline_snapshot: "BaselineSnapshot | None",
     iteration_span: object | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
     """Load current policy, execute IC iteration, and compute metrics."""
-    start_obs_func = cast(Callable[..., SupportsSpan | None], _pkg_attr("start_observation"))
+    start_obs_func = cast(
+        Callable[..., SupportsSpan | None], _pkg_attr("start_observation")
+    )
     load_policy_fn = cast(Callable[[], Callable[..., object]], _pkg_attr("load_policy"))
-    run_ic_iteration_fn = cast(Callable[..., Mapping[str, object]], _pkg_attr("run_ic_iteration"))
+    run_ic_iteration_fn = cast(
+        Callable[..., Mapping[str, object]], _pkg_attr("run_ic_iteration")
+    )
     policy_load_obs: SupportsSpan | None = None
     try:
         policy_load_obs = start_obs_func(
@@ -227,61 +264,84 @@ def evaluate_policy_on_item(
                 policy_load_obs.end(error=e)
             except Exception:
                 pass
-        metrics_map = {
+        error_metrics: ScalarMetrics = {
             "score": -10.0,
-            "error": f"policy_import_error: {str(e)}",
         }
         emit_score_for_handle(
             iteration_span,
             name="metrics.score",
-            value=_as_float(metrics_map.get("score", 0.0)),
+            value=_as_float(error_metrics.get("score", 0.0)),
             data_type="NUMERIC",
         )
         return EvaluationResult(
-            metrics=metrics_map,
-            ic_result={},
-            jc_result={},
-            jc_metrics={},
+            metrics=EvaluationMetrics.model_validate(error_metrics),
+            ic_result=ICResult(entries=[]),
+            jc_result=JCResult(entries=[]),
+            jc_metrics=EvaluationMetrics(),
             comparison_summary=None,
             policy_code="",
             success=False,
-            error=str(metrics_map.get("error")),
+            error=f"policy_import_error: {str(e)}",
         )
 
     ic_runner = cast(Callable[..., dict[str, object]], run_ic_iteration_fn)
-    ic_result = ic_runner(dict(ic_task), loaded_policy_fn, parent_trace=iteration_span)
-    jc_result: dict[str, object] = dict(baseline_snapshot.jc_result) if baseline_snapshot is not None else {}
-    jc_metrics: dict[str, object] = dict(baseline_snapshot.jc_metrics) if baseline_snapshot is not None else {}
-    if not jc_metrics:
-        jc_metrics = {k: float(v) for k, v in baseline_metrics_from_jc(jc_result).items()}
+    ic_result_map = ic_runner(
+        ic_task.model_dump(), loaded_policy_fn, parent_trace=iteration_span
+    )
+    jc_result_map: dict[str, object] = (
+        dict(baseline_snapshot.jc_result.as_map())
+        if baseline_snapshot is not None
+        else {}
+    )
+    jc_metrics_map_raw = (
+        baseline_snapshot.jc_metrics.as_map() if baseline_snapshot is not None else {}
+    )
+    jc_metrics_map: dict[str, float] = {
+        k: float(v)
+        for k, v in jc_metrics_map_raw.items()
+        if isinstance(v, (int, float, bool))
+    }
+    if not jc_metrics_map:
+        baseline_metrics_from_jc_fn = cast(
+            Callable[[Mapping[str, object]], Mapping[str, object]],
+            _pkg_attr("baseline_metrics_from_jc"),
+        )
+        jc_metrics_map = {
+            k: float(v)
+            for k, v in baseline_metrics_from_jc_fn(jc_result_map).items()
+            if isinstance(v, (int, float, bool))
+        }
 
-    metrics_map: dict[str, object] = {"score": 0.0}
-    comparison = build_comparison(metrics_map, jc_metrics)
+    metrics_map: dict[str, float | int | bool] = {"score": 0.0}
+    metrics_for_comparison = {
+        k: float(v) for k, v in metrics_map.items() if isinstance(v, (int, float, bool))
+    }
+    comparison = build_comparison(metrics_for_comparison, jc_metrics_map)
     comparison_summary = format_comparison_summary(comparison)
     metrics_map.setdefault("iteration_regression", False)
-    metrics_map["jc_baseline_metrics"] = dict(jc_metrics)
-    metrics_map["comparison"] = comparison
     trace_id = getattr(iteration_span, "id", None)
     session_id_val = _session_id_from(iteration_span)
     for name, value in metrics_map.items():
-        if isinstance(value, (int, float, bool)):
-            data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
-            score_id = f"{trace_id}-metrics.{name}" if trace_id else None
-            emit_score_for_handle(
-                iteration_span,
-                name=f"metrics.{name}",
-                value=float(value) if isinstance(value, bool) else value,
-                data_type=data_type,
-                score_id=score_id,
-                session_id=session_id_val,
-            )
+        if not isinstance(value, (int, float, bool)):
+            continue
+        num_val = cast(float | int | bool, value)
+        data_type = "BOOLEAN" if isinstance(num_val, bool) else "NUMERIC"
+        score_id = f"{trace_id}-metrics.{name}" if trace_id else None
+        emit_score_for_handle(
+            iteration_span,
+            name=f"metrics.{name}",
+            value=float(num_val) if isinstance(num_val, bool) else num_val,
+            data_type=data_type,
+            score_id=score_id,
+            session_id=session_id_val,
+        )
 
     policy_code = _read_policy()
     return EvaluationResult(
-        metrics=metrics_map,
-        ic_result=ic_result,
-        jc_result=jc_result,
-        jc_metrics=jc_metrics,
+        metrics=EvaluationMetrics.model_validate(metrics_map),
+        ic_result=ICResult.model_validate(ic_result_map),
+        jc_result=JCResult.model_validate(jc_result_map),
+        jc_metrics=EvaluationMetrics.model_validate(jc_metrics_map),
         comparison_summary=comparison_summary,
         policy_code=policy_code,
     )
@@ -295,10 +355,18 @@ def build_iteration_feedback(
 ) -> FeedbackPackage:
     """Package evaluation outputs into writer-facing inputs."""
     load_tests_fn = cast(Callable[[Path], object], _pkg_attr("load_tests"))
-    format_tests_for_prompt_fn = cast(Callable[[object], str], _pkg_attr("format_tests_for_prompt"))
-    load_scoring_types_fn = cast(Callable[[Path], object], _pkg_attr("load_scoring_types"))
-    load_scoring_examples_fn = cast(Callable[[Path], object], _pkg_attr("load_scoring_examples"))
-    format_scoring_context_fn = cast(Callable[..., str], _pkg_attr("format_scoring_context"))
+    format_tests_for_prompt_fn = cast(
+        Callable[[object], str], _pkg_attr("format_tests_for_prompt")
+    )
+    load_scoring_types_fn = cast(
+        Callable[[Path], object], _pkg_attr("load_scoring_types")
+    )
+    load_scoring_examples_fn = cast(
+        Callable[[Path], object], _pkg_attr("load_scoring_examples")
+    )
+    format_scoring_context_fn = cast(
+        Callable[..., str], _pkg_attr("format_scoring_context")
+    )
     compute_diff_fn = cast(Callable[..., object], _pkg_attr("compute_diff"))
     format_diff_fn = cast(Callable[[object], str], _pkg_attr("format_diff"))
     interpret_diff_fn = cast(Callable[[object], str], _pkg_attr("interpret_diff"))
@@ -325,18 +393,20 @@ def build_iteration_feedback(
             diff_str = ""
             diff_hint = ""
 
-    feedback_map: dict[str, str | float | int | bool | None] = {}
+    feedback_entries: list[FeedbackEntry] = []
     for key, value in evaluation.metrics.items():
+        normalized_val: str | float | int | bool | None
         if isinstance(value, (str, float, int, bool)) or value is None:
-            feedback_map[key] = value
+            normalized_val = value
         else:
-            feedback_map[key] = str(value)
+            normalized_val = str(value)
+        feedback_entries.append(FeedbackEntry(name=key, value=normalized_val))
 
     return FeedbackPackage(
         tests=tests_str,
         scoring_context=scoring_ctx,
         comparison_summary=evaluation.comparison_summary,
-        feedback=feedback_map,
+        feedback=FeedbackEntries.model_validate({"entries": feedback_entries}),
         feedback_str=str(evaluation.metrics.get("error", "")),
         guidance_hint="Fix errors before improving score",
         diff_str=diff_str,
@@ -346,7 +416,7 @@ def build_iteration_feedback(
 
 def attempt_policy_generation(
     *,
-    feedback: dict[str, object],
+    feedback: FeedbackEntries,
     initial_policy: str,
     tests: str,
     scoring_context: str,
@@ -364,8 +434,12 @@ def attempt_policy_generation(
         generator = cast(Callable[..., str], _pkg_attr("generate_policy"))
         new_code = generator(
             feedback={
-                **feedback,
-                **({"pipeline_feedback": pipeline_feedback.model_dump()} if pipeline_feedback else {}),
+                **feedback.as_map(),
+                **(
+                    {"pipeline_feedback": pipeline_feedback.model_dump()}
+                    if pipeline_feedback
+                    else {}
+                ),
             },
             current_policy=initial_policy,
             tests=tests,
@@ -385,23 +459,43 @@ def attempt_policy_generation(
         return None, str(e)
 
 
-def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_obs: object | None = None, allow_no_parent: bool = False) -> tuple[list[StepResult], bool]:
+def run_policy_pipeline(
+    pipeline: SupportsPipelineRun,
+    repo_root: Path,
+    repair_obs: object | None = None,
+    allow_no_parent: bool = False,
+) -> tuple[list[StepResult], bool]:
     try:
-        raw_results: list[object] = list(pipeline.run(repo_root, observation=repair_obs, allow_no_parent=allow_no_parent))
+        raw_results: list[object] = list(
+            pipeline.run(
+                repo_root, observation=repair_obs, allow_no_parent=allow_no_parent
+            )
+        )
     except TypeError:
         raw_results = list(pipeline.run(repo_root, observation=repair_obs))
-    step_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in raw_results]
+    step_results = [
+        step if isinstance(step, StepResult) else StepResult.from_external(step)
+        for step in raw_results
+    ]
     trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
     observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
-    dataset_run_id = getattr(repair_obs, "dataset_run_id", None) if repair_obs is not None else None
-    session_id_val = getattr(repair_obs, "session_id", None) if repair_obs is not None else None
+    dataset_run_id = (
+        getattr(repair_obs, "dataset_run_id", None) if repair_obs is not None else None
+    )
+    session_id_val = (
+        getattr(repair_obs, "session_id", None) if repair_obs is not None else None
+    )
     emit_score_fn = cast(Callable[..., None], _pkg_attr("emit_score"))
     if not any([trace_id, observation_id, dataset_run_id, session_id_val]):
         pipeline_success = all(_step_succeeded(r) for r in step_results)
         return step_results, pipeline_success
     for step in step_results:
         data_type = "NUMERIC"
-        score_id = f"{observation_id or trace_id}-pipeline.{step.name}.exit_code" if (observation_id or trace_id) else None
+        score_id = (
+            f"{observation_id or trace_id}-pipeline.{step.name}.exit_code"
+            if (observation_id or trace_id)
+            else None
+        )
         emit_score_fn(
             name=f"pipeline.{step.name}.exit_code",
             value=step.exit_code,
@@ -412,7 +506,11 @@ def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_o
             session_id=session_id_val,
             score_id=score_id,
         )
-        pass_score_id = f"{observation_id or trace_id}-pipeline.{step.name}.passed" if (observation_id or trace_id) else None
+        pass_score_id = (
+            f"{observation_id or trace_id}-pipeline.{step.name}.passed"
+            if (observation_id or trace_id)
+            else None
+        )
         emit_score_fn(
             name=f"pipeline.{step.name}.passed",
             value=int(step.success),
@@ -473,14 +571,21 @@ def finalize_failed_repair(
 
 
 def _build_dependencies() -> LoopDependencies:
-    classify_results_fn = cast(Callable[[list[StepResult]], PipelineClassification], _pkg_attr("classify_results"))
+    classify_results_fn = cast(
+        Callable[[list[StepResult]], PipelineClassification],
+        _pkg_attr("classify_results"),
+    )
     format_pipeline_failure_context_fn = _format_pipeline_failure_context
     read_policy_fn = _pkg_attr("_read_policy")
     write_policy_fn = _pkg_attr("_write_policy")
     get_writer_model_fn = cast(Callable[[], str | None], _pkg_attr("get_writer_model"))
-    start_obs_fn = cast(Callable[..., SupportsSpan | None], _pkg_attr("start_observation"))
+    start_obs_fn = cast(
+        Callable[..., SupportsSpan | None], _pkg_attr("start_observation")
+    )
     find_repo_root_fn = cast(Callable[[], Path], _pkg_attr("find_repo_root"))
-    default_pipeline_fn = cast(Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline"))
+    default_pipeline_fn = cast(
+        Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline")
+    )
     return LoopDependencies(
         prepare_iteration_tasks=prepare_iteration_tasks,
         evaluate_policy_on_item=evaluate_policy_on_item,
@@ -501,7 +606,7 @@ def _build_dependencies() -> LoopDependencies:
 
 
 def run_loop(
-    task: Mapping[str, object],
+    task: Mapping[str, object] | TaskPayload,
     iterations: int = 5,
     parent_trace: object | None = None,
     baseline_snapshot: BaselineSnapshot | None = None,
@@ -510,11 +615,14 @@ def run_loop(
     """
     Closed-loop optimizer: execute, score, rewrite policy, repeat.
     """
-    root_meta = {"task": dict(task), "iterations": iterations, "session_id": session_id}
+    base_task = TaskPayload.model_validate(task)
+    root_meta = RunMetadata(
+        task=base_task, iterations=iterations, session_id=session_id
+    )
     with propagate_context(
         trace_name="run_loop",
         session_id=session_id,
-        metadata=root_meta,
+        metadata=root_meta.model_dump(),
     ):
         baseline_model = (
             BaselineSnapshot.model_validate(baseline_snapshot)
@@ -522,7 +630,7 @@ def run_loop(
             else baseline_snapshot
         )
         context = LoopContext(
-            task=TaskPayload.model_validate(task),
+            task=base_task,
             iterations=iterations,
             session_id=session_id,
             parent_trace=parent_trace,
@@ -552,7 +660,9 @@ def run_loop(
             flush_langfuse_fn()
     if not history:
         repo_root = cast(Callable[[], Path], _pkg_attr("find_repo_root"))()
-        pipeline = cast(Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline"))()
+        pipeline = cast(
+            Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline")
+        )()
         fallback_parent = opt_model.context.run_trace or parent_trace
         pipeline_results, pipeline_success = run_policy_pipeline(
             pipeline,
@@ -560,17 +670,23 @@ def run_loop(
             repair_obs=fallback_parent,
             allow_no_parent=fallback_parent is None,
         )
-        classify_results_fn = cast(Callable[[list[StepResult]], PipelineClassification], _pkg_attr("classify_results"))
+        classify_results_fn = cast(
+            Callable[[list[StepResult]], PipelineClassification],
+            _pkg_attr("classify_results"),
+        )
         classified = classify_results_fn(pipeline_results)
         failed_step = _first_failed_step(pipeline_results)
+        metrics_map: dict[str, float | int | bool | None] = {}
         record = IterationRecord(
             iteration=0,
-            metrics={},
+            metrics=EvaluationMetrics.model_validate(metrics_map),
             pipeline_passed=pipeline_success,
             pipeline_feedback=classified,
             failed_step=failed_step.name if failed_step else "pipeline_failed",
             failed_exit_code=failed_step.exit_code if failed_step else None,
-            failed_summary=(failed_step.stderr or failed_step.stdout) if failed_step else None,
+            failed_summary=(failed_step.stderr or failed_step.stdout)
+            if failed_step
+            else None,
             repair_attempts=_MAX_POLICY_REPAIRS,
             max_policy_repairs=_MAX_POLICY_REPAIRS,
             writer_error="writer_failed" if not pipeline_success else None,

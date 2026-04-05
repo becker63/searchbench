@@ -92,9 +92,11 @@ tests_harness/
   test_localization.py
   test_loop_state_machine_min.py
   test_loop_viz.py
+  test_model_strictness.py
   test_observability.py
   test_pipeline_steps_scope.py
   test_pipeline_warning_semantics.py
+  test_policy_loader.py
   test_prompt_templates.py
   test_pytest_scope.py
   test_repo_resolution_execution.py
@@ -228,6 +230,8 @@ By default both machines are rendered; use `--machine optimization` or `--machin
 </file>
 
 <file path="localization/__init__.py">
+# pyright: reportUnusedImport=false
+
 from .models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
 from .scoring import file_localization_metrics, score_file_localization
 from .eval import build_file_localization_eval_record, localization_eval_identity
@@ -239,9 +243,20 @@ from .telemetry import build_localization_telemetry
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Mapping, MutableMapping, Optional
+from typing import Iterable, List, Mapping, Optional, cast
 
-from .models import LCAGold, LCAPrediction, LCATaskIdentity
+from .models import (
+    LCAGold,
+    LCAPrediction,
+    LCATaskIdentity,
+    LocalizationDatasetInfo,
+    LocalizationEvalRecord,
+    LocalizationEvidence,
+    LocalizationGold,
+    LocalizationMetrics,
+    LocalizationPrediction,
+    LocalizationRepoInfo,
+)
 from .scoring import score_file_localization
 
 
@@ -252,13 +267,31 @@ def localization_eval_identity(identity: LCATaskIdentity) -> str:
     return identity.task_id()
 
 
+def _coerce_paths(value: Iterable[object]) -> List[str]:
+    return [str(p) for p in value if isinstance(p, (str, Path)) or hasattr(p, "__fspath__")]
+
+
+def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> List[str]:
+    if isinstance(prediction, Mapping):
+        predicted_files_raw = prediction.get("predicted_files", [])
+        return _coerce_paths(cast(Iterable[object], predicted_files_raw))
+    return prediction.normalized_predicted_files()
+
+
+def _normalize_gold(gold: LCAGold | Mapping[str, object]) -> List[str]:
+    if isinstance(gold, Mapping):
+        changed_files_raw = gold.get("changed_files", [])
+        return _coerce_paths(cast(Iterable[object], changed_files_raw))
+    return gold.normalized_changed_files()
+
+
 def build_file_localization_eval_record(
     identity: LCATaskIdentity,
     prediction: LCAPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
-    evidence: Optional[Mapping[str, List[str]]] = None,
+    evidence: Optional[LocalizationEvidence] = None,
     repo_path: Optional[Path] = None,
-) -> Dict[str, object]:
+) -> LocalizationEvalRecord:
     """
     Build a canonical evaluation record for file-path-only predictions against LCA gold.
 
@@ -266,39 +299,33 @@ def build_file_localization_eval_record(
     be used only for diagnostics.
     """
     metrics = score_file_localization(prediction, gold)
-    if isinstance(prediction, Mapping):
-        predicted_files = [str(p) for p in prediction.get("predicted_files", [])]
-    else:
-        predicted_files = prediction.normalized_predicted_files()
+    predicted_files = _normalize_prediction(prediction)
+    changed_files = _normalize_gold(gold)
 
-    if isinstance(gold, Mapping):
-        changed_files = [str(p) for p in gold.get("changed_files", [])]
-    else:
-        changed_files = gold.normalized_changed_files()
-
-    record: MutableMapping[str, object] = {
-        "identity": localization_eval_identity(identity),
-        "dataset": {
-            "name": identity.dataset_name,
-            "config": identity.dataset_config,
-            "split": identity.dataset_split,
-        },
-        "repo": {
-            "owner": identity.repo_owner,
-            "name": identity.repo_name,
-            "base_sha": identity.base_sha,
-            "issue_url": identity.issue_url,
-            "pull_url": identity.pull_url,
-        },
-        "prediction": {"predicted_files": predicted_files},
-        "gold": {"changed_files": changed_files},
-        "metrics": metrics,
-    }
-    if evidence:
-        record["evidence"] = evidence
-    if repo_path:
-        record["repo_path"] = str(repo_path)
-    return dict(record)
+    dataset_block = LocalizationDatasetInfo(
+        name=identity.dataset_name,
+        config=identity.dataset_config,
+        split=identity.dataset_split,
+    )
+    repo_block = LocalizationRepoInfo(
+        owner=identity.repo_owner,
+        name=identity.repo_name,
+        base_sha=identity.base_sha,
+        issue_url=identity.issue_url,
+        pull_url=identity.pull_url,
+    )
+    evidence_block = evidence
+    repo_path_str = str(repo_path) if repo_path else None
+    return LocalizationEvalRecord(
+        identity=localization_eval_identity(identity),
+        dataset=dataset_block,
+        repo=repo_block,
+        prediction=LocalizationPrediction(predicted_files=predicted_files),
+        gold=LocalizationGold(changed_files=changed_files),
+        metrics=metrics if isinstance(metrics, LocalizationMetrics) else LocalizationMetrics.from_mapping(metrics),
+        evidence=evidence_block,
+        repo_path=repo_path_str,
+    )
 </file>
 
 <file path="localization/materializer.py">
@@ -378,9 +405,10 @@ def describe_repo_mapping(request: RepoMaterializationRequest) -> str:
 <file path="localization/models.py">
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from collections.abc import Mapping, Sequence
+from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def _normalize_path_list(paths: List[str]) -> List[str]:
@@ -440,22 +468,6 @@ class LCAContext(BaseModel):
     repo_license: Optional[str] = None
     repo_stars: Optional[int] = None
 
-    def agent_payload(self) -> Dict[str, object]:
-        """
-        Agent-facing, localization-native payload: issue text plus repo/diff context.
-        """
-        return {
-            "issue_title": self.issue_title,
-            "issue_body": self.issue_body,
-            "diff_url": self.diff_url,
-            "diff": self.diff,
-            "head_sha": self.head_sha,
-            "repo_language": self.repo_language,
-            "repo_languages": self.repo_languages,
-            "repo_license": self.repo_license,
-            "repo_stars": self.repo_stars,
-        }
-
 
 class LCAGold(BaseModel):
     """
@@ -466,7 +478,7 @@ class LCAGold(BaseModel):
 
     changed_files: List[str]
     changed_files_count: Optional[int] = None
-    changed_files_exts: Optional[Dict[str, int]] = None
+    changed_files_exts: Optional["LocalizationExtensionCounts"] = None
 
     def normalized_changed_files(self) -> List[str]:
         return _normalize_path_list(self.changed_files)
@@ -495,37 +507,212 @@ class LCATask(BaseModel):
     identity: LCATaskIdentity
     context: LCAContext
     gold: LCAGold
-    evidence: Optional[Dict[str, List[str]]] = Field(
-        default=None, description="Optional per-file evidence kept separate from predictions"
-    )
+    evidence: Optional["LocalizationEvidence"] = Field(default=None, description="Optional per-file evidence kept separate from predictions")
 
     def canonical_prediction_shape(self) -> str:
         """
         Describe the canonical prediction contract: file paths only.
         """
         return "predicted_files: list[str]"
+
+
+class LocalizationDatasetInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    config: str
+    split: str
+
+
+class LocalizationRepoInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    owner: str
+    name: str
+    base_sha: str
+    issue_url: Optional[str] = None
+    pull_url: Optional[str] = None
+    language: Optional[str] = None
+    license: Optional[str] = None
+
+
+class LocalizationPrediction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    predicted_files: List[str]
+
+    @classmethod
+    def from_raw(cls, value: Sequence[str] | Mapping[str, Sequence[str]]) -> "LocalizationPrediction":
+        if isinstance(value, Mapping):
+            files = value.get("predicted_files", [])
+            return cls(predicted_files=list(files))
+        return cls(predicted_files=list(value))
+
+
+class LocalizationGold(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    changed_files: List[str]
+
+    @classmethod
+    def from_raw(cls, value: Sequence[str] | Mapping[str, Sequence[str]]) -> "LocalizationGold":
+        if isinstance(value, Mapping):
+            files = value.get("changed_files", [])
+            return cls(changed_files=list(files))
+        return cls(changed_files=list(value))
+
+
+class LocalizationEvidenceItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file: str
+    hints: List[str] = Field(default_factory=list)
+
+
+class LocalizationEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: List[LocalizationEvidenceItem] = Field(default_factory=list)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Sequence[str]]) -> "LocalizationEvidence":
+        return cls(
+            items=[
+                LocalizationEvidenceItem(file=str(path), hints=[str(h) for h in hints])
+                for path, hints in value.items()
+            ]
+        )
+
+
+class LocalizationExtensionCount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    extension: str
+    count: int
+
+
+class LocalizationExtensionCounts(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entries: List[LocalizationExtensionCount] = Field(default_factory=list)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, int]) -> "LocalizationExtensionCounts":
+        return cls(entries=[LocalizationExtensionCount(extension=str(ext), count=int(count)) for ext, count in value.items()])
+
+
+class LocalizationMetrics(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    precision: float
+    recall: float
+    f1: float
+    hit: float
+    score: float
+
+    @classmethod
+    def from_mapping(cls, metrics: Mapping[str, float]) -> "LocalizationMetrics":
+        return cls(
+            precision=float(metrics.get("precision", 0.0)),
+            recall=float(metrics.get("recall", 0.0)),
+            f1=float(metrics.get("f1", 0.0)),
+            hit=float(metrics.get("hit", 0.0)),
+            score=float(metrics.get("score", metrics.get("f1", 0.0))),
+        )
+
+
+class LocalizationMaterialization(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: List[str] = Field(default_factory=list)
+
+
+class LocalizationEvalRecord(BaseModel):
+    """
+    Canonical evaluation record for file-path localization.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    identity: str
+    dataset: LocalizationDatasetInfo
+    repo: LocalizationRepoInfo
+    prediction: LocalizationPrediction
+    gold: LocalizationGold
+    metrics: LocalizationMetrics
+    evidence: Optional[LocalizationEvidence] = None
+    repo_path: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_blocks(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            raw = dict(value)
+            metrics_val = raw.get("metrics")
+            if isinstance(metrics_val, Mapping):
+                raw["metrics"] = LocalizationMetrics.from_mapping(metrics_val)
+            evidence_val = raw.get("evidence")
+            if isinstance(evidence_val, Mapping):
+                raw["evidence"] = LocalizationEvidence.from_mapping(evidence_val)
+            return raw
+        return value
+
+
+class LocalizationTelemetryEnvelope(BaseModel):
+    """
+    Structured telemetry envelope for localization runs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    identity: str
+    dataset: LocalizationDatasetInfo
+    repo: LocalizationRepoInfo
+    metrics: LocalizationMetrics
+    changed_files_count: Optional[int] = None
+    evidence: Optional[LocalizationEvidence] = None
+    materialization_events: Optional[LocalizationMaterialization] = None
+    repo_language: Optional[str] = None
+    repo_license: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_blocks(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            raw = dict(value)
+            metrics_val = raw.get("metrics")
+            if isinstance(metrics_val, Mapping):
+                raw["metrics"] = LocalizationMetrics.from_mapping(metrics_val)
+            evidence_val = raw.get("evidence")
+            if isinstance(evidence_val, Mapping):
+                raw["evidence"] = LocalizationEvidence.from_mapping(evidence_val)
+            materialization_val = raw.get("materialization_events")
+            if isinstance(materialization_val, list):
+                raw["materialization_events"] = LocalizationMaterialization(events=list(materialization_val))
+            return raw
+        return value
 </file>
 
 <file path="localization/scoring.py">
 from __future__ import annotations
 
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, cast
 
-from .models import LCAGold, LCAPrediction
+from .models import LCAGold, LCAPrediction, LocalizationMetrics
 
 
 def _as_path_set(paths: Iterable[str]) -> set[str]:
     return {p.strip() for p in paths if p and p.strip()}
 
 
-def file_localization_metrics(predicted_files: Iterable[str], changed_files: Iterable[str]) -> dict[str, float]:
+def file_localization_metrics(predicted_files: Iterable[str], changed_files: Iterable[str]) -> LocalizationMetrics:
     """
     Compute file-set localization metrics from predicted file paths vs. gold changed_files.
     """
     pred_set = _as_path_set(predicted_files)
     gold_set = _as_path_set(changed_files)
     if not gold_set:
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "hit": 0.0}
+        return LocalizationMetrics(precision=0.0, recall=0.0, f1=0.0, hit=0.0, score=0.0)
 
     true_positives = len(pred_set & gold_set)
     precision = true_positives / len(pred_set) if pred_set else 0.0
@@ -535,79 +722,91 @@ def file_localization_metrics(predicted_files: Iterable[str], changed_files: Ite
     else:
         f1 = 2 * precision * recall / (precision + recall)
     hit = 1.0 if true_positives > 0 else 0.0
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "hit": hit,
-    }
+    return LocalizationMetrics(
+        precision=precision,
+        recall=recall,
+        f1=f1,
+        hit=hit,
+        score=f1,
+    )
 
 
-def score_file_localization(prediction: LCAPrediction | Mapping[str, object], gold: LCAGold | Mapping[str, object]) -> dict[str, float]:
+def score_file_localization(prediction: LCAPrediction | Mapping[str, object], gold: LCAGold | Mapping[str, object]) -> LocalizationMetrics:
     """
     Phase-1 scorer: primary metrics from file-path predictions vs. `changed_files`.
-    `metrics["score"]` is mapped to F1 for a simple, stable scalar.
+    `metrics.score` is mapped to F1 for a simple, stable scalar.
     """
     if isinstance(prediction, Mapping):
-        predicted_files = [str(p) for p in prediction.get("predicted_files", [])]
+        predicted_files_raw = prediction.get("predicted_files", [])
+        predicted_files = [str(p) for p in cast(Iterable[object], predicted_files_raw)]
     else:
         predicted_files = prediction.normalized_predicted_files()
 
     if isinstance(gold, Mapping):
-        changed_files = [str(p) for p in gold.get("changed_files", [])]
+        changed_files_raw = gold.get("changed_files", [])
+        changed_files = [str(p) for p in cast(Iterable[object], changed_files_raw)]
     else:
         changed_files = gold.normalized_changed_files()
 
-    metrics = file_localization_metrics(predicted_files, changed_files)
-    metrics["score"] = metrics["f1"]
-    return metrics
+    return file_localization_metrics(predicted_files, changed_files)
 </file>
 
 <file path="localization/telemetry.py">
 from __future__ import annotations
 
-from typing import Dict, List, Mapping, Optional
+from typing import List, Mapping, Optional
 
-from .models import LCATaskIdentity
+from .models import (
+    LCATaskIdentity,
+    LocalizationDatasetInfo,
+    LocalizationEvidence,
+    LocalizationMetrics,
+    LocalizationMaterialization,
+    LocalizationRepoInfo,
+    LocalizationTelemetryEnvelope,
+)
 
 
 def build_localization_telemetry(
     identity: LCATaskIdentity,
-    metrics: Mapping[str, float],
+    metrics: LocalizationMetrics,
     changed_files_count: Optional[int] = None,
     repo_language: Optional[str] = None,
     repo_license: Optional[str] = None,
-    evidence: Optional[Mapping[str, List[str]]] = None,
+    evidence: Optional[LocalizationEvidence] = None,
     materialization_events: Optional[List[str]] = None,
-) -> Dict[str, object]:
+) -> LocalizationTelemetryEnvelope:
     """
     Telemetry payload for file-path localization runs.
     Includes required LCA metadata and excludes legacy snippet/ranking fields.
     """
-    payload: Dict[str, object] = {
-        "identity": identity.task_id(),
-        "dataset": {
-            "name": identity.dataset_name,
-            "config": identity.dataset_config,
-            "split": identity.dataset_split,
-        },
-        "repo": {
-            "owner": identity.repo_owner,
-            "name": identity.repo_name,
-            "base_sha": identity.base_sha,
-            "issue_url": identity.issue_url,
-            "pull_url": identity.pull_url,
-            "language": repo_language,
-            "license": repo_license,
-        },
-        "changed_files_count": changed_files_count,
-        "metrics": dict(metrics),
-    }
-    if evidence:
-        payload["evidence"] = evidence
-    if materialization_events:
-        payload["materialization_events"] = materialization_events
-    return payload
+    dataset_block = LocalizationDatasetInfo(
+        name=identity.dataset_name,
+        config=identity.dataset_config,
+        split=identity.dataset_split,
+    )
+    repo_block = LocalizationRepoInfo(
+        owner=identity.repo_owner,
+        name=identity.repo_name,
+        base_sha=identity.base_sha,
+        issue_url=identity.issue_url,
+        pull_url=identity.pull_url,
+        language=repo_language,
+        license=repo_license,
+    )
+    evidence_block = evidence
+    materialization_block = LocalizationMaterialization(events=list(materialization_events)) if materialization_events else None
+    return LocalizationTelemetryEnvelope(
+        identity=identity.task_id(),
+        dataset=dataset_block,
+        repo=repo_block,
+        metrics=metrics,
+        changed_files_count=changed_files_count,
+        evidence=evidence_block,
+        materialization_events=materialization_block,
+        repo_language=repo_language,
+        repo_license=repo_license,
+    )
 </file>
 
 <file path="loop/__init__.py">
@@ -629,16 +828,15 @@ from .loop import (  # noqa: E402
     _hash_tests_dir,
     _read_policy,
     _write_policy,
-    index_folder,
-    evaluate_policy_on_item,
-    prepare_iteration_tasks,
-    run_loop,
     emit_score,
     emit_score_for_handle,
+    evaluate_policy_on_item,
+    index_folder,
     load_policy,
+    prepare_iteration_tasks,
+    run_loop,
     run_policy_pipeline,
 )
-from .runner_agent import run_ic_iteration
 from .loop_machine import OptimizationStateMachine, RepairStateMachine
 from .loop_types import (
     AcceptedPolicy,
@@ -647,6 +845,7 @@ from .loop_types import (
     FailedRepairDetails,
     FeedbackPackage,
     IterationRecord,
+    IterationTasks,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
@@ -654,8 +853,11 @@ from .loop_types import (
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
+    RunMetadata,
+    TaskPayload,
+    iteration_record_to_public_dict,
 )
-from .loop_types import iteration_record_to_public_dict
+from .runner_agent import run_ic_iteration
 
 __all__ = [
     "run_loop",
@@ -678,6 +880,7 @@ __all__ = [
     "EvaluationResult",
     "FailedRepairDetails",
     "FeedbackPackage",
+    "IterationTasks",
     "IterationRecord",
     "LoopContext",
     "LoopDependencies",
@@ -686,6 +889,8 @@ __all__ = [
     "RepairContext",
     "RepairMachineModel",
     "RepairOutcome",
+    "RunMetadata",
+    "TaskPayload",
     "iteration_record_to_public_dict",
 ]
 
@@ -712,43 +917,106 @@ Shared agent utilities that are reused by runner and writer agents.
 from collections.abc import Mapping
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
 
-def usage_from_response(resp: Any) -> dict[str, object] | None:
+
+class UsageEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: float
+
+
+class UsageEnvelope(BaseModel):
+    """Canonical usage details envelope aligned with observability expectations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_tokens: float | None = None
+    completion_tokens: float | None = None
+    total_tokens: float | None = None
+    input: float | None = None
+    output: float | None = None
+    total: float | None = None
+    prompt_details: list[UsageEntry] = Field(default_factory=list)
+    completion_details: list[UsageEntry] = Field(default_factory=list)
+
+    def model_dump_flat(self) -> dict[str, float]:
+        data: dict[str, float] = {}
+        if self.prompt_tokens is not None:
+            data["prompt_tokens"] = float(self.prompt_tokens)
+        if self.completion_tokens is not None:
+            data["completion_tokens"] = float(self.completion_tokens)
+        if self.total_tokens is not None:
+            data["total_tokens"] = float(self.total_tokens)
+        if self.input is not None:
+            data["input"] = float(self.input)
+        elif self.prompt_tokens is not None:
+            data["input"] = float(self.prompt_tokens)
+        if self.output is not None:
+            data["output"] = float(self.output)
+        elif self.completion_tokens is not None:
+            data["output"] = float(self.completion_tokens)
+        if self.total is not None:
+            data["total"] = float(self.total)
+        elif self.total_tokens is not None:
+            data["total"] = float(self.total_tokens)
+        for entry in self.prompt_details:
+            data[f"prompt_tokens_details.{entry.name}"] = float(entry.value)
+            data[f"input_{entry.name}"] = float(entry.value)
+        for entry in self.completion_details:
+            data[f"completion_tokens_details.{entry.name}"] = float(entry.value)
+            data[f"output_{entry.name}"] = float(entry.value)
+        return data
+
+
+def usage_from_response(resp: Any) -> UsageEnvelope | None:
     """
     Normalize OpenAI-style usage into Langfuse usage_details shape.
     """
     usage = getattr(resp, "usage", None)
     if usage is None:
         return None
-    payload: dict[str, object] = {}
     prompt_tokens = getattr(usage, "prompt_tokens", None)
     completion_tokens = getattr(usage, "completion_tokens", None)
     total_tokens = getattr(usage, "total_tokens", None)
     prompt_details = getattr(usage, "prompt_tokens_details", None)
     completion_details = getattr(usage, "completion_tokens_details", None)
-    if isinstance(prompt_tokens, (int, float)):
-        payload["prompt_tokens"] = prompt_tokens
-        payload["input"] = prompt_tokens
-    if isinstance(completion_tokens, (int, float)):
-        payload["completion_tokens"] = completion_tokens
-        payload["output"] = completion_tokens
-    if isinstance(total_tokens, (int, float)):
-        payload["total_tokens"] = total_tokens
-        payload["total"] = total_tokens
+    prompt_entries: list[UsageEntry] = []
+    completion_entries: list[UsageEntry] = []
     if isinstance(prompt_details, Mapping):
         for key, val in prompt_details.items():
             if isinstance(val, (int, float)):
-                payload[f"prompt_tokens_details.{key}"] = val
-                payload[f"input_{key}"] = val
+                prompt_entries.append(UsageEntry(name=str(key), value=float(val)))
     if isinstance(completion_details, Mapping):
         for key, val in completion_details.items():
             if isinstance(val, (int, float)):
-                payload[f"completion_tokens_details.{key}"] = val
-                payload[f"output_{key}"] = val
-    return payload or None
+                completion_entries.append(UsageEntry(name=str(key), value=float(val)))
+    return UsageEnvelope(
+        prompt_tokens=float(prompt_tokens) if isinstance(prompt_tokens, (int, float)) else None,
+        completion_tokens=float(completion_tokens) if isinstance(completion_tokens, (int, float)) else None,
+        total_tokens=float(total_tokens) if isinstance(total_tokens, (int, float)) else None,
+        input=float(prompt_tokens) if isinstance(prompt_tokens, (int, float)) else None,
+        output=float(completion_tokens) if isinstance(completion_tokens, (int, float)) else None,
+        total=float(total_tokens) if isinstance(total_tokens, (int, float)) else None,
+        prompt_details=prompt_entries,
+        completion_details=completion_entries,
+    )
 
 
 __all__ = ["usage_from_response"]
+
+
+class AgentTaskPayload(BaseModel):
+    """Validated agent task payload for runner agents."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    repo: str
+    symbol_id: str
+    raw_symbol: str
+    extra: dict[str, object] = Field(default_factory=dict)
 </file>
 
 <file path="loop/loop_listeners.py">
@@ -760,7 +1028,7 @@ No session creation; reacts to machine events only.
 """
 
 import json
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 from statemachine import State
 
@@ -774,7 +1042,12 @@ def _safe_end_span(span: object | None, **kwargs: object) -> None:
     if span is None or not hasattr(span, "end"):
         return
     try:
-        cast(Any, span).end(**kwargs)
+        end_kwargs: dict[str, object] = {}
+        metadata = kwargs.pop("metadata", None)
+        if isinstance(metadata, Mapping):
+            end_kwargs.update(dict(metadata))
+        end_kwargs.update(kwargs)
+        cast(Any, span).end(**end_kwargs)
     except Exception:
         pass
 
@@ -837,15 +1110,15 @@ class OptimizationTracingListener:
         if ctx.prepared_tasks is None:
             machine.model.current_iteration_span = None  # noqa: SLF001
             return
-        ic_task, jc_task = ctx.prepared_tasks.build_iteration_tasks()
+        iteration_tasks = ctx.prepared_tasks.build_iteration_tasks()
         machine.model.current_iteration_span = machine.model.deps.start_observation(  # noqa: SLF001
             name=f"iteration_{ctx.current_iteration}",
             parent=ctx.run_trace,
             metadata={
                 "iteration": ctx.current_iteration,
                 "iterations": ctx.iterations,
-                "task": dict(ic_task),
-                "jc_repo": jc_task.get("repo"),
+                "task": iteration_tasks.ic_task.model_dump(),
+                "jc_repo": iteration_tasks.jc_task.repo,
             },
         )
 
@@ -947,11 +1220,13 @@ if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
 
 from harness.pipeline.types import PipelineClassification, StepResult
 
-from .loop_listeners import OptimizationTracingListener, RepairTracingListener, _safe_end_span
+from .loop_listeners import OptimizationTracingListener, RepairTracingListener, _safe_end_span as safe_end_span  # pyright: ignore[reportPrivateUsage]
 from .loop_types import (
     AcceptedPolicy,
+    EvaluationMetrics,
     EvaluationResult,
     FeedbackPackage,
+    IterationTasks,
     IterationRecord,
     LoopContext,
     LoopDependencies,
@@ -960,6 +1235,7 @@ from .loop_types import (
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
+    TaskPayload,
 )
 
 
@@ -1107,7 +1383,8 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             ctx.repo_root,
             repair_obs=ctx.repair_observation,
         )
-        ctx.pipeline_results = pipeline_results
+        # Enforce canonical step result shape at the boundary.
+        ctx.pipeline_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in pipeline_results]
         ctx.pipeline_passed = pipeline_success
         ctx.attempts_used += 1
 
@@ -1225,11 +1502,15 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         if ctx.run_trace is not None:
             return
         start_obs = model.deps.start_observation
-        meta = ctx.run_metadata or {"iterations": ctx.iterations, "task": dict(ctx.task)}
+        meta = (
+            ctx.run_metadata.model_dump()
+            if ctx.run_metadata
+            else {"iterations": ctx.iterations, "task": ctx.task.model_dump()}
+        )
         ctx.run_trace = start_obs(
             name="run_loop",
             parent=ctx.parent_trace,
-            input=ctx.task,
+            input=ctx.task.model_dump(),
             metadata=meta,
         )
 
@@ -1240,7 +1521,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         metadata: dict[str, object] = {"iterations_completed": len(self.context.history)}
         if status:
             metadata["status"] = status
-        _safe_end_span(span, metadata=metadata)
+        safe_end_span(span, metadata=metadata)
         self.context.run_trace = None
 
     # Preparation ---------------------------------------------------------
@@ -1253,11 +1534,16 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         except Exception:
             self.context.prepared_tasks = None
             self.model.prep_ok = False
-        if self.context.prepared_tasks is None and isinstance(self.context.task, dict):
-            repo_val = self.context.task.get("repo")
+        if self.context.prepared_tasks is None:
+            base_task = (
+                self.context.task
+                if isinstance(self.context.task, TaskPayload)
+                else TaskPayload.model_validate(self.context.task)
+            )
+            repo_val = base_task.repo
             resolved_repo = repo_val if isinstance(repo_val, str) else None
             self.context.prepared_tasks = PreparedTasks(
-                base_task=dict(self.context.task), resolved_repo_path=resolved_repo, jc_repo_id=None
+                base_task=base_task, resolved_repo_path=resolved_repo, jc_repo_id=None
             )
             self.model.prep_ok = True
 
@@ -1271,9 +1557,9 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             self.raise_("evaluation_done")  # type: ignore[call-arg]
             return
 
-        ic_task, _ = prepared_tasks.build_iteration_tasks()
+        iteration_tasks = prepared_tasks.build_iteration_tasks()
         self.model.current_evaluation = self.deps.evaluate_policy_on_item(
-            ic_task,
+            iteration_tasks.ic_task,
             self.context.baseline_snapshot,
             self.model.current_iteration_span,
             self.context.current_iteration,
@@ -1358,7 +1644,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         evaluation: EvaluationResult,
         repair_outcome: RepairOutcome | None,
     ) -> IterationRecord:
-        metrics_map = dict(evaluation.metrics)
+        metrics_map = evaluation.metrics.as_map()
         pipeline_feedback = (
             repair_outcome.pipeline_feedback if repair_outcome else self.context.last_classified
         )
@@ -1372,7 +1658,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         writer_err_val = repair_outcome.writer_error if repair_outcome else None
         record = IterationRecord(
             iteration=iteration,
-            metrics=metrics_map,
+            metrics=EvaluationMetrics.model_validate(metrics_map),
             pipeline_passed=repair_outcome.success if repair_outcome else None,
             pipeline_feedback=pipeline_feedback,
             repair_attempts=repair_attempts_val
@@ -1458,9 +1744,9 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
 
@@ -1468,25 +1754,211 @@ if TYPE_CHECKING:
     from harness.observability.baselines import BaselineSnapshot
 
 
+MetricValue = int | float | bool
+MetricsMap = Mapping[str, MetricValue | None]
+ScalarMetrics = dict[str, MetricValue | None]
+FeedbackMap = Mapping[str, str | float | int | bool | None]
+
+
+class MetricEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: MetricValue | None
+
+
+class EvaluationMetrics(BaseModel):
+    """Canonical metrics container with stable fields and extensible entries."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: MetricValue | None = None
+    iteration_regression: bool | None = None
+    additional_metrics: list[MetricEntry] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            score = value.get("score")
+            iteration_regression = value.get("iteration_regression")
+            additional_raw = value.get("additional_metrics", [])
+            unknown_keys = [k for k in value.keys() if k not in {"score", "iteration_regression", "additional_metrics"}]
+            if unknown_keys:
+                raise ValueError(f"Unknown metric keys: {unknown_keys}")
+            additional: list[dict[str, object]] = []
+            if isinstance(additional_raw, list):
+                additional = [
+                    {"name": entry.get("name"), "value": entry.get("value")}
+                    for entry in additional_raw
+                    if isinstance(entry, Mapping)
+                ]
+            return {
+                "score": score,
+                "iteration_regression": iteration_regression,
+                "additional_metrics": additional,
+            }
+        return value
+
+    def as_map(self) -> dict[str, MetricValue | None]:
+        data: dict[str, MetricValue | None] = {}
+        if self.score is not None:
+            data["score"] = self.score
+        if self.iteration_regression is not None:
+            data["iteration_regression"] = self.iteration_regression
+        for entry in self.additional_metrics:
+            data[entry.name] = entry.value
+        return data
+
+    def items(self):
+        return self.as_map().items()
+
+    def get(self, key: str, default: object | None = None) -> object | None:
+        return self.as_map().get(key, default)  # type: ignore[return-value]
+
+
+class ResultEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: object | None
+
+
+class ICResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[ResultEntry] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {"entries": [{"name": k, "value": v} for k, v in value.items()]}
+        return value
+
+    def as_map(self) -> dict[str, object]:
+        return {entry.name: entry.value for entry in self.entries}
+
+    def get(self, key: str, default: object | None = None) -> object | None:
+        return self.as_map().get(key, default)
+
+
+class JCResult(ICResult):
+    """JC result container."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class FeedbackEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: str | float | int | bool | None
+
+
+class FeedbackEntries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[FeedbackEntry] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {"entries": [{"name": k, "value": v} for k, v in value.items()]}
+        return value
+
+    def as_map(self) -> dict[str, str | float | int | bool | None]:
+        return {entry.name: entry.value for entry in self.entries}
+
+    def get(self, key: str, default: object | None = None) -> object | None:
+        return self.as_map().get(key, default)
+
+    def items(self):
+        return self.as_map().items()
+
+
+class TaskPayload(BaseModel):
+    """Normalized task payload passed into loop/runner agents."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    repo: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {"symbol": value.get("symbol"), "repo": value.get("repo")}
+        return value
+
+
+class ICTaskPayload(TaskPayload):
+    """Iteration task payload for IC runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class JCTaskPayload(TaskPayload):
+    """Iteration task payload for JC runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RunMetadata(BaseModel):
+    """Run-level metadata persisted for tracing and external visibility."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    iterations: int
+    task: TaskPayload
+    session_id: str | None = None
+
 class PreparedTasks(BaseModel):
     """Resolved IC/JC tasks for a single iteration."""
 
     model_config = ConfigDict(extra="forbid")
 
-    base_task: dict[str, object]
+    base_task: TaskPayload
     resolved_repo_path: str | None
     jc_repo_id: str | None
+    ic_task: ICTaskPayload | None = None
+    jc_task: JCTaskPayload | None = None
 
-    def build_iteration_tasks(self) -> tuple[dict[str, object], dict[str, object]]:
-        ic_task = dict(self.base_task)
-        jc_task = dict(self.base_task)
+    def _resolve_ic_repo(self) -> str:
         if self.resolved_repo_path is not None:
-            ic_task["repo"] = self.resolved_repo_path
+            return self.resolved_repo_path
+        return self.base_task.repo
+
+    def _resolve_jc_repo(self) -> str:
         if self.jc_repo_id is not None:
-            jc_task["repo"] = self.jc_repo_id
-        elif self.resolved_repo_path is not None:
-            jc_task["repo"] = self.resolved_repo_path
-        return ic_task, jc_task
+            return self.jc_repo_id
+        if self.resolved_repo_path is not None:
+            return self.resolved_repo_path
+        return self.base_task.repo
+
+    def to_ic_request(self) -> ICTaskPayload:
+        if self.ic_task is not None:
+            return self.ic_task
+        return ICTaskPayload(symbol=self.base_task.symbol, repo=self._resolve_ic_repo())
+
+    def to_jc_request(self) -> JCTaskPayload:
+        if self.jc_task is not None:
+            return self.jc_task
+        return JCTaskPayload(symbol=self.base_task.symbol, repo=self._resolve_jc_repo())
+
+    def build_iteration_tasks(self) -> "IterationTasks":
+        return IterationTasks(ic_task=self.to_ic_request(), jc_task=self.to_jc_request())
+
+
+class IterationTasks(BaseModel):
+    """Concrete task payloads for an iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ic_task: ICTaskPayload
+    jc_task: JCTaskPayload
 
 
 class EvaluationResult(BaseModel):
@@ -1494,10 +1966,10 @@ class EvaluationResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    metrics: dict[str, object]
-    ic_result: dict[str, object]
-    jc_result: dict[str, object]
-    jc_metrics: dict[str, object]
+    metrics: EvaluationMetrics
+    ic_result: ICResult
+    jc_result: JCResult
+    jc_metrics: EvaluationMetrics
     comparison_summary: str | None
     policy_code: str
     success: bool = True
@@ -1512,7 +1984,7 @@ class FeedbackPackage(BaseModel):
     tests: str
     scoring_context: str
     comparison_summary: str | None
-    feedback: dict[str, object]
+    feedback: FeedbackEntries
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -1554,7 +2026,7 @@ class IterationRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     iteration: int
-    metrics: dict[str, object]
+    metrics: EvaluationMetrics
     pipeline_passed: bool | None = None
     pipeline_feedback: PipelineClassification | None = None
     failed_step: str | None = None
@@ -1570,12 +2042,12 @@ class IterationRecord(BaseModel):
 class LoopContext(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
-    task: dict[str, object]
+    task: TaskPayload
     iterations: int
     session_id: str | None = None
     parent_trace: object | None = None
-    run_metadata: dict[str, object] | None = None
-    baseline_snapshot: "BaselineSnapshot | None" = None
+    run_metadata: RunMetadata | None = None
+    baseline_snapshot: object | None = None
     run_trace: object | None
     history: list[IterationRecord] = Field(default_factory=list)
     prepared_tasks: PreparedTasks | None = None
@@ -1590,8 +2062,8 @@ class LoopDependencies(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    prepare_iteration_tasks: Callable[[dict[str, object], object | None], PreparedTasks]
-    evaluate_policy_on_item: Callable[[dict[str, object], "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
+    prepare_iteration_tasks: Callable[[TaskPayload, object | None], PreparedTasks]
+    evaluate_policy_on_item: Callable[[ICTaskPayload, object | None, object | None, int | None], EvaluationResult]
     build_iteration_feedback: Callable[[EvaluationResult, float | None, PipelineClassification | None, Path], FeedbackPackage]
     attempt_policy_generation: Callable[..., tuple[str | None, str | None]]
     run_policy_pipeline: Callable[..., tuple[list[StepResult], bool]]
@@ -1659,7 +2131,7 @@ class FailedRepairDetails(BaseModel):
 
 def iteration_record_to_public_dict(record: IterationRecord) -> dict[str, object]:
     """Serialize iteration records for external consumers (CLI, scoring)."""
-    data: dict[str, object] = dict(record.metrics)
+    data: dict[str, object] = {k: v for k, v in record.metrics.as_map().items()}
     if record.pipeline_passed is not None:
         data["pipeline_passed"] = record.pipeline_passed
     if record.pipeline_feedback is not None:
@@ -1684,6 +2156,30 @@ def iteration_record_to_public_dict(record: IterationRecord) -> dict[str, object
     if record.max_policy_repairs is not None:
         data.setdefault("max_policy_repairs", record.max_policy_repairs)
     return data
+
+
+def format_failure_context_payload(
+    pipeline_results: Sequence[StepResult],
+    classified: PipelineClassification | None,
+    writer_error: str | None,
+    model_name: str | None,
+    repair_attempt: int,
+) -> str:
+    """Centralized failure-context serialization for writer prompts."""
+    from harness.utils.failure_context import pack_failure_context  # local import to avoid cycles
+
+    pipeline_dump = [step.model_dump() for step in pipeline_results]
+    classified_dump = classified.model_dump() if classified else None
+    failed_step = next((step for step in pipeline_results if step.exit_code != 0), None)
+    failed_dump = failed_step.model_dump() if failed_step else None
+    return pack_failure_context(
+        pipeline_dump,
+        classified_dump,
+        failed_dump,
+        writer_error,
+        model_name,
+        repair_attempt=repair_attempt,
+    )
 
 
 class RepairMachineModel(BaseModel):
@@ -1716,7 +2212,7 @@ def _rebuild_forward_refs() -> None:
         from harness.observability.baselines import BaselineSnapshot  # local import to avoid cycles
     except Exception:
         return
-    LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
+    LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot, "RunMetadata": RunMetadata})
     LoopDependencies.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
     RepairContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
     RepairMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
@@ -1738,41 +2234,71 @@ import hashlib
 from collections.abc import Mapping, Sequence
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Callable, Protocol, cast
+from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 
-from harness.observability.baselines import BaselineSnapshot, baseline_metrics_from_jc
-from harness.observability.langfuse import flush_langfuse, propagate_context, start_observation
+from jcodemunch_mcp.tools.index_folder import index_folder
+
+from harness.loop.runner_agent import run_ic_iteration
+from harness.observability.langfuse import (
+    flush_langfuse,
+    propagate_context,
+    start_observation,
+)
 from harness.observability.score_emitter import emit_score, emit_score_for_handle
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy_loader import load_policy
-from harness.loop.runner_agent import run_ic_iteration
 from harness.utils.comparison import build_comparison, format_comparison_summary
 from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
-from harness.utils.failure_context import pack_failure_context
 from harness.utils.repo_root import find_repo_root
 from harness.utils.test_loader import format_tests_for_prompt, load_tests
-from harness.utils.type_loader import format_scoring_context, load_scoring_examples, load_scoring_types
+from harness.utils.type_loader import (
+    format_scoring_context,
+    load_scoring_examples,
+    load_scoring_types,
+)
 from harness.writer import generate_policy
-from jcodemunch_mcp.tools.index_folder import index_folder
+
+if TYPE_CHECKING:
+    from harness.observability.baselines import (
+        BaselineSnapshot,
+        baseline_metrics_from_jc,
+    )
 
 from .loop_machine import OptimizationStateMachine
 from .loop_types import (
     AcceptedPolicyMeta,
+    EvaluationMetrics,
     EvaluationResult,
     FailedRepairDetails,
+    FeedbackEntries,
+    FeedbackEntry,
     FeedbackPackage,
+    ICResult,
+    ICTaskPayload,
     IterationRecord,
+    JCResult,
+    JCTaskPayload,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
     PreparedTasks,
+    RunMetadata,
+    ScalarMetrics,
+    TaskPayload,
+    format_failure_context_payload,
 )
 
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.py"
 _MAX_POLICY_REPAIRS = 3
 _MAX_FAILURE_SUMMARY_CHARS = 400
+
+
+def score(result: Mapping[str, object]) -> Mapping[str, object]:  # pyright: ignore[reportUnusedFunction]
+    """Legacy scoring shim for tests; retains mapping interface."""
+    return result
+
 
 # Re-exported helpers so callers can monkeypatch harness.loop.* directly.
 _REEXPORTED = (
@@ -1850,19 +2376,6 @@ def _hash_tests_dir(repo_root: Path) -> str:  # pyright: ignore[reportUnusedFunc
     return hasher.hexdigest()
 
 
-def _tool_call_stats(bucket: Mapping[str, object] | None) -> tuple[int, int]:
-    if not isinstance(bucket, Mapping):
-        return 0, 0
-    observations = bucket.get("observations")
-    if not isinstance(observations, list):
-        return 0, 0
-    errors = 0
-    for obs in observations:
-        if isinstance(obs, Mapping) and "error" in obs:
-            errors += 1
-    return len(observations), errors
-
-
 def _step_succeeded(step: StepResult) -> bool:
     return step.exit_code == 0
 
@@ -1881,38 +2394,40 @@ def _format_pipeline_failure_context(
     model_name: str | None,
     repair_attempt: int,
 ) -> str:
-    failed_step = _first_failed_step(pipeline_results)
-    pipeline_dump = [step.model_dump() for step in pipeline_results]
-    classified_dump = classified.model_dump() if classified else None
-    failed_dump = failed_step.model_dump() if failed_step else None
-    return pack_failure_context(
-        pipeline_dump,
-        classified_dump,
-        failed_dump,
+    return format_failure_context_payload(
+        pipeline_results,
+        classified,
         writer_error,
         model_name,
-        repair_attempt=repair_attempt,
+        repair_attempt,
     )
 
 
 class SupportsPipelineRun(Protocol):
-    def run(self, repo_root: Path, observation: object | None = None) -> list[StepResult]:
-        ...
+    def run(
+        self,
+        repo_root: Path,
+        observation: object | None = None,
+        allow_no_parent: bool = False,
+    ) -> list[StepResult]: ...
 
 
 class SupportsSpan(Protocol):
-    def end(self, **kwargs: object) -> None:
-        ...
+    def end(self, **kwargs: object) -> None: ...
 
 
-def prepare_iteration_tasks(task: dict[str, object], parent_trace: object | None = None) -> PreparedTasks:
+def prepare_iteration_tasks(
+    task: TaskPayload, parent_trace: object | None = None
+) -> PreparedTasks:
     """Resolve repo paths and index JC repo once for the run."""
-    repo_path_val = task.get("repo")
-    resolved_repo_path = repo_path_val if isinstance(repo_path_val, str) else None
+    repo_path_val = task.repo
+    resolved_repo_path = repo_path_val
     jc_repo_id: str | None = None
     index_obs: SupportsSpan | None = None
     start_obs_func = cast(Callable[..., object | None], _pkg_attr("start_observation"))
-    index_folder_fn = cast(Callable[[str], Mapping[str, object]], _pkg_attr("index_folder"))
+    index_folder_fn = cast(
+        Callable[[str], Mapping[str, object]], _pkg_attr("index_folder")
+    )
     if isinstance(repo_path_val, str):
         try:
             index_obs = cast(
@@ -1936,19 +2451,31 @@ def prepare_iteration_tasks(task: dict[str, object], parent_trace: object | None
                     pass
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
-    return PreparedTasks(base_task=dict(task), resolved_repo_path=resolved_repo_path, jc_repo_id=jc_repo_id)
+    ic_task = ICTaskPayload(symbol=task.symbol, repo=resolved_repo_path)
+    jc_task = JCTaskPayload(symbol=task.symbol, repo=jc_repo_id or resolved_repo_path)
+    return PreparedTasks(
+        base_task=task,
+        resolved_repo_path=resolved_repo_path,
+        jc_repo_id=jc_repo_id,
+        ic_task=ic_task,
+        jc_task=jc_task,
+    )
 
 
 def evaluate_policy_on_item(
-    ic_task: Mapping[str, object],
-    baseline_snapshot: BaselineSnapshot | None,
+    ic_task: ICTaskPayload,
+    baseline_snapshot: "BaselineSnapshot | None",
     iteration_span: object | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
     """Load current policy, execute IC iteration, and compute metrics."""
-    start_obs_func = cast(Callable[..., SupportsSpan | None], _pkg_attr("start_observation"))
+    start_obs_func = cast(
+        Callable[..., SupportsSpan | None], _pkg_attr("start_observation")
+    )
     load_policy_fn = cast(Callable[[], Callable[..., object]], _pkg_attr("load_policy"))
-    run_ic_iteration_fn = cast(Callable[..., Mapping[str, object]], _pkg_attr("run_ic_iteration"))
+    run_ic_iteration_fn = cast(
+        Callable[..., Mapping[str, object]], _pkg_attr("run_ic_iteration")
+    )
     policy_load_obs: SupportsSpan | None = None
     try:
         policy_load_obs = start_obs_func(
@@ -1965,62 +2492,84 @@ def evaluate_policy_on_item(
                 policy_load_obs.end(error=e)
             except Exception:
                 pass
-        metrics_map = {
+        error_metrics: ScalarMetrics = {
             "score": -10.0,
-            "error": f"policy_import_error: {str(e)}",
         }
         emit_score_for_handle(
             iteration_span,
             name="metrics.score",
-            value=_as_float(metrics_map.get("score", 0.0)),
+            value=_as_float(error_metrics.get("score", 0.0)),
             data_type="NUMERIC",
         )
         return EvaluationResult(
-            metrics=metrics_map,
-            ic_result={},
-            jc_result={},
-            jc_metrics={},
+            metrics=EvaluationMetrics.model_validate(error_metrics),
+            ic_result=ICResult(entries=[]),
+            jc_result=JCResult(entries=[]),
+            jc_metrics=EvaluationMetrics(),
             comparison_summary=None,
             policy_code="",
             success=False,
-            error=str(metrics_map.get("error")),
+            error=f"policy_import_error: {str(e)}",
         )
 
     ic_runner = cast(Callable[..., dict[str, object]], run_ic_iteration_fn)
-    ic_result = ic_runner(dict(ic_task), loaded_policy_fn, parent_trace=iteration_span)
-    jc_result: dict[str, object] = dict(baseline_snapshot.jc_result) if baseline_snapshot is not None else {}
-    jc_metrics: dict[str, object] = dict(baseline_snapshot.jc_metrics) if baseline_snapshot is not None else {}
-    if not jc_metrics:
-        jc_metrics = {k: float(v) for k, v in baseline_metrics_from_jc(jc_result).items()}
+    ic_result_map = ic_runner(
+        ic_task.model_dump(), loaded_policy_fn, parent_trace=iteration_span
+    )
+    jc_result_map: dict[str, object] = (
+        dict(baseline_snapshot.jc_result.as_map())
+        if baseline_snapshot is not None
+        else {}
+    )
+    jc_metrics_map_raw = (
+        baseline_snapshot.jc_metrics.as_map() if baseline_snapshot is not None else {}
+    )
+    jc_metrics_map: dict[str, float] = {
+        k: float(v)
+        for k, v in jc_metrics_map_raw.items()
+        if isinstance(v, (int, float, bool))
+    }
+    if not jc_metrics_map:
+        baseline_metrics_from_jc_fn = cast(
+            Callable[[Mapping[str, object]], Mapping[str, object]],
+            _pkg_attr("baseline_metrics_from_jc"),
+        )
+        jc_metrics_map = {
+            k: float(v)
+            for k, v in baseline_metrics_from_jc_fn(jc_result_map).items()
+            if isinstance(v, (int, float, bool))
+        }
 
-    combined_result = {"iterative_context": ic_result, "jcodemunch": jc_result}
-    metrics_map: dict[str, object] = {"score": 0.0}
-    comparison = build_comparison(metrics_map, jc_metrics)
+    metrics_map: dict[str, float | int | bool] = {"score": 0.0}
+    metrics_for_comparison = {
+        k: float(v) for k, v in metrics_map.items() if isinstance(v, (int, float, bool))
+    }
+    comparison = build_comparison(metrics_for_comparison, jc_metrics_map)
     comparison_summary = format_comparison_summary(comparison)
     metrics_map.setdefault("iteration_regression", False)
-    metrics_map["jc_baseline_metrics"] = dict(jc_metrics)
-    metrics_map["comparison"] = comparison
     trace_id = getattr(iteration_span, "id", None)
     session_id_val = _session_id_from(iteration_span)
     for name, value in metrics_map.items():
-        if isinstance(value, (int, float, bool)):
-            data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
-            score_id = f"{trace_id}-metrics.{name}" if trace_id else None
-            emit_score_for_handle(
-                iteration_span,
-                name=f"metrics.{name}",
-                value=float(value) if isinstance(value, bool) else value,
-                data_type=data_type,
-                score_id=score_id,
-                session_id=session_id_val,
-            )
+        if not isinstance(value, (int, float, bool)):
+            continue
+        num_val = cast(float | int | bool, value)
+        data_type = "BOOLEAN" if isinstance(num_val, bool) else "NUMERIC"
+        score_id = f"{trace_id}-metrics.{name}" if trace_id else None
+        emit_score_for_handle(
+            iteration_span,
+            name=f"metrics.{name}",
+            value=float(num_val) if isinstance(num_val, bool) else num_val,
+            data_type=data_type,
+            score_id=score_id,
+            session_id=session_id_val,
+        )
 
     policy_code = _read_policy()
     return EvaluationResult(
-        metrics=metrics_map,
-        ic_result=ic_result,
-        jc_result=jc_result,
-        jc_metrics=jc_metrics,
+        metrics=EvaluationMetrics.model_validate(metrics_map),
+        ic_result=ICResult.model_validate(ic_result_map),
+        jc_result=JCResult.model_validate(jc_result_map),
+        jc_metrics=EvaluationMetrics.model_validate(jc_metrics_map),
         comparison_summary=comparison_summary,
         policy_code=policy_code,
     )
@@ -2034,10 +2583,18 @@ def build_iteration_feedback(
 ) -> FeedbackPackage:
     """Package evaluation outputs into writer-facing inputs."""
     load_tests_fn = cast(Callable[[Path], object], _pkg_attr("load_tests"))
-    format_tests_for_prompt_fn = cast(Callable[[object], str], _pkg_attr("format_tests_for_prompt"))
-    load_scoring_types_fn = cast(Callable[[Path], object], _pkg_attr("load_scoring_types"))
-    load_scoring_examples_fn = cast(Callable[[Path], object], _pkg_attr("load_scoring_examples"))
-    format_scoring_context_fn = cast(Callable[..., str], _pkg_attr("format_scoring_context"))
+    format_tests_for_prompt_fn = cast(
+        Callable[[object], str], _pkg_attr("format_tests_for_prompt")
+    )
+    load_scoring_types_fn = cast(
+        Callable[[Path], object], _pkg_attr("load_scoring_types")
+    )
+    load_scoring_examples_fn = cast(
+        Callable[[Path], object], _pkg_attr("load_scoring_examples")
+    )
+    format_scoring_context_fn = cast(
+        Callable[..., str], _pkg_attr("format_scoring_context")
+    )
     compute_diff_fn = cast(Callable[..., object], _pkg_attr("compute_diff"))
     format_diff_fn = cast(Callable[[object], str], _pkg_attr("format_diff"))
     interpret_diff_fn = cast(Callable[[object], str], _pkg_attr("interpret_diff"))
@@ -2064,11 +2621,20 @@ def build_iteration_feedback(
             diff_str = ""
             diff_hint = ""
 
+    feedback_entries: list[FeedbackEntry] = []
+    for key, value in evaluation.metrics.items():
+        normalized_val: str | float | int | bool | None
+        if isinstance(value, (str, float, int, bool)) or value is None:
+            normalized_val = value
+        else:
+            normalized_val = str(value)
+        feedback_entries.append(FeedbackEntry(name=key, value=normalized_val))
+
     return FeedbackPackage(
         tests=tests_str,
         scoring_context=scoring_ctx,
         comparison_summary=evaluation.comparison_summary,
-        feedback=dict(evaluation.metrics),
+        feedback=FeedbackEntries.model_validate({"entries": feedback_entries}),
         feedback_str=str(evaluation.metrics.get("error", "")),
         guidance_hint="Fix errors before improving score",
         diff_str=diff_str,
@@ -2078,7 +2644,7 @@ def build_iteration_feedback(
 
 def attempt_policy_generation(
     *,
-    feedback: dict[str, object],
+    feedback: FeedbackEntries,
     initial_policy: str,
     tests: str,
     scoring_context: str,
@@ -2096,8 +2662,12 @@ def attempt_policy_generation(
         generator = cast(Callable[..., str], _pkg_attr("generate_policy"))
         new_code = generator(
             feedback={
-                **feedback,
-                **({"pipeline_feedback": pipeline_feedback.model_dump()} if pipeline_feedback else {}),
+                **feedback.as_map(),
+                **(
+                    {"pipeline_feedback": pipeline_feedback.model_dump()}
+                    if pipeline_feedback
+                    else {}
+                ),
             },
             current_policy=initial_policy,
             tests=tests,
@@ -2117,20 +2687,43 @@ def attempt_policy_generation(
         return None, str(e)
 
 
-def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_obs: object | None = None, allow_no_parent: bool = False) -> tuple[list[StepResult], bool]:
-    raw_results: list[object] = list(pipeline.run(repo_root, observation=repair_obs, allow_no_parent=allow_no_parent))
-    step_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in raw_results]
+def run_policy_pipeline(
+    pipeline: SupportsPipelineRun,
+    repo_root: Path,
+    repair_obs: object | None = None,
+    allow_no_parent: bool = False,
+) -> tuple[list[StepResult], bool]:
+    try:
+        raw_results: list[object] = list(
+            pipeline.run(
+                repo_root, observation=repair_obs, allow_no_parent=allow_no_parent
+            )
+        )
+    except TypeError:
+        raw_results = list(pipeline.run(repo_root, observation=repair_obs))
+    step_results = [
+        step if isinstance(step, StepResult) else StepResult.from_external(step)
+        for step in raw_results
+    ]
     trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
     observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
-    dataset_run_id = getattr(repair_obs, "dataset_run_id", None) if repair_obs is not None else None
-    session_id_val = getattr(repair_obs, "session_id", None) if repair_obs is not None else None
+    dataset_run_id = (
+        getattr(repair_obs, "dataset_run_id", None) if repair_obs is not None else None
+    )
+    session_id_val = (
+        getattr(repair_obs, "session_id", None) if repair_obs is not None else None
+    )
     emit_score_fn = cast(Callable[..., None], _pkg_attr("emit_score"))
     if not any([trace_id, observation_id, dataset_run_id, session_id_val]):
         pipeline_success = all(_step_succeeded(r) for r in step_results)
         return step_results, pipeline_success
     for step in step_results:
         data_type = "NUMERIC"
-        score_id = f"{observation_id or trace_id}-pipeline.{step.name}.exit_code" if (observation_id or trace_id) else None
+        score_id = (
+            f"{observation_id or trace_id}-pipeline.{step.name}.exit_code"
+            if (observation_id or trace_id)
+            else None
+        )
         emit_score_fn(
             name=f"pipeline.{step.name}.exit_code",
             value=step.exit_code,
@@ -2141,7 +2734,11 @@ def run_policy_pipeline(pipeline: SupportsPipelineRun, repo_root: Path, repair_o
             session_id=session_id_val,
             score_id=score_id,
         )
-        pass_score_id = f"{observation_id or trace_id}-pipeline.{step.name}.passed" if (observation_id or trace_id) else None
+        pass_score_id = (
+            f"{observation_id or trace_id}-pipeline.{step.name}.passed"
+            if (observation_id or trace_id)
+            else None
+        )
         emit_score_fn(
             name=f"pipeline.{step.name}.passed",
             value=int(step.success),
@@ -2202,14 +2799,21 @@ def finalize_failed_repair(
 
 
 def _build_dependencies() -> LoopDependencies:
-    classify_results_fn = cast(Callable[[list[StepResult]], PipelineClassification], _pkg_attr("classify_results"))
+    classify_results_fn = cast(
+        Callable[[list[StepResult]], PipelineClassification],
+        _pkg_attr("classify_results"),
+    )
     format_pipeline_failure_context_fn = _format_pipeline_failure_context
     read_policy_fn = _pkg_attr("_read_policy")
     write_policy_fn = _pkg_attr("_write_policy")
     get_writer_model_fn = cast(Callable[[], str | None], _pkg_attr("get_writer_model"))
-    start_obs_fn = cast(Callable[..., SupportsSpan | None], _pkg_attr("start_observation"))
+    start_obs_fn = cast(
+        Callable[..., SupportsSpan | None], _pkg_attr("start_observation")
+    )
     find_repo_root_fn = cast(Callable[[], Path], _pkg_attr("find_repo_root"))
-    default_pipeline_fn = cast(Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline"))
+    default_pipeline_fn = cast(
+        Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline")
+    )
     return LoopDependencies(
         prepare_iteration_tasks=prepare_iteration_tasks,
         evaluate_policy_on_item=evaluate_policy_on_item,
@@ -2230,7 +2834,7 @@ def _build_dependencies() -> LoopDependencies:
 
 
 def run_loop(
-    task: Mapping[str, object],
+    task: Mapping[str, object] | TaskPayload,
     iterations: int = 5,
     parent_trace: object | None = None,
     baseline_snapshot: BaselineSnapshot | None = None,
@@ -2239,11 +2843,14 @@ def run_loop(
     """
     Closed-loop optimizer: execute, score, rewrite policy, repeat.
     """
-    root_meta = {"task": dict(task), "iterations": iterations, "session_id": session_id}
+    base_task = TaskPayload.model_validate(task)
+    root_meta = RunMetadata(
+        task=base_task, iterations=iterations, session_id=session_id
+    )
     with propagate_context(
         trace_name="run_loop",
         session_id=session_id,
-        metadata=root_meta,
+        metadata=root_meta.model_dump(),
     ):
         baseline_model = (
             BaselineSnapshot.model_validate(baseline_snapshot)
@@ -2251,7 +2858,7 @@ def run_loop(
             else baseline_snapshot
         )
         context = LoopContext(
-            task=dict(task),
+            task=base_task,
             iterations=iterations,
             session_id=session_id,
             parent_trace=parent_trace,
@@ -2270,9 +2877,10 @@ def run_loop(
             history = machine.run()
         except KeyboardInterrupt:
             run_trace = opt_model.context.run_trace
-            if run_trace and hasattr(run_trace, "end"):
+            end_fn = getattr(run_trace, "end", None)
+            if callable(end_fn):
                 try:
-                    run_trace.end(error="interrupted")
+                    end_fn(error="interrupted")
                 except Exception:
                     pass
         finally:
@@ -2280,7 +2888,9 @@ def run_loop(
             flush_langfuse_fn()
     if not history:
         repo_root = cast(Callable[[], Path], _pkg_attr("find_repo_root"))()
-        pipeline = cast(Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline"))()
+        pipeline = cast(
+            Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline")
+        )()
         fallback_parent = opt_model.context.run_trace or parent_trace
         pipeline_results, pipeline_success = run_policy_pipeline(
             pipeline,
@@ -2288,17 +2898,23 @@ def run_loop(
             repair_obs=fallback_parent,
             allow_no_parent=fallback_parent is None,
         )
-        classify_results_fn = cast(Callable[[list[StepResult]], PipelineClassification], _pkg_attr("classify_results"))
+        classify_results_fn = cast(
+            Callable[[list[StepResult]], PipelineClassification],
+            _pkg_attr("classify_results"),
+        )
         classified = classify_results_fn(pipeline_results)
         failed_step = _first_failed_step(pipeline_results)
+        metrics_map: dict[str, float | int | bool | None] = {}
         record = IterationRecord(
             iteration=0,
-            metrics={},
+            metrics=EvaluationMetrics.model_validate(metrics_map),
             pipeline_passed=pipeline_success,
             pipeline_feedback=classified,
             failed_step=failed_step.name if failed_step else "pipeline_failed",
             failed_exit_code=failed_step.exit_code if failed_step else None,
-            failed_summary=(failed_step.stderr or failed_step.stdout) if failed_step else None,
+            failed_summary=(failed_step.stderr or failed_step.stdout)
+            if failed_step
+            else None,
             repair_attempts=_MAX_POLICY_REPAIRS,
             max_policy_repairs=_MAX_POLICY_REPAIRS,
             writer_error="writer_failed" if not pipeline_success else None,
@@ -2316,21 +2932,21 @@ Kept within the localization-first repo shape; no legacy top-level runner wrappe
 """
 
 import json
-import time
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from harness.observability.langfuse import get_tracing_openai_client, start_observation
+from harness.observability.langfuse import UsageDetails, get_tracing_openai_client, start_observation
 from harness.observability.score_emitter import emit_score_for_handle
 from harness.prompts import SystemPromptContext
 from harness.tools.backends.ic_backend import IterativeContextBackend
 from harness.tools.backends.jc_backend import JCodeMunchBackend
 from harness.tools.mcp_adapter import serialize_tool_result_for_model
 from harness.utils.env import get_cerebras_api_key, get_runner_model
-from harness.utils.openai_schema import OpenAITool, build_tool_response, validate_tools
+from harness.utils.openai_schema import OpenAITool, validate_tools
 from harness.utils.template_loader import render_prompt_template
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .agent_common import usage_from_response
+from .agent_common import AgentTaskPayload, usage_from_response
 
 _MAX_TOTAL_MESSAGE_CHARS = 24000
 _MAX_TOOL_CONTENT_CHARS = 4000
@@ -2341,6 +2957,26 @@ _AGGRESSIVE_TOTAL_CHARS = 12000
 _AGGRESSIVE_TOOL_CONTENT_CHARS = 1200
 _AGGRESSIVE_SYSTEM_CHARS = 1500
 _AGGRESSIVE_USER_CHARS = 1500
+
+
+class AgentTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    repo: str
+    symbol_id: str
+    raw_symbol: str
+    extra: dict[str, object] = Field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, object]:
+        payload_model = AgentTaskPayload(
+            symbol=self.symbol,
+            repo=self.repo,
+            symbol_id=self.symbol_id,
+            raw_symbol=self.raw_symbol,
+            extra=self.extra,
+        )
+        return payload_model.model_dump()
 
 
 def _require_str(mapping: dict[str, Any], key: str) -> str:
@@ -2491,34 +3127,23 @@ def _truncate_for_metadata(payload: object, limit: int = 2000) -> object:
 
 
 def _make_client(model_override: str | None = None) -> tuple[Any, str]:
+    api_key = get_cerebras_api_key()
+    if not api_key:
+        raise RuntimeError("CEREBRAS_API_KEY is required for runner agent client")
     model_name = model_override or get_runner_model()
-    return get_tracing_openai_client(model=model_name), model_name
+    return get_tracing_openai_client(base_url="https://api.cerebras.ai/v1", api_key=api_key), model_name
 
 
 def _build_ic_system_prompt(tool_specs: list[OpenAITool], aggressive: bool = False) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
-    ctx = SystemPromptContext(
-        backend_name="iterative_context",
-        max_total_chars=_AGGRESSIVE_TOTAL_CHARS if aggressive else _MAX_TOTAL_MESSAGE_CHARS,
-        max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS if aggressive else _MAX_TOOL_CONTENT_CHARS,
-        max_system_chars=_AGGRESSIVE_SYSTEM_CHARS if aggressive else _MAX_SYSTEM_CHARS,
-        max_user_chars=_AGGRESSIVE_USER_CHARS if aggressive else _MAX_USER_CHARS,
-        available_tools=_format_available_tools(tool_names),
-    )
-    return render_prompt_template("ic_system.jinja", ctx)
+    ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
+    return render_prompt_template("ic_system.jinja", ctx.model_dump())
 
 
 def _build_jc_system_prompt(tool_specs: list[OpenAITool]) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
-    ctx = SystemPromptContext(
-        backend_name="jcodemunch",
-        max_total_chars=_MAX_TOTAL_MESSAGE_CHARS,
-        max_tool_content=_MAX_TOOL_CONTENT_CHARS,
-        max_system_chars=_MAX_SYSTEM_CHARS,
-        max_user_chars=_MAX_USER_CHARS,
-        available_tools=_format_available_tools(tool_names),
-    )
-    return render_prompt_template("jc_system.jinja", ctx)
+    ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
+    return render_prompt_template("jc_system.jinja", ctx.model_dump())
 
 
 def _build_model_messages(agent_task: dict[str, object], tool_specs: list[OpenAITool], system_prompt: str) -> list[dict[str, object]]:
@@ -2535,7 +3160,7 @@ def _build_model_messages(agent_task: dict[str, object], tool_specs: list[OpenAI
 
 def _collect_tool_results(
     observations: list[dict[str, object]],
-    dispatch_tool_call: Callable[[Mapping[str, object]], object],
+    dispatch_tool_call: Callable[[str, dict[str, Any]], object],
     budget_limit: int,
     parent_trace: object | None = None,
 ) -> list[dict[str, object]]:
@@ -2546,11 +3171,36 @@ def _collect_tool_results(
     tool_calls = [obs["tool_call"] for obs in observations if isinstance(obs, Mapping) and "tool_call" in obs]
     new_results = []
     for call in tool_calls:
-        name = call.get("name") if isinstance(call, Mapping) else None
+        call_map: Mapping[str, object] | None = call if isinstance(call, Mapping) else None
+        if call_map is None:
+            func = getattr(call, "function", None)
+            name = getattr(func, "name", None) or getattr(call, "name", None)
+            arguments = getattr(func, "arguments", None) or getattr(call, "arguments", None)
+            call_map = {"name": name, "id": getattr(call, "id", None), "arguments": arguments} if name else None
+        if not isinstance(call_map, Mapping):
+            continue
+        name = cast(str | None, call_map.get("name"))
+        arguments = call_map.get("arguments")
         if name:
+            arg_map = arguments if isinstance(arguments, dict) else {}
+            if isinstance(arguments, str):
+                try:
+                    loaded_args = json.loads(arguments)
+                    if isinstance(loaded_args, dict):
+                        arg_map = loaded_args
+                except Exception:
+                    pass
             with start_observation(name=f"toolcall.{name}", parent=parent_span, metadata={"tool": name}) as tool_obs:
-                result = dispatch_tool_call(call)
-                new_results.append({"role": "tool", "tool_call_id": call.get("id"), "name": name, "content": _compact_tool_content(result)})
+                result = dispatch_tool_call(name, arg_map)
+                new_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_map.get("id"),
+                        "name": name,
+                        "content": _compact_tool_content(result),
+                        "result": result,
+                    }
+                )
                 tool_obs.update(output=_truncate_for_metadata(result))
     return new_results
 
@@ -2580,20 +3230,27 @@ def _apply_tool_results(observations: list[dict[str, object]], tool_results: lis
 
 
 def _collect_usage_details(response: Any) -> dict[str, object] | None:
-    usage_details = usage_from_response(response)
+    usage_envelope = usage_from_response(response)
+    usage_details: dict[str, object] | None = (
+        {k: v for k, v in usage_envelope.model_dump_flat().items()} if usage_envelope else None
+    )
     if not usage_details:
         return None
     model = getattr(response, "model", None)
     if isinstance(model, str):
         usage_details["model"] = model
-    return usage_details
+    try:
+        usage_model = UsageDetails.model_validate(usage_details)
+    except Exception:
+        return usage_details
+    return usage_model.to_payload()
 
 
 def run_agent(
     agent_task: dict[str, object],
     steps: int,
     tool_specs: list[OpenAITool],
-    dispatch_tool_call: Callable[[Mapping[str, object]], object],
+    dispatch_tool_call: Callable[[str, dict[str, Any]], object],
     system_prompt: str,
     parent_trace: object | None = None,
     backend_name: str | None = None,
@@ -2615,23 +3272,57 @@ def run_agent(
                 budget_limit=_MAX_TOTAL_MESSAGE_CHARS,
                 parent_trace=obs,
             )
+            if tool_results:
+                observations.extend(tool_results)
             messages = _apply_tool_results(observations, tool_results, system_prompt)
-            completion = client.chat.completions.create(
-                messages=messages,
-                model=model,
-                temperature=0.2,
-                tools=tool_specs,
-                tool_choice="auto" if tool_specs else None,
-                response_format={"type": "json_object"},
-                extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
-            )
+            try:
+                completion = client.chat.completions.create(
+                    messages=messages,
+                    model=model,
+                    temperature=0.2,
+                    tools=tool_specs,
+                    tool_choice="auto" if tool_specs else None,
+                    response_format={"type": "json_object"},
+                    extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not _is_context_error(exc):
+                    raise
+                retry_messages = _make_retry_messages(agent_task, observations, system_prompt, aggressive=True)
+                completion = client.chat.completions.create(
+                    messages=retry_messages,
+                    model=model,
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                    extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
+                )
             choice = completion.choices[0]
             usage_details = _collect_usage_details(completion)
             if usage_details:
                 obs.update(usage_details=usage_details)
-            response_message = dict(choice.message) if hasattr(choice, "message") else {}
+            else:
+                raise RuntimeError("Agent response missing usage details")
+            message_obj = getattr(choice, "message", None)
+            if isinstance(message_obj, Mapping):
+                response_message = dict(message_obj)
+            else:
+                tool_calls_attr = getattr(message_obj, "tool_calls", None)
+                content_attr = getattr(message_obj, "content", None)
+                response_message = {}
+                if tool_calls_attr is not None:
+                    response_message["tool_calls"] = tool_calls_attr
+                if content_attr is not None:
+                    response_message["content"] = content_attr
             tool_calls = response_message.get("tool_calls")
             if tool_calls:
+                tool_results = _collect_tool_results(
+                    observations=[{"tool_call": call} for call in tool_calls if isinstance(call, (Mapping, object))],
+                    dispatch_tool_call=dispatch_tool_call,
+                    budget_limit=_MAX_TOTAL_MESSAGE_CHARS,
+                    parent_trace=obs,
+                )
+                if tool_results:
+                    observations.extend(tool_results)
                 observations.append(
                     {
                         "role": "assistant",
@@ -2639,6 +3330,8 @@ def run_agent(
                         "content": response_message.get("content") or "",
                     }
                 )
+                messages = _apply_tool_results(observations, tool_results, system_prompt)
+                continue
             else:
                 try:
                     response_json = json.loads(response_message.get("content") or "{}")
@@ -2654,7 +3347,7 @@ def run_agent_with_retry(
     agent_task: dict[str, object],
     steps: int,
     tool_specs: list[OpenAITool],
-    dispatch_tool_call: Callable[[Mapping[str, object]], object],
+    dispatch_tool_call: Callable[[str, dict[str, Any]], object],
     system_prompt: str,
     parent_trace: object | None = None,
     backend_name: str | None = None,
@@ -2692,27 +3385,26 @@ def run_agent_with_retry(
 
 
 def _normalize_agent_result(raw: Any) -> dict[str, object]:
-    observations = raw.get("observations") if isinstance(raw, Mapping) else []
-    if not isinstance(observations, list):
-        observations = []
+    observations_raw = raw.get("observations") if isinstance(raw, Mapping) else []
+    observations = observations_raw if isinstance(observations_raw, list) else []
 
     def _latest_graph_node_count() -> int:
-        if not observations:
-            return 0
-        latest = observations[-1]
-        result = latest.get("result") if isinstance(latest, Mapping) else None
-        if not isinstance(result, Mapping):
-            return 0
-        full_graph = result.get("full_graph")
-        if isinstance(full_graph, Mapping):
-            nodes = full_graph.get("nodes")
-            if isinstance(nodes, list):
-                return len(nodes)
-        graph = result.get("graph")
-        if isinstance(graph, Mapping):
-            nodes = graph.get("nodes")
-            if isinstance(nodes, list):
-                return len(nodes)
+        for latest in reversed(observations):
+            if not isinstance(latest, Mapping):
+                continue
+            result = latest.get("result")
+            if not isinstance(result, Mapping):
+                continue
+            full_graph = result.get("full_graph")
+            if isinstance(full_graph, Mapping):
+                nodes = full_graph.get("nodes")
+                if isinstance(nodes, list):
+                    return len(nodes)
+            graph = result.get("graph")
+            if isinstance(graph, Mapping):
+                nodes = graph.get("nodes")
+                if isinstance(nodes, list):
+                    return len(nodes)
         return 0
 
     normalized: dict[str, object] = {
@@ -2734,12 +3426,11 @@ def run_ic_iteration(
     parent_span = _require_parent(parent_trace, owner="iterative_context")
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
-    agent_task: dict[str, object] = {
-        "symbol": symbol,
-        "repo": repo,
-        "symbol_id": symbol,
-        "raw_symbol": symbol,
-    }
+    try:
+        agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+    except ValidationError as exc:
+        raise RuntimeError(f"Invalid agent task: {exc}") from exc
+    agent_task = agent_task_model.to_payload()
 
     backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
     tool_specs: list[OpenAITool] = backend.tool_specs
@@ -2778,12 +3469,11 @@ def run_jc_iteration(
     parent_span = _require_parent(parent_trace, owner="jcodemunch")
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
-    agent_task: dict[str, object] = {
-        "symbol": symbol,
-        "repo": repo,
-        "symbol_id": symbol,
-        "raw_symbol": symbol,
-    }
+    try:
+        agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+    except ValidationError as exc:
+        raise RuntimeError(f"Invalid agent task: {exc}") from exc
+    agent_task = agent_task_model.to_payload()
 
     backend = JCodeMunchBackend(repo=repo)
     tool_specs: list[OpenAITool] = backend.tool_specs
@@ -2875,7 +3565,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from harness.loop.loop_types import EvaluationMetrics, JCResult
 
 from .datasets import DatasetItem, normalize_dataset_item
 from .langfuse import start_observation
@@ -2888,19 +3580,23 @@ def _stable_repo_symbol(repo: str, symbol: str) -> str:
 
 
 class BaselineSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     dataset_name: str | None = None
     dataset_version: str | None = None
     item_id: str | None = None
     repo: str
     symbol: str
-    jc_result: dict[str, object] = Field(default_factory=dict)
-    jc_metrics: dict[str, float] = Field(default_factory=dict)
+    jc_result: JCResult = Field(default_factory=JCResult)
+    jc_metrics: EvaluationMetrics = Field(default_factory=EvaluationMetrics)
     experiment_run_id: str | None = None
     trace_id: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class BaselineBundle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     dataset_name: str | None = None
     dataset_version: str | None = None
     baseline_run_id: str | None = None
@@ -2930,8 +3626,8 @@ def _snapshot_key(snapshot: BaselineSnapshot) -> str:
     return ""
 
 
-def baseline_metrics_from_jc(jc_result: Mapping[str, object]) -> dict[str, float]:
-    return {"score": 0.0}
+def baseline_metrics_from_jc(jc_result: Mapping[str, object]) -> EvaluationMetrics:
+    return EvaluationMetrics.model_validate({"score": 0.0})
 
 
 def index_baselines(bundle: BaselineBundle | Sequence[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
@@ -2969,11 +3665,13 @@ def compute_baseline_for_item(
             "resolved_repo": resolved_repo,
         },
     ) as trace:
-        jc_result = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
-        metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result))
+        jc_result_map = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
+        metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result_map))
         trace_id = getattr(trace, "id", None)
         dataset_run_id = getattr(parent_trace, "id", None)
         for name, value in metrics.items():
+            if not isinstance(value, (int, float, bool)):
+                continue
             data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
             score_id = f"{trace_id}-baseline.{name}" if trace_id else None
             emit_score_for_handle(
@@ -2990,7 +3688,7 @@ def compute_baseline_for_item(
             item_id=normalized.id,
             repo=normalized.repo,
             symbol=normalized.symbol,
-            jc_result=dict(jc_result),
+            jc_result=JCResult.model_validate(jc_result_map),
             jc_metrics=metrics,
             trace_id=trace_id,
             experiment_run_id=dataset_run_id,
@@ -3042,14 +3740,17 @@ def make_baseline_bundle(
 
 
 def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
-    serializable = bundle.model_dump()
+    serializable = bundle.model_dump(exclude_none=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(serializable, indent=2))
 
 
 def load_baseline_bundle(path: Path) -> BaselineBundle:
     data: object = json.loads(path.read_text())
-    return BaselineBundle.model_validate(data)
+    try:
+        return BaselineBundle.model_validate(data)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid baseline bundle: {exc}") from exc
 </file>
 
 <file path="observability/cerebras_pricing.py">
@@ -3544,10 +4245,6 @@ def _run_ic_optimizations(
                 baseline_snapshot=baseline,
                 session_id=resolved_session,
             )
-        last_record = history[-1] if history else None
-        last_dict: Mapping[str, object] = (
-            iteration_record_to_public_dict(last_record) if last_record else {}
-        )
         metrics: Mapping[str, object] = {}
         history_dicts = [iteration_record_to_public_dict(r) for r in history]
         return {
@@ -3631,19 +4328,83 @@ from typing import Any, Mapping, Optional
 
 from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
+from pydantic import BaseModel, ConfigDict
 
 from ..utils.env import get_langfuse_env
 
 _client: Optional[Langfuse] = None
 
 
-def _coerce_metadata(metadata: Mapping[str, object] | None) -> dict[str, str] | None:
-    if metadata is None:
-        return None
-    coerced: dict[str, str] = {}
-    for key, value in metadata.items():
-        coerced[str(key)] = "" if value is None else str(value)
-    return coerced
+class ObservationMetadata(BaseModel):
+    """Typed metadata envelope for observations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    data: Mapping[str, object] | None = None
+
+    def to_langfuse(self) -> dict[str, str] | None:
+        if self.data is None:
+            return None
+        coerced: dict[str, str] = {}
+        for key, value in self.data.items():
+            coerced[str(key)] = "" if value is None else str(value)
+        return coerced
+
+
+class UsageDetails(BaseModel):
+    """Structured usage/cost inputs for Langfuse/OpenAI-style responses."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    input_cost: float | None = None
+    output_cost: float | None = None
+    total_cost: float | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        return self.model_dump(exclude_none=True)
+
+
+class ObservationEnvelope(BaseModel):
+    """Structured envelope for observation creation/update."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    as_type: str = "span"
+    input: object | None = None
+    model: str | None = None
+    metadata: ObservationMetadata | None = None
+    usage_details: UsageDetails | None = None
+    tags: list[str] | None = None
+    session_id: str | None = None
+    user_id: str | None = None
+    version: str | None = None
+
+    def to_start_kwargs(self) -> dict[str, object]:
+        return {
+            "as_type": self.as_type,
+            "name": self.name,
+            "input": self.input,
+            "model": self.model,
+            "metadata": self.metadata.to_langfuse() if self.metadata else None,
+        }
+
+    def propagate_kwargs(self) -> dict[str, object]:
+        kwargs: dict[str, object] = {}
+        if self.session_id:
+            kwargs["session_id"] = self.session_id
+        if self.user_id:
+            kwargs["user_id"] = self.user_id
+        if self.tags:
+            kwargs["tags"] = [t for t in self.tags if isinstance(t, str) and t]
+        if self.version:
+            kwargs["version"] = self.version
+        return kwargs
 
 
 def _coerce_tags(tags: list[str] | None) -> list[str] | None:
@@ -3668,7 +4429,6 @@ def _build_client() -> Langfuse:
         environment=tracing_env if isinstance(tracing_env, str) and tracing_env else None,
         release=release if isinstance(release, str) and release else None,
         debug=debug,
-        # Keep default span filter (no infra spans) by not overriding should_export_span.
     )
 
 
@@ -3716,7 +4476,7 @@ def propagate_context(
     coerced_tags = _coerce_tags(tags)
     if coerced_tags:
         kwargs["tags"] = coerced_tags
-    coerced_metadata = _coerce_metadata(metadata)
+    coerced_metadata = ObservationMetadata(data=metadata).to_langfuse() if metadata else None
     if coerced_metadata:
         kwargs["metadata"] = coerced_metadata
     if version:
@@ -3732,18 +4492,21 @@ def start_root_observation(
     input: object | None = None,
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    usage_details: UsageDetails | None = None,
 ) -> Any:
     """
     Start a root observation as the current observation.
     """
     client_any: Any = get_langfuse_client()
-    with client_any.start_as_current_observation(
-        as_type=as_type,
+    envelope = ObservationEnvelope(
         name=name,
+        as_type=as_type,
         input=input,
         model=model,
-        metadata=_coerce_metadata(metadata),
-    ) as observation:
+        metadata=ObservationMetadata(data=metadata) if metadata else None,
+        usage_details=usage_details,
+    )
+    with client_any.start_as_current_observation(**envelope.to_start_kwargs()) as observation:
         yield observation
 
 
@@ -3756,19 +4519,22 @@ def start_child_observation(
     input: object | None = None,
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    usage_details: UsageDetails | None = None,
 ) -> Any:
     """
     Start a child observation from a parent observation.
     """
     if parent is None or not hasattr(parent, "start_observation"):
         raise RuntimeError("Parent observation is required to start a child observation")
-    with parent.start_observation(
+    envelope = ObservationEnvelope(
         name=name,
         as_type=as_type,
         input=input,
         model=model,
-        metadata=_coerce_metadata(metadata),
-    ) as observation:
+        metadata=ObservationMetadata(data=metadata) if metadata else None,
+        usage_details=usage_details,
+    )
+    with parent.start_observation(**envelope.to_start_kwargs()) as observation:
         yield observation
 
 
@@ -3781,6 +4547,7 @@ def start_observation(
     input: object | None = None,
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    usage_details: UsageDetails | None = None,
 ):
     """
     Convenience wrapper to start a root or child observation based on parent presence.
@@ -3792,6 +4559,7 @@ def start_observation(
             input=input,
             model=model,
             metadata=metadata,
+            usage_details=usage_details,
         ) as observation:
             yield observation
     else:
@@ -3802,13 +4570,13 @@ def start_observation(
             input=input,
             model=model,
             metadata=metadata,
+            usage_details=usage_details,
         ) as observation:
             yield observation
 
 
 def flush_langfuse() -> None:
     client = get_langfuse_client()
-    # Ensure buffered events are sent; shutdown if supported by the SDK.
     flush = getattr(client, "flush", None)
     if callable(flush):
         flush()
@@ -3875,7 +4643,7 @@ class HostedICOptimizationRequest(BaseModel):
 <file path="observability/score_emitter.py">
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class ScorePayload(BaseModel):
@@ -3893,6 +4661,12 @@ class ScorePayload(BaseModel):
     config_id: str | None = None
     comment: str | None = None
     score_id: str | None = None
+
+    @model_validator(mode="after")
+    def _require_identifier(self) -> "ScorePayload":
+        if not any([self.trace_id, self.observation_id, self.dataset_run_id, self.session_id]):
+            raise ValueError("Score emission requires at least one identifier (trace/observation/datasetRun/session)")
+        return self
 
 
 def _infer_data_type(value: float | int | bool | str, provided: str | None) -> str | None:
@@ -3921,8 +4695,6 @@ def emit_score(
     score_id: str | None = None,
 ) -> None:
     """Submit a score via Langfuse SDK using hosted run identifiers."""
-    if not any([trace_id, observation_id, dataset_run_id, session_id]):
-        raise RuntimeError("Score emission requires at least one identifier (trace/observation/datasetRun/session)")
     from .langfuse import get_langfuse_client  # local import to avoid circularity
 
     resolved_type = _infer_data_type(value, data_type)
@@ -3960,8 +4732,6 @@ def emit_score_for_handle(
     score_id: str | None = None,
 ) -> None:
     """Emit a score using IDs derived from a Langfuse trace/span handle."""
-    if handle is None:
-        raise RuntimeError("Langfuse handle is required to emit score")
     trace_id = getattr(handle, "trace_id", None) or getattr(handle, "id", None)
     observation_id = getattr(handle, "id", None)
     emit_score(
@@ -4100,6 +4870,8 @@ class Pipeline:
                 metadata={"cwd": str(repo_root)},
             ) as step_obs:
                 result = step.run(repo_root)
+                # Normalize to canonical StepResult to avoid drifting shapes.
+                result = result if isinstance(result, StepResult) else StepResult.from_external(result)
                 # Enforce success semantics based solely on exit status.
                 result.success = result.exit_code == 0
                 results.append(result)
@@ -4501,12 +5273,27 @@ class SystemPromptContext(BaseModel):
         if not value or not value.strip():
             raise ValueError("available_tools must be non-empty")
         return value
+
+
+class BackendPromptContext(BaseModel):
+    """Explicit context for backend-specific prompts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: str
+    available_tools: str
 </file>
 
 <file path="tests_harness/conftest.py">
 from __future__ import annotations
 
 from typing import Any
+from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
@@ -4604,7 +5391,7 @@ from typing import Any, cast
 import pytest
 from mcp.types import TextContent, Tool
 
-from harness import runner
+from harness.loop import runner_agent as runner
 from harness.tools.backends.ic_backend import IterativeContextBackend
 from harness.tools.backends.jc_backend import JCodeMunchBackend
 from harness.tools.mcp_adapter import (
@@ -5013,8 +5800,8 @@ def test_resolve_baseline_prefers_id():
         item_id="abc",
         repo="r",
         symbol="s",
-        jc_result={},
-        jc_metrics={},
+        jc_result=baselines.JCResult(),
+        jc_metrics=baselines.EvaluationMetrics(),
         experiment_run_id=None,
         trace_id=None,
         metadata={},
@@ -5030,8 +5817,8 @@ def test_baseline_bundle_roundtrip(tmp_path):
         item_id="abc",
         repo="r",
         symbol="s",
-        jc_result={"x": 1},
-        jc_metrics={"score": 1.0},
+        jc_result=baselines.JCResult.model_validate({"x": 1}),
+        jc_metrics=baselines.EvaluationMetrics.model_validate({"score": 1.0}),
         experiment_run_id="run1",
         trace_id="trace1",
         metadata={},
@@ -5153,8 +5940,26 @@ def test_only_policy_file_can_be_written(tmp_path: Path):
 </file>
 
 <file path="tests_harness/test_localization.py">
-from localization.models import LCATaskIdentity, LCAPrediction, LCAGold
+import pytest
+from pathlib import Path
+
+from localization.models import (
+    LCATaskIdentity,
+    LCAPrediction,
+    LCAGold,
+    LocalizationDatasetInfo,
+    LocalizationEvalRecord,
+    LocalizationEvidence,
+    LocalizationEvidenceItem,
+    LocalizationGold,
+    LocalizationMetrics,
+    LocalizationPrediction,
+    LocalizationRepoInfo,
+    LocalizationTelemetryEnvelope,
+)
 from localization.scoring import score_file_localization
+from localization.eval import build_file_localization_eval_record
+from localization.telemetry import build_localization_telemetry
 
 
 def test_identity_is_deterministic():
@@ -5177,10 +5982,80 @@ def test_file_set_scoring_paths_only():
     prediction = LCAPrediction(predicted_files=["a.py", "c.py"])
     gold = LCAGold(changed_files=["a.py", "b.py"])
     metrics = score_file_localization(prediction, gold)
-    assert metrics["precision"] == 0.5
-    assert metrics["recall"] == 0.5
-    assert metrics["f1"] == 0.5
-    assert metrics["score"] == metrics["f1"]
+    assert isinstance(metrics, LocalizationMetrics)
+    assert metrics.precision == 0.5
+    assert metrics.recall == 0.5
+    assert metrics.f1 == 0.5
+    assert metrics.score == metrics.f1
+
+
+def test_eval_builder_is_model_first():
+    identity = LCATaskIdentity(
+        dataset_name="d",
+        dataset_config="c",
+        dataset_split="s",
+        repo_owner="o",
+        repo_name="n",
+        base_sha="sha",
+        issue_url="url",
+    )
+    pred = LCAPrediction(predicted_files=["a.py"])
+    gold = LCAGold(changed_files=["a.py"])
+    evidence = LocalizationEvidence(items=[LocalizationEvidenceItem(file="a.py", hints=["line 1"])])
+    record = build_file_localization_eval_record(identity, pred, gold, evidence=evidence, repo_path=Path("/tmp/repo"))
+    assert isinstance(record, LocalizationEvalRecord)
+    assert isinstance(record.dataset, LocalizationDatasetInfo)
+    assert isinstance(record.repo, LocalizationRepoInfo)
+    assert isinstance(record.prediction, LocalizationPrediction)
+    assert isinstance(record.gold, LocalizationGold)
+    assert isinstance(record.evidence, LocalizationEvidence)
+    assert isinstance(record.metrics, LocalizationMetrics)
+    assert record.repo_path == str(Path("/tmp/repo"))
+    dumped = record.model_dump()
+    assert dumped["dataset"]["name"] == "d"
+    assert dumped["prediction"]["predicted_files"] == ["a.py"]
+    assert dumped["gold"]["changed_files"] == ["a.py"]
+    assert dumped["evidence"]["items"][0]["file"] == "a.py"
+    assert dumped["evidence"]["items"][0]["hints"] == ["line 1"]
+
+
+def test_telemetry_builder_is_model_first():
+    identity = LCATaskIdentity(
+        dataset_name="d",
+        dataset_config="c",
+        dataset_split="s",
+        repo_owner="o",
+        repo_name="n",
+        base_sha="sha",
+    )
+    metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+    evidence = LocalizationEvidence(items=[LocalizationEvidenceItem(file="a.py", hints=["hint"])])
+    envelope = build_localization_telemetry(
+        identity,
+        metrics=metrics,
+        changed_files_count=1,
+        repo_language="py",
+        repo_license="mit",
+        evidence=evidence,
+        materialization_events=["clone", "checkout"],
+    )
+    assert isinstance(envelope, LocalizationTelemetryEnvelope)
+    assert isinstance(envelope.dataset, LocalizationDatasetInfo)
+    assert isinstance(envelope.repo, LocalizationRepoInfo)
+    assert isinstance(envelope.evidence, LocalizationEvidence)
+    assert isinstance(envelope.metrics, LocalizationMetrics)
+    assert envelope.materialization_events is not None
+    dumped = envelope.model_dump()
+    assert dumped["metrics"]["score"] == 1.0
+    assert dumped["changed_files_count"] == 1
+    assert dumped["evidence"]["items"][0]["file"] == "a.py"
+    assert dumped["evidence"]["items"][0]["hints"] == ["hint"]
+    assert dumped["materialization_events"]["events"] == ["clone", "checkout"]
+
+
+def test_localization_models_reject_unknown_fields():
+    with pytest.raises(Exception):
+        LocalizationRepoInfo(owner="o", name="n", base_sha="sha", unexpected="x")  # type: ignore[arg-type]
 </file>
 
 <file path="tests_harness/test_loop_state_machine_min.py">
@@ -5194,16 +6069,24 @@ import pytest
 from harness.loop.loop_machine import OptimizationStateMachine, RepairStateMachine
 from harness.loop.loop_types import (
     AcceptedPolicyMeta,
+    EvaluationMetrics,
     EvaluationResult,
     FailedRepairDetails,
+    FeedbackEntries,
     FeedbackPackage,
+    IterationTasks,
+    ICResult,
+    ICTaskPayload,
     IterationRecord,
+    JCResult,
+    JCTaskPayload,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
     PreparedTasks,
     RepairContext,
     RepairMachineModel,
+    TaskPayload,
 )
 from harness.pipeline.types import PipelineClassification, StepResult
 
@@ -5221,7 +6104,7 @@ def _make_feedback() -> FeedbackPackage:
         tests="",
         scoring_context="",
         comparison_summary=None,
-        feedback={},
+        feedback=FeedbackEntries(),
         feedback_str="",
         guidance_hint="hint",
         diff_str="",
@@ -5231,13 +6114,24 @@ def _make_feedback() -> FeedbackPackage:
 
 def _make_eval() -> EvaluationResult:
     return EvaluationResult(
-        metrics={"score": 0.0},
-        ic_result={},
-        jc_result={},
-        jc_metrics={},
+        metrics=EvaluationMetrics.model_validate({"score": 0.0}),
+        ic_result=ICResult(),
+        jc_result=JCResult(),
+        jc_metrics=EvaluationMetrics(),
         comparison_summary=None,
         policy_code="policy",
     )
+
+
+def test_prepared_tasks_emit_models() -> None:
+    base = TaskPayload(symbol="sym", repo="repo")
+    prepared = PreparedTasks(base_task=base, resolved_repo_path="resolved", jc_repo_id="jc-id")
+    iteration_tasks = prepared.build_iteration_tasks()
+    assert isinstance(iteration_tasks, IterationTasks)
+    assert isinstance(iteration_tasks.ic_task, ICTaskPayload)
+    assert isinstance(iteration_tasks.jc_task, JCTaskPayload)
+    assert iteration_tasks.ic_task.repo == "resolved"
+    assert iteration_tasks.jc_task.repo == "jc-id"
 
 
 def _repair_deps(
@@ -5292,7 +6186,13 @@ def _repair_deps(
         return span
 
     deps = LoopDependencies(
-        prepare_iteration_tasks=lambda task, trace=None: PreparedTasks(base_task=dict(task), resolved_repo_path=".", jc_repo_id="."),
+        prepare_iteration_tasks=lambda task, trace=None: PreparedTasks(
+            base_task=task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task),
+            resolved_repo_path=".",
+            jc_repo_id=".",
+            ic_task=ICTaskPayload(symbol=task.symbol if isinstance(task, TaskPayload) else TaskPayload.model_validate(task).symbol, repo="."),
+            jc_task=JCTaskPayload(symbol=task.symbol if isinstance(task, TaskPayload) else TaskPayload.model_validate(task).symbol, repo="."),
+        ),
         evaluate_policy_on_item=lambda *a, **k: _make_eval(),  # type: ignore[arg-type]
         build_iteration_feedback=lambda *a, **k: _make_feedback(),  # type: ignore[arg-type]
         attempt_policy_generation=attempt_policy_generation,
@@ -5421,23 +6321,30 @@ def test_failed_candidate_not_marked_accepted() -> None:
 def _opt_deps(ctx: LoopContext) -> LoopDependencies:
     span = RecordingSpan()
 
-    def prepare_iteration_tasks(task: dict[str, object], trace: object | None = None) -> PreparedTasks:
-        return PreparedTasks(base_task=dict(task), resolved_repo_path=".", jc_repo_id=".")
+    def prepare_iteration_tasks(task: TaskPayload, trace: object | None = None) -> PreparedTasks:
+        base_task = task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task)
+        return PreparedTasks(
+            base_task=base_task,
+            resolved_repo_path=".",
+            jc_repo_id=".",
+            ic_task=ICTaskPayload(symbol=base_task.symbol, repo="."),
+            jc_task=JCTaskPayload(symbol=base_task.symbol, repo="."),
+        )
 
     def evaluate_policy_on_item(
-        ic_task: dict[str, object],
+        ic_task: ICTaskPayload,
         baseline,
         iteration_span: object | None = None,
         iteration_index: int | None = None,
     ) -> EvaluationResult:
-        metrics = {"score": 1.0}
+        metrics = EvaluationMetrics.model_validate({"score": 1.0})
         record = IterationRecord(iteration=iteration_index or 0, metrics=metrics, pipeline_passed=True)
         ctx.history.append(record)
         return EvaluationResult(
             metrics=metrics,
-            ic_result={},
-            jc_result={},
-            jc_metrics={},
+            ic_result=ICResult(),
+            jc_result=JCResult(),
+            jc_metrics=EvaluationMetrics(),
             comparison_summary=None,
             policy_code="policy",
         )
@@ -5464,7 +6371,7 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
 
 def test_optimization_completes_and_records_history() -> None:
     ctx = LoopContext(
-        task={"repo": ".", "symbol": "s"},
+        task=TaskPayload(symbol="s", repo="."),
         iterations=1,
         session_id=None,
         baseline_snapshot=None,
@@ -5534,6 +6441,38 @@ def test_png_writes_both_files(tmp_path: Path):
     assert second.stat().st_size > 0
 </file>
 
+<file path="tests_harness/test_model_strictness.py">
+from __future__ import annotations
+
+import pytest
+
+from harness.loop.agent_common import UsageEnvelope
+from harness.loop.loop_types import EvaluationMetrics, FeedbackEntries
+
+
+def test_evaluation_metrics_rejects_unknown_fields():
+    with pytest.raises(Exception):
+        EvaluationMetrics.model_validate({"score": 1.0, "unexpected": 2})  # type: ignore[arg-type]
+
+
+def test_feedback_entries_rejects_unknown_fields():
+    with pytest.raises(Exception):
+        FeedbackEntries.model_validate({"entries": [{"name": "a", "value": 1}], "extra": "nope"})  # type: ignore[arg-type]
+
+
+def test_usage_envelope_flattening_and_rejection():
+    env = UsageEnvelope.model_validate(
+        {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "prompt_details": [{"name": "cached", "value": 4}]}
+    )
+    flat = env.model_dump_flat()
+    assert flat["prompt_tokens"] == 1
+    assert flat["completion_tokens"] == 2
+    assert flat["total_tokens"] == 3
+    assert flat["prompt_tokens_details.cached"] == 4
+    with pytest.raises(Exception):
+        UsageEnvelope.model_validate({"prompt_tokens": 1, "extra": {"unexpected": True}})  # type: ignore[arg-type]
+</file>
+
 <file path="tests_harness/test_observability.py">
 from __future__ import annotations
 
@@ -5575,6 +6514,29 @@ def test_emit_score_uses_client(monkeypatch):
     assert emitted["name"] == "metric"
     assert emitted["value"] == 1.0
     assert emitted.get("trace_id") == "t1"
+
+
+def test_emit_score_for_handle_requires_identifier(monkeypatch):
+    class DummyClient:
+        def create_score(self, **kwargs):
+            pass
+
+    monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
+    with pytest.raises(ValueError):
+        score_emitter.emit_score_for_handle(None, name="metric", value=1.0)
+
+
+def test_emit_score_for_handle_allows_dataset_only(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class DummyClient:
+        def create_score(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
+    score_emitter.emit_score_for_handle(None, name="metric", value=1.0, dataset_run_id="run123")
+
+    assert calls and calls[0]["dataset_run_id"] == "run123"
 </file>
 
 <file path="tests_harness/test_pipeline_steps_scope.py">
@@ -5678,6 +6640,37 @@ def test_ruff_warning_not_classified_as_failure():
     feedback = format_structured_feedback(classified)
     assert "LINT ERRORS" not in feedback
     assert infer_action_hint(classified) == "All checks passed. Improve score."
+</file>
+
+<file path="tests_harness/test_policy_loader.py">
+from __future__ import annotations
+
+import pytest
+
+from harness import policy_loader
+
+
+def test_adapt_score_fn_accepts_supported_arities():
+    def score_one(node):
+        return 1.0
+
+    def score_two(node, state):
+        return 2.0
+
+    def score_three(node, state, ctx):
+        return 3.0
+
+    assert policy_loader.adapt_score_fn(score_one)("n", None, None) == 1.0
+    assert policy_loader.adapt_score_fn(score_two)("n", "s", None) == 2.0
+    assert policy_loader.adapt_score_fn(score_three)("n", "s", "c") == 3.0
+
+
+def test_adapt_score_fn_rejects_unsupported_arities():
+    def score_four(a, b, c, d):
+        return 4.0
+
+    with pytest.raises(RuntimeError):
+        policy_loader.adapt_score_fn(score_four)
 </file>
 
 <file path="tests_harness/test_prompt_templates.py">
@@ -5816,8 +6809,10 @@ from typing import Any, Mapping
 
 from harness.observability import baselines, experiments
 from harness.observability.experiments import HostedRunItemResult, HostedRunResult
-from harness import loop, runner
-from harness.loop import IterationRecord
+from harness import loop
+from harness.loop import runner_agent as runner
+from harness.loop import IterationRecord, TaskPayload
+from harness.loop.loop_types import EvaluationMetrics
 
 
 def test_baseline_resolves_repo(monkeypatch, tmp_path):
@@ -5862,9 +6857,10 @@ def test_baseline_resolves_repo(monkeypatch, tmp_path):
 def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
     calls: list[str] = []
 
-    def fake_run_loop(task: Mapping[str, object], iterations: int, parent_trace=None, baseline_snapshot=None, session_id=None):
-        calls.append(str(task.get("repo", "")))
-        return [IterationRecord(iteration=0, metrics={"score": 1.0}, pipeline_passed=True)]
+    def fake_run_loop(task: Mapping[str, object] | TaskPayload, iterations: int, parent_trace=None, baseline_snapshot=None, session_id=None):
+        repo_val = task.repo if isinstance(task, TaskPayload) else task.get("repo", "")
+        calls.append(str(repo_val))
+        return [IterationRecord(iteration=0, metrics=EvaluationMetrics.model_validate({"score": 1.0}), pipeline_passed=True)]
 
     repo_dir = tmp_path / "medium_repo"
     repo_dir.mkdir()
@@ -5884,7 +6880,15 @@ def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
 
     monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_hosted)
     baselines_bundle: Any = baselines.make_baseline_bundle(
-        [baselines.BaselineSnapshot(repo="medium", symbol="s", jc_result={}, jc_metrics={}, item_id="item2")]
+        [
+            baselines.BaselineSnapshot(
+                repo="medium",
+                symbol="s",
+                jc_result=baselines.JCResult(),
+                jc_metrics=baselines.EvaluationMetrics(),
+                item_id="item2",
+            )
+        ]
     )
     experiments._run_ic_optimizations(  # type: ignore[attr-defined,arg-type]
         [baselines.normalize_dataset_item({"id": "item3", "repo": "medium", "symbol": "s", "metadata": {}})],
@@ -6452,7 +7456,7 @@ def test_run_agent_retries_on_context_error(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
-    patched_usage = lambda resp: {"input": 1, "output": 1, "total": 2}
+    patched_usage = lambda resp: agent_common.UsageEnvelope.model_validate({"input": 1, "output": 1, "total": 2})
     monkeypatch.setattr(agent_common, "usage_from_response", patched_usage)
     monkeypatch.setitem(runner.run_agent.__globals__, "usage_from_response", patched_usage)
     @contextmanager
@@ -6486,13 +7490,14 @@ def test_usage_from_response_maps_openai_fields():
 
     mapped = agent_common.usage_from_response(DummyResponse())
     assert mapped is not None
-    assert mapped["input"] == 10
-    assert mapped["output"] == 5
-    assert mapped["total"] == 15
-    assert mapped["prompt_tokens_details.cached_tokens"] == 2
-    assert mapped["input_cached_tokens"] == 2
-    assert mapped["completion_tokens_details.reasoning_tokens"] == 3
-    assert mapped["output_reasoning_tokens"] == 3
+    flat = mapped.model_dump_flat()
+    assert flat["input"] == 10
+    assert flat["output"] == 5
+    assert flat["total"] == 15
+    assert flat["prompt_tokens_details.cached_tokens"] == 2
+    assert flat["input_cached_tokens"] == 2
+    assert flat["completion_tokens_details.reasoning_tokens"] == 3
+    assert flat["output_reasoning_tokens"] == 3
 
 
 def test_run_agent_requires_usage(monkeypatch):
@@ -6742,24 +7747,50 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from pydantic import BaseModel, ConfigDict, ValidationError
+
 from iterative_context.server import IterativeContextToolRuntime, list_tools
 
 from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
 from ...utils.openai_schema import OpenAITool
 
 
+class BackendInit(BaseModel):
+    """Validated initialization payload for IC backend."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    repo: str
+    score_fn: Callable[..., float] | None
+
+
+class ToolCallPayload(BaseModel):
+    """Validated tool dispatch payload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    arguments: dict[str, Any]
+
+
 class IterativeContextBackend:
     def __init__(self, repo: str, score_fn: Callable[..., float] | None):
+        try:
+            init_payload = BackendInit(repo=repo, score_fn=score_fn)
+        except ValidationError as exc:
+            raise RuntimeError(f"[IC] Invalid backend init payload: {exc}") from exc
+        repo = init_payload.repo
         repo_path = Path(repo).expanduser().resolve(strict=False)
         if not repo_path.exists():
             raise RuntimeError(f"[IC] Repo path does not exist: {repo}")
 
-        self._runtime = IterativeContextToolRuntime(score_fn=score_fn, repo_root=repo_path)
+        self._runtime = IterativeContextToolRuntime(score_fn=init_payload.score_fn, repo_root=repo_path)
         tools = run_async(list_tools())
         self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
-        result_blocks = run_async(self._runtime.call_tool(name, arguments))
+        payload = ToolCallPayload(name=name, arguments=arguments or {})
+        result_blocks = run_async(self._runtime.call_tool(payload.name, payload.arguments))
         return parse_text_content_payload(result_blocks)
 </file>
 
@@ -6773,20 +7804,38 @@ from typing import Any, cast
 
 from jcodemunch_mcp.server import call_tool, list_tools
 from mcp.types import TextContent, Tool
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from ...utils.openai_schema import OpenAITool
 from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
 
 
+class BackendInit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repo: str
+
+
+class ToolCallPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    arguments: dict[str, Any]
+
+
 class JCodeMunchBackend:
     def __init__(self, repo: str) -> None:
+        try:
+            init_payload = BackendInit(repo=repo)
+        except ValidationError as exc:
+            raise RuntimeError(f"[JC] Invalid backend init payload: {exc}") from exc
         list_tools_fn: Callable[[], Awaitable[list[Tool]]] = cast(
             Callable[[], Awaitable[list[Tool]]],
             list_tools,
         )
         tools = run_async(list_tools_fn())
         self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
-        self._initialize_repo(repo)
+        self._initialize_repo(init_payload.repo)
 
     def _initialize_repo(self, repo: str) -> None:
         repo = repo.strip()
@@ -6845,7 +7894,8 @@ class JCodeMunchBackend:
                 call_tool,
             )
         )
-        result_blocks = run_async(call_tool_fn(name, arguments))
+        payload = ToolCallPayload(name=name, arguments=arguments or {})
+        result_blocks = run_async(call_tool_fn(payload.name, payload.arguments))
         return parse_text_content_payload(result_blocks)
 </file>
 
@@ -6863,7 +7913,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-from typing import Mapping
 
 # Ensure the repository root (parent of the harness package) is on sys.path when executed as a script.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -6875,7 +7924,6 @@ from harness.loop import (
     RepairStateMachine,
     AcceptedPolicyMeta,
     FailedRepairDetails,
-    EvaluationResult,
     FeedbackPackage,
     LoopContext,
     LoopDependencies,
@@ -6884,21 +7932,36 @@ from harness.loop import (
     RepairContext,
     RepairMachineModel,
 )
+from harness.loop.loop_types import (
+    EvaluationMetrics,
+    EvaluationResult,
+    FeedbackEntries,
+    ICResult,
+    JCResult,
+    TaskPayload,
+)
 from harness.pipeline.types import PipelineClassification, StepResult
 
 
 def _stub_deps() -> LoopDependencies:
     """Minimal dependency set for chart rendering (no side effects)."""
 
-    def _prepare(task: Mapping[str, object], trace: object | None = None) -> PreparedTasks:
-        return PreparedTasks(base_task=dict(task), resolved_repo_path=None, jc_repo_id=None)
+    def _prepare(task: TaskPayload, trace: object | None = None) -> PreparedTasks:
+        return PreparedTasks(base_task=task, resolved_repo_path=task.repo, jc_repo_id=None)
 
-    dummy_eval = EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="")
+    dummy_eval = EvaluationResult(
+        metrics=EvaluationMetrics(),
+        ic_result=ICResult(),
+        jc_result=JCResult(),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary=None,
+        policy_code="",
+    )
     dummy_feedback = FeedbackPackage(
         tests="",
         scoring_context="",
         comparison_summary=None,
-        feedback={},
+        feedback=FeedbackEntries(),
         feedback_str="",
         guidance_hint="",
         diff_str="",
@@ -6970,9 +8033,23 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     deps = _stub_deps()
     repair_ctx = RepairContext(
         repo_root=Path("."),
-        evaluation=EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code=""),
+        evaluation=EvaluationResult(
+            metrics=EvaluationMetrics(),
+            ic_result=ICResult(),
+            jc_result=JCResult(),
+            jc_metrics=EvaluationMetrics(),
+            comparison_summary=None,
+            policy_code="",
+        ),
         feedback=FeedbackPackage(
-            tests="", scoring_context="", comparison_summary=None, feedback={}, feedback_str="", guidance_hint="", diff_str="", diff_hint=""
+            tests="",
+            scoring_context="",
+            comparison_summary=None,
+            feedback=FeedbackEntries(),
+            feedback_str="",
+            guidance_hint="",
+            diff_str="",
+            diff_hint="",
         ),
         max_repair_attempts=1,
         parent_trace=None,
@@ -6981,7 +8058,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
     repair_chart = RepairStateMachine(repair_model)
 
-    loop_ctx = LoopContext(task={}, iterations=1, baseline_snapshot=None, run_trace=None)
+    loop_ctx = LoopContext(task=TaskPayload(symbol="dummy", repo="repo"), iterations=1, baseline_snapshot=None, run_trace=None)
     opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
     opt_chart = OptimizationStateMachine(opt_model)
     return repair_chart, opt_chart
@@ -7847,20 +8924,35 @@ import inspect
 from pathlib import Path
 from typing import Callable, cast
 
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+
+class ScoreFunctionConfig(BaseModel):
+    """Typed adapter for policy score functions."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    score_fn: Callable[..., float]
+
 
 def adapt_score_fn(score_fn: Callable[..., float]) -> Callable[[object, object, object], float]:
-    sig = inspect.signature(score_fn)
+    try:
+        config = ScoreFunctionConfig(score_fn=score_fn)
+    except ValidationError as exc:
+        raise RuntimeError(f"Invalid score function: {exc}") from exc
+
+    sig = inspect.signature(config.score_fn)
     arity = len(sig.parameters)
+    if arity not in (1, 2, 3):
+        raise RuntimeError(f"Unsupported score function arity: expected 1-3, got {arity}")
 
     def wrapped(*call_args: object, **call_kwargs: object) -> float:
         node, state, context = (list(call_args) + [None, None, None])[:3]
         if arity == 3:
-            return float(score_fn(node, state, context))
+            return float(config.score_fn(node, state, context))
         if arity == 2:
-            return float(score_fn(node, state))
-        if arity == 1:
-            return float(score_fn(node))
-        return 0.0
+            return float(config.score_fn(node, state))
+        return float(config.score_fn(node))
 
     return wrapped
 
@@ -8228,6 +9320,8 @@ import json
 import time
 from typing import Any, Mapping
 
+from pydantic import BaseModel, ConfigDict, ValidationError
+
 from .observability.langfuse import get_tracing_openai_client, start_observation
 from .observability.score_emitter import emit_score_for_handle
 from .utils.env import get_cerebras_api_key, get_writer_model
@@ -8235,6 +9329,25 @@ from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from .prompts import WriterPromptContext
 from .utils.template_loader import render_prompt_template
 from .loop.agent_common import usage_from_response  # reuse usage mapping for OpenAI-style responses  # pyright: ignore[reportPrivateUsage]
+
+
+class WriterRequest(BaseModel):
+    """Validated boundary for writer requests."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    feedback: Mapping[str, object]
+    current_policy: str
+    tests: str
+    scoring_context: str
+    feedback_str: str
+    guidance_hint: str
+    diff_str: str
+    diff_hint: str
+    comparison_summary: str | None = None
+    parent_trace: object | None = None
+    failure_context: str | None = None
+    repair_attempt: int = 0
 
 _client: Any | None = None
 _WRITER_TEMPLATE = "policy_writer.jinja"
@@ -8254,6 +9367,15 @@ def _require_parent(parent_trace: object | None) -> object:
     if parent_trace is None:
         raise RuntimeError("Parent span required for writer tracing")
     return parent_trace
+
+
+def _safe_update(span: object | None, **kwargs: object) -> None:
+    updater = getattr(span, "update", None)
+    if callable(updater):
+        try:
+            updater(**kwargs)
+        except Exception:
+            pass
 
 
 def _extract_policy_code(response: Any) -> str:
@@ -8333,16 +9455,18 @@ def _render_writer_prompt(
     scoring_context: str,
 ) -> str:
     feedback_text = feedback_str if feedback_str else str(feedback)
-    context = WriterPromptContext(
-        current_policy=current_policy,
-        failure_context=failure_context,
-        feedback_text=feedback_text,
-        comparison_summary=comparison_summary or "N/A",
-        guidance_hint=guidance_hint,
-        diff_str=diff_str,
-        diff_hint=diff_hint,
-        tests=tests,
-        scoring_context=scoring_context,
+    context = WriterPromptContext.model_validate(
+        {
+            "current_policy": current_policy,
+            "failure_context": failure_context,
+            "feedback_text": feedback_text,
+            "comparison_summary": comparison_summary or "N/A",
+            "guidance_hint": guidance_hint,
+            "diff_str": diff_str,
+            "diff_hint": diff_hint,
+            "tests": tests,
+            "scoring_context": scoring_context,
+        }
     )
     rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
     if "===USER===" not in rendered:
@@ -8367,6 +9491,24 @@ def generate_policy(
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
+    try:
+        WriterRequest(
+            feedback=feedback,
+            current_policy=current_policy,
+            tests=tests,
+            scoring_context=scoring_context,
+            feedback_str=feedback_str,
+            guidance_hint=guidance_hint,
+            diff_str=diff_str,
+            diff_hint=diff_hint,
+            comparison_summary=comparison_summary,
+            parent_trace=parent_trace,
+            failure_context=failure_context,
+            repair_attempt=repair_attempt,
+        )
+    except ValidationError as exc:
+        raise RuntimeError(f"Invalid writer request: {exc}") from exc
+
     parent_span = _require_parent(parent_trace)
     client, model = _get_client()
     if client is None or not hasattr(client, "chat"):
@@ -8436,23 +9578,31 @@ def generate_policy(
                         ],
                     )
                     latency_ms = (time.perf_counter() - start_time) * 1000
-                    usage_details = usage_from_response(response)
+                    usage_env = usage_from_response(response)
+                    usage_details: dict[str, object] | None = (
+                        {k: v for k, v in usage_env.model_dump_flat().items()} if usage_env else None
+                    )
                     if usage_details is None:
                         raise RuntimeError("Cerebras response missing usage; provide usage_details explicitly or enable provider usage output.")
                     from .observability.cerebras_pricing import cost_details_for_usage
 
                     cost_details = cost_details_for_usage(model, usage_details) if usage_details else None
-                    attempt_obs.update(
+                    _safe_update(
+                        attempt_obs,
                         metadata={"model": model, "attempt": attempt, "latency_ms": latency_ms},
                         usage_details=usage_details,
                         cost_details=cost_details,
                     )
                     break
                 except Exception as e:  # noqa: BLE001
-                    attempt_obs.end(error=e)
+                    end_fn = getattr(attempt_obs, "end", None)
+                    if callable(end_fn):
+                        end_fn(error=e)
                     time.sleep(2 * (attempt + 1))
         else:
-            writer_obs.end(error="writer_failed")
+            end_fn = getattr(writer_obs, "end", None)
+            if callable(end_fn):
+                end_fn(error="writer_failed")
             raise RuntimeError("Writer failed after retries")
 
         try:
@@ -8475,7 +9625,7 @@ def generate_policy(
             data_type="BOOLEAN",
             comment=json.dumps({"model": model}),
         )
-        writer_obs.update(metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
+        _safe_update(writer_obs, metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
         return code
 </file>
 

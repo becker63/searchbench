@@ -88,15 +88,15 @@ class OptimizationTracingListener:
         if ctx.prepared_tasks is None:
             machine.model.current_iteration_span = None  # noqa: SLF001
             return
-        ic_task, jc_task = ctx.prepared_tasks.build_iteration_tasks()
+        iteration_tasks = ctx.prepared_tasks.build_iteration_tasks()
         machine.model.current_iteration_span = machine.model.deps.start_observation(  # noqa: SLF001
             name=f"iteration_{ctx.current_iteration}",
             parent=ctx.run_trace,
             metadata={
                 "iteration": ctx.current_iteration,
                 "iterations": ctx.iterations,
-                "task": dict(ic_task),
-                "jc_repo": jc_task.get("repo"),
+                "task": iteration_tasks.ic_task.model_dump(),
+                "jc_repo": iteration_tasks.jc_task.repo,
             },
         )
 

@@ -8,10 +8,17 @@ import pytest
 from harness.loop.loop_machine import OptimizationStateMachine, RepairStateMachine
 from harness.loop.loop_types import (
     AcceptedPolicyMeta,
+    EvaluationMetrics,
     EvaluationResult,
     FailedRepairDetails,
+    FeedbackEntries,
     FeedbackPackage,
+    IterationTasks,
+    ICResult,
+    ICTaskPayload,
     IterationRecord,
+    JCResult,
+    JCTaskPayload,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
@@ -36,7 +43,7 @@ def _make_feedback() -> FeedbackPackage:
         tests="",
         scoring_context="",
         comparison_summary=None,
-        feedback={},
+        feedback=FeedbackEntries(),
         feedback_str="",
         guidance_hint="hint",
         diff_str="",
@@ -46,13 +53,24 @@ def _make_feedback() -> FeedbackPackage:
 
 def _make_eval() -> EvaluationResult:
     return EvaluationResult(
-        metrics={"score": 0.0},
-        ic_result={},
-        jc_result={},
-        jc_metrics={},
+        metrics=EvaluationMetrics.model_validate({"score": 0.0}),
+        ic_result=ICResult(),
+        jc_result=JCResult(),
+        jc_metrics=EvaluationMetrics(),
         comparison_summary=None,
         policy_code="policy",
     )
+
+
+def test_prepared_tasks_emit_models() -> None:
+    base = TaskPayload(symbol="sym", repo="repo")
+    prepared = PreparedTasks(base_task=base, resolved_repo_path="resolved", jc_repo_id="jc-id")
+    iteration_tasks = prepared.build_iteration_tasks()
+    assert isinstance(iteration_tasks, IterationTasks)
+    assert isinstance(iteration_tasks.ic_task, ICTaskPayload)
+    assert isinstance(iteration_tasks.jc_task, JCTaskPayload)
+    assert iteration_tasks.ic_task.repo == "resolved"
+    assert iteration_tasks.jc_task.repo == "jc-id"
 
 
 def _repair_deps(
@@ -107,7 +125,13 @@ def _repair_deps(
         return span
 
     deps = LoopDependencies(
-        prepare_iteration_tasks=lambda task, trace=None: PreparedTasks(base_task=task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task), resolved_repo_path=".", jc_repo_id="."),
+        prepare_iteration_tasks=lambda task, trace=None: PreparedTasks(
+            base_task=task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task),
+            resolved_repo_path=".",
+            jc_repo_id=".",
+            ic_task=ICTaskPayload(symbol=task.symbol if isinstance(task, TaskPayload) else TaskPayload.model_validate(task).symbol, repo="."),
+            jc_task=JCTaskPayload(symbol=task.symbol if isinstance(task, TaskPayload) else TaskPayload.model_validate(task).symbol, repo="."),
+        ),
         evaluate_policy_on_item=lambda *a, **k: _make_eval(),  # type: ignore[arg-type]
         build_iteration_feedback=lambda *a, **k: _make_feedback(),  # type: ignore[arg-type]
         attempt_policy_generation=attempt_policy_generation,
@@ -237,22 +261,29 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
     span = RecordingSpan()
 
     def prepare_iteration_tasks(task: TaskPayload, trace: object | None = None) -> PreparedTasks:
-        return PreparedTasks(base_task=task, resolved_repo_path=".", jc_repo_id=".")
+        base_task = task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task)
+        return PreparedTasks(
+            base_task=base_task,
+            resolved_repo_path=".",
+            jc_repo_id=".",
+            ic_task=ICTaskPayload(symbol=base_task.symbol, repo="."),
+            jc_task=JCTaskPayload(symbol=base_task.symbol, repo="."),
+        )
 
     def evaluate_policy_on_item(
-        ic_task: dict[str, object],
+        ic_task: ICTaskPayload,
         baseline,
         iteration_span: object | None = None,
         iteration_index: int | None = None,
     ) -> EvaluationResult:
-        metrics = {"score": 1.0}
+        metrics = EvaluationMetrics.model_validate({"score": 1.0})
         record = IterationRecord(iteration=iteration_index or 0, metrics=metrics, pipeline_passed=True)
         ctx.history.append(record)
         return EvaluationResult(
             metrics=metrics,
-            ic_result={},
-            jc_result={},
-            jc_metrics={},
+            ic_result=ICResult(),
+            jc_result=JCResult(),
+            jc_metrics=EvaluationMetrics(),
             comparison_summary=None,
             policy_code="policy",
         )

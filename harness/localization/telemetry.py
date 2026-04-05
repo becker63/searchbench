@@ -1,44 +1,55 @@
 from __future__ import annotations
 
-from typing import Dict, List, Mapping, Optional
+from typing import List, Optional
 
-from .models import LCATaskIdentity
+from .models import (
+    LCATaskIdentity,
+    LocalizationDatasetInfo,
+    LocalizationEvidence,
+    LocalizationMetrics,
+    LocalizationMaterialization,
+    LocalizationRepoInfo,
+    LocalizationTelemetryEnvelope,
+)
 
 
 def build_localization_telemetry(
     identity: LCATaskIdentity,
-    metrics: Mapping[str, float],
+    metrics: LocalizationMetrics,
     changed_files_count: Optional[int] = None,
     repo_language: Optional[str] = None,
     repo_license: Optional[str] = None,
-    evidence: Optional[Mapping[str, List[str]]] = None,
+    evidence: Optional[LocalizationEvidence] = None,
     materialization_events: Optional[List[str]] = None,
-) -> Dict[str, object]:
+) -> LocalizationTelemetryEnvelope:
     """
     Telemetry payload for file-path localization runs.
     Includes required LCA metadata and excludes legacy snippet/ranking fields.
     """
-    payload: Dict[str, object] = {
-        "identity": identity.task_id(),
-        "dataset": {
-            "name": identity.dataset_name,
-            "config": identity.dataset_config,
-            "split": identity.dataset_split,
-        },
-        "repo": {
-            "owner": identity.repo_owner,
-            "name": identity.repo_name,
-            "base_sha": identity.base_sha,
-            "issue_url": identity.issue_url,
-            "pull_url": identity.pull_url,
-            "language": repo_language,
-            "license": repo_license,
-        },
-        "changed_files_count": changed_files_count,
-        "metrics": dict(metrics),
-    }
-    if evidence:
-        payload["evidence"] = evidence
-    if materialization_events:
-        payload["materialization_events"] = materialization_events
-    return payload
+    dataset_block = LocalizationDatasetInfo(
+        name=identity.dataset_name,
+        config=identity.dataset_config,
+        split=identity.dataset_split,
+    )
+    repo_block = LocalizationRepoInfo(
+        owner=identity.repo_owner,
+        name=identity.repo_name,
+        base_sha=identity.base_sha,
+        issue_url=identity.issue_url,
+        pull_url=identity.pull_url,
+        language=repo_language,
+        license=repo_license,
+    )
+    evidence_block = evidence
+    materialization_block = LocalizationMaterialization(events=list(materialization_events)) if materialization_events else None
+    return LocalizationTelemetryEnvelope(
+        identity=identity.task_id(),
+        dataset=dataset_block,
+        repo=repo_block,
+        metrics=metrics,
+        changed_files_count=changed_files_count,
+        evidence=evidence_block,
+        materialization_events=materialization_block,
+        repo_language=repo_language,
+        repo_license=repo_license,
+    )

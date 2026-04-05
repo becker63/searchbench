@@ -5,19 +5,83 @@ from typing import Any, Mapping, Optional
 
 from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
+from pydantic import BaseModel, ConfigDict
 
 from ..utils.env import get_langfuse_env
 
 _client: Optional[Langfuse] = None
 
 
-def _coerce_metadata(metadata: Mapping[str, object] | None) -> dict[str, str] | None:
-    if metadata is None:
-        return None
-    coerced: dict[str, str] = {}
-    for key, value in metadata.items():
-        coerced[str(key)] = "" if value is None else str(value)
-    return coerced
+class ObservationMetadata(BaseModel):
+    """Typed metadata envelope for observations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    data: Mapping[str, object] | None = None
+
+    def to_langfuse(self) -> dict[str, str] | None:
+        if self.data is None:
+            return None
+        coerced: dict[str, str] = {}
+        for key, value in self.data.items():
+            coerced[str(key)] = "" if value is None else str(value)
+        return coerced
+
+
+class UsageDetails(BaseModel):
+    """Structured usage/cost inputs for Langfuse/OpenAI-style responses."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    input_cost: float | None = None
+    output_cost: float | None = None
+    total_cost: float | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        return self.model_dump(exclude_none=True)
+
+
+class ObservationEnvelope(BaseModel):
+    """Structured envelope for observation creation/update."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    as_type: str = "span"
+    input: object | None = None
+    model: str | None = None
+    metadata: ObservationMetadata | None = None
+    usage_details: UsageDetails | None = None
+    tags: list[str] | None = None
+    session_id: str | None = None
+    user_id: str | None = None
+    version: str | None = None
+
+    def to_start_kwargs(self) -> dict[str, object]:
+        return {
+            "as_type": self.as_type,
+            "name": self.name,
+            "input": self.input,
+            "model": self.model,
+            "metadata": self.metadata.to_langfuse() if self.metadata else None,
+        }
+
+    def propagate_kwargs(self) -> dict[str, object]:
+        kwargs: dict[str, object] = {}
+        if self.session_id:
+            kwargs["session_id"] = self.session_id
+        if self.user_id:
+            kwargs["user_id"] = self.user_id
+        if self.tags:
+            kwargs["tags"] = [t for t in self.tags if isinstance(t, str) and t]
+        if self.version:
+            kwargs["version"] = self.version
+        return kwargs
 
 
 def _coerce_tags(tags: list[str] | None) -> list[str] | None:
@@ -42,7 +106,6 @@ def _build_client() -> Langfuse:
         environment=tracing_env if isinstance(tracing_env, str) and tracing_env else None,
         release=release if isinstance(release, str) and release else None,
         debug=debug,
-        # Keep default span filter (no infra spans) by not overriding should_export_span.
     )
 
 
@@ -90,7 +153,7 @@ def propagate_context(
     coerced_tags = _coerce_tags(tags)
     if coerced_tags:
         kwargs["tags"] = coerced_tags
-    coerced_metadata = _coerce_metadata(metadata)
+    coerced_metadata = ObservationMetadata(data=metadata).to_langfuse() if metadata else None
     if coerced_metadata:
         kwargs["metadata"] = coerced_metadata
     if version:
@@ -106,18 +169,21 @@ def start_root_observation(
     input: object | None = None,
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    usage_details: UsageDetails | None = None,
 ) -> Any:
     """
     Start a root observation as the current observation.
     """
     client_any: Any = get_langfuse_client()
-    with client_any.start_as_current_observation(
-        as_type=as_type,
+    envelope = ObservationEnvelope(
         name=name,
+        as_type=as_type,
         input=input,
         model=model,
-        metadata=_coerce_metadata(metadata),
-    ) as observation:
+        metadata=ObservationMetadata(data=metadata) if metadata else None,
+        usage_details=usage_details,
+    )
+    with client_any.start_as_current_observation(**envelope.to_start_kwargs()) as observation:
         yield observation
 
 
@@ -130,19 +196,22 @@ def start_child_observation(
     input: object | None = None,
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    usage_details: UsageDetails | None = None,
 ) -> Any:
     """
     Start a child observation from a parent observation.
     """
     if parent is None or not hasattr(parent, "start_observation"):
         raise RuntimeError("Parent observation is required to start a child observation")
-    with parent.start_observation(
+    envelope = ObservationEnvelope(
         name=name,
         as_type=as_type,
         input=input,
         model=model,
-        metadata=_coerce_metadata(metadata),
-    ) as observation:
+        metadata=ObservationMetadata(data=metadata) if metadata else None,
+        usage_details=usage_details,
+    )
+    with parent.start_observation(**envelope.to_start_kwargs()) as observation:
         yield observation
 
 
@@ -155,6 +224,7 @@ def start_observation(
     input: object | None = None,
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    usage_details: UsageDetails | None = None,
 ):
     """
     Convenience wrapper to start a root or child observation based on parent presence.
@@ -166,6 +236,7 @@ def start_observation(
             input=input,
             model=model,
             metadata=metadata,
+            usage_details=usage_details,
         ) as observation:
             yield observation
     else:
@@ -176,13 +247,13 @@ def start_observation(
             input=input,
             model=model,
             metadata=metadata,
+            usage_details=usage_details,
         ) as observation:
             yield observation
 
 
 def flush_langfuse() -> None:
     client = get_langfuse_client()
-    # Ensure buffered events are sent; shutdown if supported by the SDK.
     flush = getattr(client, "flush", None)
     if callable(flush):
         flush()

@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from harness.loop.loop_types import EvaluationMetrics, JCResult
 
 from .datasets import DatasetItem, normalize_dataset_item
 from .langfuse import start_observation
@@ -19,19 +21,23 @@ def _stable_repo_symbol(repo: str, symbol: str) -> str:
 
 
 class BaselineSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     dataset_name: str | None = None
     dataset_version: str | None = None
     item_id: str | None = None
     repo: str
     symbol: str
-    jc_result: dict[str, object] = Field(default_factory=dict)
-    jc_metrics: dict[str, float] = Field(default_factory=dict)
+    jc_result: JCResult = Field(default_factory=JCResult)
+    jc_metrics: EvaluationMetrics = Field(default_factory=EvaluationMetrics)
     experiment_run_id: str | None = None
     trace_id: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class BaselineBundle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     dataset_name: str | None = None
     dataset_version: str | None = None
     baseline_run_id: str | None = None
@@ -61,8 +67,8 @@ def _snapshot_key(snapshot: BaselineSnapshot) -> str:
     return ""
 
 
-def baseline_metrics_from_jc(jc_result: Mapping[str, object]) -> dict[str, float]:
-    return {"score": 0.0}
+def baseline_metrics_from_jc(jc_result: Mapping[str, object]) -> EvaluationMetrics:
+    return EvaluationMetrics.model_validate({"score": 0.0})
 
 
 def index_baselines(bundle: BaselineBundle | Sequence[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
@@ -100,11 +106,13 @@ def compute_baseline_for_item(
             "resolved_repo": resolved_repo,
         },
     ) as trace:
-        jc_result = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
-        metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result))
+        jc_result_map = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
+        metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result_map))
         trace_id = getattr(trace, "id", None)
         dataset_run_id = getattr(parent_trace, "id", None)
         for name, value in metrics.items():
+            if not isinstance(value, (int, float, bool)):
+                continue
             data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
             score_id = f"{trace_id}-baseline.{name}" if trace_id else None
             emit_score_for_handle(
@@ -121,7 +129,7 @@ def compute_baseline_for_item(
             item_id=normalized.id,
             repo=normalized.repo,
             symbol=normalized.symbol,
-            jc_result=dict(jc_result),
+            jc_result=JCResult.model_validate(jc_result_map),
             jc_metrics=metrics,
             trace_id=trace_id,
             experiment_run_id=dataset_run_id,
@@ -173,11 +181,14 @@ def make_baseline_bundle(
 
 
 def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
-    serializable = bundle.model_dump()
+    serializable = bundle.model_dump(exclude_none=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(serializable, indent=2))
 
 
 def load_baseline_bundle(path: Path) -> BaselineBundle:
     data: object = json.loads(path.read_text())
-    return BaselineBundle.model_validate(data)
+    try:
+        return BaselineBundle.model_validate(data)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid baseline bundle: {exc}") from exc

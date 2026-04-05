@@ -16,16 +16,15 @@ from .loop import (  # noqa: E402
     _hash_tests_dir,
     _read_policy,
     _write_policy,
-    index_folder,
-    evaluate_policy_on_item,
-    prepare_iteration_tasks,
-    run_loop,
     emit_score,
     emit_score_for_handle,
+    evaluate_policy_on_item,
+    index_folder,
     load_policy,
+    prepare_iteration_tasks,
+    run_loop,
     run_policy_pipeline,
 )
-from .runner_agent import run_ic_iteration
 from .loop_machine import OptimizationStateMachine, RepairStateMachine
 from .loop_types import (
     AcceptedPolicy,
@@ -34,6 +33,7 @@ from .loop_types import (
     FailedRepairDetails,
     FeedbackPackage,
     IterationRecord,
+    IterationTasks,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
@@ -41,8 +41,11 @@ from .loop_types import (
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
+    RunMetadata,
+    TaskPayload,
+    iteration_record_to_public_dict,
 )
-from .loop_types import iteration_record_to_public_dict
+from .runner_agent import run_ic_iteration
 
 __all__ = [
     "run_loop",
@@ -65,6 +68,7 @@ __all__ = [
     "EvaluationResult",
     "FailedRepairDetails",
     "FeedbackPackage",
+    "IterationTasks",
     "IterationRecord",
     "LoopContext",
     "LoopDependencies",
@@ -73,6 +77,8 @@ __all__ = [
     "RepairContext",
     "RepairMachineModel",
     "RepairOutcome",
+    "RunMetadata",
+    "TaskPayload",
     "iteration_record_to_public_dict",
 ]
 

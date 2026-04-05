@@ -6,7 +6,8 @@ from harness.observability import baselines, experiments
 from harness.observability.experiments import HostedRunItemResult, HostedRunResult
 from harness import loop
 from harness.loop import runner_agent as runner
-from harness.loop import IterationRecord
+from harness.loop import IterationRecord, TaskPayload
+from harness.loop.loop_types import EvaluationMetrics
 
 
 def test_baseline_resolves_repo(monkeypatch, tmp_path):
@@ -51,9 +52,10 @@ def test_baseline_resolves_repo(monkeypatch, tmp_path):
 def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
     calls: list[str] = []
 
-    def fake_run_loop(task: Mapping[str, object], iterations: int, parent_trace=None, baseline_snapshot=None, session_id=None):
-        calls.append(str(task.get("repo", "")))
-        return [IterationRecord(iteration=0, metrics={"score": 1.0}, pipeline_passed=True)]
+    def fake_run_loop(task: Mapping[str, object] | TaskPayload, iterations: int, parent_trace=None, baseline_snapshot=None, session_id=None):
+        repo_val = task.repo if isinstance(task, TaskPayload) else task.get("repo", "")
+        calls.append(str(repo_val))
+        return [IterationRecord(iteration=0, metrics=EvaluationMetrics.model_validate({"score": 1.0}), pipeline_passed=True)]
 
     repo_dir = tmp_path / "medium_repo"
     repo_dir.mkdir()
@@ -73,7 +75,15 @@ def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
 
     monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_hosted)
     baselines_bundle: Any = baselines.make_baseline_bundle(
-        [baselines.BaselineSnapshot(repo="medium", symbol="s", jc_result={}, jc_metrics={}, item_id="item2")]
+        [
+            baselines.BaselineSnapshot(
+                repo="medium",
+                symbol="s",
+                jc_result=baselines.JCResult(),
+                jc_metrics=baselines.EvaluationMetrics(),
+                item_id="item2",
+            )
+        ]
     )
     experiments._run_ic_optimizations(  # type: ignore[attr-defined,arg-type]
         [baselines.normalize_dataset_item({"id": "item3", "repo": "medium", "symbol": "s", "metadata": {}})],

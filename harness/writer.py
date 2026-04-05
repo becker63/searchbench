@@ -9,6 +9,8 @@ import json
 import time
 from typing import Any, Mapping
 
+from pydantic import BaseModel, ConfigDict, ValidationError
+
 from .observability.langfuse import get_tracing_openai_client, start_observation
 from .observability.score_emitter import emit_score_for_handle
 from .utils.env import get_cerebras_api_key, get_writer_model
@@ -16,6 +18,25 @@ from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from .prompts import WriterPromptContext
 from .utils.template_loader import render_prompt_template
 from .loop.agent_common import usage_from_response  # reuse usage mapping for OpenAI-style responses  # pyright: ignore[reportPrivateUsage]
+
+
+class WriterRequest(BaseModel):
+    """Validated boundary for writer requests."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    feedback: Mapping[str, object]
+    current_policy: str
+    tests: str
+    scoring_context: str
+    feedback_str: str
+    guidance_hint: str
+    diff_str: str
+    diff_hint: str
+    comparison_summary: str | None = None
+    parent_trace: object | None = None
+    failure_context: str | None = None
+    repair_attempt: int = 0
 
 _client: Any | None = None
 _WRITER_TEMPLATE = "policy_writer.jinja"
@@ -123,16 +144,18 @@ def _render_writer_prompt(
     scoring_context: str,
 ) -> str:
     feedback_text = feedback_str if feedback_str else str(feedback)
-    context = WriterPromptContext(
-        current_policy=current_policy,
-        failure_context=failure_context,
-        feedback_text=feedback_text,
-        comparison_summary=comparison_summary or "N/A",
-        guidance_hint=guidance_hint,
-        diff_str=diff_str,
-        diff_hint=diff_hint,
-        tests=tests,
-        scoring_context=scoring_context,
+    context = WriterPromptContext.model_validate(
+        {
+            "current_policy": current_policy,
+            "failure_context": failure_context,
+            "feedback_text": feedback_text,
+            "comparison_summary": comparison_summary or "N/A",
+            "guidance_hint": guidance_hint,
+            "diff_str": diff_str,
+            "diff_hint": diff_hint,
+            "tests": tests,
+            "scoring_context": scoring_context,
+        }
     )
     rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
     if "===USER===" not in rendered:
@@ -157,6 +180,24 @@ def generate_policy(
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
+    try:
+        WriterRequest(
+            feedback=feedback,
+            current_policy=current_policy,
+            tests=tests,
+            scoring_context=scoring_context,
+            feedback_str=feedback_str,
+            guidance_hint=guidance_hint,
+            diff_str=diff_str,
+            diff_hint=diff_hint,
+            comparison_summary=comparison_summary,
+            parent_trace=parent_trace,
+            failure_context=failure_context,
+            repair_attempt=repair_attempt,
+        )
+    except ValidationError as exc:
+        raise RuntimeError(f"Invalid writer request: {exc}") from exc
+
     parent_span = _require_parent(parent_trace)
     client, model = _get_client()
     if client is None or not hasattr(client, "chat"):
@@ -226,7 +267,10 @@ def generate_policy(
                         ],
                     )
                     latency_ms = (time.perf_counter() - start_time) * 1000
-                    usage_details = usage_from_response(response)
+                    usage_env = usage_from_response(response)
+                    usage_details: dict[str, object] | None = (
+                        {k: v for k, v in usage_env.model_dump_flat().items()} if usage_env else None
+                    )
                     if usage_details is None:
                         raise RuntimeError("Cerebras response missing usage; provide usage_details explicitly or enable provider usage output.")
                     from .observability.cerebras_pricing import cost_details_for_usage

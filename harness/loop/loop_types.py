@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
 
@@ -12,17 +12,165 @@ if TYPE_CHECKING:
 
 
 MetricValue = int | float | bool
-MetricsMap = Mapping[str, object]
+MetricsMap = Mapping[str, MetricValue | None]
+ScalarMetrics = dict[str, MetricValue | None]
+FeedbackMap = Mapping[str, str | float | int | bool | None]
+
+
+class MetricEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: MetricValue | None
+
+
+class EvaluationMetrics(BaseModel):
+    """Canonical metrics container with stable fields and extensible entries."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: MetricValue | None = None
+    iteration_regression: bool | None = None
+    additional_metrics: list[MetricEntry] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            score = value.get("score")
+            iteration_regression = value.get("iteration_regression")
+            additional_raw = value.get("additional_metrics", [])
+            unknown_keys = [k for k in value.keys() if k not in {"score", "iteration_regression", "additional_metrics"}]
+            if unknown_keys:
+                raise ValueError(f"Unknown metric keys: {unknown_keys}")
+            additional: list[dict[str, object]] = []
+            if isinstance(additional_raw, list):
+                additional = [
+                    {"name": entry.get("name"), "value": entry.get("value")}
+                    for entry in additional_raw
+                    if isinstance(entry, Mapping)
+                ]
+            return {
+                "score": score,
+                "iteration_regression": iteration_regression,
+                "additional_metrics": additional,
+            }
+        return value
+
+    def as_map(self) -> dict[str, MetricValue | None]:
+        data: dict[str, MetricValue | None] = {}
+        if self.score is not None:
+            data["score"] = self.score
+        if self.iteration_regression is not None:
+            data["iteration_regression"] = self.iteration_regression
+        for entry in self.additional_metrics:
+            data[entry.name] = entry.value
+        return data
+
+    def items(self):
+        return self.as_map().items()
+
+    def get(self, key: str, default: object | None = None) -> object | None:
+        return self.as_map().get(key, default)  # type: ignore[return-value]
+
+
+class ResultEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: object | None
+
+
+class ICResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[ResultEntry] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {"entries": [{"name": k, "value": v} for k, v in value.items()]}
+        return value
+
+    def as_map(self) -> dict[str, object]:
+        return {entry.name: entry.value for entry in self.entries}
+
+    def get(self, key: str, default: object | None = None) -> object | None:
+        return self.as_map().get(key, default)
+
+
+class JCResult(ICResult):
+    """JC result container."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class FeedbackEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: str | float | int | bool | None
+
+
+class FeedbackEntries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[FeedbackEntry] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {"entries": [{"name": k, "value": v} for k, v in value.items()]}
+        return value
+
+    def as_map(self) -> dict[str, str | float | int | bool | None]:
+        return {entry.name: entry.value for entry in self.entries}
+
+    def get(self, key: str, default: object | None = None) -> object | None:
+        return self.as_map().get(key, default)
+
+    def items(self):
+        return self.as_map().items()
 
 
 class TaskPayload(BaseModel):
     """Normalized task payload passed into loop/runner agents."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     symbol: str
     repo: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {"symbol": value.get("symbol"), "repo": value.get("repo")}
+        return value
+
+
+class ICTaskPayload(TaskPayload):
+    """Iteration task payload for IC runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class JCTaskPayload(TaskPayload):
+    """Iteration task payload for JC runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RunMetadata(BaseModel):
+    """Run-level metadata persisted for tracing and external visibility."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    iterations: int
+    task: TaskPayload
+    session_id: str | None = None
 
 class PreparedTasks(BaseModel):
     """Resolved IC/JC tasks for a single iteration."""
@@ -32,18 +180,42 @@ class PreparedTasks(BaseModel):
     base_task: TaskPayload
     resolved_repo_path: str | None
     jc_repo_id: str | None
+    ic_task: ICTaskPayload | None = None
+    jc_task: JCTaskPayload | None = None
 
-    def build_iteration_tasks(self) -> tuple[dict[str, object], dict[str, object]]:
-        base = self.base_task.model_dump()
-        ic_task = dict(base)
-        jc_task = dict(base)
+    def _resolve_ic_repo(self) -> str:
         if self.resolved_repo_path is not None:
-            ic_task["repo"] = self.resolved_repo_path
+            return self.resolved_repo_path
+        return self.base_task.repo
+
+    def _resolve_jc_repo(self) -> str:
         if self.jc_repo_id is not None:
-            jc_task["repo"] = self.jc_repo_id
-        elif self.resolved_repo_path is not None:
-            jc_task["repo"] = self.resolved_repo_path
-        return ic_task, jc_task
+            return self.jc_repo_id
+        if self.resolved_repo_path is not None:
+            return self.resolved_repo_path
+        return self.base_task.repo
+
+    def to_ic_request(self) -> ICTaskPayload:
+        if self.ic_task is not None:
+            return self.ic_task
+        return ICTaskPayload(symbol=self.base_task.symbol, repo=self._resolve_ic_repo())
+
+    def to_jc_request(self) -> JCTaskPayload:
+        if self.jc_task is not None:
+            return self.jc_task
+        return JCTaskPayload(symbol=self.base_task.symbol, repo=self._resolve_jc_repo())
+
+    def build_iteration_tasks(self) -> "IterationTasks":
+        return IterationTasks(ic_task=self.to_ic_request(), jc_task=self.to_jc_request())
+
+
+class IterationTasks(BaseModel):
+    """Concrete task payloads for an iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ic_task: ICTaskPayload
+    jc_task: JCTaskPayload
 
 
 class EvaluationResult(BaseModel):
@@ -51,10 +223,10 @@ class EvaluationResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    metrics: MetricsMap
-    ic_result: dict[str, object]
-    jc_result: dict[str, object]
-    jc_metrics: MetricsMap
+    metrics: EvaluationMetrics
+    ic_result: ICResult
+    jc_result: JCResult
+    jc_metrics: EvaluationMetrics
     comparison_summary: str | None
     policy_code: str
     success: bool = True
@@ -69,7 +241,7 @@ class FeedbackPackage(BaseModel):
     tests: str
     scoring_context: str
     comparison_summary: str | None
-    feedback: dict[str, str | float | int | bool | None]
+    feedback: FeedbackEntries
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -111,7 +283,7 @@ class IterationRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     iteration: int
-    metrics: MetricsMap
+    metrics: EvaluationMetrics
     pipeline_passed: bool | None = None
     pipeline_feedback: PipelineClassification | None = None
     failed_step: str | None = None
@@ -131,7 +303,7 @@ class LoopContext(BaseModel):
     iterations: int
     session_id: str | None = None
     parent_trace: object | None = None
-    run_metadata: Mapping[str, object] | None = None
+    run_metadata: RunMetadata | None = None
     baseline_snapshot: "BaselineSnapshot | None" = None
     run_trace: object | None
     history: list[IterationRecord] = Field(default_factory=list)
@@ -148,7 +320,7 @@ class LoopDependencies(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     prepare_iteration_tasks: Callable[[TaskPayload, object | None], PreparedTasks]
-    evaluate_policy_on_item: Callable[[dict[str, object], "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
+    evaluate_policy_on_item: Callable[[ICTaskPayload, "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
     build_iteration_feedback: Callable[[EvaluationResult, float | None, PipelineClassification | None, Path], FeedbackPackage]
     attempt_policy_generation: Callable[..., tuple[str | None, str | None]]
     run_policy_pipeline: Callable[..., tuple[list[StepResult], bool]]
@@ -216,7 +388,7 @@ class FailedRepairDetails(BaseModel):
 
 def iteration_record_to_public_dict(record: IterationRecord) -> dict[str, object]:
     """Serialize iteration records for external consumers (CLI, scoring)."""
-    data: dict[str, object] = dict(record.metrics)
+    data: dict[str, object] = {k: v for k, v in record.metrics.as_map().items()}
     if record.pipeline_passed is not None:
         data["pipeline_passed"] = record.pipeline_passed
     if record.pipeline_feedback is not None:
@@ -241,6 +413,30 @@ def iteration_record_to_public_dict(record: IterationRecord) -> dict[str, object
     if record.max_policy_repairs is not None:
         data.setdefault("max_policy_repairs", record.max_policy_repairs)
     return data
+
+
+def format_failure_context_payload(
+    pipeline_results: Sequence[StepResult],
+    classified: PipelineClassification | None,
+    writer_error: str | None,
+    model_name: str | None,
+    repair_attempt: int,
+) -> str:
+    """Centralized failure-context serialization for writer prompts."""
+    from harness.utils.failure_context import pack_failure_context  # local import to avoid cycles
+
+    pipeline_dump = [step.model_dump() for step in pipeline_results]
+    classified_dump = classified.model_dump() if classified else None
+    failed_step = next((step for step in pipeline_results if step.exit_code != 0), None)
+    failed_dump = failed_step.model_dump() if failed_step else None
+    return pack_failure_context(
+        pipeline_dump,
+        classified_dump,
+        failed_dump,
+        writer_error,
+        model_name,
+        repair_attempt=repair_attempt,
+    )
 
 
 class RepairMachineModel(BaseModel):
@@ -273,7 +469,7 @@ def _rebuild_forward_refs() -> None:
         from harness.observability.baselines import BaselineSnapshot  # local import to avoid cycles
     except Exception:
         return
-    LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
+    LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot, "RunMetadata": RunMetadata})
     LoopDependencies.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
     RepairContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
     RepairMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})

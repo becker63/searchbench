@@ -14,7 +14,6 @@ from harness.loop import (
     RepairStateMachine,
     AcceptedPolicyMeta,
     FailedRepairDetails,
-    EvaluationResult,
     FeedbackPackage,
     LoopContext,
     LoopDependencies,
@@ -23,7 +22,14 @@ from harness.loop import (
     RepairContext,
     RepairMachineModel,
 )
-from harness.loop.loop_types import TaskPayload
+from harness.loop.loop_types import (
+    EvaluationMetrics,
+    EvaluationResult,
+    FeedbackEntries,
+    ICResult,
+    JCResult,
+    TaskPayload,
+)
 from harness.pipeline.types import PipelineClassification, StepResult
 
 
@@ -33,12 +39,19 @@ def _stub_deps() -> LoopDependencies:
     def _prepare(task: TaskPayload, trace: object | None = None) -> PreparedTasks:
         return PreparedTasks(base_task=task, resolved_repo_path=task.repo, jc_repo_id=None)
 
-    dummy_eval = EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code="")
+    dummy_eval = EvaluationResult(
+        metrics=EvaluationMetrics(),
+        ic_result=ICResult(),
+        jc_result=JCResult(),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary=None,
+        policy_code="",
+    )
     dummy_feedback = FeedbackPackage(
         tests="",
         scoring_context="",
         comparison_summary=None,
-        feedback={},
+        feedback=FeedbackEntries(),
         feedback_str="",
         guidance_hint="",
         diff_str="",
@@ -110,9 +123,23 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     deps = _stub_deps()
     repair_ctx = RepairContext(
         repo_root=Path("."),
-        evaluation=EvaluationResult(metrics={}, ic_result={}, jc_result={}, jc_metrics={}, comparison_summary=None, policy_code=""),
+        evaluation=EvaluationResult(
+            metrics=EvaluationMetrics(),
+            ic_result=ICResult(),
+            jc_result=JCResult(),
+            jc_metrics=EvaluationMetrics(),
+            comparison_summary=None,
+            policy_code="",
+        ),
         feedback=FeedbackPackage(
-            tests="", scoring_context="", comparison_summary=None, feedback={}, feedback_str="", guidance_hint="", diff_str="", diff_hint=""
+            tests="",
+            scoring_context="",
+            comparison_summary=None,
+            feedback=FeedbackEntries(),
+            feedback_str="",
+            guidance_hint="",
+            diff_str="",
+            diff_hint="",
         ),
         max_repair_attempts=1,
         parent_trace=None,

@@ -9,7 +9,7 @@ import json
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from harness.observability.langfuse import get_tracing_openai_client, start_observation
+from harness.observability.langfuse import UsageDetails, get_tracing_openai_client, start_observation
 from harness.observability.score_emitter import emit_score_for_handle
 from harness.prompts import SystemPromptContext
 from harness.tools.backends.ic_backend import IterativeContextBackend
@@ -18,9 +18,9 @@ from harness.tools.mcp_adapter import serialize_tool_result_for_model
 from harness.utils.env import get_cerebras_api_key, get_runner_model
 from harness.utils.openai_schema import OpenAITool, validate_tools
 from harness.utils.template_loader import render_prompt_template
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .agent_common import usage_from_response
+from .agent_common import AgentTaskPayload, usage_from_response
 
 _MAX_TOTAL_MESSAGE_CHARS = 24000
 _MAX_TOOL_CONTENT_CHARS = 4000
@@ -34,6 +34,8 @@ _AGGRESSIVE_USER_CHARS = 1500
 
 
 class AgentTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     symbol: str
     repo: str
     symbol_id: str
@@ -41,14 +43,14 @@ class AgentTask(BaseModel):
     extra: dict[str, object] = Field(default_factory=dict)
 
     def to_payload(self) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "symbol": self.symbol,
-            "repo": self.repo,
-            "symbol_id": self.symbol_id,
-            "raw_symbol": self.raw_symbol,
-        }
-        payload.update(self.extra)
-        return payload
+        payload_model = AgentTaskPayload(
+            symbol=self.symbol,
+            repo=self.repo,
+            symbol_id=self.symbol_id,
+            raw_symbol=self.raw_symbol,
+            extra=self.extra,
+        )
+        return payload_model.model_dump()
 
 
 def _require_str(mapping: dict[str, Any], key: str) -> str:
@@ -251,7 +253,7 @@ def _collect_tool_results(
             call_map = {"name": name, "id": getattr(call, "id", None), "arguments": arguments} if name else None
         if not isinstance(call_map, Mapping):
             continue
-        name = call_map.get("name")
+        name = cast(str | None, call_map.get("name"))
         arguments = call_map.get("arguments")
         if name:
             arg_map = arguments if isinstance(arguments, dict) else {}
@@ -302,13 +304,20 @@ def _apply_tool_results(observations: list[dict[str, object]], tool_results: lis
 
 
 def _collect_usage_details(response: Any) -> dict[str, object] | None:
-    usage_details = usage_from_response(response)
+    usage_envelope = usage_from_response(response)
+    usage_details: dict[str, object] | None = (
+        {k: v for k, v in usage_envelope.model_dump_flat().items()} if usage_envelope else None
+    )
     if not usage_details:
         return None
     model = getattr(response, "model", None)
     if isinstance(model, str):
         usage_details["model"] = model
-    return usage_details
+    try:
+        usage_model = UsageDetails.model_validate(usage_details)
+    except Exception:
+        return usage_details
+    return usage_model.to_payload()
 
 
 def run_agent(
@@ -491,7 +500,10 @@ def run_ic_iteration(
     parent_span = _require_parent(parent_trace, owner="iterative_context")
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
-    agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+    try:
+        agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+    except ValidationError as exc:
+        raise RuntimeError(f"Invalid agent task: {exc}") from exc
     agent_task = agent_task_model.to_payload()
 
     backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
@@ -531,7 +543,10 @@ def run_jc_iteration(
     parent_span = _require_parent(parent_trace, owner="jcodemunch")
     symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
-    agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+    try:
+        agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+    except ValidationError as exc:
+        raise RuntimeError(f"Invalid agent task: {exc}") from exc
     agent_task = agent_task_model.to_payload()
 
     backend = JCodeMunchBackend(repo=repo)

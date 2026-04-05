@@ -30,6 +30,8 @@ class Pipeline:
                 metadata={"cwd": str(repo_root)},
             ) as step_obs:
                 result = step.run(repo_root)
+                # Normalize to canonical StepResult to avoid drifting shapes.
+                result = result if isinstance(result, StepResult) else StepResult.from_external(result)
                 # Enforce success semantics based solely on exit status.
                 result.success = result.exit_code == 0
                 results.append(result)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class ScorePayload(BaseModel):
@@ -18,6 +18,12 @@ class ScorePayload(BaseModel):
     config_id: str | None = None
     comment: str | None = None
     score_id: str | None = None
+
+    @model_validator(mode="after")
+    def _require_identifier(self) -> "ScorePayload":
+        if not any([self.trace_id, self.observation_id, self.dataset_run_id, self.session_id]):
+            raise ValueError("Score emission requires at least one identifier (trace/observation/datasetRun/session)")
+        return self
 
 
 def _infer_data_type(value: float | int | bool | str, provided: str | None) -> str | None:
@@ -46,8 +52,6 @@ def emit_score(
     score_id: str | None = None,
 ) -> None:
     """Submit a score via Langfuse SDK using hosted run identifiers."""
-    if not any([trace_id, observation_id, dataset_run_id, session_id]):
-        raise RuntimeError("Score emission requires at least one identifier (trace/observation/datasetRun/session)")
     from .langfuse import get_langfuse_client  # local import to avoid circularity
 
     resolved_type = _infer_data_type(value, data_type)
@@ -85,8 +89,6 @@ def emit_score_for_handle(
     score_id: str | None = None,
 ) -> None:
     """Emit a score using IDs derived from a Langfuse trace/span handle."""
-    if handle is None:
-        raise RuntimeError("Langfuse handle is required to emit score")
     trace_id = getattr(handle, "trace_id", None) or getattr(handle, "id", None)
     observation_id = getattr(handle, "id", None)
     emit_score(
