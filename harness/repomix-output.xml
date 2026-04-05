@@ -47,6 +47,7 @@ docs/
 localization/
   __init__.py
   eval.py
+  executor.py
   materializer.py
   models.py
   scoring.py
@@ -143,7 +144,7 @@ writer.py
 This section contains the contents of the repository's files.
 
 <file path="docs/lca_localization.md">
-# LCA Bug Localization (Phase 1 Prep)
+# LCA Bug Localization (Localization-First Runner)
 
 ## Canonical Contract
 - **Gold**: `changed_files` (excluding tests).
@@ -158,14 +159,15 @@ This section contains the contents of the repository's files.
 - Issue title/body, diff_url/diff, repo_language[s]/license/stars, head_sha (supplemental).
 - Delivered localization-native; no candidate IDs.
 
-## Repo Materialization (Phase 2)
+## Execution Architecture (Two-Phase)
+- **Phase A (exploration)**: backend MCP tools -> OpenAI tool-calls -> backend `dispatch(...)`; gathers observations grounded in repo/issue/diff.
+- **Phase B (finalization)**: separate no-tools request with strict JSON schema (`predicted_files`, `reasoning`, optional `evidence`); enforces shape via `response_format: json_schema`.
+- **Evaluation**: score structured prediction against gold `changed_files`; telemetry/metrics emitted post-run.
+
+## Repo Materialization
 - Inputs: dataset/config/split, repo_owner/name, `base_sha`, archive refs.
 - Outputs: local path at `base_sha`, cache/download/extract/checkout status/log hooks.
 - CLI logs: dataset/config/split, repo resolve, cache hit/miss, download/fetch, extract/materialize, checkout `base_sha`, ready path.
-
-## Phase 2 Boundaries
-- No dataset loading, repo fetch/extract/checkout, or execution in phase 1.
-- Phase 2 will implement materializer, dataset ingestion, and actual evaluation runs.
 </file>
 
 <file path="docs/loop_viz.md">
@@ -328,6 +330,141 @@ def build_file_localization_eval_record(
     )
 </file>
 
+<file path="localization/executor.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable, Mapping, Tuple
+
+from harness.localization.eval import build_file_localization_eval_record
+from harness.localization.materializer import (
+    RepoMaterializationRequest,
+    RepoMaterializationResult,
+    RepoMaterializer,
+    describe_repo_mapping,
+)
+from harness.localization.models import (
+    LCAGold,
+    LCAPrediction,
+    LCATask,
+    LocalizationEvidence,
+    LocalizationMetrics,
+)
+from harness.localization.telemetry import build_localization_telemetry
+from harness.observability.langfuse import start_observation
+from harness.observability.score_emitter import emit_score_for_handle
+from harness.loop.runner_agent import run_ic_iteration
+
+
+def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> RepoMaterializationResult | None:
+    if materializer is None:
+        return None
+    request = RepoMaterializationRequest(
+        dataset_name=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        repo_owner=task.identity.repo_owner,
+        repo_name=task.identity.repo_name,
+        base_sha=task.identity.base_sha,
+    )
+    return materializer.materialize(request)
+
+
+def run_localization_task(
+    task: LCATask,
+    materializer: RepoMaterializer | None = None,
+    parent_trace: object | None = None,
+    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
+) -> Tuple[LCAPrediction, LocalizationMetrics, LocalizationEvidence | None, RepoMaterializationResult | None]:
+    """
+    Execute a localization task end to end:
+    - materialize repo at base_sha (if a materializer is provided)
+    - run the localization agent/backend to produce predicted_files
+    - score using file-set localization metrics
+    - emit scores via Langfuse
+    Returns prediction, metrics, optional evidence, and materialization details.
+    """
+
+    def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) -> tuple[list[str], Mapping[str, object] | None]:
+        result = run_ic_iteration(
+            {
+                "identity": lca_task.identity.model_dump(),
+                "context": lca_task.context.model_dump(),
+                "repo": repo_path,
+            },
+            score_fn=None,
+            steps=5,
+            parent_trace=parent,
+        )
+        if not isinstance(result, Mapping):
+            raise RuntimeError("Localization runner returned an invalid result")
+        predicted = result.get("predicted_files")
+        if not isinstance(predicted, list):
+            raise RuntimeError("Localization runner produced no predicted_files")
+        predictions = [p for p in predicted if isinstance(p, str) and p.strip()]
+        if not predictions:
+            raise RuntimeError("Localization runner produced an empty predicted_files list")
+        return predictions, result
+
+    with start_observation(
+        name="localization_task",
+        parent=parent_trace,
+        metadata={
+            "identity": task.task_id,
+            "dataset": task.identity.dataset_name,
+            "dataset_config": task.identity.dataset_config,
+            "dataset_split": task.identity.dataset_split,
+            "repo_owner": task.identity.repo_owner,
+            "repo_name": task.identity.repo_name,
+            "base_sha": task.identity.base_sha,
+        },
+    ) as trace:
+        materialization_result = _materialize_repo(task, materializer)
+        repo_path: Path | None = materialization_result.local_path if materialization_result else None
+        if repo_path is None and task.repo:
+            repo_path = Path(task.repo).expanduser()
+        if repo_path is not None and not repo_path.exists():
+            raise RuntimeError(f"Localization repo path does not exist: {repo_path}")
+        if repo_path is None:
+            raise RuntimeError("Localization task is missing a repo path; provide a materializer or task.repo")
+        runner_fn = runner or _default_runner
+        predicted_files, _runner_result = runner_fn(task, str(repo_path), trace)
+        if not predicted_files:
+            raise RuntimeError("Localization runner produced no predicted_files")
+        prediction = LCAPrediction(predicted_files=predicted_files)
+        eval_record = build_file_localization_eval_record(
+            task.identity, prediction, task.gold, evidence=task.evidence, repo_path=repo_path
+        )
+        telemetry = build_localization_telemetry(
+            task.identity,
+            metrics=eval_record.metrics,
+            changed_files_count=len(task.gold.normalized_changed_files()),
+            repo_language=task.context.repo_language,
+            repo_license=task.context.repo_license,
+            evidence=task.evidence,
+            materialization_events=materialization_result.events if materialization_result else None,
+        )
+        dataset_run_id = getattr(parent_trace, "id", None)
+        for metric_name, metric_value in eval_record.metrics.model_dump().items():
+            if metric_value is None:
+                continue
+            emit_score_for_handle(
+                trace,
+                name=f"localization.{metric_name}",
+                value=float(metric_value),
+                data_type="NUMERIC",
+                dataset_run_id=dataset_run_id,
+                score_id=f"{trace.id}-localization.{metric_name}" if getattr(trace, "id", None) else None,
+            )
+        # surface telemetry in metadata for downstream consumers
+        if trace:
+            try:
+                trace.metadata = {**getattr(trace, "metadata", {}), "telemetry": telemetry.model_dump(exclude_none=True)}
+            except Exception:
+                pass
+        return prediction, eval_record.metrics, task.evidence, materialization_result
+</file>
+
 <file path="localization/materializer.py">
 from __future__ import annotations
 
@@ -406,7 +543,8 @@ def describe_repo_mapping(request: RepoMaterializationRequest) -> str:
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -449,6 +587,12 @@ class LCATaskIdentity(BaseModel):
                 issue_key,
             ]
         )
+    @property
+    def id(self) -> str:
+        """
+        Alias for task_id to simplify referencing identity as the canonical key.
+        """
+        return self.task_id()
 
 
 class LCAContext(BaseModel):
@@ -507,6 +651,7 @@ class LCATask(BaseModel):
     identity: LCATaskIdentity
     context: LCAContext
     gold: LCAGold
+    repo: Optional[str] = None
     evidence: Optional["LocalizationEvidence"] = Field(default=None, description="Optional per-file evidence kept separate from predictions")
 
     def canonical_prediction_shape(self) -> str:
@@ -514,6 +659,20 @@ class LCATask(BaseModel):
         Describe the canonical prediction contract: file paths only.
         """
         return "predicted_files: list[str]"
+
+    @property
+    def task_id(self) -> str:
+        """
+        Deterministic task identifier (delegates to identity).
+        """
+        return self.identity.task_id()
+
+    @property
+    def changed_files(self) -> List[str]:
+        """
+        Convenience accessor for gold changed_files.
+        """
+        return self.gold.normalized_changed_files()
 
 
 class LocalizationDatasetInfo(BaseModel):
@@ -691,6 +850,107 @@ class LocalizationTelemetryEnvelope(BaseModel):
                 raw["materialization_events"] = LocalizationMaterialization(events=list(materialization_val))
             return raw
         return value
+
+
+def _as_list(value: object) -> List[str]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [str(v) for v in value]
+    if value is None:
+        return []
+    return [str(value)]
+
+
+def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str] | None = None) -> LCATask:
+    """
+    Coerce an arbitrary mapping (e.g., LCA dataset row) into an `LCATask`.
+    `defaults` may provide (dataset_name, dataset_config, dataset_split) when absent from the row.
+    """
+    identity_map = data.get("identity") if isinstance(data.get("identity"), Mapping) else {}
+    dataset_name = str(
+        data.get("dataset_name")
+        or (identity_map.get("dataset_name") if isinstance(identity_map, Mapping) else None)
+        or data.get("dataset")
+        or (defaults[0] if defaults else "unknown-dataset")
+    )
+    dataset_config = str(
+        data.get("dataset_config")
+        or (identity_map.get("dataset_config") if isinstance(identity_map, Mapping) else None)
+        or data.get("config")
+        or (defaults[1] if defaults else "unknown-config")
+    )
+    dataset_split = str(
+        data.get("dataset_split")
+        or (identity_map.get("dataset_split") if isinstance(identity_map, Mapping) else None)
+        or data.get("split")
+        or (defaults[2] if defaults else "unknown-split")
+    )
+    repo_owner = str(
+        data.get("repo_owner")
+        or (identity_map.get("repo_owner") if isinstance(identity_map, Mapping) else None)
+        or data.get("owner")
+        or data.get("repository_owner")
+        or "unknown-owner"
+    )
+    repo_name = str(
+        data.get("repo_name")
+        or (identity_map.get("repo_name") if isinstance(identity_map, Mapping) else None)
+        or data.get("name")
+        or data.get("repository_name")
+        or "unknown-repo"
+    )
+    base_sha = str(
+        data.get("base_sha")
+        or (identity_map.get("base_sha") if isinstance(identity_map, Mapping) else None)
+        or data.get("sha")
+        or data.get("commit")
+        or "unknown-base-sha"
+    )
+    issue_url = (
+        (identity_map.get("issue_url") if isinstance(identity_map, Mapping) else None)
+        or data.get("issue_url")
+        or data.get("issue")
+    )
+    pull_url = (
+        (identity_map.get("pull_url") if isinstance(identity_map, Mapping) else None)
+        or data.get("pull_url")
+        or data.get("pull")
+    )
+
+    identity = LCATaskIdentity(
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        base_sha=base_sha,
+        issue_url=str(issue_url) if issue_url else None,
+        pull_url=str(pull_url) if pull_url else None,
+    )
+
+    issue_title = str(data.get("issue_title") or data.get("title") or "")
+    issue_body = str(data.get("issue_body") or data.get("body") or "")
+    context = LCAContext(
+        issue_title=issue_title,
+        issue_body=issue_body,
+        diff_url=str(data.get("diff_url")) if data.get("diff_url") else None,
+        diff=str(data.get("diff")) if data.get("diff") else None,
+        head_sha=str(data.get("head_sha")) if data.get("head_sha") else None,
+        repo_language=str(data.get("repo_language")) if data.get("repo_language") else None,
+        repo_languages=_as_list(data.get("repo_languages") or []),
+        repo_license=str(data.get("repo_license")) if data.get("repo_license") else None,
+        repo_stars=int(data.get("repo_stars")) if isinstance(data.get("repo_stars"), (int, float)) else None,
+    )
+
+    changed_files_raw = data.get("changed_files") or data.get("gold") or []
+    gold = LCAGold(changed_files=_as_list(changed_files_raw))
+
+    evidence_val = data.get("evidence")
+    evidence = LocalizationEvidence.from_mapping(evidence_val) if isinstance(evidence_val, Mapping) else None
+
+    repo_val = data.get("repo")
+    repo_str = str(repo_val) if isinstance(repo_val, (str, Path)) else None
+
+    return LCATask(identity=identity, context=context, gold=gold, repo=repo_str, evidence=evidence)
 </file>
 
 <file path="localization/scoring.py">
@@ -754,7 +1014,7 @@ def score_file_localization(prediction: LCAPrediction | Mapping[str, object], go
 <file path="localization/telemetry.py">
 from __future__ import annotations
 
-from typing import List, Mapping, Optional
+from typing import List, Optional
 
 from .models import (
     LCATaskIdentity,
@@ -917,7 +1177,7 @@ Shared agent utilities that are reused by runner and writer agents.
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class UsageEntry(BaseModel):
@@ -1012,11 +1272,29 @@ class AgentTaskPayload(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    symbol: str
+    identity: dict[str, object]
     repo: str
-    symbol_id: str
-    raw_symbol: str
+    context: dict[str, object]
     extra: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_blocks(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            identity_val = value.get("identity")
+            context_val = value.get("context")
+            normalized_identity = (
+                identity_val.model_dump() if hasattr(identity_val, "model_dump") else identity_val
+            )
+            normalized_context = (
+                context_val.model_dump() if hasattr(context_val, "model_dump") else context_val
+            )
+            return {
+                **value,
+                "identity": normalized_identity,
+                "context": normalized_context,
+            }
+        return value
 </file>
 
 <file path="loop/loop_listeners.py">
@@ -1226,7 +1504,6 @@ from .loop_types import (
     EvaluationMetrics,
     EvaluationResult,
     FeedbackPackage,
-    IterationTasks,
     IterationRecord,
     LoopContext,
     LoopDependencies,
@@ -1749,6 +2026,7 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.localization.models import LCAContext, LCATaskIdentity
 
 if TYPE_CHECKING:
     from harness.observability.baselines import BaselineSnapshot
@@ -1879,29 +2157,38 @@ class FeedbackEntries(BaseModel):
 
 
 class TaskPayload(BaseModel):
-    """Normalized task payload passed into loop/runner agents."""
+    """Localization-native task payload passed into loop/runner agents."""
 
     model_config = ConfigDict(extra="forbid")
 
-    symbol: str
+    identity: LCATaskIdentity
+    context: LCAContext
     repo: str
+    changed_files: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
     def _coerce_mapping(cls, value: object) -> object:
         if isinstance(value, Mapping):
-            return {"symbol": value.get("symbol"), "repo": value.get("repo")}
+            identity_val = value.get("identity") or {}
+            context_val = value.get("context") or {}
+            return {
+                "identity": identity_val,
+                "context": context_val,
+                "repo": value.get("repo"),
+                "changed_files": value.get("changed_files", []),
+            }
         return value
 
 
 class ICTaskPayload(TaskPayload):
-    """Iteration task payload for IC runs."""
+    """Iteration task payload for localization runs (IC backend)."""
 
     model_config = ConfigDict(extra="forbid")
 
 
 class JCTaskPayload(TaskPayload):
-    """Iteration task payload for JC runs."""
+    """Iteration task payload for localization runs (JC backend)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1941,12 +2228,22 @@ class PreparedTasks(BaseModel):
     def to_ic_request(self) -> ICTaskPayload:
         if self.ic_task is not None:
             return self.ic_task
-        return ICTaskPayload(symbol=self.base_task.symbol, repo=self._resolve_ic_repo())
+        return ICTaskPayload(
+            identity=self.base_task.identity,
+            context=self.base_task.context,
+            repo=self._resolve_ic_repo(),
+            changed_files=self.base_task.changed_files,
+        )
 
     def to_jc_request(self) -> JCTaskPayload:
         if self.jc_task is not None:
             return self.jc_task
-        return JCTaskPayload(symbol=self.base_task.symbol, repo=self._resolve_jc_repo())
+        return JCTaskPayload(
+            identity=self.base_task.identity,
+            context=self.base_task.context,
+            repo=self._resolve_jc_repo(),
+            changed_files=self.base_task.changed_files,
+        )
 
     def build_iteration_tasks(self) -> "IterationTasks":
         return IterationTasks(ic_task=self.to_ic_request(), jc_task=self.to_jc_request())
@@ -2047,7 +2344,7 @@ class LoopContext(BaseModel):
     session_id: str | None = None
     parent_trace: object | None = None
     run_metadata: RunMetadata | None = None
-    baseline_snapshot: object | None = None
+    baseline_snapshot: "BaselineSnapshot | None" = None
     run_trace: object | None
     history: list[IterationRecord] = Field(default_factory=list)
     prepared_tasks: PreparedTasks | None = None
@@ -2063,7 +2360,7 @@ class LoopDependencies(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     prepare_iteration_tasks: Callable[[TaskPayload, object | None], PreparedTasks]
-    evaluate_policy_on_item: Callable[[ICTaskPayload, object | None, object | None, int | None], EvaluationResult]
+    evaluate_policy_on_item: Callable[[ICTaskPayload, "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
     build_iteration_feedback: Callable[[EvaluationResult, float | None, PipelineClassification | None, Path], FeedbackPackage]
     attempt_policy_generation: Callable[..., tuple[str | None, str | None]]
     run_policy_pipeline: Callable[..., tuple[list[StepResult], bool]]
@@ -2211,7 +2508,7 @@ def _rebuild_forward_refs() -> None:
     try:
         from harness.observability.baselines import BaselineSnapshot  # local import to avoid cycles
     except Exception:
-        return
+        BaselineSnapshot = object  # type: ignore[misc,assignment]
     LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot, "RunMetadata": RunMetadata})
     LoopDependencies.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
     RepairContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
@@ -2248,7 +2545,6 @@ from harness.observability.score_emitter import emit_score, emit_score_for_handl
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy_loader import load_policy
-from harness.utils.comparison import build_comparison, format_comparison_summary
 from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
 from harness.utils.repo_root import find_repo_root
@@ -2259,12 +2555,11 @@ from harness.utils.type_loader import (
     load_scoring_types,
 )
 from harness.writer import generate_policy
+from harness.localization.models import LCAGold, LCAPrediction
+from harness.localization.scoring import score_file_localization
 
 if TYPE_CHECKING:
-    from harness.observability.baselines import (
-        BaselineSnapshot,
-        baseline_metrics_from_jc,
-    )
+    from harness.observability.baselines import BaselineSnapshot
 
 from .loop_machine import OptimizationStateMachine
 from .loop_types import (
@@ -2451,8 +2746,18 @@ def prepare_iteration_tasks(
                     pass
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
-    ic_task = ICTaskPayload(symbol=task.symbol, repo=resolved_repo_path)
-    jc_task = JCTaskPayload(symbol=task.symbol, repo=jc_repo_id or resolved_repo_path)
+    ic_task = ICTaskPayload(
+        identity=task.identity,
+        context=task.context,
+        repo=resolved_repo_path,
+        changed_files=task.changed_files,
+    )
+    jc_task = JCTaskPayload(
+        identity=task.identity,
+        context=task.context,
+        repo=jc_repo_id or resolved_repo_path,
+        changed_files=task.changed_files,
+    )
     return PreparedTasks(
         base_task=task,
         resolved_repo_path=resolved_repo_path,
@@ -2468,7 +2773,7 @@ def evaluate_policy_on_item(
     iteration_span: object | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
-    """Load current policy, execute IC iteration, and compute metrics."""
+    """Load current policy, execute IC iteration, and compute localization metrics."""
     start_obs_func = cast(
         Callable[..., SupportsSpan | None], _pkg_attr("start_observation")
     )
@@ -2516,37 +2821,19 @@ def evaluate_policy_on_item(
     ic_result_map = ic_runner(
         ic_task.model_dump(), loaded_policy_fn, parent_trace=iteration_span
     )
-    jc_result_map: dict[str, object] = (
-        dict(baseline_snapshot.jc_result.as_map())
-        if baseline_snapshot is not None
-        else {}
-    )
-    jc_metrics_map_raw = (
-        baseline_snapshot.jc_metrics.as_map() if baseline_snapshot is not None else {}
-    )
-    jc_metrics_map: dict[str, float] = {
-        k: float(v)
-        for k, v in jc_metrics_map_raw.items()
-        if isinstance(v, (int, float, bool))
+    predicted_files_raw = []
+    if isinstance(ic_result_map, Mapping):
+        predicted_files_raw = ic_result_map.get("predicted_files", [])
+    predicted_files = [str(p) for p in predicted_files_raw if isinstance(p, str)]
+    gold = LCAGold(changed_files=ic_task.changed_files)
+    metrics_obj = score_file_localization(LCAPrediction(predicted_files=predicted_files), gold)
+    metrics_map: dict[str, float | int | bool | None] = {
+        "score": metrics_obj.score,
+        "iteration_regression": False,
+        "precision": metrics_obj.precision,
+        "recall": metrics_obj.recall,
+        "hit": metrics_obj.hit,
     }
-    if not jc_metrics_map:
-        baseline_metrics_from_jc_fn = cast(
-            Callable[[Mapping[str, object]], Mapping[str, object]],
-            _pkg_attr("baseline_metrics_from_jc"),
-        )
-        jc_metrics_map = {
-            k: float(v)
-            for k, v in baseline_metrics_from_jc_fn(jc_result_map).items()
-            if isinstance(v, (int, float, bool))
-        }
-
-    metrics_map: dict[str, float | int | bool] = {"score": 0.0}
-    metrics_for_comparison = {
-        k: float(v) for k, v in metrics_map.items() if isinstance(v, (int, float, bool))
-    }
-    comparison = build_comparison(metrics_for_comparison, jc_metrics_map)
-    comparison_summary = format_comparison_summary(comparison)
-    metrics_map.setdefault("iteration_regression", False)
     trace_id = getattr(iteration_span, "id", None)
     session_id_val = _session_id_from(iteration_span)
     for name, value in metrics_map.items():
@@ -2565,12 +2852,20 @@ def evaluate_policy_on_item(
         )
 
     policy_code = _read_policy()
+    additional_metrics = [
+        {"name": "precision", "value": metrics_obj.precision},
+        {"name": "recall", "value": metrics_obj.recall},
+        {"name": "hit", "value": metrics_obj.hit},
+    ]
+    eval_metrics = EvaluationMetrics.model_validate(
+        {"score": metrics_obj.score, "iteration_regression": False, "additional_metrics": additional_metrics}
+    )
     return EvaluationResult(
-        metrics=EvaluationMetrics.model_validate(metrics_map),
+        metrics=eval_metrics,
         ic_result=ICResult.model_validate(ic_result_map),
-        jc_result=JCResult.model_validate(jc_result_map),
-        jc_metrics=EvaluationMetrics.model_validate(jc_metrics_map),
-        comparison_summary=comparison_summary,
+        jc_result=JCResult(entries=[]),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary=None,
         policy_code=policy_code,
     )
 
@@ -2944,7 +3239,9 @@ from harness.tools.mcp_adapter import serialize_tool_result_for_model
 from harness.utils.env import get_cerebras_api_key, get_runner_model
 from harness.utils.openai_schema import OpenAITool, validate_tools
 from harness.utils.template_loader import render_prompt_template
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from harness.localization.models import LCAContext, LCATaskIdentity
 
 from .agent_common import AgentTaskPayload, usage_from_response
 
@@ -2962,21 +3259,56 @@ _AGGRESSIVE_USER_CHARS = 1500
 class AgentTask(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    symbol: str
+    identity: LCATaskIdentity
     repo: str
-    symbol_id: str
-    raw_symbol: str
+    context: LCAContext
     extra: dict[str, object] = Field(default_factory=dict)
 
     def to_payload(self) -> dict[str, object]:
         payload_model = AgentTaskPayload(
-            symbol=self.symbol,
+            identity=self.identity.model_dump(),
             repo=self.repo,
-            symbol_id=self.symbol_id,
-            raw_symbol=self.raw_symbol,
+            context=self.context.model_dump(),
             extra=self.extra,
         )
         return payload_model.model_dump()
+
+
+class LocalizationRunnerResult(BaseModel):
+    """Typed localization runner output boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    predicted_files: list[str] = Field(default_factory=list)
+    reasoning: str | None = None
+    observations: list[dict[str, object]] = Field(default_factory=list)
+    node_count: int | None = None
+    raw: dict[str, object] | None = None
+    source: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            files_raw = value.get("predicted_files", [])
+            normalized: list[str] = []
+            seen: set[str] = set()
+            if isinstance(files_raw, list):
+                for item in files_raw:
+                    if not isinstance(item, str):
+                        continue
+                    cleaned = item.strip().lower()
+                    if cleaned and cleaned not in seen:
+                        seen.add(cleaned)
+                        normalized.append(cleaned)
+            elif isinstance(files_raw, str):
+                for part in files_raw.replace("\n", ",").split(","):
+                    cleaned = part.strip().lower()
+                    if cleaned and cleaned not in seen:
+                        seen.add(cleaned)
+                        normalized.append(cleaned)
+            return {**value, "predicted_files": normalized}
+        return value
 
 
 def _require_str(mapping: dict[str, Any], key: str) -> str:
@@ -3000,6 +3332,24 @@ def _tool_names_from_specs(tool_specs: list[OpenAITool]) -> list[str]:
         if isinstance(name, str):
             names.append(name)
     return names
+
+
+def _sanitize_agent_task(agent_task: Mapping[str, object]) -> dict[str, object]:
+    """Drop gold/irrelevant fields before showing the payload to the model."""
+    cleaned: dict[str, object] = {}
+    for key, val in agent_task.items():
+        cleaned[key] = val
+    return cleaned
+
+
+def _format_user_prompt(agent_task: dict[str, object]) -> str:
+    payload_json = json.dumps(_sanitize_agent_task(agent_task), indent=2)
+    return (
+        "Localize the bug by using the available tools and propose repo-relative files to change.\n"
+        "Prefer concise file lists (JSON or bullets are fine) plus brief reasoning.\n"
+        "Task payload:\n"
+        f"{payload_json}"
+    )
 
 
 def _format_available_tools(tool_names: list[str]) -> str:
@@ -3151,7 +3501,7 @@ def _build_model_messages(agent_task: dict[str, object], tool_specs: list[OpenAI
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
-            "content": f"Here is your task (model: {get_runner_model()}):\n{json.dumps(agent_task, indent=2)}",
+            "content": _format_user_prompt(agent_task),
         },
     ]
     validate_tools(tool_specs)
@@ -3211,7 +3561,12 @@ def _make_retry_messages(agent_task: dict[str, object], observations: list[dict[
     return _enforce_message_budget(_build_model_messages(agent_task, [], system_prompt) + observations)
 
 
-def _apply_tool_results(observations: list[dict[str, object]], tool_results: list[dict[str, object]], system_prompt: str) -> list[dict[str, object]]:
+def _apply_tool_results(
+    agent_task: dict[str, object],
+    observations: list[dict[str, object]],
+    tool_results: list[dict[str, object]],
+    system_prompt: str,
+) -> list[dict[str, object]]:
     if not tool_results:
         return observations
     new_obs = []
@@ -3220,7 +3575,7 @@ def _apply_tool_results(observations: list[dict[str, object]], tool_results: lis
         if obs.get("role") == "assistant" and obs.get("tool_calls"):
             new_obs.extend(tool_results)
     return _enforce_message_budget(
-        _build_model_messages({"placeholder": True}, [], system_prompt) + new_obs,
+        _build_model_messages(agent_task, [], system_prompt) + new_obs,
         max_total_chars=_AGGRESSIVE_TOTAL_CHARS,
         max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS,
         max_system_chars=_AGGRESSIVE_SYSTEM_CHARS,
@@ -3274,7 +3629,7 @@ def run_agent(
             )
             if tool_results:
                 observations.extend(tool_results)
-            messages = _apply_tool_results(observations, tool_results, system_prompt)
+            messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt)
             try:
                 completion = client.chat.completions.create(
                     messages=messages,
@@ -3282,7 +3637,6 @@ def run_agent(
                     temperature=0.2,
                     tools=tool_specs,
                     tool_choice="auto" if tool_specs else None,
-                    response_format={"type": "json_object"},
                     extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -3293,7 +3647,6 @@ def run_agent(
                     messages=retry_messages,
                     model=model,
                     temperature=0.2,
-                    response_format={"type": "json_object"},
                     extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
                 )
             choice = completion.choices[0]
@@ -3330,7 +3683,7 @@ def run_agent(
                         "content": response_message.get("content") or "",
                     }
                 )
-                messages = _apply_tool_results(observations, tool_results, system_prompt)
+                messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt)
                 continue
             else:
                 try:
@@ -3372,7 +3725,6 @@ def run_agent_with_retry(
             messages=retry_messages,
             model=model,
             temperature=0.2,
-            response_format={"type": "json_object"},
             extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
         )
         choice = completion.choices[0]
@@ -3417,17 +3769,187 @@ def _normalize_agent_result(raw: Any) -> dict[str, object]:
     return normalized
 
 
+def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tuple[list[str], str | None]:
+    """
+    Emergency-only fallback: try to extract predicted_files from assistant content when finalization fails.
+    This is a degraded path and should not be considered equivalent to schema-finalized output.
+    """
+    observations = agent_result.get("observations")
+    if not isinstance(observations, list):
+        return [], None
+
+    def _as_file_list(value: object) -> list[str]:
+        # Fallback only accepts already-structured array or JSON string.
+        cleaned: list[str] = []
+        if isinstance(value, list):
+            for entry in value:
+                if isinstance(entry, str):
+                    stripped = entry.strip()
+                    if stripped:
+                        cleaned.append(stripped.lower())
+        elif isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    for entry in parsed:
+                        if isinstance(entry, str):
+                            stripped = entry.strip()
+                            if stripped:
+                                cleaned.append(stripped.lower())
+            except Exception:
+                return []
+        # Preserve order while de-duplicating
+        seen: set[str] = set()
+        unique: list[str] = []
+        for path in cleaned:
+            if path in seen:
+                continue
+            seen.add(path)
+            unique.append(path)
+        return unique
+
+    for obs in reversed(observations):
+        if not isinstance(obs, Mapping):
+            continue
+        content = obs.get("content")
+        reasoning: str | None = None
+        if isinstance(content, Mapping):
+            predicted = _as_file_list(content.get("predicted_files"))
+            if not predicted:
+                predicted = _as_file_list(content.get("files") or content.get("paths"))
+            reasoning = content.get("reasoning") if isinstance(content.get("reasoning"), str) else None
+            if predicted:
+                return predicted, reasoning
+        elif isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, Mapping):
+                    predicted = _as_file_list(parsed.get("predicted_files"))
+                    reasoning = parsed.get("reasoning") if isinstance(parsed.get("reasoning"), str) else None
+                    if predicted:
+                        return predicted, reasoning
+            except Exception:
+                return [], None
+    return [], None
+
+
+def _localization_result_schema() -> dict[str, object]:
+    return {
+        "name": "localization_result",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "predicted_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                },
+                "reasoning": {"type": "string"},
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "file": {"type": "string"},
+                            "notes": {"type": "string"},
+                        },
+                        "required": ["file"],
+                    },
+                    "default": [],
+                },
+            },
+            "required": ["predicted_files"],
+        },
+        "strict": True,
+    }
+
+
+def _format_finalization_messages(agent_task: dict[str, object], observations: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Summarize exploration observations and request a structured result."""
+    observation_snippets: list[str] = []
+    for obs in observations[-5:]:
+        try:
+            observation_snippets.append(json.dumps(obs, default=str)[:400])
+        except Exception:
+            observation_snippets.append(str(obs)[:400])
+    summary = "\n".join(observation_snippets)
+    user_prompt = (
+        "Based on the prior tool-assisted exploration, produce the final localization result.\n"
+        "Return repo-relative `predicted_files` and brief reasoning.\n"
+        "Observations:\n"
+        f"{summary}"
+    )
+    return [
+        {"role": "system", "content": "You are finalizing a bug localization task. Output must follow the provided JSON schema."},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _finalize_localization(
+    agent_task: dict[str, object],
+    observations: list[dict[str, object]],
+    parent_trace: object | None = None,
+) -> LocalizationRunnerResult:
+    client, model = _make_client()
+    messages = _format_finalization_messages(agent_task, observations)
+    schema = _localization_result_schema()
+    with start_observation(
+        name="localization_finalize",
+        parent=_require_parent(parent_trace, owner="runner agent"),
+        metadata={"phase": "finalize"},
+    ) as obs:
+        completion = client.chat.completions.create(
+            messages=messages,
+            model=model,
+            temperature=0.0,
+            response_format={"type": "json_schema", "json_schema": schema},
+            extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
+        )
+        choice = completion.choices[0]
+        message_obj = getattr(choice, "message", None)
+        content = getattr(message_obj, "content", None) if message_obj is not None else None
+        parsed: dict[str, object] = {}
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as exc:  # noqa: BLE001
+                raise RuntimeError(f"Invalid structured output: {exc}") from exc
+        elif isinstance(content, Mapping):
+            parsed = dict(content)
+        else:
+            raise RuntimeError("Structured output missing content")
+        obs.update(output=_truncate_for_metadata(parsed))
+        result = LocalizationRunnerResult.model_validate(
+            {
+                "predicted_files": parsed.get("predicted_files", []),
+                "reasoning": parsed.get("reasoning"),
+                "observations": observations,
+                "raw": {"final": parsed},
+                "source": "finalize",
+            }
+        )
+        return result
+
+
 def run_ic_iteration(
     task: dict[str, object],
-    score_fn: Callable[..., float],
+    score_fn: Callable[..., float] | None = None,
     steps: int = 5,
     parent_trace: object | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner="iterative_context")
-    symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
+    identity = LCATaskIdentity.model_validate(task.get("identity") or {})
+    context = LCAContext.model_validate(task.get("context") or {})
     try:
-        agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+        agent_task_model = AgentTask(
+            identity=identity,
+            repo=repo,
+            context=context,
+            extra={k: v for k, v in task.items() if k not in {"identity", "context", "repo", "changed_files"}},
+        )
     except ValidationError as exc:
         raise RuntimeError(f"Invalid agent task: {exc}") from exc
     agent_task = agent_task_model.to_payload()
@@ -3438,7 +3960,7 @@ def run_ic_iteration(
     with start_observation(
         name="iterative_context",
         parent=parent_span,
-        metadata={"backend": "iterative_context", "repo": repo, "symbol": symbol},
+        metadata={"backend": "iterative_context", "repo": repo, "identity": identity.task_id()},
     ) as backend_obs:
         try:
             raw = run_agent(
@@ -3458,7 +3980,24 @@ def run_ic_iteration(
         node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
         emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count, data_type="NUMERIC")
         backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
-        return normalized
+
+    try:
+        final = _finalize_localization(agent_task, normalized.get("observations", []), parent_trace=parent_span)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        predicted_files, reasoning = _extract_localization_prediction(normalized)
+        final = LocalizationRunnerResult(
+            predicted_files=predicted_files,
+            reasoning=reasoning,
+            observations=normalized.get("observations", []),
+            node_count=normalized.get("node_count"),
+            raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
+            source="fallback",
+        )
+    if not final.observations:
+        final.observations = normalized.get("observations", [])
+    if final.node_count is None:
+        final.node_count = normalized.get("node_count")
+    return final.model_dump()
 
 
 def run_jc_iteration(
@@ -3467,10 +4006,16 @@ def run_jc_iteration(
     parent_trace: object | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner="jcodemunch")
-    symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
+    identity = LCATaskIdentity.model_validate(task.get("identity") or {})
+    context = LCAContext.model_validate(task.get("context") or {})
     try:
-        agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+        agent_task_model = AgentTask(
+            identity=identity,
+            repo=repo,
+            context=context,
+            extra={k: v for k, v in task.items() if k not in {"identity", "context", "repo", "changed_files"}},
+        )
     except ValidationError as exc:
         raise RuntimeError(f"Invalid agent task: {exc}") from exc
     agent_task = agent_task_model.to_payload()
@@ -3481,7 +4026,7 @@ def run_jc_iteration(
     with start_observation(
         name="jcodemunch",
         parent=parent_span,
-        metadata={"backend": "jcodemunch", "repo": repo, "symbol": symbol},
+        metadata={"backend": "jcodemunch", "repo": repo, "identity": identity.task_id()},
     ) as backend_obs:
         try:
             raw = run_agent(
@@ -3501,7 +4046,24 @@ def run_jc_iteration(
         node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
         emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count, data_type="NUMERIC")
         backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
-        return normalized
+
+    try:
+        final = _finalize_localization(agent_task, normalized.get("observations", []), parent_trace=parent_span)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        predicted_files, reasoning = _extract_localization_prediction(normalized)
+        final = LocalizationRunnerResult(
+            predicted_files=predicted_files,
+            reasoning=reasoning,
+            observations=normalized.get("observations", []),
+            node_count=normalized.get("node_count"),
+            raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
+            source="fallback",
+        )
+    if not final.observations:
+        final.observations = normalized.get("observations", [])
+    if final.node_count is None:
+        final.node_count = normalized.get("node_count")
+    return final.model_dump()
 
 
 __all__ = [
@@ -3526,8 +4088,8 @@ from .langfuse import (  # noqa: F401
     start_root_observation,
 )
 from .score_emitter import ScorePayload, emit_score, emit_score_for_handle  # noqa: F401
-from .datasets import DatasetItem, fetch_dataset_items, local_dataset, map_task_to_dataset_item, normalize_dataset_item  # noqa: F401
-from .baselines import BaselineBundle, BaselineSnapshot, baseline_key, compute_baseline_for_item, make_baseline_bundle, require_baseline, resolve_baseline  # noqa: F401
+from .datasets import LocalizationDataset, fetch_localization_dataset, local_dataset, normalize_localization_task  # noqa: F401
+from .baselines import BaselineBundle, BaselineSnapshot, baseline_key, compute_baseline_for_task, make_baseline_bundle, require_baseline, resolve_baseline  # noqa: F401
 
 __all__ = [
     "flush_langfuse",
@@ -3541,15 +4103,14 @@ __all__ = [
     "emit_score",
     "emit_score_for_handle",
     "ScorePayload",
-    "DatasetItem",
-    "fetch_dataset_items",
+    "LocalizationDataset",
+    "fetch_localization_dataset",
     "local_dataset",
-    "map_task_to_dataset_item",
-    "normalize_dataset_item",
+    "normalize_localization_task",
     "BaselineBundle",
     "BaselineSnapshot",
     "baseline_key",
-    "compute_baseline_for_item",
+    "compute_baseline_for_task",
     "make_baseline_bundle",
     "require_baseline",
     "resolve_baseline",
@@ -3559,169 +4120,144 @@ __all__ = [
 <file path="observability/baselines.py">
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Sequence, cast
+from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.loop.loop_types import EvaluationMetrics, JCResult
-
-from .datasets import DatasetItem, normalize_dataset_item
-from .langfuse import start_observation
-from .score_emitter import emit_score_for_handle
-from ..utils.repo_targets import resolve_repo_target
-
-
-def _stable_repo_symbol(repo: str, symbol: str) -> str:
-    return hashlib.sha256(f"{repo}::{symbol}".encode()).hexdigest()
+from harness.localization.executor import run_localization_task
+from harness.localization.models import (
+    LCATask,
+    LocalizationDatasetInfo,
+    LocalizationEvidence,
+    LocalizationGold,
+    LocalizationMetrics,
+    LocalizationPrediction,
+    normalize_lca_task,
+)
+from harness.localization.telemetry import build_localization_telemetry
+from harness.observability.langfuse import start_observation
+from harness.observability.score_emitter import emit_score_for_handle
 
 
 class BaselineSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    dataset_name: str | None = None
+    dataset_name: str
+    dataset_config: str
+    dataset_split: str
     dataset_version: str | None = None
-    item_id: str | None = None
-    repo: str
-    symbol: str
-    jc_result: JCResult = Field(default_factory=JCResult)
-    jc_metrics: EvaluationMetrics = Field(default_factory=EvaluationMetrics)
-    experiment_run_id: str | None = None
+    identity: str
+    prediction: LocalizationPrediction
+    gold: LocalizationGold
+    metrics: LocalizationMetrics
+    repo_owner: str
+    repo_name: str
+    base_sha: str
     trace_id: str | None = None
+    experiment_run_id: str | None = None
+    evidence: LocalizationEvidence | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class BaselineBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    dataset_name: str | None = None
+    dataset_name: str
     dataset_version: str | None = None
-    baseline_run_id: str | None = None
-    baseline_run_name: str | None = None
-    dataset_run_id: str | None = None
     created_at: str | None = None
     items: list[BaselineSnapshot] = Field(default_factory=list)
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
-def _item_identity(item: DatasetItem) -> str:
-    normalized = normalize_dataset_item(item)
-    if normalized.id:
-        return normalized.id
-    return hashlib.sha256(f"{normalized.repo}::{normalized.symbol}".encode()).hexdigest()
-
-
-def baseline_key(item: DatasetItem) -> str:
-    return _item_identity(item)
-
-
-def _snapshot_key(snapshot: BaselineSnapshot) -> str:
-    if snapshot.item_id:
-        return snapshot.item_id
-    if snapshot.repo and snapshot.symbol:
-        return _stable_repo_symbol(snapshot.repo, snapshot.symbol)
-    return ""
-
-
-def baseline_metrics_from_jc(jc_result: Mapping[str, object]) -> EvaluationMetrics:
-    return EvaluationMetrics.model_validate({"score": 0.0})
+def baseline_key(task: LCATask) -> str:
+    return task.task_id
 
 
 def index_baselines(bundle: BaselineBundle | Sequence[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
     items = bundle.items if isinstance(bundle, BaselineBundle) else list(bundle)
-    indexed: dict[str, BaselineSnapshot] = {}
-    for snap in items:
-        key = _snapshot_key(snap)
-        if key:
-            indexed[key] = snap
-    return indexed
+    return {snap.identity: snap for snap in items}
 
 
-def compute_baseline_for_item(
-    item: DatasetItem,
-    dataset_name: str | None = None,
+def compute_baseline_for_task(
+    task: LCATask,
     dataset_version: str | None = None,
     parent_trace: object | None = None,
+    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
 ) -> BaselineSnapshot:
-    from ..loop.runner_agent import run_jc_iteration  # local import to avoid circular dependency
-
-    normalized = normalize_dataset_item(item)
-    repo_ref = normalized.repo
-    resolved_repo = resolve_repo_target(repo_ref)
     with start_observation(
-        name="jc_baseline_item",
+        name="localization_baseline_item",
         parent=parent_trace,
         metadata={
-            "dataset": dataset_name,
+            "dataset": task.identity.dataset_name,
+            "dataset_config": task.identity.dataset_config,
+            "dataset_split": task.identity.dataset_split,
             "dataset_version": dataset_version,
-            "item_id": normalized.id,
-            "repo": normalized.repo,
-            "symbol": normalized.symbol,
-            "run_kind": "jc_baseline",
-            "repo_ref": repo_ref,
-            "resolved_repo": resolved_repo,
+            "identity": task.task_id,
         },
     ) as trace:
-        jc_result_map = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
-        metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result_map))
-        trace_id = getattr(trace, "id", None)
+        prediction, metrics, evidence, materialization = run_localization_task(task, parent_trace=trace, runner=runner)
+        telemetry = build_localization_telemetry(
+            task.identity,
+            metrics=metrics,
+            changed_files_count=len(task.gold.normalized_changed_files()),
+            repo_language=task.context.repo_language,
+            repo_license=task.context.repo_license,
+            evidence=evidence,
+            materialization_events=materialization.events if materialization else None,
+        )
         dataset_run_id = getattr(parent_trace, "id", None)
-        for name, value in metrics.items():
-            if not isinstance(value, (int, float, bool)):
+        for name, value in metrics.model_dump().items():
+            if value is None:
                 continue
-            data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
-            score_id = f"{trace_id}-baseline.{name}" if trace_id else None
             emit_score_for_handle(
                 trace,
                 name=f"baseline.{name}",
-                value=float(value) if isinstance(value, bool) else value,
-                data_type=data_type,
+                value=float(value),
+                data_type="NUMERIC",
                 dataset_run_id=dataset_run_id,
-                score_id=score_id,
+                score_id=f"{trace.id}-baseline.{name}" if getattr(trace, "id", None) else None,
             )
         return BaselineSnapshot(
-            dataset_name=dataset_name,
+            dataset_name=task.identity.dataset_name,
+            dataset_config=task.identity.dataset_config,
+            dataset_split=task.identity.dataset_split,
             dataset_version=dataset_version,
-            item_id=normalized.id,
-            repo=normalized.repo,
-            symbol=normalized.symbol,
-            jc_result=JCResult.model_validate(jc_result_map),
-            jc_metrics=metrics,
-            trace_id=trace_id,
+            identity=task.task_id,
+            prediction=LocalizationPrediction(predicted_files=prediction.predicted_files),
+            gold=LocalizationGold(changed_files=task.gold.normalized_changed_files()),
+            metrics=metrics,
+            repo_owner=task.identity.repo_owner,
+            repo_name=task.identity.repo_name,
+            base_sha=task.identity.base_sha,
+            trace_id=getattr(trace, "id", None),
             experiment_run_id=dataset_run_id,
-            metadata={"run_kind": "jc_baseline"},
+            evidence=evidence,
+            metadata={
+                "telemetry": telemetry.model_dump(exclude_none=True),
+                "run_kind": "localization_baseline",
+            },
         )
 
 
-def resolve_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot | None:
-    identity = baseline_key(item)
-    snapshots = baselines.items if isinstance(baselines, BaselineBundle) else list(baselines)
-    for snap in snapshots:
-        if _snapshot_key(snap) == identity:
-            return snap
-    for snap in snapshots:
-        if snap.repo == item.repo and snap.symbol == item.symbol:
-            return snap
-    return None
+def resolve_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask) -> BaselineSnapshot | None:
+    indexed = index_baselines(baselines)
+    return indexed.get(task.task_id)
 
 
-def require_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot:
-    resolved = resolve_baseline(baselines, item)
+def require_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask) -> BaselineSnapshot:
+    resolved = resolve_baseline(baselines, task)
     if resolved is None:
-        raise ValueError(f"No baseline snapshot found for repo={item.repo} symbol={item.symbol}")
+        raise ValueError(f"No baseline snapshot found for localization task_id={task.task_id}")
     return resolved
 
 
 def make_baseline_bundle(
     snapshots: list[BaselineSnapshot] | Sequence[Mapping[str, object]],
-    dataset_name: str | None = None,
+    dataset_name: str,
     dataset_version: str | None = None,
-    baseline_run_id: str | None = None,
-    baseline_run_name: str | None = None,
-    dataset_run_id: str | None = None,
     metadata: Mapping[str, object] | None = None,
 ) -> BaselineBundle:
     snapshot_models = [
@@ -3730,9 +4266,6 @@ def make_baseline_bundle(
     return BaselineBundle(
         dataset_name=dataset_name,
         dataset_version=dataset_version,
-        baseline_run_id=baseline_run_id,
-        baseline_run_name=baseline_run_name,
-        dataset_run_id=dataset_run_id or baseline_run_id,
         created_at=datetime.now(tz=timezone.utc).isoformat(),
         items=snapshot_models,
         metadata=dict(metadata) if metadata else {},
@@ -3751,6 +4284,13 @@ def load_baseline_bundle(path: Path) -> BaselineBundle:
         return BaselineBundle.model_validate(data)
     except ValidationError as exc:
         raise ValueError(f"Invalid baseline bundle: {exc}") from exc
+
+
+def normalize_baseline_task(data: Mapping[str, object]) -> LCATask:
+    """
+    Helper to coerce legacy mappings into LCATask for baseline compatibility.
+    """
+    return normalize_lca_task(data)
 </file>
 
 <file path="observability/cerebras_pricing.py">
@@ -3907,75 +4447,60 @@ __all__ = ["CEREBRAS_PRICING", "pricing_payload", "sync_cerebras_models"]
 <file path="observability/datasets.py">
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
+
+from harness.localization.models import LCATask, normalize_lca_task
 
 from .langfuse import get_langfuse_client
 
 
-def _stable_id(repo: str, symbol: str) -> str:
-    return hashlib.sha256(f"{repo}::{symbol}".encode()).hexdigest()
-
-
-class DatasetItem(BaseModel):
-    repo: str
-    symbol: str
-    metadata: dict[str, object] = Field(default_factory=dict)
-    id: str | None = None
-
-    @model_validator(mode="after")
-    def _ensure_id(self) -> "DatasetItem":
-        if not self.id:
-            self.id = _stable_id(self.repo, self.symbol)
-        return self
-
-
-class Dataset(BaseModel):
+class LocalizationDataset(BaseModel):
     name: str
-    items: list[DatasetItem] = Field(default_factory=list)
+    version: str | None = None
+    items: list[LCATask] = Field(default_factory=list)
 
     @property
-    def entries(self) -> list[DatasetItem]:
-        return self.__dict__.get("items", [])
+    def entries(self) -> list[LCATask]:
+        return self.items
 
 
-def map_task_to_dataset_item(task: Mapping[str, object] | DatasetItem) -> DatasetItem:
-    if isinstance(task, DatasetItem):
-        return task
-    repo = task.get("repo")
-    symbol = task.get("symbol")
-    if not isinstance(repo, str) or not isinstance(symbol, str):
-        raise ValueError("Task must include 'repo' and 'symbol'")
-    metadata = {k: v for k, v in task.items() if k not in {"repo", "symbol"}}
-    return DatasetItem(repo=repo, symbol=symbol, metadata=metadata)
+def _defaults(dataset_name: str, dataset_config: str | None, dataset_split: str | None) -> tuple[str, str, str]:
+    return (
+        dataset_name,
+        dataset_config or "unspecified-config",
+        dataset_split or "unspecified-split",
+    )
 
 
-def normalize_dataset_item(item: Mapping[str, object] | DatasetItem) -> DatasetItem:
-    if isinstance(item, DatasetItem):
-        return item
-    repo_obj = item.get("repo")
-    symbol_obj = item.get("symbol")
-    if not isinstance(repo_obj, str) or not isinstance(symbol_obj, str):
-        raise ValueError("Dataset item missing repo/symbol")
-    metadata_obj = item.get("metadata")
-    metadata: dict[str, object] = {}
-    if isinstance(metadata_obj, Mapping):
-        metadata = {str(k): v for k, v in metadata_obj.items()}
-    normalized = DatasetItem(repo=repo_obj, symbol=symbol_obj, metadata=metadata)
-    item_id = item.get("id")
-    if isinstance(item_id, str):
-        normalized.id = item_id
-    elif item_id is not None:
-        normalized.id = str(item_id)
-    return normalized
-
-
-def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetItem]:
+def normalize_localization_task(
+    item: Mapping[str, object] | LCATask,
+    dataset_name: str | None = None,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+) -> LCATask:
     """
-    Fetch dataset items from Langfuse. Falls back to empty list if unavailable.
+    Normalize an arbitrary mapping into an LCATask using dataset defaults where provided.
+    """
+    if isinstance(item, LCATask):
+        return item
+    defaults = None
+    if dataset_name:
+        defaults = _defaults(dataset_name, dataset_config, dataset_split)
+    return normalize_lca_task(item, defaults=defaults)
+
+
+def fetch_localization_dataset(
+    name: str,
+    version: str | None = None,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+) -> list[LCATask]:
+    """
+    Fetch localization tasks from Langfuse dataset items.
+    Expects each item to include LCA identity fields and changed_files; legacy symbol fields are not used.
     """
     client = get_langfuse_client()
     if not client:
@@ -3983,10 +4508,11 @@ def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetIt
     client_any = cast(Any, client)
     dataset: Any = None
     try:
-        if hasattr(client_any, "get_dataset"):
-            dataset = client_any.get_dataset(name=name, version=version)  # type: ignore[arg-type]
-        elif hasattr(client_any, "dataset"):
-            dataset = client_any.dataset(name=name, version=version)  # type: ignore[arg-type]
+        dataset = (
+            client_any.get_dataset(name=name, version=version)
+            if hasattr(client_any, "get_dataset")
+            else client_any.dataset(name=name, version=version)
+        )
     except Exception:
         dataset = None
     if dataset is None:
@@ -3995,329 +4521,133 @@ def fetch_dataset_items(name: str, version: str | None = None) -> list[DatasetIt
         raw_items = dataset.items() if callable(getattr(dataset, "items", None)) else getattr(dataset, "items", [])
     except Exception:
         raw_items = []
-    items: list[DatasetItem] = []
-    for item in raw_items:
-        if isinstance(item, Mapping):
-            task_meta = cast(Mapping[str, object], item)
-            input_section = task_meta.get("input")
-            if not isinstance(input_section, Mapping):
-                input_section = {}
-            repo = task_meta.get("repo") or input_section.get("repo")
-            symbol = task_meta.get("symbol") or input_section.get("symbol")
-            if not isinstance(repo, str) or not isinstance(symbol, str):
-                continue
-            meta = task_meta.get("metadata")
-            meta_map: Mapping[str, object] = input_section if isinstance(input_section, Mapping) else {}
-            if isinstance(meta, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]
-                meta_map = meta
-            try:
-                mapped = map_task_to_dataset_item({"repo": repo, "symbol": symbol, **{str(k): v for k, v in meta_map.items()}})
-                item_id = task_meta.get("id")
-                if isinstance(item_id, str):
-                    mapped.id = item_id
-                elif item_id is not None:
-                    mapped.id = str(item_id)
-                items.append(mapped)
-            except Exception:
-                continue
-    return items
+    tasks: list[LCATask] = []
+    defaults = _defaults(name, dataset_config, dataset_split)
+    for raw in raw_items:
+        if not isinstance(raw, Mapping):
+            continue
+        # Langfuse typically stores payload under "input"
+        input_section = raw.get("input") if isinstance(raw.get("input"), Mapping) else raw
+        try:
+            tasks.append(normalize_lca_task(cast(Mapping[str, object], input_section), defaults=defaults))
+        except Exception:
+            continue
+    return tasks
 
 
-def local_dataset(name: str, items: Sequence[Mapping[str, object] | DatasetItem]) -> Dataset:
-    normalized_items = [normalize_dataset_item(item) for item in items]
-    return Dataset(name=name, items=normalized_items)
+def local_dataset(
+    name: str,
+    items: Sequence[Mapping[str, object] | LCATask],
+    version: str | None = None,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+) -> LocalizationDataset:
+    defaults = _defaults(name, dataset_config, dataset_split)
+    normalized_items = [normalize_lca_task(item, defaults=defaults) for item in items]  # type: ignore[arg-type]
+    return LocalizationDataset(name=name, version=version, items=normalized_items)
 </file>
 
 <file path="observability/experiments.py">
 from __future__ import annotations
 
-"""
-Application/experiment boundary: hosted JC baseline and IC optimization wrappers.
-Accept normalized inputs or typed requests; do not embed CLI or leaf logic.
-"""
+from typing import Mapping
 
-import time
-from typing import Any, Callable, Mapping, Sequence, cast
-
-from .requests import HostedICOptimizationRequest, HostedJCBaselineRequest
-from ..loop import iteration_record_to_public_dict, run_loop
-from ..utils.repo_targets import resolve_repo_target
-from .baselines import (
-    BaselineBundle,
-    BaselineSnapshot,
-    compute_baseline_for_item,
-    index_baselines,
-    make_baseline_bundle,
-    require_baseline,
-    resolve_baseline,
-)
-from .datasets import DatasetItem, fetch_dataset_items, normalize_dataset_item
-from .langfuse import flush_langfuse, propagate_context
-from .langfuse import get_langfuse_client
 from pydantic import BaseModel, Field
-from .session_policy import SessionConfig, resolve_session_id
+
+from harness.localization.executor import run_localization_task
+from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
+from harness.observability.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
+from harness.observability.datasets import fetch_localization_dataset, normalize_localization_task
+from harness.observability.langfuse import flush_langfuse, propagate_context
+from harness.observability.session_policy import resolve_session_id
+
+from .requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
 
 
-class HostedRunItemResult(BaseModel):
-    item: Mapping[str, object]
-    output: Mapping[str, object] | dict[str, object] | None = None
+class LocalizationRunItemResult(BaseModel):
+    task: Mapping[str, object]
+    metrics: LocalizationMetrics
+    prediction: list[str] = Field(default_factory=list)
     trace_id: str | None = None
 
 
-class HostedRunResult(BaseModel):
-    run_id: str | None = None
-    run_name: str | None = None
-    dataset_name: str | None = None
+class LocalizationRunResult(BaseModel):
+    dataset_name: str
     dataset_version: str | None = None
-    items: list[HostedRunItemResult] = Field(default_factory=list)
-    metadata: dict[str, object] = Field(default_factory=dict)
+    items: list[LocalizationRunItemResult] = Field(default_factory=list)
 
 
-def _normalize_items(raw_items: Any) -> list[HostedRunItemResult]:
-    normalized: list[HostedRunItemResult] = []
-    if not isinstance(raw_items, list):
-        return normalized
-    for entry in raw_items:
-        if isinstance(entry, Mapping):
-            item = cast(Mapping[str, object], entry.get("item") or entry.get("input") or {})
-            output = cast(Mapping[str, object] | dict[str, object] | None, entry.get("output") or entry.get("result"))
-            trace_id = cast(str | None, entry.get("trace_id") or entry.get("traceId") or entry.get("id"))
-            normalized.append(HostedRunItemResult(item=item, output=output, trace_id=trace_id))
-        else:
-            try:
-                item_val = cast(Mapping[str, object], getattr(entry, "item", {}) or getattr(entry, "input", {}) or {})
-                output_val = cast(Mapping[str, object] | dict[str, object] | None, getattr(entry, "output", None) or getattr(entry, "result", None))
-                trace_val = cast(str | None, getattr(entry, "trace_id", None) or getattr(entry, "traceId", None) or getattr(entry, "id", None))
-                normalized.append(HostedRunItemResult(item=item_val, output=output_val, trace_id=trace_val))
-            except Exception:
-                continue
-    return normalized
-
-
-def run_hosted_dataset_experiment(
-    dataset_name: str,
-    dataset_version: str | None,
-    experiment_name: str,
-    task_fn: Callable[[Mapping[str, object], object | None], Mapping[str, object] | dict[str, object]],
-    evaluators: list[object] | None = None,
-    run_evaluators: list[object] | None = None,
-    metadata: Mapping[str, object] | None = None,
-    max_concurrency: int | None = None,
-) -> HostedRunResult:
-    client = get_langfuse_client()
-    run_name = f"{experiment_name}-{int(time.time())}"
-    client_any = cast(Any, client)
-    dataset = client_any.get_dataset(name=dataset_name, version=dataset_version)
-    run_kwargs: dict[str, Any] = {
-        "name": experiment_name,
-        "run_name": run_name,
-        "task": task_fn,
-        "metadata": dict(metadata) if metadata else None,
-    }
-    if evaluators is not None:
-        run_kwargs["evaluators"] = evaluators
-    if run_evaluators is not None:
-        run_kwargs["run_evaluators"] = run_evaluators
-    if max_concurrency is not None:
-        run_kwargs["max_concurrency"] = max_concurrency
-    result = cast(Any, dataset).run_experiment(**run_kwargs)
-    run_id = cast(str | None, getattr(result, "id", None) or getattr(result, "run_id", None))
-    items_raw = getattr(result, "items", None) or getattr(result, "item_results", None)
-    hosted_result = HostedRunResult(
-        run_id=run_id,
-        run_name=run_name,
-        dataset_name=dataset_name,
-        dataset_version=dataset_version,
-        items=_normalize_items(items_raw),
-        metadata={"run_kind": experiment_name, **(dict(metadata) if metadata else {})},
+def _resolve_items(req: HostedLocalizationRunRequest) -> list[LCATask]:
+    return fetch_localization_dataset(
+        name=req.dataset,
+        version=req.version,
+        dataset_config=req.dataset_config,
+        dataset_split=req.dataset_split,
     )
+
+
+def run_hosted_localization_baseline(req: HostedLocalizationBaselineRequest) -> BaselineBundle:
+    tasks = fetch_localization_dataset(
+        name=req.dataset,
+        version=req.version,
+        dataset_config=req.dataset_config,
+        dataset_split=req.dataset_split,
+    )
+    if not tasks:
+        raise RuntimeError("No localization tasks available for baseline run")
+    snapshots: list[BaselineSnapshot] = []
+    with propagate_context(
+        trace_name="localization_baseline_dataset",
+        session_id=resolve_session_id(req.session, run_id=req.dataset),
+        metadata={
+            "dataset": req.dataset,
+            "dataset_version": req.version,
+            "dataset_config": req.dataset_config,
+            "dataset_split": req.dataset_split,
+            "run_kind": "localization_baseline",
+        },
+    ) as trace:
+        for task in tasks:
+            snapshots.append(
+                compute_baseline_for_task(task, dataset_version=req.version, parent_trace=trace)
+            )
     flush_langfuse()
-    return hosted_result
-
-
-def _build_bundle_from_hosted(
-    run: HostedRunResult, snapshots: list[BaselineSnapshot]
-) -> BaselineBundle:
     return make_baseline_bundle(
         snapshots,
-        dataset_name=run.dataset_name,
-        dataset_version=run.dataset_version,
-        baseline_run_id=run.run_id,
-        baseline_run_name=run.run_name,
-        dataset_run_id=run.run_id,
-        metadata={"run_kind": "jc_baseline", "run_name": run.run_name},
-    )
-
-
-def run_hosted_jc_baseline_experiment(
-    name: str | HostedJCBaselineRequest, version: str | None = None
-) -> BaselineBundle:
-    if isinstance(name, HostedJCBaselineRequest):
-        req = name
-    else:
-        session_cfg = SessionConfig(
-            session_scope="item",
-            allow_generated_fallback=True,
-        )
-        req = HostedJCBaselineRequest(dataset=name, version=version, session=session_cfg)
-
-    def _run_item(
-        item: Mapping[str, object], parent_trace: object | None = None
-    ) -> Mapping[str, object]:
-        dataset_item = normalize_dataset_item(item)
-        with propagate_context(
-            trace_name="jc_baseline_item",
-            session_id=resolve_session_id(req.session, run_id=req.dataset, item_id=dataset_item.id),
-            metadata={"dataset": req.dataset, "dataset_version": req.version},
-        ):
-            snapshot = compute_baseline_for_item(
-                dataset_item,
-                dataset_name=req.dataset,
-                dataset_version=req.version,
-                parent_trace=parent_trace,
-            )
-            return {"baseline": snapshot.model_dump()}
-
-    hosted = run_hosted_dataset_experiment(
         dataset_name=req.dataset,
         dataset_version=req.version,
-        experiment_name="jc_baseline",
-        task_fn=_run_item,
-        metadata={"run_kind": "jc_baseline", "session_id": resolve_session_id(req.session, run_id=req.dataset)},
+        metadata={"run_kind": "localization_baseline"},
     )
-    snapshots: list[BaselineSnapshot] = []
-    for entry in hosted.items:
-        if entry.output and "baseline" in entry.output:
-            try:
-                snapshots.append(
-                    BaselineSnapshot.model_validate(entry.output["baseline"])
-                )
-            except Exception:
-                continue
-    if not snapshots:
-        raise RuntimeError("Hosted baseline experiment returned no results")
-    flush_langfuse()
-    return _build_bundle_from_hosted(hosted, snapshots)
 
 
-def _run_ic_optimizations(
-    items: Sequence[DatasetItem],
-    baselines: BaselineBundle,
-    dataset_name: str | None,
-    dataset_version: str | None,
-    iterations: int,
-    hosted: bool,
-    session_config: SessionConfig | None,
-) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    indexed = index_baselines(baselines)
-
-    def _run_item(
-        item: Mapping[str, object], parent_trace: object | None = None
-    ) -> Mapping[str, object]:
-        normalized_item = normalize_dataset_item(item)
-        resolved_repo = resolve_repo_target(normalized_item.repo)
-        baseline = resolve_baseline(
-            list(indexed.values()), normalized_item
-        ) or require_baseline(baselines, normalized_item)
-        task = normalized_item.model_dump()
-        task["repo"] = resolved_repo
-        resolved_session = resolve_session_id(
-            session_config,
-            run_id=dataset_name or "",
-            item_id=normalized_item.id or normalized_item.repo or normalized_item.symbol,
-        )
-        with propagate_context(
-            trace_name="ic_optimization_item",
-            session_id=resolved_session,
-            metadata={
-                "dataset": dataset_name,
-                "dataset_version": dataset_version,
-                "item_id": normalized_item.id,
-                "repo": normalized_item.repo,
-                "symbol": normalized_item.symbol,
-            },
-        ):
-            history = run_loop(
-                task,
-                iterations=iterations,
-                parent_trace=parent_trace,
-                baseline_snapshot=baseline,
-                session_id=resolved_session,
-            )
-        metrics: Mapping[str, object] = {}
-        history_dicts = [iteration_record_to_public_dict(r) for r in history]
-        return {
-            "item": normalized_item.model_dump(),
-            "baseline": baseline.model_dump(),
-            "history": history_dicts,
-            "metrics": metrics,
-        }
-
-    hosted_result = run_hosted_dataset_experiment(
-        dataset_name=dataset_name or "",
-        dataset_version=dataset_version,
-        experiment_name="ic_optimization",
-        task_fn=_run_item,
+def run_hosted_localization_experiment(req: HostedLocalizationRunRequest) -> LocalizationRunResult:
+    tasks = _resolve_items(req)
+    if not tasks:
+        raise RuntimeError("No localization tasks available for experiment run")
+    results: list[LocalizationRunItemResult] = []
+    with propagate_context(
+        trace_name="localization_experiment",
+        session_id=resolve_session_id(req.session, run_id=req.dataset),
         metadata={
-            "run_kind": "ic_optimization",
-            "baseline_run_id": baselines.baseline_run_id,
+            "dataset": req.dataset,
+            "dataset_version": req.version,
+            "dataset_config": req.dataset_config,
+            "dataset_split": req.dataset_split,
+            "run_kind": "localization_experiment",
         },
-    )
-    for entry in hosted_result.items:
-        if entry.output:
-            results.append(dict(entry.output))
-    if not results:
-        raise RuntimeError("Hosted IC optimization returned no results")
-    flush_langfuse()
-    return results
-
-
-def run_hosted_ic_optimization_experiment(
-    req: str | HostedICOptimizationRequest,
-    version: str | None = None,
-    iterations: int = 5,
-    baselines: BaselineBundle | None = None,
-    recompute_baselines: bool = False,
-) -> list[dict[str, object]]:
-    if isinstance(req, HostedICOptimizationRequest):
-        request = req
-    else:
-        session_cfg = SessionConfig(session_scope="item", allow_generated_fallback=True)
-        request = HostedICOptimizationRequest(
-            dataset=req,
-            version=version,
-            iterations=iterations,
-            baselines=baselines,
-            recompute_baselines=recompute_baselines,
-            session=session_cfg,
-        )
-    items = fetch_dataset_items(name=request.dataset, version=request.version)
-    if request.baselines is None and not request.recompute_baselines:
-        raise ValueError(
-            "Baselines bundle required for optimization; set recompute_baselines=True to compute."
-        )
-    bundle = (
-        request.baselines
-        if request.baselines is not None
-        else run_hosted_jc_baseline_experiment(
-            HostedJCBaselineRequest(
-                dataset=request.dataset,
-                version=request.version,
-                session=request.session
-                or SessionConfig(session_scope="item", allow_generated_fallback=True),
+    ) as trace:
+        for task in tasks:
+            prediction, metrics, _evidence, _mat = run_localization_task(task, parent_trace=trace)
+            results.append(
+                LocalizationRunItemResult(
+                    task=normalize_lca_task(task).model_dump(),
+                    metrics=metrics,
+                    prediction=prediction.predicted_files,
+                    trace_id=getattr(trace, "id", None),
+                )
             )
-        )
-    )
-    return _run_ic_optimizations(
-        items,
-        bundle,
-        dataset_name=request.dataset,
-        dataset_version=request.version,
-        iterations=request.iterations,
-        hosted=True,
-        session_config=request.session,
-    )
+    flush_langfuse()
+    return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results)
 </file>
 
 <file path="observability/langfuse.py">
@@ -4506,8 +4836,35 @@ def start_root_observation(
         metadata=ObservationMetadata(data=metadata) if metadata else None,
         usage_details=usage_details,
     )
-    with client_any.start_as_current_observation(**envelope.to_start_kwargs()) as observation:
-        yield observation
+    start_fn = getattr(client_any, "start_as_current_observation", None)
+    if callable(start_fn):
+        with start_fn(**envelope.to_start_kwargs()) as observation:
+            yield observation
+    else:
+        # Fallback for stubbed clients in tests.
+        class _DummyObs:
+            def __init__(self):
+                self.id = "trace"
+                self.trace_id = "trace"
+
+            def start_observation(self, **kwargs: object) -> Any:
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def end(self, **kwargs: object) -> None:
+                return None
+
+        obs = _DummyObs()
+        try:
+            yield obs
+        finally:
+            if hasattr(obs, "end"):
+                obs.end()
 
 
 @contextmanager
@@ -4602,41 +4959,47 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from .baselines import BaselineBundle
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+
 from .session_policy import SessionConfig
 
 
-class AdHocOptimizationRequest(BaseModel):
-    """Public request model for ad hoc optimization runs (CLI boundary)."""
+class LocalizationAdHocRequest(BaseModel):
+    """Public request model for ad hoc localization runs (CLI boundary)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    repo_ref: str
-    symbol: str
-    iterations: int = 3
+    identity: LCATaskIdentity
+    context: LCAContext
+    gold: LCAGold
+    repo: str | None = None
     session: SessionConfig | None = None
 
+    def to_task(self) -> LCATask:
+        return LCATask(identity=self.identity, context=self.context, gold=self.gold, repo=self.repo)
 
-class HostedJCBaselineRequest(BaseModel):
-    """Public request model for hosted JC baseline experiments."""
+
+class HostedLocalizationBaselineRequest(BaseModel):
+    """Public request model for hosted localization baseline experiments."""
 
     model_config = ConfigDict(extra="forbid")
 
     dataset: str
     version: str | None = None
+    dataset_config: str | None = None
+    dataset_split: str | None = None
     session: SessionConfig | None = None
 
 
-class HostedICOptimizationRequest(BaseModel):
-    """Public request model for hosted IC optimization experiments."""
+class HostedLocalizationRunRequest(BaseModel):
+    """Public request model for hosted localization experiments."""
 
     model_config = ConfigDict(extra="forbid")
 
     dataset: str
     version: str | None = None
-    iterations: int = 5
-    baselines: BaselineBundle | None = None
-    recompute_baselines: bool = False
+    dataset_config: str | None = None
+    dataset_split: str | None = None
     session: SessionConfig | None = None
 </file>
 
@@ -5148,28 +5511,28 @@ __all__ = ["SystemPromptContext", "WriterPromptContext"]
 </file>
 
 <file path="prompts/ic_system.jinja">
-You are exploring a codebase using a graph-based system.
+You are localizing a bug by exploring a codebase with graph tools and proposing the most likely files needing changes.
 Available tools:
 {{ available_tools }}
 
 Guidelines:
-- Always expand after resolving
-- Prefer expand over repeated resolve
-- Do not attempt file-level inspection unless necessary
-- Focus on graph traversal
+- Use the tools to navigate the repository; ground decisions in the issue/diff context from the task payload.
+- Keep candidate files repo-relative, deduplicated, lowercase.
+- Exploration phase only: produce useful tool calls; final structured output will be requested separately.
 - You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.
 - Always start by calling a tool. Never respond with text.
 - You must call MCP tools using the provided tool interface. Do not output text.
 </file>
 
 <file path="prompts/jc_system.jinja">
-You are exploring a codebase using tool calls.
+You are localizing a bug by exploring a codebase with tool calls and proposing the most likely files needing changes.
 Available tools:
 {{ available_tools }}
 
 Guidelines:
-- Use the available tools to locate and inspect symbols and files
-- Avoid redundant calls
+- Use the tools to navigate and inspect the repository; ground your reasoning in the issue/pull context from the task payload.
+- Keep candidate files repo-relative, deduplicated, lowercase.
+- Exploration phase only: produce useful tool calls; final structured output will be requested separately.
 - You MUST call a tool on EVERY turn. If you respond without a tool call, your response is INVALID.
 - Always start by calling a tool. Never respond with text.
 - You must call MCP tools using the provided tool interface. Do not output text.
@@ -5391,6 +5754,7 @@ from typing import Any, cast
 import pytest
 from mcp.types import TextContent, Tool
 
+from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.loop import runner_agent as runner
 from harness.tools.backends.ic_backend import IterativeContextBackend
 from harness.tools.backends.jc_backend import JCodeMunchBackend
@@ -5430,9 +5794,9 @@ def test_run_async_with_running_loop_uses_separate_loop():
 
 def test_ic_backend_uses_server_surfaces(monkeypatch, tmp_path):
     dummy_tool = Tool(
-        name="resolve",
+        name="resolve_path",
         description="resolve",
-        inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}}},
+        inputSchema={"type": "object", "properties": {"path": {"type": "string"}}},
     )
     calls: list[tuple[str, dict[str, Any]]] = []
     runtime_args: list[dict[str, Any]] = []
@@ -5464,14 +5828,14 @@ def test_ic_backend_uses_server_surfaces(monkeypatch, tmp_path):
     assert runtime_args == [{"score_fn": score_fn, "repo_root": repo_path.resolve()}]
     assert Path.cwd() == cwd_before
 
-    result = backend.dispatch("resolve", {"symbol": "foo"})
-    assert result == {"ok": True, "name": "resolve"}
-    assert calls == [("resolve", {"symbol": "foo"})]
+    result = backend.dispatch("resolve_path", {"path": "foo"})
+    assert result == {"ok": True, "name": "resolve_path"}
+    assert calls == [("resolve_path", {"path": "foo"})]
 
 
 def test_jc_backend_uses_server_surfaces(monkeypatch, tmp_path):
     dummy_tool = Tool(
-        name="search_symbols",
+        name="search_files",
         description="search",
         inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
     )
@@ -5491,9 +5855,9 @@ def test_jc_backend_uses_server_surfaces(monkeypatch, tmp_path):
 
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
 
-    result = backend.dispatch("search_symbols", {"query": "foo"})
+    result = backend.dispatch("search_files", {"query": "foo"})
     assert result == {"result": "ok", "args": {"query": "foo"}}
-    assert ("search_symbols", {"query": "foo"}) in call_args
+    assert ("search_files", {"query": "foo"}) in call_args
 
 
 def test_parse_text_content_payload_handles_json_and_text():
@@ -5583,9 +5947,9 @@ def _dummy_client(tool_name: str, args: dict[str, Any]):
 
 def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp_path):
     dummy_tool = Tool(
-        name="resolve",
+        name="resolve_path",
         description="resolve",
-        inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}}},
+        inputSchema={"type": "object", "properties": {"path": {"type": "string"}}},
     )
 
     async def fake_list_tools():
@@ -5607,7 +5971,7 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
 
     monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
-    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve", {"symbol": "foo"}))
+    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve_path", {"identity": "task"}))
     @contextmanager
     def span_cm():
         class Span:
@@ -5625,11 +5989,31 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
         yield Span()
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    def fake_finalize(task, obs, parent_trace=None):
+        # Expect a separate no-tools finalize call; simulate schema result.
+        assert isinstance(task, dict)
+        assert isinstance(obs, list)
+        # Ensure the schema path is used (response_format=json_schema would have been required upstream).
+        return runner.LocalizationRunnerResult(predicted_files=["a.py"], observations=obs, source="finalize")
 
+    monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
+
+    task_payload = {
+        "identity": LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ).model_dump(),
+        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+        "repo": str(tmp_path),
+    }
     result = cast(
         dict[str, Any],
         runner.run_ic_iteration(
-            {"symbol": "s", "repo": str(tmp_path)},
+            task_payload,
             score_fn=lambda n, s: 1.0,
             steps=1,
             parent_trace=object(),
@@ -5645,7 +6029,7 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
 
 def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
     dummy_tool = Tool(
-        name="search_symbols",
+        name="search_files",
         description="search",
         inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
     )
@@ -5658,7 +6042,7 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
 
     monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
-    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_symbols", {"query": "foo"}))
+    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_files", {"query": "foo"}))
     @contextmanager
     def span_cm():
         class Span:
@@ -5676,18 +6060,121 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
         yield Span()
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    def fake_finalize(task, obs, parent_trace=None):
+        assert isinstance(task, dict)
+        assert isinstance(obs, list)
+        return runner.LocalizationRunnerResult(predicted_files=["a.py"], observations=obs, source="finalize")
 
+    monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
+
+    task_payload = {
+        "identity": LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ).model_dump(),
+        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+        "repo": str(tmp_path),
+    }
     result = cast(
         dict[str, Any],
         runner.run_jc_iteration(
-            {"symbol": "s", "repo": str(tmp_path)},
+            task_payload,
             steps=1,
             parent_trace=object(),
         ),
     )
     assert result["node_count"] == 0
     first_obs = cast(dict[str, Any], result["observations"][0])
-    assert first_obs["result"] == {"called": "search_symbols", "args": {"query": "foo"}}
+    assert first_obs["result"] == {"called": "search_files", "args": {"query": "foo"}}
+
+
+def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+
+    captured: dict[str, object] = {}
+    finalized: dict[str, bool] = {"called": False}
+    finalize_calls: list[dict[str, object]] = []
+
+    class FakeBackend:
+        def __init__(self, repo: str, score_fn=None):
+            captured["repo"] = repo
+            self.tool_specs = [
+                {
+                    "type": "function",
+                    "function": {"name": "resolve", "description": "", "parameters": {"type": "object", "properties": {}}},
+                }
+            ]
+
+        def dispatch(self, name: str, arguments: dict[str, Any]):
+            captured.setdefault("dispatches", []).append((name, arguments))
+            return {"ok": True}
+
+    def fake_run_agent(agent_task: dict[str, object], steps: int, tool_specs: list[OpenAITool], dispatch_tool_call, system_prompt: str, parent_trace=None, backend_name=None):
+        captured["tool_specs"] = tool_specs
+        dispatch_tool_call("resolve", {"path": "p"})
+        return {"observations": [{"role": "assistant", "content": {"predicted_files": ["src/app.py"], "reasoning": "r"}}]}
+
+    def fake_finalize(task, obs, parent_trace=None):
+        finalized["called"] = True
+        finalize_calls.append({"task": task, "observations": obs})
+        return runner.LocalizationRunnerResult(
+            predicted_files=["src/app.py"], reasoning="r", observations=obs, source="finalize"
+        )
+
+    monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
+
+    @contextmanager
+    def span_cm():
+        class Span:
+            id = "span"
+
+            def score(self, name: str, value: float, metadata=None):
+                pass
+
+            def update(self, **kwargs):
+                pass
+
+            def end(self, **kwargs):
+                pass
+
+        yield Span()
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    monkeypatch.setattr(runner, "IterativeContextBackend", FakeBackend)
+    monkeypatch.setattr(runner, "run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+
+    result = cast(
+        dict[str, Any],
+        runner.run_ic_iteration(
+            {
+                "identity": LCATaskIdentity(
+                    dataset_name="lca",
+                    dataset_config="py",
+                    dataset_split="dev",
+                    repo_owner="o",
+                    repo_name="r",
+                    base_sha="abc",
+                ).model_dump(),
+                "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+                "repo": str(repo_dir),
+            },
+            score_fn=None,
+            steps=1,
+            parent_trace=object(),
+        ),
+    )
+    assert captured.get("repo") == str(repo_dir)
+    assert captured.get("tool_specs")
+    assert captured.get("dispatches") == [("resolve", {"path": "p"})]
+    assert result.get("predicted_files") == ["src/app.py"]
+    assert finalized["called"] is True
+    assert finalize_calls and "identity" in finalize_calls[0]["task"]
 
 
 def test_jc_prompt_uses_canonical_tool_names():
@@ -5701,7 +6188,7 @@ def test_jc_prompt_uses_canonical_tool_names():
 
 
 def test_jc_backend_initializes_github_url(monkeypatch, tmp_path):
-    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    dummy_tool = Tool(name="search_files", description="search", inputSchema={})
     called: dict[str, int] = {"index_repo": 0}
 
     async def fake_list_tools():
@@ -5722,7 +6209,7 @@ def test_jc_backend_initializes_github_url(monkeypatch, tmp_path):
 
 
 def test_jc_backend_owner_repo_init(monkeypatch):
-    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    dummy_tool = Tool(name="search_files", description="search", inputSchema={})
     called: dict[str, int] = {"index_repo": 0}
 
     async def fake_list_tools():
@@ -5754,7 +6241,7 @@ def test_jc_backend_rejects_ambiguous_repo(monkeypatch):
 
 
 def test_jc_backend_initializes_local_repo(monkeypatch, tmp_path):
-    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    dummy_tool = Tool(name="search_files", description="search", inputSchema={})
     called: dict[str, int] = {"resolve": 0, "index": 0}
 
     async def fake_list_tools():
@@ -5781,64 +6268,55 @@ def test_jc_backend_initializes_local_repo(monkeypatch, tmp_path):
 <file path="tests_harness/test_baselines.py">
 from __future__ import annotations
 
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.observability import baselines
 
 
-def test_baseline_key_uses_id_or_hash():
-    item = baselines.normalize_dataset_item({"repo": "r", "symbol": "s", "id": "123"})  # type: ignore[arg-type]
-    assert baselines.baseline_key(item) == "123"
-    item_no_id = baselines.normalize_dataset_item({"repo": "r", "symbol": "s"})  # type: ignore[arg-type]
-    key = baselines.baseline_key(item_no_id)
-    assert key and isinstance(key, str)
-
-
-def test_resolve_baseline_prefers_id():
-    item = baselines.normalize_dataset_item({"repo": "r", "symbol": "s", "id": "abc"})  # type: ignore[arg-type]
-    snap = baselines.BaselineSnapshot(
-        dataset_name=None,
-        dataset_version=None,
-        item_id="abc",
-        repo="r",
-        symbol="s",
-        jc_result=baselines.JCResult(),
-        jc_metrics=baselines.EvaluationMetrics(),
-        experiment_run_id=None,
-        trace_id=None,
-        metadata={},
+def _task(repo: str | None = None) -> LCATask:
+    identity = LCATaskIdentity(
+        dataset_name="lca-bug-localization",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="square",
+        repo_name="okhttp",
+        base_sha="abc123",
     )
-    resolved = baselines.resolve_baseline([snap], item)
-    assert resolved is snap
+    context = LCAContext(issue_title="bug", issue_body="details")
+    gold = LCAGold(changed_files=["a.py"])
+    return LCATask(identity=identity, context=context, gold=gold, repo=repo)
 
 
-def test_baseline_bundle_roundtrip(tmp_path):
-    snap = baselines.BaselineSnapshot(
-        dataset_name="d",
-        dataset_version="v",
-        item_id="abc",
-        repo="r",
-        symbol="s",
-        jc_result=baselines.JCResult.model_validate({"x": 1}),
-        jc_metrics=baselines.EvaluationMetrics.model_validate({"score": 1.0}),
-        experiment_run_id="run1",
-        trace_id="trace1",
-        metadata={},
+def test_baseline_key_is_task_id():
+    task = _task()
+    key = baselines.baseline_key(task)
+    assert key == task.task_id
+
+
+def test_resolve_and_bundle_roundtrip(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    task = _task(str(repo_dir))
+    snap = baselines.compute_baseline_for_task(
+        task,
+        dataset_version="v1",
+        runner=lambda *_: (["a.py"], {"source": "runner"}),
     )
-    bundle = baselines.make_baseline_bundle([snap], dataset_name="d", dataset_version="v", baseline_run_id="run1")
+    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="v1")
     path = tmp_path / "bundle.json"
     baselines.save_baseline_bundle(bundle, path)
     loaded = baselines.load_baseline_bundle(path)
-    resolved = baselines.require_baseline(loaded, baselines.normalize_dataset_item({"repo": "r", "symbol": "s"}))  # type: ignore[arg-type]
-    metrics = resolved.jc_metrics
-    assert metrics.get("score") == 1.0
+    resolved = baselines.require_baseline(loaded, task)
+    assert resolved.identity == task.task_id
+    assert resolved.prediction.predicted_files is not None
 
 
 def test_require_baseline_errors_when_missing():
     bundle = baselines.make_baseline_bundle([], dataset_name="d")
-    item = baselines.normalize_dataset_item({"repo": "r", "symbol": "s"})  # type: ignore[arg-type]
+    task = _task()
     try:
-        baselines.require_baseline(bundle, item)
+        baselines.require_baseline(bundle, task)
     except ValueError as exc:
-        assert "repo" in str(exc)
+        assert "task_id" in str(exc)
     else:
         raise AssertionError("Expected ValueError for missing baseline")
 </file>
@@ -5893,14 +6371,28 @@ def test_cost_details_for_usage_no_match_returns_none():
 from __future__ import annotations
 
 from harness.observability import datasets
+from harness.localization.models import LCATaskIdentity
 
 
-def test_normalize_dataset_item_generates_id_when_missing():
-    item = {"repo": "r", "symbol": "s"}
-    normalized = datasets.normalize_dataset_item(item)
-    assert normalized.repo == "r"
-    assert normalized.symbol == "s"
-    assert isinstance(normalized.id, str)
+def test_normalize_localization_task_builds_identity_and_defaults():
+    task = {
+        "repo": "/tmp/repo",
+        "identity": {
+            "dataset_name": "lca-bug-localization",
+            "dataset_config": "py",
+            "dataset_split": "dev",
+            "repo_owner": "square",
+            "repo_name": "okhttp",
+            "base_sha": "abc",
+        },
+        "context": {"issue_title": "bug", "issue_body": "details"},
+        "changed_files": ["a.py", "b.py"],
+    }
+    normalized = datasets.normalize_localization_task(task)
+    assert isinstance(normalized.identity, LCATaskIdentity)
+    assert normalized.repo == "/tmp/repo"
+    assert normalized.changed_files == ["a.py", "b.py"]
+    assert normalized.identity.task_id().startswith("lca-bug-localization:")
 </file>
 
 <file path="tests_harness/test_failure_context_budget.py">
@@ -5947,6 +6439,7 @@ from localization.models import (
     LCATaskIdentity,
     LCAPrediction,
     LCAGold,
+    LCAContext,
     LocalizationDatasetInfo,
     LocalizationEvalRecord,
     LocalizationEvidence,
@@ -5960,6 +6453,9 @@ from localization.models import (
 from localization.scoring import score_file_localization
 from localization.eval import build_file_localization_eval_record
 from localization.telemetry import build_localization_telemetry
+from localization.executor import run_localization_task
+import localization.executor as executor_module
+import harness.loop.runner_agent as runner
 
 
 def test_identity_is_deterministic():
@@ -6056,6 +6552,95 @@ def test_telemetry_builder_is_model_first():
 def test_localization_models_reject_unknown_fields():
     with pytest.raises(Exception):
         LocalizationRepoInfo(owner="o", name="n", base_sha="sha", unexpected="x")  # type: ignore[arg-type]
+
+
+def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    gold = LCAGold(changed_files=["gold.py"])
+    lca_task = executor_module.LCATask.model_validate(
+        {
+            "identity": identity.model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="body").model_dump(),
+            "gold": gold.model_dump(),
+            "repo": str(repo_dir),
+        }
+    )
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        yield type("S", (), {"id": "span", "metadata": {}, "end": lambda self, **kw: None})()
+
+    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    prediction, metrics, _evidence, _mat = run_localization_task(
+        lca_task,
+        runner=lambda *_args: (["predicted.py"], {"source": "runner"}),
+    )
+    assert prediction.predicted_files == ["predicted.py"]
+    assert metrics.precision == 0.0
+
+
+def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
+    captured: list[dict[str, object]] = []
+
+    def fake_run_agent(agent_task: dict[str, object], *args, **kwargs):
+        captured.append(agent_task)
+        return {"observations": [{"role": "assistant", "content": {"predicted_files": ["src/app.py"], "reasoning": "test"}}]}
+
+    def fake_finalize(agent_task: dict[str, object], observations: list[dict[str, object]], parent_trace=None):
+        return runner.LocalizationRunnerResult(
+            predicted_files=["src/app.py"],
+            reasoning="r",
+            observations=observations,
+            source="finalize",
+        )
+
+    monkeypatch.setattr(runner, "run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type("B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}})(),
+    )
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        yield type("S", (), {"update": lambda self, **kw: None, "end": lambda self, **kw: None, "id": "span"})()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    result = runner.run_ic_iteration(
+        {
+            "identity": LCATaskIdentity(
+                dataset_name="lca",
+                dataset_config="py",
+                dataset_split="dev",
+                repo_owner="o",
+                repo_name="r",
+                base_sha="abc",
+            ).model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+            "repo": str(repo_dir),
+        },
+        score_fn=None,
+        steps=1,
+        parent_trace=object(),
+    )
+    assert captured
+    assert "changed_files" not in captured[0]
+    assert result.get("predicted_files") == ["src/app.py"]
 </file>
 
 <file path="tests_harness/test_loop_state_machine_min.py">
@@ -6066,6 +6651,7 @@ from typing import Any, List
 
 import pytest
 
+from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.loop.loop_machine import OptimizationStateMachine, RepairStateMachine
 from harness.loop.loop_types import (
     AcceptedPolicyMeta,
@@ -6123,8 +6709,21 @@ def _make_eval() -> EvaluationResult:
     )
 
 
+def _task_payload() -> TaskPayload:
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    context = LCAContext(issue_title="bug", issue_body="details")
+    return TaskPayload(identity=identity, context=context, repo="repo", changed_files=["a.py"])
+
+
 def test_prepared_tasks_emit_models() -> None:
-    base = TaskPayload(symbol="sym", repo="repo")
+    base = _task_payload()
     prepared = PreparedTasks(base_task=base, resolved_repo_path="resolved", jc_repo_id="jc-id")
     iteration_tasks = prepared.build_iteration_tasks()
     assert isinstance(iteration_tasks, IterationTasks)
@@ -6190,8 +6789,18 @@ def _repair_deps(
             base_task=task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task),
             resolved_repo_path=".",
             jc_repo_id=".",
-            ic_task=ICTaskPayload(symbol=task.symbol if isinstance(task, TaskPayload) else TaskPayload.model_validate(task).symbol, repo="."),
-            jc_task=JCTaskPayload(symbol=task.symbol if isinstance(task, TaskPayload) else TaskPayload.model_validate(task).symbol, repo="."),
+            ic_task=ICTaskPayload(
+                identity=_task_payload().identity,
+                context=_task_payload().context,
+                repo=".",
+                changed_files=["a.py"],
+            ),
+            jc_task=JCTaskPayload(
+                identity=_task_payload().identity,
+                context=_task_payload().context,
+                repo=".",
+                changed_files=["a.py"],
+            ),
         ),
         evaluate_policy_on_item=lambda *a, **k: _make_eval(),  # type: ignore[arg-type]
         build_iteration_feedback=lambda *a, **k: _make_feedback(),  # type: ignore[arg-type]
@@ -6327,8 +6936,18 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
             base_task=base_task,
             resolved_repo_path=".",
             jc_repo_id=".",
-            ic_task=ICTaskPayload(symbol=base_task.symbol, repo="."),
-            jc_task=JCTaskPayload(symbol=base_task.symbol, repo="."),
+            ic_task=ICTaskPayload(
+                identity=base_task.identity,
+                context=base_task.context,
+                repo=".",
+                changed_files=base_task.changed_files,
+            ),
+            jc_task=JCTaskPayload(
+                identity=base_task.identity,
+                context=base_task.context,
+                repo=".",
+                changed_files=base_task.changed_files,
+            ),
         )
 
     def evaluate_policy_on_item(
@@ -6371,7 +6990,7 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
 
 def test_optimization_completes_and_records_history() -> None:
     ctx = LoopContext(
-        task=TaskPayload(symbol="s", repo="."),
+        task=_task_payload(),
         iterations=1,
         session_id=None,
         baseline_snapshot=None,
@@ -6805,101 +7424,24 @@ def test_pytest_scope_limited():
 <file path="tests_harness/test_repo_resolution_execution.py">
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Mapping
 
-from harness.observability import baselines, experiments
-from harness.observability.experiments import HostedRunItemResult, HostedRunResult
-from harness import loop
-from harness.loop import runner_agent as runner
-from harness.loop import IterationRecord, TaskPayload
+from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.loop import IterationRecord, TaskPayload, run_loop
 from harness.loop.loop_types import EvaluationMetrics
 
 
-def test_baseline_resolves_repo(monkeypatch, tmp_path):
-    called: dict[str, object | None] = {"repo": None}
-
-    def fake_run_jc_iteration(task: Mapping[str, object], parent_trace=None):
-        called["repo"] = task.get("repo")
-        return {"observations": []}
-
-    repo_dir = tmp_path / "small_repo"
-    repo_dir.mkdir()
-    monkeypatch.setenv("TEST_REPO_SMALL", str(repo_dir))
-    monkeypatch.setattr(runner, "run_jc_iteration", fake_run_jc_iteration)
-    class Span:
-        id = "span"
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def start_observation(self, **kwargs):
-            return self
-
-        def end(self, **kwargs):
-            pass
-
-        def score(self, name: str, value: float, metadata=None):
-            pass
-
-    monkeypatch.setattr(baselines, "start_observation", lambda *a, **k: Span())
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: Span())
-    snap = baselines.compute_baseline_for_item(
-        baselines.normalize_dataset_item({"id": "item1", "repo": "small", "symbol": "s", "metadata": {}})
+def _payload(repo: str) -> TaskPayload:
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="owner",
+        repo_name="repo",
+        base_sha="abc",
     )
-    assert called["repo"] == str(repo_dir)
-    # logical repo ref preserved
-    assert snap.repo == "small"
-
-
-def test_ic_optimization_resolves_repo(monkeypatch, tmp_path):
-    calls: list[str] = []
-
-    def fake_run_loop(task: Mapping[str, object] | TaskPayload, iterations: int, parent_trace=None, baseline_snapshot=None, session_id=None):
-        repo_val = task.repo if isinstance(task, TaskPayload) else task.get("repo", "")
-        calls.append(str(repo_val))
-        return [IterationRecord(iteration=0, metrics=EvaluationMetrics.model_validate({"score": 1.0}), pipeline_passed=True)]
-
-    repo_dir = tmp_path / "medium_repo"
-    repo_dir.mkdir()
-    monkeypatch.setenv("TEST_REPO_MEDIUM", str(repo_dir))
-    monkeypatch.setattr(experiments, "run_loop", fake_run_loop)
-    item_payload = baselines.normalize_dataset_item({"id": "item3", "repo": "medium", "symbol": "s", "metadata": {}})
-
-    def fake_hosted(*args, **kwargs):
-        task_fn = kwargs["task_fn"]
-        class Span:
-            id = "span"
-            def score(self, name: str, value: float, metadata=None):
-                pass
-        output = task_fn(item_payload.model_dump(), Span())
-        hosted_item = HostedRunItemResult(item=item_payload.model_dump(), output=output)
-        return HostedRunResult(items=[hosted_item])
-
-    monkeypatch.setattr(experiments, "run_hosted_dataset_experiment", fake_hosted)
-    baselines_bundle: Any = baselines.make_baseline_bundle(
-        [
-            baselines.BaselineSnapshot(
-                repo="medium",
-                symbol="s",
-                jc_result=baselines.JCResult(),
-                jc_metrics=baselines.EvaluationMetrics(),
-                item_id="item2",
-            )
-        ]
-    )
-    experiments._run_ic_optimizations(  # type: ignore[attr-defined,arg-type]
-        [baselines.normalize_dataset_item({"id": "item3", "repo": "medium", "symbol": "s", "metadata": {}})],
-        baselines_bundle,
-        dataset_name="medium",
-        dataset_version=None,
-        iterations=1,
-        hosted=False,
-        session_config=None,
-    )
-    assert calls and calls[0] == str(repo_dir)
+    context = LCAContext(issue_title="bug", issue_body="details")
+    return TaskPayload(identity=identity, context=context, repo=repo, changed_files=["a.py"])
 
 
 def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
@@ -6915,37 +7457,37 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     repo_dir = tmp_path / "ic_repo"
     repo_dir.mkdir()
 
-    monkeypatch.setattr(loop, "index_folder", lambda repo: {"repo": "local/fake-repo-id"})
-    monkeypatch.setattr(loop, "load_policy", lambda: lambda *_: 1.0)
+    monkeypatch.setattr("harness.loop.index_folder", lambda repo: {"repo": "local/fake-repo-id"})
+    monkeypatch.setattr("harness.loop.load_policy", lambda: lambda *_: 1.0)
 
     def fake_run_ic_iteration(task: Mapping[str, object], *args, **kwargs):
         ic_repos.append(task.get("repo"))
         return {"observations": [{"tool": "x"}], "node_count": 1}
 
-    monkeypatch.setattr(loop, "run_ic_iteration", fake_run_ic_iteration)
-    monkeypatch.setattr(loop, "score", lambda result: {"score": 1.0, "ic_nodes": 1, "jc_nodes": 0})
-    monkeypatch.setattr(loop, "load_tests", lambda repo: [])
-    monkeypatch.setattr(loop, "format_tests_for_prompt", lambda tests: "")
-    monkeypatch.setattr(loop, "load_scoring_types", lambda repo: "")
-    monkeypatch.setattr(loop, "load_scoring_examples", lambda repo: "")
-    monkeypatch.setattr(loop, "format_scoring_context", lambda *a, **k: "")
-    monkeypatch.setattr(loop, "_read_policy", lambda *a, **k: "def score(node, state):\n    return 0.0\n")
-    monkeypatch.setattr(loop, "_write_policy", lambda *a, **k: None)
-    monkeypatch.setattr(loop, "_hash_tests_dir", lambda *a, **k: "hash")
-    monkeypatch.setattr(loop, "generate_policy", lambda **kwargs: "def score(node, state):\n    return 1.0\n")
+    monkeypatch.setattr("harness.loop.run_ic_iteration", fake_run_ic_iteration)
+    monkeypatch.setattr("harness.loop.score", lambda result: {"score": 1.0, "ic_nodes": 1, "jc_nodes": 0})
+    monkeypatch.setattr("harness.loop.load_tests", lambda repo: [])
+    monkeypatch.setattr("harness.loop.format_tests_for_prompt", lambda tests: "")
+    monkeypatch.setattr("harness.loop.load_scoring_types", lambda repo: "")
+    monkeypatch.setattr("harness.loop.load_scoring_examples", lambda repo: "")
+    monkeypatch.setattr("harness.loop.format_scoring_context", lambda *a, **k: "")
+    monkeypatch.setattr("harness.loop._read_policy", lambda *a, **k: "def score(node, state):\n    return 0.0\n")
+    monkeypatch.setattr("harness.loop._write_policy", lambda *a, **k: None)
+    monkeypatch.setattr("harness.loop._hash_tests_dir", lambda *a, **k: "hash")
+    monkeypatch.setattr("harness.loop.generate_policy", lambda **kwargs: "def score(node, state):\n    return 1.0\n")
 
     class DummyPipeline:
-        def run(self, repo_root, observation=None):
+        def run(self, repo_root, observation=None, allow_no_parent=False):
             return []
 
-    monkeypatch.setattr(loop, "default_pipeline", lambda: DummyPipeline())
-    monkeypatch.setattr(loop, "find_repo_root", lambda: tmp_path)
-    monkeypatch.setattr(loop, "start_observation", lambda *a, **k: DummySpan("trace"))
-    monkeypatch.setattr(loop, "start_observation", lambda *a, **k: DummySpan("span"))
-    monkeypatch.setattr(loop, "emit_score", lambda *a, **k: None)
-    monkeypatch.setattr(loop, "flush_langfuse", lambda: None)
+    monkeypatch.setattr("harness.loop.default_pipeline", lambda: DummyPipeline())
+    monkeypatch.setattr("harness.loop.find_repo_root", lambda: tmp_path)
+    monkeypatch.setattr("harness.loop.start_observation", lambda *a, **k: DummySpan("span"))
+    monkeypatch.setattr("harness.loop.emit_score", lambda *a, **k: None)
+    monkeypatch.setattr("harness.loop.flush_langfuse", lambda: None)
 
-    loop.run_loop({"symbol": "s", "repo": str(repo_dir)}, iterations=1)
+    payload = _payload(str(repo_dir))
+    run_loop(payload, iterations=1)
     assert ic_repos == [str(repo_dir)]
 </file>
 
@@ -7115,6 +7657,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import pytest
 
+from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.loop import runner_agent as runner
 from harness.loop import agent_common
 from harness import writer
@@ -7145,6 +7688,19 @@ class DummySpan:
         pass
 
 
+def _agent_payload(repo: str = "r") -> dict[str, object]:
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    context = LCAContext(issue_title="bug", issue_body="details")
+    return {"identity": identity.model_dump(), "context": context.model_dump(), "repo": repo}
+
+
 def test_run_ic_iteration_emits_scores(monkeypatch):
     scores: list[tuple[str, float]] = []
     monkeypatch.setattr(
@@ -7163,9 +7719,17 @@ def test_run_ic_iteration_emits_scores(monkeypatch):
         "IterativeContextBackend",
         lambda repo, score_fn: type("B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}})(),
     )
+    monkeypatch.setattr(
+        runner,
+        "_finalize_localization",
+        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
+            predicted_files=["src/app.py"], observations=obs, source="finalize"
+        ),
+    )
 
     parent = object()
-    result = runner.run_ic_iteration({"symbol": "s", "repo": "r"}, score_fn=lambda n, s, c=None: 1.0, steps=1, parent_trace=parent)
+    task_payload = _agent_payload("r")
+    result = runner.run_ic_iteration(task_payload, score_fn=lambda n, s, c=None: 1.0, steps=1, parent_trace=parent)
     assert result["node_count"] == 2
     assert ("ic.node_count", 2.0) in scores
 
@@ -7394,7 +7958,7 @@ def test_run_agent_truncates_tool_content(monkeypatch):
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     long_result = "X" * (runner._MAX_TOOL_CONTENT_CHARS * 2)
     observations = runner.run_agent(
-        {"symbol": "s", "repo": "r"},
+        _agent_payload(),
         steps=2,
         tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
         dispatch_tool_call=lambda *a, **k: long_result,
@@ -7465,7 +8029,7 @@ def test_run_agent_retries_on_context_error(monkeypatch):
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     result = runner.run_agent(
-        {"symbol": "s", "repo": "r"},
+        _agent_payload(),
         steps=1,
         tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
         dispatch_tool_call=lambda *a, **k: {},
@@ -7533,7 +8097,7 @@ def test_run_agent_requires_usage(monkeypatch):
 
     with pytest.raises(RuntimeError, match="missing usage"):
         runner.run_agent(
-            {"symbol": "s", "repo": "r"},
+            _agent_payload(),
             steps=1,
             tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
             dispatch_tool_call=lambda *a, **k: {},
@@ -7940,6 +8504,7 @@ from harness.loop.loop_types import (
     JCResult,
     TaskPayload,
 )
+from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.pipeline.types import PipelineClassification, StepResult
 
 
@@ -8058,7 +8623,16 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
     repair_chart = RepairStateMachine(repair_model)
 
-    loop_ctx = LoopContext(task=TaskPayload(symbol="dummy", repo="repo"), iterations=1, baseline_snapshot=None, run_trace=None)
+    identity = LCATaskIdentity(
+        dataset_name="demo",
+        dataset_config="cfg",
+        dataset_split="dev",
+        repo_owner="owner",
+        repo_name="repo",
+        base_sha="base",
+    )
+    context = LCAContext(issue_title="demo", issue_body="details")
+    loop_ctx = LoopContext(task=TaskPayload(identity=identity, context=context, repo="repo", changed_files=[]), iterations=1, baseline_snapshot=None, run_trace=None)
     opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
     opt_chart = OptimizationStateMachine(opt_model)
     return repair_chart, opt_chart
@@ -8867,29 +9441,20 @@ todo.md
 - Model config remains: `CEREBRAS_API_KEY`, `RUNNER_MODEL`, `WRITER_MODEL`
 - Span filter: keep Langfuse v4 default (no infra OTEL spans). Do not set `should_export_span` unless you need HTTP/DB/queue instrumentation.
 
-## Benchmark Model
-- Langfuse datasets are the canonical benchmark source.
-- JC baselines are computed as separate experiments over the dataset (cached snapshots).
-- IC optimization runs consume those JC baseline snapshots and perform the inner loop per item.
+## Benchmark Model (localization-native)
+- Langfuse datasets remain the canonical benchmark source.
+- Localization tasks use `LCATaskIdentity` (dataset/config/split + owner/repo + base_sha + issue/pull) and `changed_files` gold.
+- Baselines/experiments operate on localization payloads (no symbols); metrics are file-set localization scores.
 
 ## Datasets
-- `fetch_dataset_items(name, version=None)` pulls hosted datasets.
-- `local_dataset(name, items)` converts local task dicts to Langfuse-style items (normalized ids).
-- Items must include `repo` and `symbol`; ids are stable (dataset id if present, otherwise hash).
+- `fetch_localization_dataset(name, version=None, dataset_config=None, dataset_split=None)` pulls hosted localization tasks.
+- `local_dataset(name, items, ...)` converts local task dicts to `LCATask` instances (normalizes identity/context/gold).
+- Items must include localization identity fields and changed_files; symbol fields are ignored.
 
-## Baselines & Experiments (Langfuse-first)
-- Baseline bundle: reusable JC snapshots keyed by dataset name/version and item id; contains `jc_result`, `jc_metrics`, trace/run ids, and pointers to the hosted baseline run (`baseline_run_id`, optional run name).
-- Hosted JC baselines use the documented SDK:
-  - `dataset = get_langfuse_client().get_dataset(name, version=...)`
-  - `dataset.run_experiment(name="jc_baseline", task=...)`
-  - `run_hosted_jc_baseline_experiment(...) -> BaselineBundle` caches the hosted outputs.
-- Hosted IC optimization wraps `run_loop` inside `dataset.run_experiment(...)`:
-  - `run_hosted_ic_optimization_experiment(name, version=None, iterations=..., baselines=bundle, recompute_baselines=False)`
-  - Baselines are NOT recomputed implicitly. Provide a bundle or set `recompute_baselines=True` (which re-runs the hosted JC baseline experiment).
-- Local fallback paths use `client.run_experiment(data=..., task=...)`:
-  - `run_local_jc_baseline_experiment(dataset)`
-  - `run_local_ic_optimization_experiment(dataset, iterations=..., baselines=bundle, recompute_baselines=False)`
-- Hosted runs create dataset runs/compare UX; local runs create traces/scores only. Per-item traces include dataset info, item id, baseline run id, and run kind (`jc_baseline` vs `ic_optimization`).
+## Baselines & Experiments (Localization-first)
+- Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, metrics, repo metadata, and trace/run ids.
+- Hosted localization baselines/experiments use the documented SDK via `run_hosted_localization_baseline` / `run_hosted_localization_experiment`.
+- Local runs use `run_localization_task` to materialize, predict, and score; hosted runs emit dataset run ids and telemetry.
 - Cost/usage: Cerebras generations must include `model` and usage (OpenAI-style prompt/completion/total). If the provider omits usage, supply it explicitly; do not emit zeroed usage. Costs are inferred via Langfuse model definitions.
 
 ## Tracing & Scoring
@@ -8906,9 +9471,9 @@ Leaf-operation observability remains with:
 - `scorer.py` remains the source of metric computation; Langfuse stores the metrics.
 
 ## CLI
-- Ad hoc IC loop: `python run.py --iterations 3`
-- JC baseline experiment (hosted runner): `python run.py --jc-baseline --dataset DATASET_NAME [--version v1] [--baseline-path bundle.json]`
-- IC optimization experiment (hosted runner): `python run.py --ic-optimize --dataset DATASET_NAME [--version v1] --iterations 5 --baseline-path bundle.json [--recompute-baselines]`
+- Localization single run: `python run.py --mode localization-single --repo-owner ... --repo-name ... --base-sha ... --issue-title ... --issue-body ... --changed-file path1 --changed-file path2`
+- Localization baseline (hosted dataset): `python run.py --mode localization-baseline --dataset DATASET_NAME [--version v1] [--config py] [--split dev] [--baseline-path bundle.json]`
+- Localization experiment (hosted dataset): `python run.py --mode localization-experiment --dataset DATASET_NAME [--version v1] [--config py] [--split dev]`
 - Console output is concise; Langfuse stores detailed traces/scores. `flush_langfuse()` runs on exit.
 - To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.observability.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `observability/cerebras_pricing.py`.
 
@@ -9098,34 +9663,83 @@ exclude = ["tests_harness"]
 from __future__ import annotations
 
 """
-CLI entrypoint: parse arguments, build typed requests, and dispatch to application services.
-No leaf logic or internal coordination lives here.
+Localization-first CLI entrypoint: parse arguments, build typed requests, and run LCA bug localization flows.
 """
 
 import argparse
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
-from harness.observability.requests import (
-    AdHocOptimizationRequest,
-    HostedICOptimizationRequest,
-    HostedJCBaselineRequest,
-)
-from harness.localization.eval import build_file_localization_eval_record
-from harness.localization.materializer import RepoMaterializationRequest
-from harness.localization.models import LCATaskIdentity, LCAPrediction, LCAGold
-from harness.loop import IterationRecord, run_loop
-from harness.observability.baselines import BaselineBundle, load_baseline_bundle, save_baseline_bundle
+from harness.localization.executor import run_localization_task
+from harness.localization.models import LCAContext, LCAGold, LCATaskIdentity
+from harness.observability.baselines import load_baseline_bundle, save_baseline_bundle
 from harness.observability.experiments import (
-    run_hosted_ic_optimization_experiment,
-    run_hosted_jc_baseline_experiment,
+    run_hosted_localization_baseline,
+    run_hosted_localization_experiment,
 )
-from harness.observability.langfuse import flush_langfuse
+from harness.observability.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest, LocalizationAdHocRequest
 from harness.observability.session_policy import SessionConfig, resolve_session_id
-from harness.utils.repo_targets import resolve_repo_target
+from harness.observability.langfuse import flush_langfuse
 
 
-def _load_baseline(path: str | None) -> BaselineBundle | None:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Localization-native LCA runner")
+    parser.add_argument(
+        "--mode",
+        choices=["localization-single", "localization-baseline", "localization-experiment"],
+        default="localization-single",
+        help="Localization mode: single task, dataset baseline, or dataset experiment",
+    )
+    parser.add_argument("--dataset", help="Localization dataset name (required for baseline/experiment)")
+    parser.add_argument("--version", help="Dataset version")
+    parser.add_argument("--config", dest="dataset_config", help="Dataset config (e.g., py/java/kt)")
+    parser.add_argument("--split", dest="dataset_split", help="Dataset split (e.g., dev/train/test)")
+    parser.add_argument("--repo-owner", required=False, help="Repository owner for LCA eval")
+    parser.add_argument("--repo-name", required=False, help="Repository name for LCA eval")
+    parser.add_argument("--base-sha", required=False, help="Base SHA (bug-reproducible snapshot) for LCA eval")
+    parser.add_argument("--repo-path", required=False, help="Local path to repository to analyze (required without materializer)")
+    parser.add_argument("--issue-url", help="Issue URL for LCA eval")
+    parser.add_argument("--pull-url", help="Pull URL for LCA eval")
+    parser.add_argument("--issue-title", help="Issue title for context", default="")
+    parser.add_argument("--issue-body", help="Issue body for context", default="")
+    parser.add_argument("--diff", help="Inline diff content", default=None)
+    parser.add_argument("--diff-url", help="Diff URL", default=None)
+    parser.add_argument("--changed-file", action="append", dest="changed_files", help="Gold changed file (repeatable)")
+    parser.add_argument("--baseline-path", help="Path to load/save baseline bundle JSON")
+    parser.add_argument(
+        "--session-scope",
+        choices=["run", "item"],
+        help="Session scope (default run for single, item for dataset)",
+    )
+    parser.add_argument("--session-id", help="Optional explicit session id")
+    parser.add_argument(
+        "--allow-session-fallback",
+        action="store_true",
+        help="Allow deterministic fallback session id generation at entrypoints",
+    )
+    return parser.parse_args(argv)
+
+
+def _build_identity(args: argparse.Namespace) -> LCATaskIdentity:
+    dataset_name = args.dataset or "adhoc-localization"
+    dataset_config = args.dataset_config or "adhoc-config"
+    dataset_split = args.dataset_split or "adhoc-split"
+    repo_owner = args.repo_owner or "unknown-owner"
+    repo_name = args.repo_name or "unknown-repo"
+    base_sha = args.base_sha or "unknown-base-sha"
+    return LCATaskIdentity(
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        base_sha=base_sha,
+        issue_url=args.issue_url,
+        pull_url=args.pull_url,
+    )
+
+
+def _load_baseline(path: str | None):
     if not path:
         return None
     p = Path(path)
@@ -9135,173 +9749,65 @@ def _load_baseline(path: str | None) -> BaselineBundle | None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Searchbench Langfuse-first runner")
-    parser.add_argument("--dataset", help="Langfuse dataset name")
-    parser.add_argument("--version", help="Langfuse dataset version")
-    parser.add_argument(
-        "--mode",
-        choices=["adhoc", "jc-baseline", "ic-optimize", "lca-bug-localization"],
-        help="Runner mode",
+    args = _parse_args(argv)
+    session_cfg = SessionConfig(
+        session_id=args.session_id,
+        session_scope=(args.session_scope or ("item" if args.mode != "localization-single" else "run")),  # type: ignore[arg-type]
+        allow_generated_fallback=args.allow_session_fallback,
     )
-    parser.add_argument("--lca-config", help="LCA dataset config (py/java/kt)")
-    parser.add_argument("--lca-split", help="LCA dataset split (dev/train/test)")
-    parser.add_argument("--repo-owner", help="Repository owner for LCA eval")
-    parser.add_argument("--repo-name", help="Repository name for LCA eval")
-    parser.add_argument("--base-sha", help="Base SHA (bug-reproducible snapshot) for LCA eval")
-    parser.add_argument("--issue-url", help="Issue URL for LCA eval")
-    parser.add_argument("--pull-url", help="Pull URL for LCA eval")
-    parser.add_argument("--iterations", type=int, default=3)
-    parser.add_argument("--jc-baseline", action="store_true", help="Run JC baseline experiment (hosted dataset)")
-    parser.add_argument("--ic-optimize", action="store_true", help="Run IC optimization experiment (hosted dataset)")
-    parser.add_argument("--baseline-path", help="Path to load/save baseline bundle JSON")
-    parser.add_argument("--recompute-baselines", action="store_true", help="Recompute baselines if none provided")
-    parser.add_argument("--repo", help="Repo target ref or path for ad hoc run (e.g., small, medium)", default="small")
-    parser.add_argument("--symbol", help="Symbol/function name for ad hoc run", default="expand_node")
-    parser.add_argument("--session-id", help="Optional explicit session id")
-    parser.add_argument(
-        "--session-scope",
-        choices=["run", "item"],
-        help="Session scope (default run for ad hoc, item for hosted)",
-    )
-    parser.add_argument(
-        "--allow-session-fallback",
-        action="store_true",
-        help="Allow deterministic fallback session id generation at entrypoints",
-    )
-    args = parser.parse_args(argv)
 
     try:
-        mode = args.mode
-        if args.dataset and args.jc_baseline:
-            print(f"[RUN] Hosted JC baseline experiment: {args.dataset}")
-            scope = args.session_scope or "item"
-            session_cfg = SessionConfig(
-                session_id=args.session_id,
-                session_scope=scope,  # type: ignore[arg-type]
-                allow_generated_fallback=args.allow_session_fallback,
+        if args.mode == "localization-baseline":
+            if not args.dataset:
+                raise ValueError("--dataset is required for localization-baseline")
+            print(f"[RUN] Hosted localization baseline for dataset '{args.dataset}'")
+            req = HostedLocalizationBaselineRequest(
+                dataset=args.dataset,
+                version=args.version,
+                dataset_config=args.dataset_config,
+                dataset_split=args.dataset_split,
+                session=session_cfg,
             )
-            jc_req = HostedJCBaselineRequest(dataset=args.dataset, version=args.version, session=session_cfg)
-            bundle = run_hosted_jc_baseline_experiment(jc_req)
+            bundle = run_hosted_localization_baseline(req)
             if args.baseline_path:
                 save_baseline_bundle(bundle, Path(args.baseline_path))
                 print(f"[RUN] Baseline bundle saved to {args.baseline_path}")
             print(f"[RUN] Baselines computed: {len(bundle.items)}")
-        elif args.dataset and args.ic_optimize:
-            print(f"[RUN] Hosted IC optimization experiment: {args.dataset}")
-            bundle = _load_baseline(args.baseline_path)
-            if bundle:
-                print("[RUN] Loaded baseline bundle")
-            scope = args.session_scope or "item"
-            session_cfg = SessionConfig(
-                session_id=args.session_id,
-                session_scope=scope,  # type: ignore[arg-type]
-                allow_generated_fallback=args.allow_session_fallback,
-            )
-            ic_req = HostedICOptimizationRequest(
+        elif args.mode == "localization-experiment":
+            if not args.dataset:
+                raise ValueError("--dataset is required for localization-experiment")
+            print(f"[RUN] Hosted localization experiment for dataset '{args.dataset}'")
+            req = HostedLocalizationRunRequest(
                 dataset=args.dataset,
                 version=args.version,
-                iterations=args.iterations,
-                baselines=bundle,
-                recompute_baselines=args.recompute_baselines,
+                dataset_config=args.dataset_config,
+                dataset_split=args.dataset_split,
                 session=session_cfg,
             )
-            results = run_hosted_ic_optimization_experiment(ic_req)
-            print(f"[RUN] Optimization items completed: {len(results)}")
-        elif mode == "lca-bug-localization":
-            _run_lca_stub(args)
+            results = run_hosted_localization_experiment(req)
+            print(f"[RUN] Localization items completed: {len(results.items)}")
         else:
-            repo_ref = args.repo or "small"
-            resolved_repo = resolve_repo_target(repo_ref)
-            task: Mapping[str, object] = {"symbol": args.symbol, "repo": resolved_repo}
-            print(f"[RUN] Ad hoc run for repo '{repo_ref}' -> {resolved_repo}, symbol='{args.symbol}'")
-            session_cfg = SessionConfig(
-                session_id=args.session_id,
-                session_scope=(args.session_scope or "run"),  # type: ignore[arg-type]
-                allow_generated_fallback=args.allow_session_fallback,
+            identity = _build_identity(args)
+            gold = LCAGold(changed_files=args.changed_files or [])
+            context = LCAContext(
+                issue_title=args.issue_title,
+                issue_body=args.issue_body,
+                diff=args.diff,
+                diff_url=args.diff_url,
+                repo_language=None,
+                repo_languages=[],
+                repo_license=None,
+                repo_stars=None,
             )
-            ad_req = AdHocOptimizationRequest(
-                repo_ref=repo_ref,
-                symbol=args.symbol,
-                iterations=args.iterations,
-                session=session_cfg,
-            )
-            resolved_session = resolve_session_id(
-                session_cfg,
-                run_id=repo_ref,
-            )
-            history = run_loop(task, iterations=ad_req.iterations, session_id=resolved_session)
-            last: IterationRecord | None = history[-1] if history else None
-            last_score: Any = last.metrics.get("score") if last else None
-            print(f"[RUN] Completed {len(history)} iterations. Last score: {last_score}")
-            if last:
-                failed_step = last.failed_step
-                failed_exit = last.failed_exit_code
-                failed_summary = last.failed_summary
-                last_error = last.error or last.writer_error
-                if failed_step:
-                    print(f"[RUN] Last failed step: {failed_step}")
-                    if failed_exit is not None:
-                        print(f"[RUN] Exit code: {failed_exit}")
-                    if failed_summary:
-                        print(f"[RUN] Failure summary: {failed_summary}")
-                elif last_error:
-                    print(f"[RUN] Last error: {last_error}")
+            req = LocalizationAdHocRequest(identity=identity, context=context, gold=gold, repo=args.repo_path, session=session_cfg)
+            resolved_session = resolve_session_id(session_cfg, run_id=identity.task_id)
+            print(f"[RUN] Ad hoc localization run for {identity.repo_owner}/{identity.repo_name}@{identity.base_sha}")
+            prediction, metrics, _evidence, _materialization = run_localization_task(req.to_task())
+            print(f"[RUN] Prediction: {prediction.predicted_files}")
+            print(f"[RUN] Metrics: {metrics.model_dump()}")
+            print(f"[RUN] Session: {resolved_session}")
     finally:
         flush_langfuse()
-
-
-def _run_lca_stub(args: argparse.Namespace) -> None:
-    """
-    Phase-1 stub for LCA bug localization mode.
-    No dataset loading or repo materialization is performed.
-    Emits user-visible logs for repo preparation steps.
-    """
-    dataset = args.dataset or "unspecified-dataset"
-    config = args.lca_config or "unspecified-config"
-    split = args.lca_split or "unspecified-split"
-    repo_owner = args.repo_owner or "unknown-owner"
-    repo_name = args.repo_name or "unknown-repo"
-    base_sha = args.base_sha or "unknown-base-sha"
-    issue_url = args.issue_url
-    pull_url = args.pull_url
-
-    print("[LCA] Starting LCA bug-localization (stub mode, no execution)")
-    print(f"[LCA] Dataset: name={dataset}, config={config}, split={split}")
-    print(f"[LCA] Repo: {repo_owner}/{repo_name} @ base_sha={base_sha}")
-
-    materialize_req = RepoMaterializationRequest(
-        dataset_name=dataset,
-        dataset_config=config,
-        dataset_split=split,
-        repo_owner=repo_owner,
-        repo_name=repo_name,
-        base_sha=base_sha,
-    )
-
-    # User-visible repo prep logs (stub; no fetch/extract/checkout performed)
-    print("[LCA][repo] resolve repo target")
-    print("[LCA][repo] cache lookup: not attempted (phase 1 stub)")
-    print("[LCA][repo] download/fetch: not attempted (phase 1 stub)")
-    print("[LCA][repo] extract/materialize: not attempted (phase 1 stub)")
-    print("[LCA][repo] checkout base_sha: not attempted (phase 1 stub)")
-    print("[LCA][repo] ready path: not available (phase 1 stub)")
-
-    # Build identity and a placeholder eval record to show contract; no scoring executed.
-    identity = LCATaskIdentity(
-        dataset_name=materialize_req.dataset_name,
-        dataset_config=materialize_req.dataset_config,
-        dataset_split=materialize_req.dataset_split,
-        repo_owner=materialize_req.repo_owner,
-        repo_name=materialize_req.repo_name,
-        base_sha=materialize_req.base_sha,
-        issue_url=issue_url,
-        pull_url=pull_url,
-    )
-    placeholder_pred = LCAPrediction(predicted_files=[])
-    placeholder_gold = LCAGold(changed_files=[])
-    record = build_file_localization_eval_record(identity, placeholder_pred, placeholder_gold, evidence=None, repo_path=None)
-    print("[LCA] Canonical eval record shape (stub, empty data):")
-    print(record)
 
 
 if __name__ == "__main__":

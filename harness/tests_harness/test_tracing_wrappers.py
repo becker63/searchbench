@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import pytest
 
+from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.loop import runner_agent as runner
 from harness.loop import agent_common
 from harness import writer
@@ -33,6 +34,19 @@ class DummySpan:
         pass
 
 
+def _agent_payload(repo: str = "r") -> dict[str, object]:
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    context = LCAContext(issue_title="bug", issue_body="details")
+    return {"identity": identity.model_dump(), "context": context.model_dump(), "repo": repo}
+
+
 def test_run_ic_iteration_emits_scores(monkeypatch):
     scores: list[tuple[str, float]] = []
     monkeypatch.setattr(
@@ -51,9 +65,17 @@ def test_run_ic_iteration_emits_scores(monkeypatch):
         "IterativeContextBackend",
         lambda repo, score_fn: type("B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}})(),
     )
+    monkeypatch.setattr(
+        runner,
+        "_finalize_localization",
+        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
+            predicted_files=["src/app.py"], observations=obs, source="finalize"
+        ),
+    )
 
     parent = object()
-    result = runner.run_ic_iteration({"symbol": "s", "repo": "r"}, score_fn=lambda n, s, c=None: 1.0, steps=1, parent_trace=parent)
+    task_payload = _agent_payload("r")
+    result = runner.run_ic_iteration(task_payload, score_fn=lambda n, s, c=None: 1.0, steps=1, parent_trace=parent)
     assert result["node_count"] == 2
     assert ("ic.node_count", 2.0) in scores
 
@@ -282,7 +304,7 @@ def test_run_agent_truncates_tool_content(monkeypatch):
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     long_result = "X" * (runner._MAX_TOOL_CONTENT_CHARS * 2)
     observations = runner.run_agent(
-        {"symbol": "s", "repo": "r"},
+        _agent_payload(),
         steps=2,
         tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
         dispatch_tool_call=lambda *a, **k: long_result,
@@ -353,7 +375,7 @@ def test_run_agent_retries_on_context_error(monkeypatch):
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     result = runner.run_agent(
-        {"symbol": "s", "repo": "r"},
+        _agent_payload(),
         steps=1,
         tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
         dispatch_tool_call=lambda *a, **k: {},
@@ -421,7 +443,7 @@ def test_run_agent_requires_usage(monkeypatch):
 
     with pytest.raises(RuntimeError, match="missing usage"):
         runner.run_agent(
-            {"symbol": "s", "repo": "r"},
+            _agent_payload(),
             steps=1,
             tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
             dispatch_tool_call=lambda *a, **k: {},

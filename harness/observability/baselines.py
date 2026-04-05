@@ -1,168 +1,143 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Sequence, cast
+from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.loop.loop_types import EvaluationMetrics, JCResult
-
-from .datasets import DatasetItem, normalize_dataset_item
-from .langfuse import start_observation
-from .score_emitter import emit_score_for_handle
-from ..utils.repo_targets import resolve_repo_target
-
-
-def _stable_repo_symbol(repo: str, symbol: str) -> str:
-    return hashlib.sha256(f"{repo}::{symbol}".encode()).hexdigest()
+from harness.localization.executor import run_localization_task
+from harness.localization.models import (
+    LCATask,
+    LocalizationDatasetInfo,
+    LocalizationEvidence,
+    LocalizationGold,
+    LocalizationMetrics,
+    LocalizationPrediction,
+    normalize_lca_task,
+)
+from harness.localization.telemetry import build_localization_telemetry
+from harness.observability.langfuse import start_observation
+from harness.observability.score_emitter import emit_score_for_handle
 
 
 class BaselineSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    dataset_name: str | None = None
+    dataset_name: str
+    dataset_config: str
+    dataset_split: str
     dataset_version: str | None = None
-    item_id: str | None = None
-    repo: str
-    symbol: str
-    jc_result: JCResult = Field(default_factory=JCResult)
-    jc_metrics: EvaluationMetrics = Field(default_factory=EvaluationMetrics)
-    experiment_run_id: str | None = None
+    identity: str
+    prediction: LocalizationPrediction
+    gold: LocalizationGold
+    metrics: LocalizationMetrics
+    repo_owner: str
+    repo_name: str
+    base_sha: str
     trace_id: str | None = None
+    experiment_run_id: str | None = None
+    evidence: LocalizationEvidence | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class BaselineBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    dataset_name: str | None = None
+    dataset_name: str
     dataset_version: str | None = None
-    baseline_run_id: str | None = None
-    baseline_run_name: str | None = None
-    dataset_run_id: str | None = None
     created_at: str | None = None
     items: list[BaselineSnapshot] = Field(default_factory=list)
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
-def _item_identity(item: DatasetItem) -> str:
-    normalized = normalize_dataset_item(item)
-    if normalized.id:
-        return normalized.id
-    return hashlib.sha256(f"{normalized.repo}::{normalized.symbol}".encode()).hexdigest()
-
-
-def baseline_key(item: DatasetItem) -> str:
-    return _item_identity(item)
-
-
-def _snapshot_key(snapshot: BaselineSnapshot) -> str:
-    if snapshot.item_id:
-        return snapshot.item_id
-    if snapshot.repo and snapshot.symbol:
-        return _stable_repo_symbol(snapshot.repo, snapshot.symbol)
-    return ""
-
-
-def baseline_metrics_from_jc(jc_result: Mapping[str, object]) -> EvaluationMetrics:
-    return EvaluationMetrics.model_validate({"score": 0.0})
+def baseline_key(task: LCATask) -> str:
+    return task.task_id
 
 
 def index_baselines(bundle: BaselineBundle | Sequence[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
     items = bundle.items if isinstance(bundle, BaselineBundle) else list(bundle)
-    indexed: dict[str, BaselineSnapshot] = {}
-    for snap in items:
-        key = _snapshot_key(snap)
-        if key:
-            indexed[key] = snap
-    return indexed
+    return {snap.identity: snap for snap in items}
 
 
-def compute_baseline_for_item(
-    item: DatasetItem,
-    dataset_name: str | None = None,
+def compute_baseline_for_task(
+    task: LCATask,
     dataset_version: str | None = None,
     parent_trace: object | None = None,
+    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
 ) -> BaselineSnapshot:
-    from ..loop.runner_agent import run_jc_iteration  # local import to avoid circular dependency
-
-    normalized = normalize_dataset_item(item)
-    repo_ref = normalized.repo
-    resolved_repo = resolve_repo_target(repo_ref)
     with start_observation(
-        name="jc_baseline_item",
+        name="localization_baseline_item",
         parent=parent_trace,
         metadata={
-            "dataset": dataset_name,
+            "dataset": task.identity.dataset_name,
+            "dataset_config": task.identity.dataset_config,
+            "dataset_split": task.identity.dataset_split,
             "dataset_version": dataset_version,
-            "item_id": normalized.id,
-            "repo": normalized.repo,
-            "symbol": normalized.symbol,
-            "run_kind": "jc_baseline",
-            "repo_ref": repo_ref,
-            "resolved_repo": resolved_repo,
+            "identity": task.task_id,
         },
     ) as trace:
-        jc_result_map = run_jc_iteration({"symbol": normalized.symbol, "repo": resolved_repo}, parent_trace=trace)
-        metrics = baseline_metrics_from_jc(cast(Mapping[str, object], jc_result_map))
-        trace_id = getattr(trace, "id", None)
+        prediction, metrics, evidence, materialization = run_localization_task(task, parent_trace=trace, runner=runner)
+        telemetry = build_localization_telemetry(
+            task.identity,
+            metrics=metrics,
+            changed_files_count=len(task.gold.normalized_changed_files()),
+            repo_language=task.context.repo_language,
+            repo_license=task.context.repo_license,
+            evidence=evidence,
+            materialization_events=materialization.events if materialization else None,
+        )
         dataset_run_id = getattr(parent_trace, "id", None)
-        for name, value in metrics.items():
-            if not isinstance(value, (int, float, bool)):
+        for name, value in metrics.model_dump().items():
+            if value is None:
                 continue
-            data_type = "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
-            score_id = f"{trace_id}-baseline.{name}" if trace_id else None
             emit_score_for_handle(
                 trace,
                 name=f"baseline.{name}",
-                value=float(value) if isinstance(value, bool) else value,
-                data_type=data_type,
+                value=float(value),
+                data_type="NUMERIC",
                 dataset_run_id=dataset_run_id,
-                score_id=score_id,
+                score_id=f"{trace.id}-baseline.{name}" if getattr(trace, "id", None) else None,
             )
         return BaselineSnapshot(
-            dataset_name=dataset_name,
+            dataset_name=task.identity.dataset_name,
+            dataset_config=task.identity.dataset_config,
+            dataset_split=task.identity.dataset_split,
             dataset_version=dataset_version,
-            item_id=normalized.id,
-            repo=normalized.repo,
-            symbol=normalized.symbol,
-            jc_result=JCResult.model_validate(jc_result_map),
-            jc_metrics=metrics,
-            trace_id=trace_id,
+            identity=task.task_id,
+            prediction=LocalizationPrediction(predicted_files=prediction.predicted_files),
+            gold=LocalizationGold(changed_files=task.gold.normalized_changed_files()),
+            metrics=metrics,
+            repo_owner=task.identity.repo_owner,
+            repo_name=task.identity.repo_name,
+            base_sha=task.identity.base_sha,
+            trace_id=getattr(trace, "id", None),
             experiment_run_id=dataset_run_id,
-            metadata={"run_kind": "jc_baseline"},
+            evidence=evidence,
+            metadata={
+                "telemetry": telemetry.model_dump(exclude_none=True),
+                "run_kind": "localization_baseline",
+            },
         )
 
 
-def resolve_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot | None:
-    identity = baseline_key(item)
-    snapshots = baselines.items if isinstance(baselines, BaselineBundle) else list(baselines)
-    for snap in snapshots:
-        if _snapshot_key(snap) == identity:
-            return snap
-    for snap in snapshots:
-        if snap.repo == item.repo and snap.symbol == item.symbol:
-            return snap
-    return None
+def resolve_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask) -> BaselineSnapshot | None:
+    indexed = index_baselines(baselines)
+    return indexed.get(task.task_id)
 
 
-def require_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], item: DatasetItem) -> BaselineSnapshot:
-    resolved = resolve_baseline(baselines, item)
+def require_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask) -> BaselineSnapshot:
+    resolved = resolve_baseline(baselines, task)
     if resolved is None:
-        raise ValueError(f"No baseline snapshot found for repo={item.repo} symbol={item.symbol}")
+        raise ValueError(f"No baseline snapshot found for localization task_id={task.task_id}")
     return resolved
 
 
 def make_baseline_bundle(
     snapshots: list[BaselineSnapshot] | Sequence[Mapping[str, object]],
-    dataset_name: str | None = None,
+    dataset_name: str,
     dataset_version: str | None = None,
-    baseline_run_id: str | None = None,
-    baseline_run_name: str | None = None,
-    dataset_run_id: str | None = None,
     metadata: Mapping[str, object] | None = None,
 ) -> BaselineBundle:
     snapshot_models = [
@@ -171,9 +146,6 @@ def make_baseline_bundle(
     return BaselineBundle(
         dataset_name=dataset_name,
         dataset_version=dataset_version,
-        baseline_run_id=baseline_run_id,
-        baseline_run_name=baseline_run_name,
-        dataset_run_id=dataset_run_id or baseline_run_id,
         created_at=datetime.now(tz=timezone.utc).isoformat(),
         items=snapshot_models,
         metadata=dict(metadata) if metadata else {},
@@ -192,3 +164,10 @@ def load_baseline_bundle(path: Path) -> BaselineBundle:
         return BaselineBundle.model_validate(data)
     except ValidationError as exc:
         raise ValueError(f"Invalid baseline bundle: {exc}") from exc
+
+
+def normalize_baseline_task(data: Mapping[str, object]) -> LCATask:
+    """
+    Helper to coerce legacy mappings into LCATask for baseline compatibility.
+    """
+    return normalize_lca_task(data)

@@ -7,7 +7,7 @@ Shared agent utilities that are reused by runner and writer agents.
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class UsageEntry(BaseModel):
@@ -102,8 +102,26 @@ class AgentTaskPayload(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    symbol: str
+    identity: dict[str, object]
     repo: str
-    symbol_id: str
-    raw_symbol: str
+    context: dict[str, object]
     extra: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_blocks(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            identity_val = value.get("identity")
+            context_val = value.get("context")
+            normalized_identity = (
+                identity_val.model_dump() if hasattr(identity_val, "model_dump") else identity_val
+            )
+            normalized_context = (
+                context_val.model_dump() if hasattr(context_val, "model_dump") else context_val
+            )
+            return {
+                **value,
+                "identity": normalized_identity,
+                "context": normalized_context,
+            }
+        return value

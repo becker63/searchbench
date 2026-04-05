@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -44,6 +45,12 @@ class LCATaskIdentity(BaseModel):
                 issue_key,
             ]
         )
+    @property
+    def id(self) -> str:
+        """
+        Alias for task_id to simplify referencing identity as the canonical key.
+        """
+        return self.task_id()
 
 
 class LCAContext(BaseModel):
@@ -102,6 +109,7 @@ class LCATask(BaseModel):
     identity: LCATaskIdentity
     context: LCAContext
     gold: LCAGold
+    repo: Optional[str] = None
     evidence: Optional["LocalizationEvidence"] = Field(default=None, description="Optional per-file evidence kept separate from predictions")
 
     def canonical_prediction_shape(self) -> str:
@@ -109,6 +117,20 @@ class LCATask(BaseModel):
         Describe the canonical prediction contract: file paths only.
         """
         return "predicted_files: list[str]"
+
+    @property
+    def task_id(self) -> str:
+        """
+        Deterministic task identifier (delegates to identity).
+        """
+        return self.identity.task_id()
+
+    @property
+    def changed_files(self) -> List[str]:
+        """
+        Convenience accessor for gold changed_files.
+        """
+        return self.gold.normalized_changed_files()
 
 
 class LocalizationDatasetInfo(BaseModel):
@@ -286,3 +308,104 @@ class LocalizationTelemetryEnvelope(BaseModel):
                 raw["materialization_events"] = LocalizationMaterialization(events=list(materialization_val))
             return raw
         return value
+
+
+def _as_list(value: object) -> List[str]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [str(v) for v in value]
+    if value is None:
+        return []
+    return [str(value)]
+
+
+def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str] | None = None) -> LCATask:
+    """
+    Coerce an arbitrary mapping (e.g., LCA dataset row) into an `LCATask`.
+    `defaults` may provide (dataset_name, dataset_config, dataset_split) when absent from the row.
+    """
+    identity_map = data.get("identity") if isinstance(data.get("identity"), Mapping) else {}
+    dataset_name = str(
+        data.get("dataset_name")
+        or (identity_map.get("dataset_name") if isinstance(identity_map, Mapping) else None)
+        or data.get("dataset")
+        or (defaults[0] if defaults else "unknown-dataset")
+    )
+    dataset_config = str(
+        data.get("dataset_config")
+        or (identity_map.get("dataset_config") if isinstance(identity_map, Mapping) else None)
+        or data.get("config")
+        or (defaults[1] if defaults else "unknown-config")
+    )
+    dataset_split = str(
+        data.get("dataset_split")
+        or (identity_map.get("dataset_split") if isinstance(identity_map, Mapping) else None)
+        or data.get("split")
+        or (defaults[2] if defaults else "unknown-split")
+    )
+    repo_owner = str(
+        data.get("repo_owner")
+        or (identity_map.get("repo_owner") if isinstance(identity_map, Mapping) else None)
+        or data.get("owner")
+        or data.get("repository_owner")
+        or "unknown-owner"
+    )
+    repo_name = str(
+        data.get("repo_name")
+        or (identity_map.get("repo_name") if isinstance(identity_map, Mapping) else None)
+        or data.get("name")
+        or data.get("repository_name")
+        or "unknown-repo"
+    )
+    base_sha = str(
+        data.get("base_sha")
+        or (identity_map.get("base_sha") if isinstance(identity_map, Mapping) else None)
+        or data.get("sha")
+        or data.get("commit")
+        or "unknown-base-sha"
+    )
+    issue_url = (
+        (identity_map.get("issue_url") if isinstance(identity_map, Mapping) else None)
+        or data.get("issue_url")
+        or data.get("issue")
+    )
+    pull_url = (
+        (identity_map.get("pull_url") if isinstance(identity_map, Mapping) else None)
+        or data.get("pull_url")
+        or data.get("pull")
+    )
+
+    identity = LCATaskIdentity(
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        base_sha=base_sha,
+        issue_url=str(issue_url) if issue_url else None,
+        pull_url=str(pull_url) if pull_url else None,
+    )
+
+    issue_title = str(data.get("issue_title") or data.get("title") or "")
+    issue_body = str(data.get("issue_body") or data.get("body") or "")
+    context = LCAContext(
+        issue_title=issue_title,
+        issue_body=issue_body,
+        diff_url=str(data.get("diff_url")) if data.get("diff_url") else None,
+        diff=str(data.get("diff")) if data.get("diff") else None,
+        head_sha=str(data.get("head_sha")) if data.get("head_sha") else None,
+        repo_language=str(data.get("repo_language")) if data.get("repo_language") else None,
+        repo_languages=_as_list(data.get("repo_languages") or []),
+        repo_license=str(data.get("repo_license")) if data.get("repo_license") else None,
+        repo_stars=int(data.get("repo_stars")) if isinstance(data.get("repo_stars"), (int, float)) else None,
+    )
+
+    changed_files_raw = data.get("changed_files") or data.get("gold") or []
+    gold = LCAGold(changed_files=_as_list(changed_files_raw))
+
+    evidence_val = data.get("evidence")
+    evidence = LocalizationEvidence.from_mapping(evidence_val) if isinstance(evidence_val, Mapping) else None
+
+    repo_val = data.get("repo")
+    repo_str = str(repo_val) if isinstance(repo_val, (str, Path)) else None
+
+    return LCATask(identity=identity, context=context, gold=gold, repo=repo_str, evidence=evidence)

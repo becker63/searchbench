@@ -30,6 +30,7 @@ from harness.loop.loop_types import (
     JCResult,
     TaskPayload,
 )
+from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.pipeline.types import PipelineClassification, StepResult
 
 
@@ -148,7 +149,16 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
     repair_chart = RepairStateMachine(repair_model)
 
-    loop_ctx = LoopContext(task=TaskPayload(symbol="dummy", repo="repo"), iterations=1, baseline_snapshot=None, run_trace=None)
+    identity = LCATaskIdentity(
+        dataset_name="demo",
+        dataset_config="cfg",
+        dataset_split="dev",
+        repo_owner="owner",
+        repo_name="repo",
+        base_sha="base",
+    )
+    context = LCAContext(issue_title="demo", issue_body="details")
+    loop_ctx = LoopContext(task=TaskPayload(identity=identity, context=context, repo="repo", changed_files=[]), iterations=1, baseline_snapshot=None, run_trace=None)
     opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
     opt_chart = OptimizationStateMachine(opt_model)
     return repair_chart, opt_chart

@@ -5,6 +5,7 @@ from typing import Any, List
 
 import pytest
 
+from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.loop.loop_machine import OptimizationStateMachine, RepairStateMachine
 from harness.loop.loop_types import (
     AcceptedPolicyMeta,
@@ -62,8 +63,21 @@ def _make_eval() -> EvaluationResult:
     )
 
 
+def _task_payload() -> TaskPayload:
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    context = LCAContext(issue_title="bug", issue_body="details")
+    return TaskPayload(identity=identity, context=context, repo="repo", changed_files=["a.py"])
+
+
 def test_prepared_tasks_emit_models() -> None:
-    base = TaskPayload(symbol="sym", repo="repo")
+    base = _task_payload()
     prepared = PreparedTasks(base_task=base, resolved_repo_path="resolved", jc_repo_id="jc-id")
     iteration_tasks = prepared.build_iteration_tasks()
     assert isinstance(iteration_tasks, IterationTasks)
@@ -129,8 +143,18 @@ def _repair_deps(
             base_task=task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task),
             resolved_repo_path=".",
             jc_repo_id=".",
-            ic_task=ICTaskPayload(symbol=task.symbol if isinstance(task, TaskPayload) else TaskPayload.model_validate(task).symbol, repo="."),
-            jc_task=JCTaskPayload(symbol=task.symbol if isinstance(task, TaskPayload) else TaskPayload.model_validate(task).symbol, repo="."),
+            ic_task=ICTaskPayload(
+                identity=_task_payload().identity,
+                context=_task_payload().context,
+                repo=".",
+                changed_files=["a.py"],
+            ),
+            jc_task=JCTaskPayload(
+                identity=_task_payload().identity,
+                context=_task_payload().context,
+                repo=".",
+                changed_files=["a.py"],
+            ),
         ),
         evaluate_policy_on_item=lambda *a, **k: _make_eval(),  # type: ignore[arg-type]
         build_iteration_feedback=lambda *a, **k: _make_feedback(),  # type: ignore[arg-type]
@@ -266,8 +290,18 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
             base_task=base_task,
             resolved_repo_path=".",
             jc_repo_id=".",
-            ic_task=ICTaskPayload(symbol=base_task.symbol, repo="."),
-            jc_task=JCTaskPayload(symbol=base_task.symbol, repo="."),
+            ic_task=ICTaskPayload(
+                identity=base_task.identity,
+                context=base_task.context,
+                repo=".",
+                changed_files=base_task.changed_files,
+            ),
+            jc_task=JCTaskPayload(
+                identity=base_task.identity,
+                context=base_task.context,
+                repo=".",
+                changed_files=base_task.changed_files,
+            ),
         )
 
     def evaluate_policy_on_item(
@@ -310,7 +344,7 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
 
 def test_optimization_completes_and_records_history() -> None:
     ctx = LoopContext(
-        task=TaskPayload(symbol="s", repo="."),
+        task=_task_payload(),
         iterations=1,
         session_id=None,
         baseline_snapshot=None,

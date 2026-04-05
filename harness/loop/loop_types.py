@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.localization.models import LCAContext, LCATaskIdentity
 
 if TYPE_CHECKING:
     from harness.observability.baselines import BaselineSnapshot
@@ -136,29 +137,38 @@ class FeedbackEntries(BaseModel):
 
 
 class TaskPayload(BaseModel):
-    """Normalized task payload passed into loop/runner agents."""
+    """Localization-native task payload passed into loop/runner agents."""
 
     model_config = ConfigDict(extra="forbid")
 
-    symbol: str
+    identity: LCATaskIdentity
+    context: LCAContext
     repo: str
+    changed_files: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
     def _coerce_mapping(cls, value: object) -> object:
         if isinstance(value, Mapping):
-            return {"symbol": value.get("symbol"), "repo": value.get("repo")}
+            identity_val = value.get("identity") or {}
+            context_val = value.get("context") or {}
+            return {
+                "identity": identity_val,
+                "context": context_val,
+                "repo": value.get("repo"),
+                "changed_files": value.get("changed_files", []),
+            }
         return value
 
 
 class ICTaskPayload(TaskPayload):
-    """Iteration task payload for IC runs."""
+    """Iteration task payload for localization runs (IC backend)."""
 
     model_config = ConfigDict(extra="forbid")
 
 
 class JCTaskPayload(TaskPayload):
-    """Iteration task payload for JC runs."""
+    """Iteration task payload for localization runs (JC backend)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -198,12 +208,22 @@ class PreparedTasks(BaseModel):
     def to_ic_request(self) -> ICTaskPayload:
         if self.ic_task is not None:
             return self.ic_task
-        return ICTaskPayload(symbol=self.base_task.symbol, repo=self._resolve_ic_repo())
+        return ICTaskPayload(
+            identity=self.base_task.identity,
+            context=self.base_task.context,
+            repo=self._resolve_ic_repo(),
+            changed_files=self.base_task.changed_files,
+        )
 
     def to_jc_request(self) -> JCTaskPayload:
         if self.jc_task is not None:
             return self.jc_task
-        return JCTaskPayload(symbol=self.base_task.symbol, repo=self._resolve_jc_repo())
+        return JCTaskPayload(
+            identity=self.base_task.identity,
+            context=self.base_task.context,
+            repo=self._resolve_jc_repo(),
+            changed_files=self.base_task.changed_files,
+        )
 
     def build_iteration_tasks(self) -> "IterationTasks":
         return IterationTasks(ic_task=self.to_ic_request(), jc_task=self.to_jc_request())
@@ -468,7 +488,7 @@ def _rebuild_forward_refs() -> None:
     try:
         from harness.observability.baselines import BaselineSnapshot  # local import to avoid cycles
     except Exception:
-        return
+        BaselineSnapshot = object  # type: ignore[misc,assignment]
     LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot, "RunMetadata": RunMetadata})
     LoopDependencies.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
     RepairContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})

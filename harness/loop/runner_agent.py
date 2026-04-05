@@ -18,7 +18,9 @@ from harness.tools.mcp_adapter import serialize_tool_result_for_model
 from harness.utils.env import get_cerebras_api_key, get_runner_model
 from harness.utils.openai_schema import OpenAITool, validate_tools
 from harness.utils.template_loader import render_prompt_template
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from harness.localization.models import LCAContext, LCATaskIdentity
 
 from .agent_common import AgentTaskPayload, usage_from_response
 
@@ -36,21 +38,56 @@ _AGGRESSIVE_USER_CHARS = 1500
 class AgentTask(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    symbol: str
+    identity: LCATaskIdentity
     repo: str
-    symbol_id: str
-    raw_symbol: str
+    context: LCAContext
     extra: dict[str, object] = Field(default_factory=dict)
 
     def to_payload(self) -> dict[str, object]:
         payload_model = AgentTaskPayload(
-            symbol=self.symbol,
+            identity=self.identity.model_dump(),
             repo=self.repo,
-            symbol_id=self.symbol_id,
-            raw_symbol=self.raw_symbol,
+            context=self.context.model_dump(),
             extra=self.extra,
         )
         return payload_model.model_dump()
+
+
+class LocalizationRunnerResult(BaseModel):
+    """Typed localization runner output boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    predicted_files: list[str] = Field(default_factory=list)
+    reasoning: str | None = None
+    observations: list[dict[str, object]] = Field(default_factory=list)
+    node_count: int | None = None
+    raw: dict[str, object] | None = None
+    source: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            files_raw = value.get("predicted_files", [])
+            normalized: list[str] = []
+            seen: set[str] = set()
+            if isinstance(files_raw, list):
+                for item in files_raw:
+                    if not isinstance(item, str):
+                        continue
+                    cleaned = item.strip().lower()
+                    if cleaned and cleaned not in seen:
+                        seen.add(cleaned)
+                        normalized.append(cleaned)
+            elif isinstance(files_raw, str):
+                for part in files_raw.replace("\n", ",").split(","):
+                    cleaned = part.strip().lower()
+                    if cleaned and cleaned not in seen:
+                        seen.add(cleaned)
+                        normalized.append(cleaned)
+            return {**value, "predicted_files": normalized}
+        return value
 
 
 def _require_str(mapping: dict[str, Any], key: str) -> str:
@@ -74,6 +111,24 @@ def _tool_names_from_specs(tool_specs: list[OpenAITool]) -> list[str]:
         if isinstance(name, str):
             names.append(name)
     return names
+
+
+def _sanitize_agent_task(agent_task: Mapping[str, object]) -> dict[str, object]:
+    """Drop gold/irrelevant fields before showing the payload to the model."""
+    cleaned: dict[str, object] = {}
+    for key, val in agent_task.items():
+        cleaned[key] = val
+    return cleaned
+
+
+def _format_user_prompt(agent_task: dict[str, object]) -> str:
+    payload_json = json.dumps(_sanitize_agent_task(agent_task), indent=2)
+    return (
+        "Localize the bug by using the available tools and propose repo-relative files to change.\n"
+        "Prefer concise file lists (JSON or bullets are fine) plus brief reasoning.\n"
+        "Task payload:\n"
+        f"{payload_json}"
+    )
 
 
 def _format_available_tools(tool_names: list[str]) -> str:
@@ -225,7 +280,7 @@ def _build_model_messages(agent_task: dict[str, object], tool_specs: list[OpenAI
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
-            "content": f"Here is your task (model: {get_runner_model()}):\n{json.dumps(agent_task, indent=2)}",
+            "content": _format_user_prompt(agent_task),
         },
     ]
     validate_tools(tool_specs)
@@ -285,7 +340,12 @@ def _make_retry_messages(agent_task: dict[str, object], observations: list[dict[
     return _enforce_message_budget(_build_model_messages(agent_task, [], system_prompt) + observations)
 
 
-def _apply_tool_results(observations: list[dict[str, object]], tool_results: list[dict[str, object]], system_prompt: str) -> list[dict[str, object]]:
+def _apply_tool_results(
+    agent_task: dict[str, object],
+    observations: list[dict[str, object]],
+    tool_results: list[dict[str, object]],
+    system_prompt: str,
+) -> list[dict[str, object]]:
     if not tool_results:
         return observations
     new_obs = []
@@ -294,7 +354,7 @@ def _apply_tool_results(observations: list[dict[str, object]], tool_results: lis
         if obs.get("role") == "assistant" and obs.get("tool_calls"):
             new_obs.extend(tool_results)
     return _enforce_message_budget(
-        _build_model_messages({"placeholder": True}, [], system_prompt) + new_obs,
+        _build_model_messages(agent_task, [], system_prompt) + new_obs,
         max_total_chars=_AGGRESSIVE_TOTAL_CHARS,
         max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS,
         max_system_chars=_AGGRESSIVE_SYSTEM_CHARS,
@@ -348,7 +408,7 @@ def run_agent(
             )
             if tool_results:
                 observations.extend(tool_results)
-            messages = _apply_tool_results(observations, tool_results, system_prompt)
+            messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt)
             try:
                 completion = client.chat.completions.create(
                     messages=messages,
@@ -356,7 +416,6 @@ def run_agent(
                     temperature=0.2,
                     tools=tool_specs,
                     tool_choice="auto" if tool_specs else None,
-                    response_format={"type": "json_object"},
                     extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -367,7 +426,6 @@ def run_agent(
                     messages=retry_messages,
                     model=model,
                     temperature=0.2,
-                    response_format={"type": "json_object"},
                     extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
                 )
             choice = completion.choices[0]
@@ -404,7 +462,7 @@ def run_agent(
                         "content": response_message.get("content") or "",
                     }
                 )
-                messages = _apply_tool_results(observations, tool_results, system_prompt)
+                messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt)
                 continue
             else:
                 try:
@@ -446,7 +504,6 @@ def run_agent_with_retry(
             messages=retry_messages,
             model=model,
             temperature=0.2,
-            response_format={"type": "json_object"},
             extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
         )
         choice = completion.choices[0]
@@ -491,17 +548,187 @@ def _normalize_agent_result(raw: Any) -> dict[str, object]:
     return normalized
 
 
+def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tuple[list[str], str | None]:
+    """
+    Emergency-only fallback: try to extract predicted_files from assistant content when finalization fails.
+    This is a degraded path and should not be considered equivalent to schema-finalized output.
+    """
+    observations = agent_result.get("observations")
+    if not isinstance(observations, list):
+        return [], None
+
+    def _as_file_list(value: object) -> list[str]:
+        # Fallback only accepts already-structured array or JSON string.
+        cleaned: list[str] = []
+        if isinstance(value, list):
+            for entry in value:
+                if isinstance(entry, str):
+                    stripped = entry.strip()
+                    if stripped:
+                        cleaned.append(stripped.lower())
+        elif isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    for entry in parsed:
+                        if isinstance(entry, str):
+                            stripped = entry.strip()
+                            if stripped:
+                                cleaned.append(stripped.lower())
+            except Exception:
+                return []
+        # Preserve order while de-duplicating
+        seen: set[str] = set()
+        unique: list[str] = []
+        for path in cleaned:
+            if path in seen:
+                continue
+            seen.add(path)
+            unique.append(path)
+        return unique
+
+    for obs in reversed(observations):
+        if not isinstance(obs, Mapping):
+            continue
+        content = obs.get("content")
+        reasoning: str | None = None
+        if isinstance(content, Mapping):
+            predicted = _as_file_list(content.get("predicted_files"))
+            if not predicted:
+                predicted = _as_file_list(content.get("files") or content.get("paths"))
+            reasoning = content.get("reasoning") if isinstance(content.get("reasoning"), str) else None
+            if predicted:
+                return predicted, reasoning
+        elif isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, Mapping):
+                    predicted = _as_file_list(parsed.get("predicted_files"))
+                    reasoning = parsed.get("reasoning") if isinstance(parsed.get("reasoning"), str) else None
+                    if predicted:
+                        return predicted, reasoning
+            except Exception:
+                return [], None
+    return [], None
+
+
+def _localization_result_schema() -> dict[str, object]:
+    return {
+        "name": "localization_result",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "predicted_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                },
+                "reasoning": {"type": "string"},
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "file": {"type": "string"},
+                            "notes": {"type": "string"},
+                        },
+                        "required": ["file"],
+                    },
+                    "default": [],
+                },
+            },
+            "required": ["predicted_files"],
+        },
+        "strict": True,
+    }
+
+
+def _format_finalization_messages(agent_task: dict[str, object], observations: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Summarize exploration observations and request a structured result."""
+    observation_snippets: list[str] = []
+    for obs in observations[-5:]:
+        try:
+            observation_snippets.append(json.dumps(obs, default=str)[:400])
+        except Exception:
+            observation_snippets.append(str(obs)[:400])
+    summary = "\n".join(observation_snippets)
+    user_prompt = (
+        "Based on the prior tool-assisted exploration, produce the final localization result.\n"
+        "Return repo-relative `predicted_files` and brief reasoning.\n"
+        "Observations:\n"
+        f"{summary}"
+    )
+    return [
+        {"role": "system", "content": "You are finalizing a bug localization task. Output must follow the provided JSON schema."},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _finalize_localization(
+    agent_task: dict[str, object],
+    observations: list[dict[str, object]],
+    parent_trace: object | None = None,
+) -> LocalizationRunnerResult:
+    client, model = _make_client()
+    messages = _format_finalization_messages(agent_task, observations)
+    schema = _localization_result_schema()
+    with start_observation(
+        name="localization_finalize",
+        parent=_require_parent(parent_trace, owner="runner agent"),
+        metadata={"phase": "finalize"},
+    ) as obs:
+        completion = client.chat.completions.create(
+            messages=messages,
+            model=model,
+            temperature=0.0,
+            response_format={"type": "json_schema", "json_schema": schema},
+            extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
+        )
+        choice = completion.choices[0]
+        message_obj = getattr(choice, "message", None)
+        content = getattr(message_obj, "content", None) if message_obj is not None else None
+        parsed: dict[str, object] = {}
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as exc:  # noqa: BLE001
+                raise RuntimeError(f"Invalid structured output: {exc}") from exc
+        elif isinstance(content, Mapping):
+            parsed = dict(content)
+        else:
+            raise RuntimeError("Structured output missing content")
+        obs.update(output=_truncate_for_metadata(parsed))
+        result = LocalizationRunnerResult.model_validate(
+            {
+                "predicted_files": parsed.get("predicted_files", []),
+                "reasoning": parsed.get("reasoning"),
+                "observations": observations,
+                "raw": {"final": parsed},
+                "source": "finalize",
+            }
+        )
+        return result
+
+
 def run_ic_iteration(
     task: dict[str, object],
-    score_fn: Callable[..., float],
+    score_fn: Callable[..., float] | None = None,
     steps: int = 5,
     parent_trace: object | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner="iterative_context")
-    symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
+    identity = LCATaskIdentity.model_validate(task.get("identity") or {})
+    context = LCAContext.model_validate(task.get("context") or {})
     try:
-        agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+        agent_task_model = AgentTask(
+            identity=identity,
+            repo=repo,
+            context=context,
+            extra={k: v for k, v in task.items() if k not in {"identity", "context", "repo", "changed_files"}},
+        )
     except ValidationError as exc:
         raise RuntimeError(f"Invalid agent task: {exc}") from exc
     agent_task = agent_task_model.to_payload()
@@ -512,7 +739,7 @@ def run_ic_iteration(
     with start_observation(
         name="iterative_context",
         parent=parent_span,
-        metadata={"backend": "iterative_context", "repo": repo, "symbol": symbol},
+        metadata={"backend": "iterative_context", "repo": repo, "identity": identity.task_id()},
     ) as backend_obs:
         try:
             raw = run_agent(
@@ -532,7 +759,24 @@ def run_ic_iteration(
         node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
         emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count, data_type="NUMERIC")
         backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
-        return normalized
+
+    try:
+        final = _finalize_localization(agent_task, normalized.get("observations", []), parent_trace=parent_span)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        predicted_files, reasoning = _extract_localization_prediction(normalized)
+        final = LocalizationRunnerResult(
+            predicted_files=predicted_files,
+            reasoning=reasoning,
+            observations=normalized.get("observations", []),
+            node_count=normalized.get("node_count"),
+            raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
+            source="fallback",
+        )
+    if not final.observations:
+        final.observations = normalized.get("observations", [])
+    if final.node_count is None:
+        final.node_count = normalized.get("node_count")
+    return final.model_dump()
 
 
 def run_jc_iteration(
@@ -541,10 +785,16 @@ def run_jc_iteration(
     parent_trace: object | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner="jcodemunch")
-    symbol = _require_str(task, "symbol")
     repo = _require_str(task, "repo")
+    identity = LCATaskIdentity.model_validate(task.get("identity") or {})
+    context = LCAContext.model_validate(task.get("context") or {})
     try:
-        agent_task_model = AgentTask(symbol=symbol, repo=repo, symbol_id=symbol, raw_symbol=symbol, extra={k: v for k, v in task.items() if k not in {"symbol", "repo"}})
+        agent_task_model = AgentTask(
+            identity=identity,
+            repo=repo,
+            context=context,
+            extra={k: v for k, v in task.items() if k not in {"identity", "context", "repo", "changed_files"}},
+        )
     except ValidationError as exc:
         raise RuntimeError(f"Invalid agent task: {exc}") from exc
     agent_task = agent_task_model.to_payload()
@@ -555,7 +805,7 @@ def run_jc_iteration(
     with start_observation(
         name="jcodemunch",
         parent=parent_span,
-        metadata={"backend": "jcodemunch", "repo": repo, "symbol": symbol},
+        metadata={"backend": "jcodemunch", "repo": repo, "identity": identity.task_id()},
     ) as backend_obs:
         try:
             raw = run_agent(
@@ -575,7 +825,24 @@ def run_jc_iteration(
         node_count = float(nc_val) if isinstance(nc_val, (int, float, bool)) else 0.0
         emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count, data_type="NUMERIC")
         backend_obs.update(metadata={"node_count": normalized.get("node_count", 0)})
-        return normalized
+
+    try:
+        final = _finalize_localization(agent_task, normalized.get("observations", []), parent_trace=parent_span)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        predicted_files, reasoning = _extract_localization_prediction(normalized)
+        final = LocalizationRunnerResult(
+            predicted_files=predicted_files,
+            reasoning=reasoning,
+            observations=normalized.get("observations", []),
+            node_count=normalized.get("node_count"),
+            raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
+            source="fallback",
+        )
+    if not final.observations:
+        final.observations = normalized.get("observations", [])
+    if final.node_count is None:
+        final.node_count = normalized.get("node_count")
+    return final.model_dump()
 
 
 __all__ = [

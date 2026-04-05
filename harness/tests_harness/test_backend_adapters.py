@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 from mcp.types import TextContent, Tool
 
+from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.loop import runner_agent as runner
 from harness.tools.backends.ic_backend import IterativeContextBackend
 from harness.tools.backends.jc_backend import JCodeMunchBackend
@@ -48,9 +49,9 @@ def test_run_async_with_running_loop_uses_separate_loop():
 
 def test_ic_backend_uses_server_surfaces(monkeypatch, tmp_path):
     dummy_tool = Tool(
-        name="resolve",
+        name="resolve_path",
         description="resolve",
-        inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}}},
+        inputSchema={"type": "object", "properties": {"path": {"type": "string"}}},
     )
     calls: list[tuple[str, dict[str, Any]]] = []
     runtime_args: list[dict[str, Any]] = []
@@ -82,14 +83,14 @@ def test_ic_backend_uses_server_surfaces(monkeypatch, tmp_path):
     assert runtime_args == [{"score_fn": score_fn, "repo_root": repo_path.resolve()}]
     assert Path.cwd() == cwd_before
 
-    result = backend.dispatch("resolve", {"symbol": "foo"})
-    assert result == {"ok": True, "name": "resolve"}
-    assert calls == [("resolve", {"symbol": "foo"})]
+    result = backend.dispatch("resolve_path", {"path": "foo"})
+    assert result == {"ok": True, "name": "resolve_path"}
+    assert calls == [("resolve_path", {"path": "foo"})]
 
 
 def test_jc_backend_uses_server_surfaces(monkeypatch, tmp_path):
     dummy_tool = Tool(
-        name="search_symbols",
+        name="search_files",
         description="search",
         inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
     )
@@ -109,9 +110,9 @@ def test_jc_backend_uses_server_surfaces(monkeypatch, tmp_path):
 
     assert backend.tool_specs == [mcp_tool_to_openai_tool(dummy_tool)]
 
-    result = backend.dispatch("search_symbols", {"query": "foo"})
+    result = backend.dispatch("search_files", {"query": "foo"})
     assert result == {"result": "ok", "args": {"query": "foo"}}
-    assert ("search_symbols", {"query": "foo"}) in call_args
+    assert ("search_files", {"query": "foo"}) in call_args
 
 
 def test_parse_text_content_payload_handles_json_and_text():
@@ -201,9 +202,9 @@ def _dummy_client(tool_name: str, args: dict[str, Any]):
 
 def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp_path):
     dummy_tool = Tool(
-        name="resolve",
+        name="resolve_path",
         description="resolve",
-        inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}}},
+        inputSchema={"type": "object", "properties": {"path": {"type": "string"}}},
     )
 
     async def fake_list_tools():
@@ -225,7 +226,7 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
 
     monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
-    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve", {"symbol": "foo"}))
+    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve_path", {"identity": "task"}))
     @contextmanager
     def span_cm():
         class Span:
@@ -243,11 +244,31 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
         yield Span()
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    def fake_finalize(task, obs, parent_trace=None):
+        # Expect a separate no-tools finalize call; simulate schema result.
+        assert isinstance(task, dict)
+        assert isinstance(obs, list)
+        # Ensure the schema path is used (response_format=json_schema would have been required upstream).
+        return runner.LocalizationRunnerResult(predicted_files=["a.py"], observations=obs, source="finalize")
 
+    monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
+
+    task_payload = {
+        "identity": LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ).model_dump(),
+        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+        "repo": str(tmp_path),
+    }
     result = cast(
         dict[str, Any],
         runner.run_ic_iteration(
-            {"symbol": "s", "repo": str(tmp_path)},
+            task_payload,
             score_fn=lambda n, s: 1.0,
             steps=1,
             parent_trace=object(),
@@ -263,7 +284,7 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
 
 def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
     dummy_tool = Tool(
-        name="search_symbols",
+        name="search_files",
         description="search",
         inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
     )
@@ -276,7 +297,7 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
 
     monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
-    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_symbols", {"query": "foo"}))
+    monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_files", {"query": "foo"}))
     @contextmanager
     def span_cm():
         class Span:
@@ -294,18 +315,213 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
         yield Span()
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    def fake_finalize(task, obs, parent_trace=None):
+        assert isinstance(task, dict)
+        assert isinstance(obs, list)
+        return runner.LocalizationRunnerResult(predicted_files=["a.py"], observations=obs, source="finalize")
 
+    monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
+
+    task_payload = {
+        "identity": LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ).model_dump(),
+        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+        "repo": str(tmp_path),
+    }
     result = cast(
         dict[str, Any],
         runner.run_jc_iteration(
-            {"symbol": "s", "repo": str(tmp_path)},
+            task_payload,
             steps=1,
             parent_trace=object(),
         ),
     )
     assert result["node_count"] == 0
     first_obs = cast(dict[str, Any], result["observations"][0])
-    assert first_obs["result"] == {"called": "search_symbols", "args": {"query": "foo"}}
+    assert first_obs["result"] == {"called": "search_files", "args": {"query": "foo"}}
+
+
+def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+
+    captured: dict[str, object] = {}
+    finalized: dict[str, bool] = {"called": False}
+    finalize_calls: list[dict[str, object]] = []
+
+    class FakeBackend:
+        def __init__(self, repo: str, score_fn=None):
+            captured["repo"] = repo
+            self.tool_specs = [
+                {
+                    "type": "function",
+                    "function": {"name": "resolve", "description": "", "parameters": {"type": "object", "properties": {}}},
+                }
+            ]
+
+        def dispatch(self, name: str, arguments: dict[str, Any]):
+            captured.setdefault("dispatches", []).append((name, arguments))
+            return {"ok": True}
+
+    def fake_run_agent(agent_task: dict[str, object], steps: int, tool_specs: list[OpenAITool], dispatch_tool_call, system_prompt: str, parent_trace=None, backend_name=None):
+        captured["tool_specs"] = tool_specs
+        dispatch_tool_call("resolve", {"path": "p"})
+        return {"observations": [{"role": "assistant", "content": {"predicted_files": ["src/app.py"], "reasoning": "r"}}]}
+
+    def fake_finalize(task, obs, parent_trace=None):
+        finalized["called"] = True
+        finalize_calls.append({"task": task, "observations": obs})
+        return runner.LocalizationRunnerResult(
+            predicted_files=["src/app.py"], reasoning="r", observations=obs, source="finalize"
+        )
+
+    monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
+
+    @contextmanager
+    def span_cm():
+        class Span:
+            id = "span"
+
+            def score(self, name: str, value: float, metadata=None):
+                pass
+
+            def update(self, **kwargs):
+                pass
+
+            def end(self, **kwargs):
+                pass
+
+        yield Span()
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    monkeypatch.setattr(runner, "IterativeContextBackend", FakeBackend)
+    monkeypatch.setattr(runner, "run_agent", fake_run_agent)
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+
+    result = cast(
+        dict[str, Any],
+        runner.run_ic_iteration(
+            {
+                "identity": LCATaskIdentity(
+                    dataset_name="lca",
+                    dataset_config="py",
+                    dataset_split="dev",
+                    repo_owner="o",
+                    repo_name="r",
+                    base_sha="abc",
+                ).model_dump(),
+                "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+                "repo": str(repo_dir),
+            },
+            score_fn=None,
+            steps=1,
+            parent_trace=object(),
+        ),
+    )
+    assert captured.get("repo") == str(repo_dir)
+    assert captured.get("tool_specs")
+    assert captured.get("dispatches") == [("resolve", {"path": "p"})]
+    assert result.get("predicted_files") == ["src/app.py"]
+    assert finalized["called"] is True
+    assert finalize_calls and "identity" in finalize_calls[0]["task"]
+
+
+def test_finalization_uses_json_schema(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+
+    calls: list[dict[str, object]] = []
+
+    class DummyCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            # Finalization expects JSON content; return minimal schema-conforming payload on second call.
+            content = "{}"
+            if len(calls) >= 2:
+                content = '{"predicted_files": ["src/app.py"], "reasoning": "r"}'
+            response = type(
+                "DummyResponse",
+                (),
+                {
+                    "choices": [
+                        type("Choice", (), {"message": type("Msg", (), {"content": content})()})()
+                    ],
+                    "usage": type(
+                        "U",
+                        (),
+                        {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2,
+                            "prompt_tokens_details": {},
+                            "completion_tokens_details": {},
+                        },
+                    )(),
+                },
+            )()
+            return response
+
+    class DummyClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": DummyCompletions()})()
+
+    def fake_make_client(model_override=None):
+        return DummyClient(), "dummy-model"
+
+    monkeypatch.setattr(runner, "_make_client", fake_make_client)
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type("B", (), {"tool_specs": [{"type": "function", "function": {"name": "t", "parameters": {"type": "object", "properties": {}}}}], "dispatch": lambda self, name, args: {"ok": True}})(),
+    )
+    @contextmanager
+    def span_cm():
+        class Span:
+            id = "span"
+
+            def update(self, **kwargs): ...
+            def end(self, **kwargs): ...
+
+        yield Span()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+
+    task_payload = {
+        "identity": LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ).model_dump(),
+        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+        "repo": str(tmp_path),
+    }
+
+    result = runner.run_ic_iteration(task_payload, score_fn=None, steps=1, parent_trace=object())
+    assert result["predicted_files"] == ["src/app.py"]
+    assert len(calls) >= 2
+    explore_call = calls[0]
+    finalize_call = calls[-1]
+    assert "tools" in explore_call
+    assert "tools" not in finalize_call or finalize_call.get("tools") in (None, [])
+    rf = finalize_call.get("response_format")
+    assert isinstance(rf, dict)
+    assert rf.get("type") == "json_schema"
+    js = rf.get("json_schema")
+    assert isinstance(js, dict)
+    assert js.get("strict") is True
+    schema = js.get("schema")
+    assert isinstance(schema, dict)
+    assert schema.get("type") == "object"
+    assert schema.get("additionalProperties") is False
+    assert "predicted_files" in schema.get("properties", {})
 
 
 def test_jc_prompt_uses_canonical_tool_names():
@@ -319,7 +535,7 @@ def test_jc_prompt_uses_canonical_tool_names():
 
 
 def test_jc_backend_initializes_github_url(monkeypatch, tmp_path):
-    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    dummy_tool = Tool(name="search_files", description="search", inputSchema={})
     called: dict[str, int] = {"index_repo": 0}
 
     async def fake_list_tools():
@@ -340,7 +556,7 @@ def test_jc_backend_initializes_github_url(monkeypatch, tmp_path):
 
 
 def test_jc_backend_owner_repo_init(monkeypatch):
-    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    dummy_tool = Tool(name="search_files", description="search", inputSchema={})
     called: dict[str, int] = {"index_repo": 0}
 
     async def fake_list_tools():
@@ -372,7 +588,7 @@ def test_jc_backend_rejects_ambiguous_repo(monkeypatch):
 
 
 def test_jc_backend_initializes_local_repo(monkeypatch, tmp_path):
-    dummy_tool = Tool(name="search_symbols", description="search", inputSchema={})
+    dummy_tool = Tool(name="search_files", description="search", inputSchema={})
     called: dict[str, int] = {"resolve": 0, "index": 0}
 
     async def fake_list_tools():

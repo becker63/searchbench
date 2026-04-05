@@ -5,6 +5,7 @@ from localization.models import (
     LCATaskIdentity,
     LCAPrediction,
     LCAGold,
+    LCAContext,
     LocalizationDatasetInfo,
     LocalizationEvalRecord,
     LocalizationEvidence,
@@ -18,6 +19,9 @@ from localization.models import (
 from localization.scoring import score_file_localization
 from localization.eval import build_file_localization_eval_record
 from localization.telemetry import build_localization_telemetry
+from localization.executor import run_localization_task
+import localization.executor as executor_module
+import harness.loop.runner_agent as runner
 
 
 def test_identity_is_deterministic():
@@ -114,3 +118,91 @@ def test_telemetry_builder_is_model_first():
 def test_localization_models_reject_unknown_fields():
     with pytest.raises(Exception):
         LocalizationRepoInfo(owner="o", name="n", base_sha="sha", unexpected="x")  # type: ignore[arg-type]
+
+
+def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    gold = LCAGold(changed_files=["gold.py"])
+    lca_task = executor_module.LCATask.model_validate(
+        {
+            "identity": identity.model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="body").model_dump(),
+            "gold": gold.model_dump(),
+            "repo": str(repo_dir),
+        }
+    )
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        yield type("S", (), {"id": "span", "metadata": {}, "end": lambda self, **kw: None})()
+
+    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    prediction, metrics, _evidence, _mat = run_localization_task(
+        lca_task,
+        runner=lambda *_args: (["predicted.py"], {"source": "runner"}),
+    )
+    assert prediction.predicted_files == ["predicted.py"]
+    assert metrics.precision == 0.0
+
+
+def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
+    captured: list[dict[str, object]] = []
+
+    def fake_run_agent(agent_task: dict[str, object], *args, **kwargs):
+        captured.append(agent_task)
+        return {"observations": [{"role": "assistant", "content": {"predicted_files": ["src/app.py"], "reasoning": "test"}}]}
+
+    monkeypatch.setattr(
+        runner,
+        "_finalize_localization",
+        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
+            predicted_files=["src/app.py"], reasoning="r", observations=obs, source="finalize"
+        ),
+    )
+
+    monkeypatch.setattr(runner, "run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type("B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}})(),
+    )
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        yield type("S", (), {"update": lambda self, **kw: None, "end": lambda self, **kw: None, "id": "span"})()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    result = runner.run_ic_iteration(
+        {
+            "identity": LCATaskIdentity(
+                dataset_name="lca",
+                dataset_config="py",
+                dataset_split="dev",
+                repo_owner="o",
+                repo_name="r",
+                base_sha="abc",
+            ).model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+            "repo": str(repo_dir),
+        },
+        score_fn=None,
+        steps=1,
+        parent_trace=object(),
+    )
+    assert captured
+    assert "changed_files" not in captured[0]
+    assert result.get("predicted_files") == ["src/app.py"]

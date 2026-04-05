@@ -23,7 +23,6 @@ from harness.observability.score_emitter import emit_score, emit_score_for_handl
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy_loader import load_policy
-from harness.utils.comparison import build_comparison, format_comparison_summary
 from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
 from harness.utils.repo_root import find_repo_root
@@ -34,6 +33,8 @@ from harness.utils.type_loader import (
     load_scoring_types,
 )
 from harness.writer import generate_policy
+from harness.localization.models import LCAGold, LCAPrediction
+from harness.localization.scoring import score_file_localization
 
 if TYPE_CHECKING:
     from harness.observability.baselines import BaselineSnapshot
@@ -223,8 +224,18 @@ def prepare_iteration_tasks(
                     pass
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
-    ic_task = ICTaskPayload(symbol=task.symbol, repo=resolved_repo_path)
-    jc_task = JCTaskPayload(symbol=task.symbol, repo=jc_repo_id or resolved_repo_path)
+    ic_task = ICTaskPayload(
+        identity=task.identity,
+        context=task.context,
+        repo=resolved_repo_path,
+        changed_files=task.changed_files,
+    )
+    jc_task = JCTaskPayload(
+        identity=task.identity,
+        context=task.context,
+        repo=jc_repo_id or resolved_repo_path,
+        changed_files=task.changed_files,
+    )
     return PreparedTasks(
         base_task=task,
         resolved_repo_path=resolved_repo_path,
@@ -240,7 +251,7 @@ def evaluate_policy_on_item(
     iteration_span: object | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
-    """Load current policy, execute IC iteration, and compute metrics."""
+    """Load current policy, execute IC iteration, and compute localization metrics."""
     start_obs_func = cast(
         Callable[..., SupportsSpan | None], _pkg_attr("start_observation")
     )
@@ -288,37 +299,19 @@ def evaluate_policy_on_item(
     ic_result_map = ic_runner(
         ic_task.model_dump(), loaded_policy_fn, parent_trace=iteration_span
     )
-    jc_result_map: dict[str, object] = (
-        dict(baseline_snapshot.jc_result.as_map())
-        if baseline_snapshot is not None
-        else {}
-    )
-    jc_metrics_map_raw = (
-        baseline_snapshot.jc_metrics.as_map() if baseline_snapshot is not None else {}
-    )
-    jc_metrics_map: dict[str, float] = {
-        k: float(v)
-        for k, v in jc_metrics_map_raw.items()
-        if isinstance(v, (int, float, bool))
+    predicted_files_raw = []
+    if isinstance(ic_result_map, Mapping):
+        predicted_files_raw = ic_result_map.get("predicted_files", [])
+    predicted_files = [str(p) for p in predicted_files_raw if isinstance(p, str)]
+    gold = LCAGold(changed_files=ic_task.changed_files)
+    metrics_obj = score_file_localization(LCAPrediction(predicted_files=predicted_files), gold)
+    metrics_map: dict[str, float | int | bool | None] = {
+        "score": metrics_obj.score,
+        "iteration_regression": False,
+        "precision": metrics_obj.precision,
+        "recall": metrics_obj.recall,
+        "hit": metrics_obj.hit,
     }
-    if not jc_metrics_map:
-        baseline_metrics_from_jc_fn = cast(
-            Callable[[Mapping[str, object]], Mapping[str, object]],
-            _pkg_attr("baseline_metrics_from_jc"),
-        )
-        jc_metrics_map = {
-            k: float(v)
-            for k, v in baseline_metrics_from_jc_fn(jc_result_map).items()
-            if isinstance(v, (int, float, bool))
-        }
-
-    metrics_map: dict[str, float | int | bool] = {"score": 0.0}
-    metrics_for_comparison = {
-        k: float(v) for k, v in metrics_map.items() if isinstance(v, (int, float, bool))
-    }
-    comparison = build_comparison(metrics_for_comparison, jc_metrics_map)
-    comparison_summary = format_comparison_summary(comparison)
-    metrics_map.setdefault("iteration_regression", False)
     trace_id = getattr(iteration_span, "id", None)
     session_id_val = _session_id_from(iteration_span)
     for name, value in metrics_map.items():
@@ -337,12 +330,20 @@ def evaluate_policy_on_item(
         )
 
     policy_code = _read_policy()
+    additional_metrics = [
+        {"name": "precision", "value": metrics_obj.precision},
+        {"name": "recall", "value": metrics_obj.recall},
+        {"name": "hit", "value": metrics_obj.hit},
+    ]
+    eval_metrics = EvaluationMetrics.model_validate(
+        {"score": metrics_obj.score, "iteration_regression": False, "additional_metrics": additional_metrics}
+    )
     return EvaluationResult(
-        metrics=EvaluationMetrics.model_validate(metrics_map),
+        metrics=eval_metrics,
         ic_result=ICResult.model_validate(ic_result_map),
-        jc_result=JCResult.model_validate(jc_result_map),
-        jc_metrics=EvaluationMetrics.model_validate(jc_metrics_map),
-        comparison_summary=comparison_summary,
+        jc_result=JCResult(entries=[]),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary=None,
         policy_code=policy_code,
     )
 
