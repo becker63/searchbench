@@ -7,6 +7,7 @@ import pytest
 from typing import TypedDict
 
 from harness import writer
+from harness.utils.type_loader import ScorerContext
 
 
 class DummySpan:
@@ -79,6 +80,7 @@ class BaseInputs(TypedDict, total=False):
     current_policy: str
     tests: str
     scoring_context: str
+    scoring_context_details: ScorerContext
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -92,9 +94,16 @@ class BaseInputs(TypedDict, total=False):
 def _base_inputs() -> BaseInputs:
     return {
         "feedback": {"a": 1},
-        "current_policy": "def score(node, state):\n    return 0.0\n",
+        "current_policy": "def score(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 0.0\n",
         "tests": "",
         "scoring_context": "",
+        "scoring_context_details": ScorerContext(
+            signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            graph_models="",
+            types="",
+            examples="",
+            notes="",
+        ),
         "feedback_str": "",
         "guidance_hint": "",
         "diff_str": "",
@@ -107,7 +116,7 @@ def _base_inputs() -> BaseInputs:
 def test_generate_policy_accepts_structured_code(monkeypatch):
     scores: list[tuple[str, float]] = []
     calls: list[dict[str, object]] = []
-    payload = {"code": "def score(node: object, state: object, context: object | None = None) -> float:\n    return 1.0\n"}
+    payload = {"code": "def score(node: \"GraphNode\", graph: \"Graph\", step: int) -> float:\n    return 1.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), calls), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(
@@ -180,9 +189,35 @@ def test_generate_policy_rejects_invalid_json(monkeypatch):
 
 def test_generate_policy_accepts_parsed_fallback(monkeypatch):
     calls: list[dict[str, object]] = []
-    parsed = {"code": "def score(node, state):\n    return 2.0\n"}
+    parsed = {"code": "def score(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 2.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(None, calls, parsed=parsed), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     code = writer.generate_policy(**_base_inputs())
     assert "return 2.0" in code
+
+
+def test_scoring_context_is_derived_from_structured_context(monkeypatch):
+    derived: list[str] = []
+
+    def fake_format(ctx):
+        derived.append(ctx.signature)
+        return "rendered-context"
+
+    payload = {"code": "def score(node: \"GraphNode\", graph: \"Graph\", step: int) -> float:\n    return 1.0\n"}
+    monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
+    monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
+    monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
+    monkeypatch.setattr(writer, "format_scoring_context", fake_format)
+    inputs = _base_inputs()
+    inputs["scoring_context"] = ""  # force derivation from structured context
+    inputs["scoring_context_details"] = ScorerContext(
+        signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        graph_models="",
+        types="",
+        examples="from iterative_context.graph_models import Graph, GraphNode\n"
+        "def score(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
+        notes="",
+    )
+    writer.generate_policy(**inputs)
+    assert derived and derived[0] == "SelectionCallable = Callable[[GraphNode, Graph, int], float]"

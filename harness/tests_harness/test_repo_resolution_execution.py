@@ -44,13 +44,15 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     monkeypatch.setattr("harness.loop.score", lambda result: {"score": 1.0, "ic_nodes": 1, "jc_nodes": 0})
     monkeypatch.setattr("harness.loop.load_tests", lambda repo: [])
     monkeypatch.setattr("harness.loop.format_tests_for_prompt", lambda tests: "")
-    monkeypatch.setattr("harness.loop.load_scoring_types", lambda repo: "")
-    monkeypatch.setattr("harness.loop.load_scoring_examples", lambda repo: "")
+    from harness.utils.type_loader import ScorerContext
+
+    dummy_ctx = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
+    monkeypatch.setattr("harness.loop.build_scorer_context", lambda repo: dummy_ctx)
     monkeypatch.setattr("harness.loop.format_scoring_context", lambda *a, **k: "")
-    monkeypatch.setattr("harness.loop._read_policy", lambda *a, **k: "def score(node, state):\n    return 0.0\n")
+    monkeypatch.setattr("harness.loop._read_policy", lambda *a, **k: "def score(node, graph, step):\n    return 0.0\n")
     monkeypatch.setattr("harness.loop._write_policy", lambda *a, **k: None)
     monkeypatch.setattr("harness.loop._hash_tests_dir", lambda *a, **k: "hash")
-    monkeypatch.setattr("harness.loop.generate_policy", lambda **kwargs: "def score(node, state):\n    return 1.0\n")
+    monkeypatch.setattr("harness.loop.generate_policy", lambda **kwargs: "def score(node, graph, step):\n    return 1.0\n")
 
     class DummyPipeline:
         def run(self, repo_root, observation=None, allow_no_parent=False):

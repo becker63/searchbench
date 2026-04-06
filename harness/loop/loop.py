@@ -27,17 +27,14 @@ from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
 from harness.utils.repo_root import find_repo_root
 from harness.utils.test_loader import format_tests_for_prompt, load_tests
-from harness.utils.type_loader import (
-    format_scoring_context,
-    load_scoring_examples,
-    load_scoring_types,
-)
+from harness.utils.type_loader import ScorerContext, build_scorer_context, format_scoring_context, load_graph_models, load_scoring_examples, load_scoring_types
 from harness.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 
 if TYPE_CHECKING:
     from harness.localization.evaluation_backend import LocalizationEvaluationRequest as LocalizationEvaluationRequestType
     from harness.observability.baselines import BaselineSnapshot
+    from iterative_context.graph_models import Graph, GraphNode
 else:
     LocalizationEvaluationRequestType = object
 
@@ -73,6 +70,7 @@ _MAX_FAILURE_SUMMARY_CHARS = 400
 _REEXPORTED = (
     index_folder,
     load_policy,
+    load_graph_models,
     run_ic_iteration,
     compute_diff,
     format_diff,
@@ -81,6 +79,7 @@ _REEXPORTED = (
     find_repo_root,
     format_tests_for_prompt,
     load_tests,
+    build_scorer_context,
     format_scoring_context,
     load_scoring_examples,
     load_scoring_types,
@@ -113,13 +112,13 @@ def LocalizationEvaluationRequest(
     return _LocalizationEvaluationRequest(*args, **kwargs)
 
 
-def score(node: object, state: object, context: object | None = None) -> float:
+def score(node: "GraphNode", graph: "Graph", step: int) -> float:
     """
     Delegate to policy.score while keeping a stable harness.loop.* attribute for tests/monkeypatching.
     """
     from harness.policy import score as _policy_score
 
-    return _policy_score(node, state, context)
+    return _policy_score(node, graph, step)
 
 
 def _pkg_attr(name: str) -> object:
@@ -358,24 +357,16 @@ def build_iteration_feedback(
     format_tests_for_prompt_fn = cast(
         Callable[[object], str], _pkg_attr("format_tests_for_prompt")
     )
-    load_scoring_types_fn = cast(
-        Callable[[Path], object], _pkg_attr("load_scoring_types")
-    )
-    load_scoring_examples_fn = cast(
-        Callable[[Path], object], _pkg_attr("load_scoring_examples")
-    )
-    format_scoring_context_fn = cast(
-        Callable[..., str], _pkg_attr("format_scoring_context")
-    )
+    build_scorer_context_fn = cast(Callable[[Path], ScorerContext], _pkg_attr("build_scorer_context"))
+    format_scoring_context_fn = cast(Callable[..., str], _pkg_attr("format_scoring_context"))
     compute_diff_fn = cast(Callable[..., object], _pkg_attr("compute_diff"))
     format_diff_fn = cast(Callable[[object], str], _pkg_attr("format_diff"))
     interpret_diff_fn = cast(Callable[[object], str], _pkg_attr("interpret_diff"))
 
     tests = load_tests_fn(repo_root)
     tests_str = format_tests_for_prompt_fn(tests)
-    types_str = load_scoring_types_fn(repo_root)
-    examples_str = load_scoring_examples_fn(repo_root)
-    scoring_ctx = format_scoring_context_fn(types_str, examples_str)
+    scorer_ctx = build_scorer_context_fn(repo_root)
+    scoring_ctx = format_scoring_context_fn(scorer_ctx)
 
     diff_str = ""
     diff_hint = ""
@@ -405,6 +396,7 @@ def build_iteration_feedback(
     return FeedbackPackage(
         tests=tests_str,
         scoring_context=scoring_ctx,
+        scoring_context_details=scorer_ctx,
         comparison_summary=evaluation.comparison_summary,
         feedback=FeedbackEntries.model_validate({"entries": feedback_entries}),
         feedback_str=str(evaluation.metrics.get("error", "")),
@@ -420,6 +412,7 @@ def attempt_policy_generation(
     initial_policy: str,
     tests: str,
     scoring_context: str,
+    scoring_context_details: ScorerContext,
     feedback_str: str,
     guidance_hint: str,
     diff_str: str,
@@ -444,6 +437,7 @@ def attempt_policy_generation(
             current_policy=initial_policy,
             tests=tests,
             scoring_context=scoring_context,
+            scoring_context_details=scoring_context_details,
             feedback_str=str(feedback_str),
             guidance_hint=guidance_hint,
             diff_str=diff_str,

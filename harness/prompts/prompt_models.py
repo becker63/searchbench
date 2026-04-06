@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, field_validator
+from harness.utils.type_loader import ScorerContext
 
 
 class WriterPromptContext(BaseModel):
@@ -17,6 +18,7 @@ class WriterPromptContext(BaseModel):
     diff_hint: str
     tests: str
     scoring_context: str
+    scoring_context_details: ScorerContext
 
 
 class SystemPromptContext(BaseModel):

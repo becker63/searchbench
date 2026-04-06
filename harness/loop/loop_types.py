@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.utils.type_loader import ScorerContext
 from harness.localization.models import LCAContext, LCATaskIdentity
 
 if TYPE_CHECKING:
@@ -261,6 +262,7 @@ class FeedbackPackage(BaseModel):
 
     tests: str
     scoring_context: str
+    scoring_context_details: ScorerContext
     comparison_summary: str | None
     feedback: FeedbackEntries
     feedback_str: str

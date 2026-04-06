@@ -146,6 +146,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             initial_policy=ctx.evaluation.policy_code,
             tests=ctx.feedback.tests,
             scoring_context=ctx.feedback.scoring_context,
+            scoring_context_details=ctx.feedback.scoring_context_details,
             feedback_str=ctx.feedback.feedback_str,
             guidance_hint=guidance,
             diff_str=ctx.feedback.diff_str,
@@ -154,7 +155,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             failure_context_str=ctx.failure_context,
             repair_attempt=ctx.attempts_used,
             parent_trace=ctx.repair_observation,
-            pipeline_feedback=ctx.last_classified.model_dump() if ctx.last_classified else None,
+            pipeline_feedback=ctx.last_classified,
         )
 
         if new_code is None:

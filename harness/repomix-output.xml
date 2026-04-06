@@ -122,7 +122,9 @@ tests_harness/
   test_session_policy.py
   test_subprocess_guard.py
   test_test_integrity.py
+  test_token_usage.py
   test_tracing_wrappers.py
+  test_type_loader.py
   test_writer.py
 tools/
   backends/
@@ -214,7 +216,7 @@ This section contains the contents of the repository's files.
 - Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they continue to emit localization-native metrics and outputs.
 - Machine-facing scores use explicit `machine_score` semantics: by default `machine_score == aggregate_score`; derivation policies may select precision/recall/f1/hit while raw localization metrics remain canonical (`predicted_files` vs `changed_files`, F1/score).
 - Rollback should be treated as an implementation revert/emergency only, not a co-equal path; the shared backend remains the canonical evaluation route.
-- Post-hoc policy-selection reducers run outside the loop to compare candidate policies; they consume canonical metrics plus token-usage metadata with explicit availability flags. Reducer outputs are parallel to localization metrics/control scores and do not alter loop control.
+- Post-hoc policy-selection reducers run outside the loop to compare candidate policies; they consume canonical metrics plus token-usage metadata with explicit availability flags. Reducer outputs are parallel to localization metrics/control scores and do not alter loop control. Reducer quality guards default to enforcing a non-zero score/F1 floor (default >=0.2, with optional hit/precision/recall floors) so token savings cannot win when quality regresses.
 </file>
 
 <file path="docs/loop_viz.md">
@@ -261,6 +263,7 @@ By default both machines are rendered; use `--machine optimization` or `--machin
   - Qwen 3 235B Instruct — input $0.60/M, output $1.20/M; regex `(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct`
 - Sync helper: `observability.cerebras_pricing.sync_cerebras_models()` calls `client.api.models.create` for each entry (requires Langfuse Cloud credentials).
 - Generations must include `model` and `usage_details` (OpenAI-style prompt/completion/total) so Langfuse can infer cost. If the provider omits usage, supply it explicitly or add an estimator; do not emit zeroed usage.
+- Token usage extraction is deterministic and explicit: readers look for `usage_details`/`usage` at the top level, in `raw`, or in observations; absence stays `available=False` with null fields and is never coerced to zero.
 - Projection vs observed costs: CLI projections for dataset-backed runs are tagged separately as projection metadata (selection window + fixed planned/hard-cap totals). Do not mix projected values into observed Langfuse usage/cost fields. If pricing is unknown, projection fails closed instead of emitting a pseudo-cost.
 
 ## Sessions (where and how)
@@ -585,7 +588,7 @@ from harness.localization.materializer import (
     RepoMaterializer,
 )
 from harness.localization.models import LCAPrediction, LCATask, LocalizationEvidence, LocalizationMetrics
-from harness.localization.token_usage import TokenUsage, TokenUsageRecord
+from harness.localization.token_usage import TokenUsageRecord, extract_token_usage_record
 from harness.localization.telemetry import build_localization_telemetry
 from harness.observability.langfuse import start_observation
 from harness.observability.score_emitter import emit_score_for_handle
@@ -684,37 +687,6 @@ def _score_task(task: LCATask, prediction: LCAPrediction, repo_path: Path) -> Lo
         raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, str(exc), task_id=task.task_id) from exc
 
 
-def _extract_usage_record(result: Mapping[str, object] | None) -> TokenUsageRecord:
-    """
-    Extract token usage details from runner results.
-    Observations may contain ``usage_details`` produced by the agent runner.
-    """
-    observations = result.get("observations") if isinstance(result, Mapping) else None
-    if isinstance(observations, list):
-        for obs in observations:
-            if not isinstance(obs, Mapping):
-                continue
-            usage_raw = obs.get("usage_details")
-            if isinstance(usage_raw, Mapping):
-                prompt = usage_raw.get("prompt_tokens") or usage_raw.get("input")
-                completion = usage_raw.get("completion_tokens") or usage_raw.get("output")
-                total = usage_raw.get("total_tokens") or usage_raw.get("total")
-                model_name = usage_raw.get("model") if isinstance(usage_raw.get("model"), str) else None
-                usage = TokenUsage(
-                    prompt_tokens=float(prompt) if isinstance(prompt, (int, float)) else None,
-                    completion_tokens=float(completion) if isinstance(completion, (int, float)) else None,
-                    total_tokens=float(total) if isinstance(total, (int, float)) else None,
-                )
-                return TokenUsageRecord(
-                    available=True,
-                    usage=usage,
-                    model=model_name,
-                    source="runner",
-                    details=usage_raw,
-                )
-    return TokenUsageRecord(available=False, usage=None, source="runner")
-
-
 def _emit_telemetry(
     task: LCATask,
     metrics: LocalizationMetrics,
@@ -790,7 +762,7 @@ def run_localization_task(
         predicted_files, runner_result = _run_runner(task, repo_path, trace, runner)
         prediction = LCAPrediction(predicted_files=predicted_files)
         metrics = _score_task(task, prediction, repo_path)
-        usage = _extract_usage_record(runner_result if isinstance(runner_result, Mapping) else None)
+        usage = extract_token_usage_record(runner_result if isinstance(runner_result, Mapping) else None, source="runner")
         _emit_telemetry(
             task=task,
             metrics=metrics,
@@ -1705,7 +1677,7 @@ def build_localization_telemetry(
 <file path="localization/token_usage.py">
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -1750,7 +1722,81 @@ class TokenUsageRecord(BaseModel):
         return float((prompt or 0.0) + (completion or 0.0))
 
 
-__all__ = ["TokenUsage", "TokenUsageRecord"]
+def _usage_from_mapping(data: Mapping[str, object]) -> TokenUsageRecord:
+    prompt_raw = data.get("prompt_tokens") if isinstance(data, Mapping) else None
+    completion_raw = data.get("completion_tokens") if isinstance(data, Mapping) else None
+    total_raw = data.get("total_tokens") if isinstance(data, Mapping) else None
+    # Support alternate keys used in usage payloads.
+    prompt_raw = prompt_raw if isinstance(prompt_raw, (int, float)) else data.get("input")
+    completion_raw = completion_raw if isinstance(completion_raw, (int, float)) else data.get("output")
+    total_raw = total_raw if isinstance(total_raw, (int, float)) else data.get("total")
+
+    has_numeric = any(isinstance(val, (int, float)) for val in (prompt_raw, completion_raw, total_raw))
+    model_name = data.get("model") if isinstance(data.get("model"), str) else None
+    usage = TokenUsage(
+        prompt_tokens=float(prompt_raw) if isinstance(prompt_raw, (int, float)) else None,
+        completion_tokens=float(completion_raw) if isinstance(completion_raw, (int, float)) else None,
+        total_tokens=float(total_raw) if isinstance(total_raw, (int, float)) else None,
+    )
+    return TokenUsageRecord(
+        available=has_numeric,
+        usage=usage if has_numeric else None,
+        model=model_name,
+        details=data,
+    )
+
+
+def _iter_usage_mappings(payload: Mapping[str, object] | None) -> Iterable[Mapping[str, object]]:
+    if not isinstance(payload, Mapping):
+        return
+    # Priority: top-level usage_details, then usage, then raw block, then observations.
+    direct = payload.get("usage_details")
+    if isinstance(direct, Mapping):
+        yield direct
+    direct_usage = payload.get("usage")
+    if isinstance(direct_usage, Mapping):
+        yield direct_usage
+    raw_block = payload.get("raw")
+    if isinstance(raw_block, Mapping):
+        raw_usage_details = raw_block.get("usage_details")
+        if isinstance(raw_usage_details, Mapping):
+            yield raw_usage_details
+        raw_usage = raw_block.get("usage")
+        if isinstance(raw_usage, Mapping):
+            yield raw_usage
+    observations = payload.get("observations")
+    if isinstance(observations, list):
+        for obs in observations:
+            if not isinstance(obs, Mapping):
+                continue
+            obs_usage_details = obs.get("usage_details")
+            if isinstance(obs_usage_details, Mapping):
+                yield obs_usage_details
+            obs_usage = obs.get("usage")
+            if isinstance(obs_usage, Mapping):
+                yield obs_usage
+    return
+
+
+def extract_token_usage_record(payload: Mapping[str, object] | None, source: str = "runner") -> TokenUsageRecord:
+    """
+    Extract token usage from known shapes without fabricating values.
+    Supported precedence:
+    - top-level usage_details
+    - top-level usage
+    - raw.usage_details / raw.usage
+    - observations[*].usage_details / observations[*].usage
+    Missing usage remains available=False with null fields.
+    """
+    for usage_map in _iter_usage_mappings(payload):
+        record = _usage_from_mapping(usage_map)
+        if record.available:
+            record.source = source
+            return record
+    return TokenUsageRecord(available=False, usage=None, source=source)
+
+
+__all__ = ["TokenUsage", "TokenUsageRecord", "extract_token_usage_record"]
 </file>
 
 <file path="loop/__init__.py">
@@ -1776,6 +1822,8 @@ from .loop import (  # noqa: E402
     evaluate_policy_on_item,
     index_folder,
     load_policy,
+    build_scorer_context,
+    load_graph_models,
     prepare_iteration_tasks,
     run_loop,
     run_policy_pipeline,
@@ -1812,6 +1860,8 @@ __all__ = [
     "index_folder",
     "emit_score",
     "load_policy",
+    "load_graph_models",
+    "build_scorer_context",
     "run_policy_pipeline",
     "run_ic_iteration",
     "_hash_tests_dir",
@@ -2733,6 +2783,7 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.utils.type_loader import ScorerContext
 from harness.localization.models import LCAContext, LCATaskIdentity
 
 if TYPE_CHECKING:
@@ -2988,6 +3039,7 @@ class FeedbackPackage(BaseModel):
 
     tests: str
     scoring_context: str
+    scoring_context_details: ScorerContext
     comparison_summary: str | None
     feedback: FeedbackEntries
     feedback_str: str
@@ -3257,11 +3309,7 @@ from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
 from harness.utils.repo_root import find_repo_root
 from harness.utils.test_loader import format_tests_for_prompt, load_tests
-from harness.utils.type_loader import (
-    format_scoring_context,
-    load_scoring_examples,
-    load_scoring_types,
-)
+from harness.utils.type_loader import build_scorer_context, format_scoring_context, load_graph_models, load_scoring_examples, load_scoring_types
 from harness.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 
@@ -3303,6 +3351,7 @@ _MAX_FAILURE_SUMMARY_CHARS = 400
 _REEXPORTED = (
     index_folder,
     load_policy,
+    load_graph_models,
     run_ic_iteration,
     compute_diff,
     format_diff,
@@ -3343,13 +3392,13 @@ def LocalizationEvaluationRequest(
     return _LocalizationEvaluationRequest(*args, **kwargs)
 
 
-def score(node: object, state: object, context: object | None = None) -> float:
+def score(node: object, graph: object, step: int) -> float:
     """
     Delegate to policy.score while keeping a stable harness.loop.* attribute for tests/monkeypatching.
     """
     from harness.policy import score as _policy_score
 
-    return _policy_score(node, state, context)
+    return _policy_score(node, graph, step)
 
 
 def _pkg_attr(name: str) -> object:
@@ -3588,15 +3637,10 @@ def build_iteration_feedback(
     format_tests_for_prompt_fn = cast(
         Callable[[object], str], _pkg_attr("format_tests_for_prompt")
     )
-    load_scoring_types_fn = cast(
-        Callable[[Path], object], _pkg_attr("load_scoring_types")
-    )
-    load_scoring_examples_fn = cast(
-        Callable[[Path], object], _pkg_attr("load_scoring_examples")
-    )
-    format_scoring_context_fn = cast(
-        Callable[..., str], _pkg_attr("format_scoring_context")
-    )
+    load_scoring_types_fn = cast(Callable[[Path], object], _pkg_attr("load_scoring_types"))
+    load_scoring_examples_fn = cast(Callable[[Path], object], _pkg_attr("load_scoring_examples"))
+    build_scorer_context_fn = cast(Callable[[Path], object], _pkg_attr("build_scorer_context"))
+    format_scoring_context_fn = cast(Callable[..., str], _pkg_attr("format_scoring_context"))
     compute_diff_fn = cast(Callable[..., object], _pkg_attr("compute_diff"))
     format_diff_fn = cast(Callable[[object], str], _pkg_attr("format_diff"))
     interpret_diff_fn = cast(Callable[[object], str], _pkg_attr("interpret_diff"))
@@ -3605,7 +3649,8 @@ def build_iteration_feedback(
     tests_str = format_tests_for_prompt_fn(tests)
     types_str = load_scoring_types_fn(repo_root)
     examples_str = load_scoring_examples_fn(repo_root)
-    scoring_ctx = format_scoring_context_fn(types_str, examples_str)
+    scorer_ctx = build_scorer_context_fn(repo_root)
+    scoring_ctx = format_scoring_context_fn(scorer_ctx)
 
     diff_str = ""
     diff_hint = ""
@@ -3635,6 +3680,7 @@ def build_iteration_feedback(
     return FeedbackPackage(
         tests=tests_str,
         scoring_context=scoring_ctx,
+        scoring_context_details=scorer_ctx,
         comparison_summary=evaluation.comparison_summary,
         feedback=FeedbackEntries.model_validate({"entries": feedback_entries}),
         feedback_str=str(evaluation.metrics.get("error", "")),
@@ -3674,6 +3720,7 @@ def attempt_policy_generation(
             current_policy=initial_policy,
             tests=tests,
             scoring_context=scoring_context,
+            scoring_context_details=feedback.scoring_context_details,
             feedback_str=str(feedback_str),
             guidance_hint=guidance_hint,
             diff_str=diff_str,
@@ -5757,7 +5804,6 @@ def _build_reducer_summary(results: list[LocalizationRunItemResult]) -> PolicyRe
                 metrics=item.metrics,
                 candidate_usage=item.token_usage,
                 baseline_usage=None,
-                quality_floor=0.0,
             )
         )
     if not task_inputs:
@@ -6221,6 +6267,29 @@ class PolicyReducerTaskInput(BaseModel):
     token_delta: float | None = None
 
 
+class PolicyQualityGuard(BaseModel):
+    """Configurable quality floors for reducer eligibility."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score_floor: float = 0.2
+    hit_floor: float | None = None
+    precision_floor: float | None = None
+    recall_floor: float | None = None
+
+    def evaluate(self, metrics: LocalizationMetrics) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        if metrics.score is None or metrics.score < self.score_floor:
+            reasons.append("score_below_floor")
+        if self.hit_floor is not None and (metrics.hit is None or metrics.hit < self.hit_floor):
+            reasons.append("hit_below_floor")
+        if self.precision_floor is not None and (metrics.precision is None or metrics.precision < self.precision_floor):
+            reasons.append("precision_below_floor")
+        if self.recall_floor is not None and (metrics.recall is None or metrics.recall < self.recall_floor):
+            reasons.append("recall_below_floor")
+        return (len(reasons) == 0, reasons)
+
+
 class RepoReducerResult(BaseModel):
     """Repo-level reducer output."""
 
@@ -6265,15 +6334,13 @@ def build_task_input(
     metrics: LocalizationMetrics,
     candidate_usage: TokenUsageRecord | None,
     baseline_usage: TokenUsageRecord | None = None,
-    quality_floor: float = 0.0,
+    quality_guard: PolicyQualityGuard | None = None,
 ) -> PolicyReducerTaskInput:
     baseline_record = baseline_usage or TokenUsageRecord(available=False, usage=None, source="baseline")
     candidate_record = candidate_usage or TokenUsageRecord(available=False, usage=None, source="candidate")
     token_delta = _compute_token_delta(baseline_record, candidate_record)
-    quality_ok = metrics.score > quality_floor
-    reasons: list[str] = []
-    if not quality_ok:
-        reasons.append("score_below_floor")
+    guard = quality_guard or PolicyQualityGuard()
+    quality_ok, reasons = guard.evaluate(metrics)
     return PolicyReducerTaskInput(
         task_id=task_id,
         repo_key=repo_key_from_identity(identity),
@@ -6921,7 +6988,10 @@ Guidelines:
 You are optimizing a scoring function for a graph search system.
 Respond ONLY with JSON matching the provided schema.
 The 'code' field must contain pure Python defining a typed score function with signature:
-def score(node: object, state: object, context: object | None = None) -> float.
+def score(node: GraphNode, graph: Graph, step: int) -> float.
+- node: GraphNode (Pending/Pruned/Anchor/Resolved) from graph_models.py
+- graph: Graph (networkx DiGraph with GraphNode data)
+- step: int traversal step index
 
 STRICT RULES:
 - You MUST NOT use import statements
@@ -6929,6 +6999,7 @@ STRICT RULES:
 - You MUST NOT access the filesystem
 - Only use built-in Python operations
 - Do NOT wrap the code in Markdown
+- Use the provided GraphNode/Graph shapes; annotate parameters with GraphNode, Graph, step (int). Quoted annotations are allowed to avoid imports.
 Any violation will cause immediate failure.
 {%- endset %}
 
@@ -6962,8 +7033,10 @@ Scoring interface + examples (STRICT CONTRACT):
 
 Validation requirements:
 - score MUST have type annotations on all parameters and return float
-- Target signature: def score(node: object, state: object, context: object | None = None) -> float
+- Target signature: def score(node: GraphNode, graph: Graph, step: int) -> float
 - Code MUST be valid under BasedPyright
+- Use GraphNode/Graph model fields directly; do NOT invent alternate signatures
+- scorer is deterministic and local to traversal selection
 
 Instructions:
 - Fix errors in order of priority:
@@ -6983,6 +7056,7 @@ Return ONLY the JSON object specified by the schema.
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, field_validator
+from harness.utils.type_loader import ScorerContext
 
 
 class WriterPromptContext(BaseModel):
@@ -6999,6 +7073,7 @@ class WriterPromptContext(BaseModel):
     diff_hint: str
     tests: str
     scoring_context: str
+    scoring_context_details: ScorerContext
 
 
 class SystemPromptContext(BaseModel):
@@ -9867,32 +9942,43 @@ def test_ruff_warning_not_classified_as_failure():
 <file path="tests_harness/test_policy_loader.py">
 from __future__ import annotations
 
+import types
 import pytest
 
 from harness import policy_loader
 
 
-def test_adapt_score_fn_accepts_supported_arities():
-    def score_one(node):
+def test_require_selection_callable_accepts_three_args():
+    def score(node, graph, step):
         return 1.0
 
-    def score_two(node, state):
-        return 2.0
-
-    def score_three(node, state, ctx):
-        return 3.0
-
-    assert policy_loader.adapt_score_fn(score_one)("n", None, None) == 1.0
-    assert policy_loader.adapt_score_fn(score_two)("n", "s", None) == 2.0
-    assert policy_loader.adapt_score_fn(score_three)("n", "s", "c") == 3.0
+    wrapped = policy_loader._require_selection_callable(score)
+    assert wrapped("n", "g", 1) == 1.0
 
 
-def test_adapt_score_fn_rejects_unsupported_arities():
-    def score_four(a, b, c, d):
-        return 4.0
+def test_require_selection_callable_rejects_wrong_arity():
+    def score_two(node, graph):
+        return 1.0
 
     with pytest.raises(RuntimeError):
-        policy_loader.adapt_score_fn(score_four)
+        policy_loader._require_selection_callable(score_two)
+
+
+def test_load_policy_uses_selection_callable(monkeypatch, tmp_path):
+    policy_file = tmp_path / "policy.py"
+    policy_file.write_text(
+        "from iterative_context.graph_models import Graph, GraphNode\n"
+        "def score(node: GraphNode, graph: Graph, step: int) -> float:\n"
+        "    return 42.0\n",
+        encoding="utf-8",
+    )
+
+    def fake_with_name(self, name):
+        return policy_file
+
+    monkeypatch.setattr(policy_loader.Path, "with_name", fake_with_name)
+    score_fn = policy_loader.load_policy()
+    assert score_fn("n", "g", 0) == 42.0
 </file>
 
 <file path="tests_harness/test_policy_reducer.py">
@@ -9902,6 +9988,7 @@ from harness.localization.models import LCATaskIdentity, LocalizationMetrics
 from harness.localization.token_usage import TokenUsage, TokenUsageRecord
 from harness.observability.policy_reducer import (
     build_task_input,
+    PolicyQualityGuard,
     reduce_global,
     reduce_repo,
 )
@@ -9985,6 +10072,37 @@ def test_quality_floor_drops_zero_score_tasks():
     repo_result = reduce_repo([task])
     assert repo_result.valid_count == 0
     assert repo_result.dropped_for_quality == 1
+
+
+def test_token_savings_not_rewarded_when_quality_fails():
+    low_metrics = LocalizationMetrics(precision=0.1, recall=0.1, f1=0.1, hit=0.0, score=0.1)
+    task = build_task_input(
+        identity=_identity("o5/r5"),
+        task_id="t_low_quality",
+        metrics=low_metrics,
+        baseline_usage=_usage(100),
+        candidate_usage=_usage(1),
+    )
+    repo_result = reduce_repo([task])
+    assert repo_result.valid_count == 0
+    assert repo_result.score is None
+    assert repo_result.dropped_for_quality == 1
+
+
+def test_optional_hit_floor_guard():
+    metrics = LocalizationMetrics(precision=0.9, recall=0.9, f1=0.9, hit=0.0, score=0.9)
+    guard = PolicyQualityGuard(hit_floor=1.0)
+    task = build_task_input(
+        identity=_identity("o6/r6"),
+        task_id="t_hit_guard",
+        metrics=metrics,
+        baseline_usage=_usage(100),
+        candidate_usage=_usage(10),
+        quality_guard=guard,
+    )
+    repo_result = reduce_repo([task])
+    assert repo_result.valid_count == 0
+    assert repo_result.dropped_for_quality == 1
 </file>
 
 <file path="tests_harness/test_prompt_templates.py">
@@ -9996,6 +10114,7 @@ import pytest
 
 import harness.loop.runner_agent as runner
 import harness.writer as writer
+from harness.utils import type_loader
 from harness.pipeline.types import StepResult
 from harness.prompts import SystemPromptContext, WriterPromptContext
 from harness.utils import template_loader
@@ -10008,6 +10127,13 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
     template_path = prompts_dir / "policy_writer.jinja"
     template_path.write_text("Policy: {{ current_policy }} | Tests: {{ tests }} | Feedback: {{ feedback_text }}", encoding="utf-8")
     monkeypatch.setattr(template_loader, "find_repo_root", lambda: tmp_path)
+    dummy_ctx = type_loader.ScorerContext(
+        signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        graph_models="",
+        types="",
+        examples="",
+        notes="",
+    )
 
     rendered = writer._render_writer_prompt(
         current_policy="code_v1",
@@ -10020,10 +10146,36 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
         diff_hint="hint2",
         tests="tests-content",
         scoring_context="ctx",
+        scoring_context_details=dummy_ctx,
     )
     assert "code_v1" in rendered
     assert "tests-content" in rendered
     assert "fb" in rendered
+
+
+def test_real_writer_prompt_includes_selection_signature():
+    rendered = writer._render_writer_prompt(
+        current_policy="def score(node, graph, step):\n    return 0",
+        failure_context="",
+        feedback_str="",
+        feedback={},
+        comparison_summary="N/A",
+        guidance_hint="",
+        diff_str="",
+        diff_hint="",
+        tests="",
+        scoring_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        scoring_context_details=type_loader.ScorerContext(
+            signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            graph_models="class GraphNode:\n    pass\nclass Graph:\n    ...",
+            types="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            examples="def score(node, graph, step): ...",
+            notes="Traversal calls score(node, graph, step).",
+        ),
+    )
+    assert "SelectionCallable" in rendered
+    assert "GraphNode" in rendered
+    assert "graph" in rendered
 
 
 def test_runner_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -10062,6 +10214,13 @@ def test_writer_prompt_validation_rejects_extra_fields():
                 "diff_hint": "",
                 "tests": "",
                 "scoring_context": "",
+                "scoring_context_details": type_loader.ScorerContext(
+                    signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+                    graph_models="",
+                    types="",
+                    examples="",
+                    notes="",
+                ),
                 "extra_field": "nope",
             }
         )
@@ -10163,13 +10322,15 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     monkeypatch.setattr("harness.loop.score", lambda result: {"score": 1.0, "ic_nodes": 1, "jc_nodes": 0})
     monkeypatch.setattr("harness.loop.load_tests", lambda repo: [])
     monkeypatch.setattr("harness.loop.format_tests_for_prompt", lambda tests: "")
-    monkeypatch.setattr("harness.loop.load_scoring_types", lambda repo: "")
-    monkeypatch.setattr("harness.loop.load_scoring_examples", lambda repo: "")
+    from harness.utils.type_loader import ScorerContext
+
+    dummy_ctx = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
+    monkeypatch.setattr("harness.loop.build_scorer_context", lambda repo: dummy_ctx)
     monkeypatch.setattr("harness.loop.format_scoring_context", lambda *a, **k: "")
-    monkeypatch.setattr("harness.loop._read_policy", lambda *a, **k: "def score(node, state):\n    return 0.0\n")
+    monkeypatch.setattr("harness.loop._read_policy", lambda *a, **k: "def score(node, graph, step):\n    return 0.0\n")
     monkeypatch.setattr("harness.loop._write_policy", lambda *a, **k: None)
     monkeypatch.setattr("harness.loop._hash_tests_dir", lambda *a, **k: "hash")
-    monkeypatch.setattr("harness.loop.generate_policy", lambda **kwargs: "def score(node, state):\n    return 1.0\n")
+    monkeypatch.setattr("harness.loop.generate_policy", lambda **kwargs: "def score(node, graph, step):\n    return 1.0\n")
 
     class DummyPipeline:
         def run(self, repo_root, observation=None, allow_no_parent=False):
@@ -10384,6 +10545,78 @@ def test_test_directory_integrity(tmp_path: Path):
         _write_policy(_read_policy(policy_path), policy_path)
 </file>
 
+<file path="tests_harness/test_token_usage.py">
+from __future__ import annotations
+
+from harness.localization.token_usage import extract_token_usage_record
+
+
+def test_extracts_from_top_level_usage_details():
+    payload = {
+        "usage_details": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "model": "m1",
+        }
+    }
+    record = extract_token_usage_record(payload, source="test")
+    assert record.available is True
+    assert record.usage.total_tokens == 15
+    assert record.usage.prompt_tokens == 10
+    assert record.usage.completion_tokens == 5
+    assert record.model == "m1"
+
+
+def test_extracts_from_observations_fallback():
+    payload = {
+        "observations": [
+            {"usage_details": {"input": 7, "output": 3, "total": 10, "model": "m2"}},
+        ]
+    }
+    record = extract_token_usage_record(payload, source="test")
+    assert record.available is True
+    assert record.usage.total_tokens == 10
+    assert record.usage.prompt_tokens == 7
+    assert record.usage.completion_tokens == 3
+    assert record.model == "m2"
+
+
+def test_extracts_from_raw_block():
+    payload = {
+        "raw": {
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+                "total_tokens": 3,
+            }
+        }
+    }
+    record = extract_token_usage_record(payload, source="test")
+    assert record.available is True
+    assert record.usage.total_tokens == 3
+
+
+def test_extracts_from_top_level_usage():
+    payload = {
+        "usage": {
+            "input": 4,
+            "output": 6,
+            "total": 10,
+        }
+    }
+    record = extract_token_usage_record(payload, source="test")
+    assert record.available is True
+    assert record.usage.total_tokens == 10
+
+
+def test_missing_usage_remains_unavailable():
+    payload = {"observations": [{"role": "assistant", "content": "noop"}]}
+    record = extract_token_usage_record(payload, source="test")
+    assert record.available is False
+    assert record.usage is None
+</file>
+
 <file path="tests_harness/test_tracing_wrappers.py">
 from __future__ import annotations
 
@@ -10394,6 +10627,7 @@ from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.loop import runner_agent as runner
 from harness.loop import agent_common
 from harness import writer
+from harness.utils import type_loader
 
 
 class DummySpan:
@@ -10462,7 +10696,7 @@ def test_run_ic_iteration_emits_scores(monkeypatch):
 
     parent = object()
     task_payload = _agent_payload("r")
-    result = runner.run_ic_iteration(task_payload, score_fn=lambda n, s, c=None: 1.0, steps=1, parent_trace=parent)
+    result = runner.run_ic_iteration(task_payload, score_fn=lambda n, g, step: 1.0, steps=1, parent_trace=parent)
     assert result["node_count"] == 2
     assert ("ic.node_count", 2.0) in scores
 
@@ -10472,7 +10706,7 @@ def test_writer_records_policy_events(monkeypatch):
 
     class DummyMessage:
         def __init__(self):
-            self.content = '{"code": "def score(node, state):\\n    return 1.0\\n"}'
+            self.content = '{"code": "def score(node, graph, step):\\n    return 1.0\\n"}'
 
     class DummyChoice:
         def __init__(self):
@@ -10522,9 +10756,16 @@ def test_writer_records_policy_events(monkeypatch):
 
     result = writer.generate_policy(
         feedback={"a": 1},
-        current_policy="def score(node, state):\n    return 0.0\n",
+        current_policy="def score(node, graph, step):\n    return 0.0\n",
         tests="",
         scoring_context="",
+        scoring_context_details=type_loader.ScorerContext(
+            signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            graph_models="",
+            types="",
+            examples="",
+            notes="",
+        ),
         feedback_str="",
         guidance_hint="",
         diff_str="",
@@ -10840,6 +11081,26 @@ def test_run_agent_requires_usage(monkeypatch):
         )
 </file>
 
+<file path="tests_harness/test_type_loader.py">
+from __future__ import annotations
+
+from harness.utils import type_loader
+
+
+def test_format_scoring_context_includes_selection_and_graph_models():
+    ctx = type_loader.ScorerContext(
+        signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        graph_models="class GraphNode:\n    pass\nclass Graph:\n    ...\n",
+        types="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        examples="def score(node, graph, step): ...",
+        notes="Traversal uses score(node, graph, step).",
+    )
+    rendered = type_loader.format_scoring_context(ctx)
+    assert "SelectionCallable" in rendered
+    assert "GraphNode" in rendered
+    assert "Graph" in rendered
+</file>
+
 <file path="tests_harness/test_writer.py">
 from __future__ import annotations
 
@@ -10850,6 +11111,7 @@ import pytest
 from typing import TypedDict
 
 from harness import writer
+from harness.utils.type_loader import ScorerContext
 
 
 class DummySpan:
@@ -10922,6 +11184,7 @@ class BaseInputs(TypedDict, total=False):
     current_policy: str
     tests: str
     scoring_context: str
+    scoring_context_details: ScorerContext
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -10935,9 +11198,16 @@ class BaseInputs(TypedDict, total=False):
 def _base_inputs() -> BaseInputs:
     return {
         "feedback": {"a": 1},
-        "current_policy": "def score(node, state):\n    return 0.0\n",
+        "current_policy": "def score(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 0.0\n",
         "tests": "",
         "scoring_context": "",
+        "scoring_context_details": ScorerContext(
+            signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            graph_models="",
+            types="",
+            examples="",
+            notes="",
+        ),
         "feedback_str": "",
         "guidance_hint": "",
         "diff_str": "",
@@ -10950,7 +11220,7 @@ def _base_inputs() -> BaseInputs:
 def test_generate_policy_accepts_structured_code(monkeypatch):
     scores: list[tuple[str, float]] = []
     calls: list[dict[str, object]] = []
-    payload = {"code": "def score(node: object, state: object, context: object | None = None) -> float:\n    return 1.0\n"}
+    payload = {"code": "def score(node: \"GraphNode\", graph: \"Graph\", step: int) -> float:\n    return 1.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), calls), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(
@@ -11023,12 +11293,30 @@ def test_generate_policy_rejects_invalid_json(monkeypatch):
 
 def test_generate_policy_accepts_parsed_fallback(monkeypatch):
     calls: list[dict[str, object]] = []
-    parsed = {"code": "def score(node, state):\n    return 2.0\n"}
+    parsed = {"code": "def score(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 2.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(None, calls, parsed=parsed), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     code = writer.generate_policy(**_base_inputs())
     assert "return 2.0" in code
+
+
+def test_scoring_context_is_derived_from_structured_context(monkeypatch):
+    derived: list[str] = []
+
+    def fake_format(ctx):
+        derived.append(ctx.signature)
+        return "rendered-context"
+
+    payload = {"code": "def score(node: \"GraphNode\", graph: \"Graph\", step: int) -> float:\n    return 1.0\n"}
+    monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
+    monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
+    monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
+    monkeypatch.setattr(writer, "format_scoring_context", fake_format)
+    inputs = _base_inputs()
+    inputs["scoring_context"] = ""  # force derivation
+    writer.generate_policy(**inputs)
+    assert derived and derived[0] == "SelectionCallable = Callable[[GraphNode, Graph, int], float]"
 </file>
 
 <file path="tools/backends/__init__.py">
@@ -12114,6 +12402,33 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict
+
+
+class ScorerContext(BaseModel):
+    """Structured scorer context for writer prompts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    signature: str
+    graph_models: str
+    types: str
+    examples: str
+    notes: str = ""
+
+
+def load_graph_models(repo_root: Path) -> str:
+    """
+    Load graph model definitions for scorer context.
+    """
+    models_path = repo_root / "iterative-context" / "src" / "iterative_context" / "graph_models.py"
+    if not models_path.exists():
+        return ""
+    try:
+        return models_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
 
 def load_scoring_types(repo_root: Path) -> str:
     """
@@ -12138,16 +12453,30 @@ def load_scoring_examples(repo_root: Path) -> str:
         return ""
 
 
-def format_scoring_context(types: str, examples: str, max_chars: int = 8000) -> str:
+def build_scorer_context(repo_root: Path) -> ScorerContext:
+    signature = "SelectionCallable = Callable[[GraphNode, Graph, int], float]"
+    return ScorerContext(
+        signature=signature,
+        graph_models=load_graph_models(repo_root),
+        types=load_scoring_types(repo_root),
+        examples=load_scoring_examples(repo_root),
+        notes="Traversal calls score(node, graph, step) deterministically; use GraphNode/Graph shapes above.",
+    )
+
+
+def format_scoring_context(ctx: ScorerContext, max_chars: int = 8000) -> str:
     """
     Concatenate type definitions and reference implementations for prompt use.
     """
-    canonical = "def score(node: object, state: object, context: object) -> float: ..."
-    parts: list[str] = [f"# CANONICAL SIGNATURE\n{canonical}"]
-    if types:
-        parts.append(f"# TYPES (source of truth)\n{types}")
-    if examples:
-        parts.append(f"# EXAMPLES (reference implementations)\n{examples}")
+    parts: list[str] = [f"# CANONICAL SIGNATURE\n{ctx.signature}"]
+    if ctx.graph_models:
+        parts.append("# GRAPH MODELS (Graph, GraphNode, Node variants, Edge/Event types)\n" + ctx.graph_models)
+    if ctx.types:
+        parts.append(f"# TYPES (source of truth)\n{ctx.types}")
+    if ctx.examples:
+        parts.append(f"# EXAMPLES (reference implementations)\n{ctx.examples}")
+    if ctx.notes:
+        parts.append(f"# NOTES\n{ctx.notes}")
 
     joined = "\n\n".join(parts)
     if len(joined) > max_chars:
@@ -12213,7 +12542,7 @@ Leaf-operation observability remains with:
 - To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.observability.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `observability/cerebras_pricing.py`.
 
 ## Policy Loading
-- `policy_loader.py` now simply loads `policy.py`, validates a callable `score`, and adapts 1/2/3-arg callables to `score(node, state, context) -> float`. No sandbox or restricted execution.
+- `policy_loader.py` now loads `policy.py` and requires the public Iterative Context scorer contract `score(node: GraphNode, graph: Graph, step: int) -> float` (SelectionCallable). No sandbox or restricted execution.
 </file>
 
 <file path="policy_loader.py">
@@ -12224,42 +12553,24 @@ import inspect
 from pathlib import Path
 from typing import Callable, cast
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from iterative_context.graph_models import Graph, GraphNode  # type: ignore[import-not-found]
+from iterative_context.types import SelectionCallable  # type: ignore[import-not-found]
 
 
-class ScoreFunctionConfig(BaseModel):
-    """Typed adapter for policy score functions."""
+def _require_selection_callable(score_fn: Callable[[GraphNode, Graph, int], float]) -> SelectionCallable:
+    sig = inspect.signature(score_fn)
+    if len(sig.parameters) != 3:
+        raise RuntimeError(f"Unsupported score function arity: expected 3 (node, graph, step), got {len(sig.parameters)}")
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
-
-    score_fn: Callable[..., float]
-
-
-def adapt_score_fn(score_fn: Callable[..., float]) -> Callable[[object, object, object], float]:
-    try:
-        config = ScoreFunctionConfig(score_fn=score_fn)
-    except ValidationError as exc:
-        raise RuntimeError(f"Invalid score function: {exc}") from exc
-
-    sig = inspect.signature(config.score_fn)
-    arity = len(sig.parameters)
-    if arity not in (1, 2, 3):
-        raise RuntimeError(f"Unsupported score function arity: expected 1-3, got {arity}")
-
-    def wrapped(*call_args: object, **call_kwargs: object) -> float:
-        node, state, context = (list(call_args) + [None, None, None])[:3]
-        if arity == 3:
-            return float(config.score_fn(node, state, context))
-        if arity == 2:
-            return float(config.score_fn(node, state))
-        return float(config.score_fn(node))
+    def wrapped(node: GraphNode, graph: Graph, step: int) -> float:
+        return float(score_fn(node, graph, step))
 
     return wrapped
 
 
-def load_policy() -> Callable[[object, object, object], float]:
+def load_policy() -> SelectionCallable:
     """
-    Load the current policy module and return its score callable (adapted to node, state, context).
+    Load the current policy module and return its score callable aligned to SelectionCallable.
     """
     policy_path = Path(__file__).with_name("policy.py")
     if not policy_path.exists():
@@ -12275,76 +12586,33 @@ def load_policy() -> Callable[[object, object, object], float]:
     if not callable(score_fn_obj):
         raise AttributeError("Policy module must define a callable 'score'")
 
-    score_fn_typed: Callable[..., float] = cast(Callable[..., float], score_fn_obj)
-    adapted: Callable[[object, object, object], float] = adapt_score_fn(score_fn_typed)
+    score_fn_typed: Callable[[GraphNode, Graph, int], float] = cast(Callable[[GraphNode, Graph, int], float], score_fn_obj)
+    adapted: SelectionCallable = _require_selection_callable(score_fn_typed)
     return adapted
 </file>
 
 <file path="policy.py">
-def _get_attr(obj: object, name: str, default: object = None) -> object:
-    """Safely retrieve an attribute.
-    Returns ``default`` if the attribute lookup fails.
-    """
-    try:
-        return getattr(obj, name)
-    except Exception:
-        return default
+from __future__ import annotations
+
+from iterative_context.graph_models import Graph, GraphNode  # type: ignore[import-not-found]
 
 
-def score(node: object, state: object, context: object | None = None) -> float:
-    """Deterministic scoring function.
-
-    Parameters
-    ----------
-    node: object
-        Expected to have ``state``, ``id`` and optional ``tokens`` attributes.
-    state: object
-        Expected to provide ``in_degree`` and ``out_degree`` callables.
-    context: object | None, optional
-        If provided and contains a numeric ``scale`` attribute, the total is multiplied by it.
-    """
-    n_state = _get_attr(node, "state")
-    n_id = _get_attr(node, "id")
-    tokens = _get_attr(node, "tokens")
-
+def score(node: GraphNode, graph: Graph, step: int) -> float:
+    """Deterministic scoring function aligned to SelectionCallable."""
     total: float = 0.0
 
-    # State contribution.
-    if n_state == "pending":
+    if node.state == "pending":
         total += 5.0
-    if n_state == "anchor":
+    if node.state == "anchor":
         total += 10.0
 
-    # Degree contribution.
-    if n_id is not None:
-        degree = 0
-        in_func = _get_attr(state, "in_degree")
-        out_func = _get_attr(state, "out_degree")
-        if callable(in_func):
-            try:
-                val = in_func(n_id)
-                if isinstance(val, (int, float)):
-                    degree += int(val)
-            except Exception:
-                pass
-        if callable(out_func):
-            try:
-                val = out_func(n_id)
-                if isinstance(val, (int, float)):
-                    degree += int(val)
-            except Exception:
-                pass
-        total += degree * 0.5
+    degree = graph.in_degree(node.id) + graph.out_degree(node.id)
+    total += degree * 0.5
 
-    # Tokens contribution.
-    if isinstance(tokens, (int, float)):
-        total += min(tokens, 50) * 0.1
-
-    # Optional scaling from context.
-    if context is not None:
-        scale = _get_attr(context, "scale")
-        if isinstance(scale, (int, float)):
-            total *= float(scale)
+    if node.state in ("anchor", "resolved"):
+        tokens_val = node.tokens
+        if isinstance(tokens_val, (int, float)):
+            total += min(tokens_val, 50) * 0.1
 
     return float(total)
 </file>
@@ -12870,6 +13138,7 @@ from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from .prompts import WriterPromptContext
 from .utils.template_loader import render_prompt_template
 from .loop.agent_common import usage_from_response  # reuse usage mapping for OpenAI-style responses  # pyright: ignore[reportPrivateUsage]
+from .utils.type_loader import ScorerContext, format_scoring_context
 
 
 class WriterRequest(BaseModel):
@@ -12881,6 +13150,7 @@ class WriterRequest(BaseModel):
     current_policy: str
     tests: str
     scoring_context: str
+    scoring_context_details: ScorerContext
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -12994,6 +13264,7 @@ def _render_writer_prompt(
     diff_hint: str,
     tests: str,
     scoring_context: str,
+    scoring_context_details: ScorerContext,
 ) -> str:
     feedback_text = feedback_str if feedback_str else str(feedback)
     context = WriterPromptContext.model_validate(
@@ -13007,6 +13278,7 @@ def _render_writer_prompt(
             "diff_hint": diff_hint,
             "tests": tests,
             "scoring_context": scoring_context,
+            "scoring_context_details": scoring_context_details,
         }
     )
     rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
@@ -13020,6 +13292,7 @@ def generate_policy(
     current_policy: str,
     tests: str,
     scoring_context: str,
+    scoring_context_details: ScorerContext,
     feedback_str: str,
     guidance_hint: str,
     diff_str: str,
@@ -13032,12 +13305,14 @@ def generate_policy(
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
+    scoring_context_rendered = scoring_context or format_scoring_context(scoring_context_details)
     try:
         WriterRequest(
             feedback=feedback,
             current_policy=current_policy,
             tests=tests,
-            scoring_context=scoring_context,
+            scoring_context=scoring_context_rendered,
+            scoring_context_details=scoring_context_details,
             feedback_str=feedback_str,
             guidance_hint=guidance_hint,
             diff_str=diff_str,
@@ -13070,7 +13345,8 @@ def generate_policy(
         diff_str=diff_str,
         diff_hint=diff_hint,
         tests=tests,
-        scoring_context=scoring_context,
+        scoring_context=scoring_context_rendered,
+        scoring_context_details=scoring_context_details,
     )
     with start_observation(
         name="policy_writer",

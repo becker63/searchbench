@@ -2,7 +2,10 @@
 You are optimizing a scoring function for a graph search system.
 Respond ONLY with JSON matching the provided schema.
 The 'code' field must contain pure Python defining a typed score function with signature:
-def score(node: object, state: object, context: object | None = None) -> float.
+def score(node: GraphNode, graph: Graph, step: int) -> float.
+- node: GraphNode (Pending/Pruned/Anchor/Resolved) from graph_models.py
+- graph: Graph (networkx DiGraph with GraphNode data)
+- step: int traversal step index
 
 STRICT RULES:
 - You MUST NOT use import statements
@@ -10,6 +13,7 @@ STRICT RULES:
 - You MUST NOT access the filesystem
 - Only use built-in Python operations
 - Do NOT wrap the code in Markdown
+- Use the provided GraphNode/Graph shapes; annotate parameters with GraphNode, Graph, step (int). Quoted annotations are allowed to avoid imports.
 Any violation will cause immediate failure.
 {%- endset %}
 
@@ -43,8 +47,10 @@ Scoring interface + examples (STRICT CONTRACT):
 
 Validation requirements:
 - score MUST have type annotations on all parameters and return float
-- Target signature: def score(node: object, state: object, context: object | None = None) -> float
+- Target signature: def score(node: GraphNode, graph: Graph, step: int) -> float
 - Code MUST be valid under BasedPyright
+- Use GraphNode/Graph model fields directly; do NOT invent alternate signatures
+- scorer is deterministic and local to traversal selection
 
 Instructions:
 - Fix errors in order of priority:

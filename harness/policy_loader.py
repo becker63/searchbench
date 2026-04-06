@@ -5,42 +5,24 @@ import inspect
 from pathlib import Path
 from typing import Callable, cast
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from iterative_context.graph_models import Graph, GraphNode  # type: ignore[import-not-found]
+from iterative_context.types import SelectionCallable  # type: ignore[import-not-found]
 
 
-class ScoreFunctionConfig(BaseModel):
-    """Typed adapter for policy score functions."""
+def _require_selection_callable(score_fn: Callable[[GraphNode, Graph, int], float]) -> SelectionCallable:
+    sig = inspect.signature(score_fn)
+    if len(sig.parameters) != 3:
+        raise RuntimeError(f"Unsupported score function arity: expected 3 (node, graph, step), got {len(sig.parameters)}")
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
-
-    score_fn: Callable[..., float]
-
-
-def adapt_score_fn(score_fn: Callable[..., float]) -> Callable[[object, object, object], float]:
-    try:
-        config = ScoreFunctionConfig(score_fn=score_fn)
-    except ValidationError as exc:
-        raise RuntimeError(f"Invalid score function: {exc}") from exc
-
-    sig = inspect.signature(config.score_fn)
-    arity = len(sig.parameters)
-    if arity not in (1, 2, 3):
-        raise RuntimeError(f"Unsupported score function arity: expected 1-3, got {arity}")
-
-    def wrapped(*call_args: object, **call_kwargs: object) -> float:
-        node, state, context = (list(call_args) + [None, None, None])[:3]
-        if arity == 3:
-            return float(config.score_fn(node, state, context))
-        if arity == 2:
-            return float(config.score_fn(node, state))
-        return float(config.score_fn(node))
+    def wrapped(node: GraphNode, graph: Graph, step: int) -> float:
+        return float(score_fn(node, graph, step))
 
     return wrapped
 
 
-def load_policy() -> Callable[[object, object, object], float]:
+def load_policy() -> SelectionCallable:
     """
-    Load the current policy module and return its score callable (adapted to node, state, context).
+    Load the current policy module and return its score callable aligned to SelectionCallable.
     """
     policy_path = Path(__file__).with_name("policy.py")
     if not policy_path.exists():
@@ -56,6 +38,6 @@ def load_policy() -> Callable[[object, object, object], float]:
     if not callable(score_fn_obj):
         raise AttributeError("Policy module must define a callable 'score'")
 
-    score_fn_typed: Callable[..., float] = cast(Callable[..., float], score_fn_obj)
-    adapted: Callable[[object, object, object], float] = adapt_score_fn(score_fn_typed)
+    score_fn_typed: Callable[[GraphNode, Graph, int], float] = cast(Callable[[GraphNode, Graph, int], float], score_fn_obj)
+    adapted: SelectionCallable = _require_selection_callable(score_fn_typed)
     return adapted

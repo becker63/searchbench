@@ -18,6 +18,7 @@ from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from .prompts import WriterPromptContext
 from .utils.template_loader import render_prompt_template
 from .loop.agent_common import usage_from_response  # reuse usage mapping for OpenAI-style responses  # pyright: ignore[reportPrivateUsage]
+from .utils.type_loader import ScorerContext, format_scoring_context
 
 
 class WriterRequest(BaseModel):
@@ -29,6 +30,7 @@ class WriterRequest(BaseModel):
     current_policy: str
     tests: str
     scoring_context: str
+    scoring_context_details: ScorerContext
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -142,6 +144,7 @@ def _render_writer_prompt(
     diff_hint: str,
     tests: str,
     scoring_context: str,
+    scoring_context_details: ScorerContext,
 ) -> str:
     feedback_text = feedback_str if feedback_str else str(feedback)
     context = WriterPromptContext.model_validate(
@@ -155,6 +158,7 @@ def _render_writer_prompt(
             "diff_hint": diff_hint,
             "tests": tests,
             "scoring_context": scoring_context,
+            "scoring_context_details": scoring_context_details,
         }
     )
     rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
@@ -168,6 +172,7 @@ def generate_policy(
     current_policy: str,
     tests: str,
     scoring_context: str,
+    scoring_context_details: ScorerContext,
     feedback_str: str,
     guidance_hint: str,
     diff_str: str,
@@ -180,12 +185,14 @@ def generate_policy(
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
+    scoring_context_rendered = scoring_context or format_scoring_context(scoring_context_details)
     try:
         WriterRequest(
             feedback=feedback,
             current_policy=current_policy,
             tests=tests,
-            scoring_context=scoring_context,
+            scoring_context=scoring_context_rendered,
+            scoring_context_details=scoring_context_details,
             feedback_str=feedback_str,
             guidance_hint=guidance_hint,
             diff_str=diff_str,
@@ -218,7 +225,8 @@ def generate_policy(
         diff_str=diff_str,
         diff_hint=diff_hint,
         tests=tests,
-        scoring_context=scoring_context,
+        scoring_context=scoring_context_rendered,
+        scoring_context_details=scoring_context_details,
     )
     with start_observation(
         name="policy_writer",

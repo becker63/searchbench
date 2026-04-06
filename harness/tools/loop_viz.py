@@ -32,6 +32,9 @@ from harness.loop.loop_types import (
 )
 from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.utils.type_loader import ScorerContext
+
+STUB_SCORER_CTX = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
 
 
 def _stub_deps() -> LoopDependencies:
@@ -51,6 +54,7 @@ def _stub_deps() -> LoopDependencies:
     dummy_feedback = FeedbackPackage(
         tests="",
         scoring_context="",
+        scoring_context_details=STUB_SCORER_CTX,
         comparison_summary=None,
         feedback=FeedbackEntries(),
         feedback_str="",
@@ -135,6 +139,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
         feedback=FeedbackPackage(
             tests="",
             scoring_context="",
+            scoring_context_details=STUB_SCORER_CTX,
             comparison_summary=None,
             feedback=FeedbackEntries(),
             feedback_str="",

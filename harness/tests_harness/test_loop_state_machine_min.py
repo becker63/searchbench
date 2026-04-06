@@ -29,6 +29,7 @@ from harness.loop.loop_types import (
     TaskPayload,
 )
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.utils.type_loader import ScorerContext
 
 
 class RecordingSpan:
@@ -40,9 +41,11 @@ class RecordingSpan:
 
 
 def _make_feedback() -> FeedbackPackage:
+    scorer_ctx = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
     return FeedbackPackage(
         tests="",
         scoring_context="",
+        scoring_context_details=scorer_ctx,
         comparison_summary=None,
         feedback=FeedbackEntries(),
         feedback_str="",

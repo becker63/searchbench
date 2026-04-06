@@ -7,6 +7,7 @@ from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.loop import runner_agent as runner
 from harness.loop import agent_common
 from harness import writer
+from harness.utils import type_loader
 
 
 class DummySpan:
@@ -75,7 +76,7 @@ def test_run_ic_iteration_emits_scores(monkeypatch):
 
     parent = object()
     task_payload = _agent_payload("r")
-    result = runner.run_ic_iteration(task_payload, score_fn=lambda n, s, c=None: 1.0, steps=1, parent_trace=parent)
+    result = runner.run_ic_iteration(task_payload, score_fn=lambda n, g, step: 1.0, steps=1, parent_trace=parent)
     assert result["node_count"] == 2
     assert ("ic.node_count", 2.0) in scores
 
@@ -85,7 +86,7 @@ def test_writer_records_policy_events(monkeypatch):
 
     class DummyMessage:
         def __init__(self):
-            self.content = '{"code": "def score(node, state):\\n    return 1.0\\n"}'
+            self.content = '{"code": "def score(node, graph, step):\\n    return 1.0\\n"}'
 
     class DummyChoice:
         def __init__(self):
@@ -135,9 +136,16 @@ def test_writer_records_policy_events(monkeypatch):
 
     result = writer.generate_policy(
         feedback={"a": 1},
-        current_policy="def score(node, state):\n    return 0.0\n",
+        current_policy="def score(node, graph, step):\n    return 0.0\n",
         tests="",
         scoring_context="",
+        scoring_context_details=type_loader.ScorerContext(
+            signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            graph_models="",
+            types="",
+            examples="",
+            notes="",
+        ),
         feedback_str="",
         guidance_hint="",
         diff_str="",

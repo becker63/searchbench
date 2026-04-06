@@ -86,13 +86,21 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
     task_results: list[LocalizationEvaluationTaskResult] = []
     for task in tasks:
         try:
-            prediction, metrics, evidence, materialization, usage = run_localization_task(
+            run_result = run_localization_task(
                 task,
                 dataset_source=req.dataset_source,
                 materializer=req.materializer,
                 parent_trace=req.parent_trace,
                 runner=runner,
             )
+            if isinstance(run_result, tuple):
+                if len(run_result) < 4:
+                    raise LocalizationEvaluationError(LocalizationFailureCategory.UNKNOWN, "Runner returned insufficient values", task_id=task.task_id)
+                prediction, metrics, evidence, materialization = run_result[:4]
+                usage = run_result[4] if len(run_result) > 4 else None
+            else:
+                prediction, metrics, evidence, materialization = run_result  # type: ignore[misc]
+                usage = None
             task_results.append(
                 LocalizationEvaluationTaskResult(
                     task=task,

@@ -55,7 +55,8 @@ def _usage_from_mapping(data: Mapping[str, object]) -> TokenUsageRecord:
     total_raw = total_raw if isinstance(total_raw, (int, float)) else data.get("total")
 
     has_numeric = any(isinstance(val, (int, float)) for val in (prompt_raw, completion_raw, total_raw))
-    model_name = data.get("model") if isinstance(data.get("model"), str) else None
+    raw_model = data.get("model")
+    model_name: str | None = raw_model if isinstance(raw_model, str) else None
     usage = TokenUsage(
         prompt_tokens=float(prompt_raw) if isinstance(prompt_raw, (int, float)) else None,
         completion_tokens=float(completion_raw) if isinstance(completion_raw, (int, float)) else None,
