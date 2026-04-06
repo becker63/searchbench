@@ -25,16 +25,24 @@
 - CLI logs: dataset/config/split, dataset source (langfuse|huggingface), cache hit/miss, git fetch/worktree/verification status, checkout `base_sha`, ready path, summary printed to stdout.
 - Telemetry: includes dataset source and materialization events; failure categories surfaced (lock, auth/fetch, checkout verification, cache corruption).
 
-## Dataset Sources
-- **Langfuse (default)**: hosted datasets fetched via `fetch_localization_dataset`.
-- **Hugging Face**: `--dataset-source huggingface` (or request dataset_source=huggingface) loads `JetBrains-Research/lca-bug-localization` by config/split/revision, normalizes rows to `LCATask`, and materializes repos via git mirror/worktree. Networked tests are opt-in (`HF_NETWORK_TESTS=1`).
-  - Recommended to pin dataset revision and surface it in logs; cache keys include dataset/config/split + repo + base_sha.
+## Dataset Source (HF-only public CLI)
+- Public CLI baseline/experiment commands use the Hugging Face LCA dataset (`JetBrains-Research/lca-bug-localization`) directly, resolved via config/split/revision.
+- Repo materialization still locks/cache-validates HF mirrors/worktrees per task (repo + base_sha), and logs materialization events as before.
 
-## CLI Examples
-- Baseline (Langfuse): `python run.py --mode localization-baseline --dataset DATASET_NAME --config py --split dev`
-- Baseline (HF): `python run.py --mode localization-baseline --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --config py --split dev`
-- Experiment (HF): `python run.py --mode localization-experiment --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --config java --split test`
-- Single (HF-backed requires repo materializer): `python run.py --mode localization-single --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --repo-owner ... --repo-name ... --base-sha ...`
+## CLI Examples (HF-only)
+- Baseline: `python run.py baseline --config py --split dev --max-items 25`
+- Experiment: `python run.py experiment --config java --split test --max-items 50`
+- Projection only: `python run.py experiment --config py --split dev --max-items 25 --projection-only`
+- Pinned revision: `python run.py baseline --config py --split dev --revision 4b7c1d2 --max-items 20`
+- Non-interactive: `python run.py experiment --config py --split dev --max-items 10 --yes`
+
+## Dataset Guardrails (Baselines/Experiments)
+- **Deterministic selection:** Tasks are sorted by task_id (dataset/config/split + repo owner/name + base_sha + issue/pull) before applying `--offset` (default 0) and `--max-items`. Selection metadata (offset, limit, selected count, total, identity preview) is printed and propagated.
+- **Limits:** `--max-items N` bounds the window; `--offset K` skips K items before the window. Negative/zero limits are rejected. If `--max-items` is omitted, the run is unbounded.
+- **Warnings:** If selection is unbounded or resolves to >50 items, the CLI emits a warning before projection/confirmation.
+- **Cost projection (always-on):** Before running, the CLI prints planned and hard-cap projections using fixed bounds: localization (llama3.1-8b) 75k/10k tokens per item (planned) and 110k/14k (hard cap); writer (gpt-oss-120b) 20k/4096 tokens per call with 9 calls/iteration and 5 iterations hard cap. Pricing uses Cerebras tables only; unknown pricing fails closed. No user-provided assumptions or price overrides are accepted.
+- **Confirmation:** After projection, the CLI requires confirmation (spacebar semantics). On TTY it reads a single key; if raw capture is unavailable it falls back to a line prompt requiring an explicit token (not a bare Enter). Ctrl+C/EOF aborts. Non-interactive runs must set `--yes` **and** `--max-items`.
+- **Projection-only:** `--projection-only` prints selection + projection, runs confirmation/bypass logic, and exits without executing tasks.
 
 ## Shared Evaluation Backend (Machine + Hosted)
 - A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.

@@ -57,7 +57,6 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
         dataset_config="c",
         dataset_split="s",
         session=None,
-        dataset_source=experiments.HostedLocalizationRunRequest.model_fields["dataset_source"].default,
     )
     result = experiments.run_hosted_localization_experiment(req, materializer=None)
     assert calls

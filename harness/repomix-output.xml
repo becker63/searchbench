@@ -1,10 +1,10 @@
-This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
 
 <file_summary>
 This section contains a summary of this file.
 
 <purpose>
-This file contains a packed representation of the entire repository's contents.
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
 It is designed to be easily consumable by AI systems for analysis, code review,
 or other automated processes.
 </purpose>
@@ -32,6 +32,7 @@ The content is organized as follows:
 <notes>
 - Some files may have been excluded based on .gitignore rules and Repomix's configuration
 - Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: openspec
 - Files matching patterns in .gitignore are excluded
 - Files matching default ignore patterns are excluded
 - Files are sorted by Git change count (files with more changes are at the bottom)
@@ -91,6 +92,7 @@ tests_harness/
   test_backend_adapters.py
   test_baselines.py
   test_cerebras_pricing.py
+  test_cli_guardrails.py
   test_datasets.py
   test_executor_helpers.py
   test_experiments_backend.py
@@ -189,11 +191,20 @@ This section contains the contents of the repository's files.
 - **Hugging Face**: `--dataset-source huggingface` (or request dataset_source=huggingface) loads `JetBrains-Research/lca-bug-localization` by config/split/revision, normalizes rows to `LCATask`, and materializes repos via git mirror/worktree. Networked tests are opt-in (`HF_NETWORK_TESTS=1`).
   - Recommended to pin dataset revision and surface it in logs; cache keys include dataset/config/split + repo + base_sha.
 
-## CLI Examples
-- Baseline (Langfuse): `python run.py --mode localization-baseline --dataset DATASET_NAME --config py --split dev`
-- Baseline (HF): `python run.py --mode localization-baseline --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --config py --split dev`
-- Experiment (HF): `python run.py --mode localization-experiment --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --config java --split test`
-- Single (HF-backed requires repo materializer): `python run.py --mode localization-single --dataset-source huggingface --dataset JetBrains-Research/lca-bug-localization --repo-owner ... --repo-name ... --base-sha ...`
+## CLI Examples (HF-only)
+- Baseline: `python run.py baseline --config py --split dev --max-items 25`
+- Experiment: `python run.py experiment --config java --split test --max-items 50`
+- Projection only: `python run.py experiment --config py --split dev --max-items 25 --projection-only`
+- Pinned revision: `python run.py baseline --config py --split dev --revision 4b7c1d2 --max-items 20`
+- Non-interactive: `python run.py experiment --config py --split dev --max-items 10 --yes`
+
+## Dataset Guardrails (Baselines/Experiments)
+- **Deterministic selection:** Tasks are sorted by task_id (dataset/config/split + repo owner/name + base_sha + issue/pull) before applying `--offset` (default 0) and `--max-items`. Selection metadata (offset, limit, selected count, total, identity preview) is printed and propagated.
+- **Limits:** `--max-items N` bounds the window; `--offset K` skips K items before the window. Negative/zero limits are rejected. If `--max-items` is omitted, the run is unbounded.
+- **Warnings:** If selection is unbounded or resolves to >50 items, the CLI emits a warning before projection/confirmation.
+- **Cost projection (always-on):** Before running, the CLI prints planned and hard-cap projections using fixed constants: localization (llama3.1-8b) 75k/10k tokens per item (planned) and 110k/14k (hard cap); writer (gpt-oss-120b) 20k/4096 tokens per call with 9 calls/iteration and 5 iterations hard cap. Pricing uses Cerebras tables only; unknown pricing fails closed. No user-provided assumptions or price overrides are accepted.
+- **Confirmation:** After projection, the CLI requires confirmation (spacebar semantics). On TTY it reads a single key; if raw capture is unavailable it falls back to a line prompt requiring an explicit token (not a bare Enter). Ctrl+C/EOF aborts. Non-interactive runs must set `--yes` **and** `--max-items`.
+- **Projection-only:** `--projection-only` prints selection + projection, runs confirmation/bypass logic, and exits without executing tasks.
 
 ## Shared Evaluation Backend (Machine + Hosted)
 - A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.
@@ -247,6 +258,7 @@ By default both machines are rendered; use `--machine optimization` or `--machin
   - Qwen 3 235B Instruct — input $0.60/M, output $1.20/M; regex `(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct`
 - Sync helper: `observability.cerebras_pricing.sync_cerebras_models()` calls `client.api.models.create` for each entry (requires Langfuse Cloud credentials).
 - Generations must include `model` and `usage_details` (OpenAI-style prompt/completion/total) so Langfuse can infer cost. If the provider omits usage, supply it explicitly or add an estimator; do not emit zeroed usage.
+- Projection vs observed costs: CLI projections for dataset-backed runs are tagged separately as projection metadata (selection window + assumptions + projected totals). Do not mix projected values into observed Langfuse usage/cost fields. If pricing is unknown and no explicit overrides are provided, projection fails closed instead of emitting a pseudo-cost.
 
 ## Sessions (where and how)
 
@@ -5189,7 +5201,8 @@ def fetch_localization_dataset_from_source(
     token: str | None = None,
 ) -> list[LCATask]:
     """
-    Branching loader that supports Langfuse (default) and Hugging Face sources.
+    Branching loader that supports Langfuse or Hugging Face; retained for internal use.
+    Public CLI should call the HF loader directly.
     """
     if source == LocalizationDatasetSource.HUGGINGFACE:
         try:
@@ -5232,7 +5245,7 @@ def local_dataset(
 <file path="observability/experiments.py">
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -5240,7 +5253,7 @@ from harness.localization.evaluation_backend import LocalizationEvaluationReques
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
 from harness.localization.materializer import RepoMaterializationResult, RepoMaterializer
 from harness.observability.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
-from harness.observability.datasets import fetch_localization_dataset_from_source
+from harness.observability.hf_lca import fetch_hf_localization_dataset
 from harness.observability.langfuse import flush_langfuse, propagate_context
 from harness.observability.session_policy import resolve_session_id
 
@@ -5262,25 +5275,57 @@ class LocalizationRunResult(BaseModel):
 
 
 def _resolve_items(req: HostedLocalizationRunRequest) -> list[LCATask]:
-    return fetch_localization_dataset_from_source(
-        source=req.dataset_source,
-        name=req.dataset,
-        version=req.version,
+    return fetch_hf_localization_dataset(
+        req.dataset,
         dataset_config=req.dataset_config,
         dataset_split=req.dataset_split,
+        revision=req.version,
     )
 
 
-def run_hosted_localization_baseline(req: HostedLocalizationBaselineRequest, materializer: RepoMaterializer | None = None) -> BaselineBundle:
-    tasks = fetch_localization_dataset_from_source(
-        source=req.dataset_source,
-        name=req.dataset,
-        version=req.version,
+def select_localization_tasks(
+    tasks: Sequence[LCATask],
+    max_items: int | None = None,
+    offset: int = 0,
+) -> tuple[list[LCATask], dict[str, object]]:
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    if max_items is not None and max_items <= 0:
+        raise ValueError("max_items must be > 0 when provided")
+    sorted_tasks = sorted(list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id())
+    total_available = len(sorted_tasks)
+    start = min(offset, total_available)
+    end = total_available if max_items is None else min(start + max_items, total_available)
+    selected = sorted_tasks[start:end]
+    preview = [getattr(t, "task_id", None) or t.identity.task_id() for t in selected[:5]]
+    selection_info: dict[str, object] = {
+        "total_available": total_available,
+        "offset": offset,
+        "limit": max_items,
+        "selected_count": len(selected),
+        "preview": preview,
+    }
+    return selected, selection_info
+
+
+def run_hosted_localization_baseline(
+    req: HostedLocalizationBaselineRequest,
+    materializer: RepoMaterializer | None = None,
+    tasks: list[LCATask] | None = None,
+) -> BaselineBundle:
+    tasks = tasks or fetch_hf_localization_dataset(
+        req.dataset,
         dataset_config=req.dataset_config,
         dataset_split=req.dataset_split,
+        revision=req.version,
     )
     if not tasks:
         raise RuntimeError("No localization tasks available for baseline run")
+    if req.selection:
+        selected_tasks = list(tasks)
+        selection_info = req.selection
+    else:
+        selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
     snapshots: list[BaselineSnapshot] = []
     with propagate_context(
         trace_name="localization_baseline_dataset",
@@ -5291,16 +5336,18 @@ def run_hosted_localization_baseline(req: HostedLocalizationBaselineRequest, mat
             "dataset_config": req.dataset_config,
             "dataset_split": req.dataset_split,
             "run_kind": "localization_baseline",
-            "dataset_source": req.dataset_source.value,
+            "dataset_source": "huggingface",
+            "selection": selection_info,
+            "projection": req.projection,
         },
     ) as trace:
-        for task in tasks:
+        for task in selected_tasks:
             snapshots.append(
                 compute_baseline_for_task(
                     task,
                     dataset_version=req.version,
                     parent_trace=trace,
-                    dataset_source=req.dataset_source.value,
+                    dataset_source="huggingface",
                     materializer=materializer,
                 )
             )
@@ -5313,10 +5360,19 @@ def run_hosted_localization_baseline(req: HostedLocalizationBaselineRequest, mat
     )
 
 
-def run_hosted_localization_experiment(req: HostedLocalizationRunRequest, materializer: RepoMaterializer | None = None) -> LocalizationRunResult:
-    tasks = _resolve_items(req)
+def run_hosted_localization_experiment(
+    req: HostedLocalizationRunRequest,
+    materializer: RepoMaterializer | None = None,
+    tasks: list[LCATask] | None = None,
+) -> LocalizationRunResult:
+    tasks = tasks or _resolve_items(req)
     if not tasks:
         raise RuntimeError("No localization tasks available for experiment run")
+    if req.selection:
+        selected_tasks = list(tasks)
+        selection_info = req.selection
+    else:
+        selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
     results: list[LocalizationRunItemResult] = []
     with propagate_context(
         trace_name="localization_experiment",
@@ -5327,10 +5383,12 @@ def run_hosted_localization_experiment(req: HostedLocalizationRunRequest, materi
             "dataset_config": req.dataset_config,
             "dataset_split": req.dataset_split,
             "run_kind": "localization_experiment",
-            "dataset_source": req.dataset_source.value,
+            "dataset_source": "huggingface",
+            "selection": selection_info,
+            "projection": req.projection,
         },
     ) as trace:
-        for task in tasks:
+        for task in selected_tasks:
             if isinstance(task, Mapping):
                 task_payload: Mapping[str, object] = task
             elif hasattr(task, "model_dump"):
@@ -5340,7 +5398,7 @@ def run_hosted_localization_experiment(req: HostedLocalizationRunRequest, materi
             eval_result = evaluate_localization_batch(
                 LocalizationEvaluationRequest(
                     tasks=[task],
-                    dataset_source=req.dataset_source.value,
+                    dataset_source="huggingface",
                     materializer=materializer,
                     parent_trace=trace,
                 )
@@ -5782,36 +5840,9 @@ __all__ = [
 <file path="observability/requests.py">
 from __future__ import annotations
 
-from enum import Enum
-
 from pydantic import BaseModel, ConfigDict
 
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
-
 from .session_policy import SessionConfig
-
-
-class LocalizationDatasetSource(str, Enum):
-    """Dataset source options for hosted/localized runs."""
-
-    LANGFUSE = "langfuse"
-    HUGGINGFACE = "huggingface"
-
-
-class LocalizationAdHocRequest(BaseModel):
-    """Public request model for ad hoc localization runs (CLI boundary)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    identity: LCATaskIdentity
-    context: LCAContext
-    gold: LCAGold
-    repo: str | None = None
-    session: SessionConfig | None = None
-    dataset_source: LocalizationDatasetSource = LocalizationDatasetSource.LANGFUSE
-
-    def to_task(self) -> LCATask:
-        return LCATask(identity=self.identity, context=self.context, gold=self.gold, repo=self.repo)
 
 
 class HostedLocalizationBaselineRequest(BaseModel):
@@ -5824,7 +5855,10 @@ class HostedLocalizationBaselineRequest(BaseModel):
     dataset_config: str | None = None
     dataset_split: str | None = None
     session: SessionConfig | None = None
-    dataset_source: LocalizationDatasetSource = LocalizationDatasetSource.LANGFUSE
+    max_items: int | None = None
+    offset: int = 0
+    selection: dict[str, object] | None = None
+    projection: dict[str, object] | None = None
 
 
 class HostedLocalizationRunRequest(BaseModel):
@@ -5837,7 +5871,10 @@ class HostedLocalizationRunRequest(BaseModel):
     dataset_config: str | None = None
     dataset_split: str | None = None
     session: SessionConfig | None = None
-    dataset_source: LocalizationDatasetSource = LocalizationDatasetSource.LANGFUSE
+    max_items: int | None = None
+    offset: int = 0
+    selection: dict[str, object] | None = None
+    projection: dict[str, object] | None = None
 </file>
 
 <file path="observability/score_emitter.py">
@@ -7332,6 +7369,167 @@ def test_cost_details_for_usage_no_match_returns_none():
     assert cost_details_for_usage("unknown-model", usage) is None
 </file>
 
+<file path="tests_harness/test_cli_guardrails.py">
+from __future__ import annotations
+
+import builtins
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+import run as run_module
+from observability.requests import HostedLocalizationBaselineRequest
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+
+
+def _task(repo_owner: str, repo_name: str, base_sha: str, dataset: str = "d", config: str = "c", split: str = "s") -> LCATask:
+    identity = LCATaskIdentity(
+        dataset_name=dataset,
+        dataset_config=config,
+        dataset_split=split,
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        base_sha=base_sha,
+    )
+    ctx = LCAContext(issue_title="t", issue_body="b")
+    gold = LCAGold(changed_files=["a.py"])
+    return LCATask(identity=identity, context=ctx, gold=gold)
+
+
+def test_parse_defaults():
+    args = run_module._parse_args(["baseline", "--config", "py", "--split", "dev"])
+    assert args.max_items is None
+    assert args.offset == 0
+    assert args.command == "baseline"
+    args_exp = run_module._parse_args(["experiment", "--config", "java", "--split", "test", "--max-items", "5"])
+    assert args_exp.command == "experiment"
+    assert args_exp.max_items == 5
+
+
+def test_removed_flags_rejected():
+    with pytest.raises(SystemExit):
+        run_module._parse_args(["baseline", "--config", "py", "--split", "dev", "--dataset", "foo"])
+    with pytest.raises(SystemExit):
+        run_module._parse_args(["baseline", "--config", "py", "--split", "dev", "--mode", "localization-baseline"])
+    with pytest.raises(SystemExit):
+        run_module._parse_args(["experiment", "--config", "py", "--split", "dev", "--assume-input-tokens", "10"])
+    with pytest.raises(SystemExit):
+        run_module._parse_args(["experiment", "--config", "py", "--split", "dev", "--dataset-source", "huggingface"])
+
+
+def test_select_tasks_is_deterministic_and_offsets():
+    tasks = [
+        _task("o2", "r2", "b2"),
+        _task("o1", "r1", "b1"),
+    ]
+    selected, info = run_module._select_tasks(tasks, max_items=1, offset=0)
+    assert [t.identity.task_id() for t in selected] == [_task("o1", "r1", "b1").identity.task_id()]
+    assert info["selected_count"] == 1
+    selected_offset, info_offset = run_module._select_tasks(tasks, max_items=1, offset=1)
+    assert [t.identity.task_id() for t in selected_offset] == [_task("o2", "r2", "b2").identity.task_id()]
+    assert info_offset["offset"] == 1
+
+
+def test_projection_fail_closed_on_unknown_pricing_without_override(monkeypatch):
+    monkeypatch.setattr(run_module, "cost_details_for_usage", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError):
+        run_module._compute_projection(1)
+
+
+def test_projection_with_override(monkeypatch):
+    # Override pricing by stubbing cost_details_for_usage
+    def fake_cost(model, usage):
+        # scale so hard-cap totals differ from planned
+        return {"total": (usage.get("input", 0) + usage.get("output", 0)) * 0.000001}
+
+    monkeypatch.setattr(run_module, "cost_details_for_usage", fake_cost)
+    proj = run_module._compute_projection(3)
+    assert proj["total"]["planned"] < proj["total"]["hard_cap"]
+    assert proj["localization"]["planned"]["cost"] < proj["localization"]["hard_cap"]["cost"]
+
+
+def test_confirmation_fallback_line_prompt(monkeypatch):
+    # Force non-raw path and force TTY true
+    monkeypatch.setattr(run_module, "termios", None)
+    monkeypatch.setattr(run_module, "tty", None)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "space")
+    run_module._require_confirmation(skip_confirmation=False, selection={}, projection={})
+
+
+def test_confirmation_non_interactive_rejected(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    with pytest.raises(RuntimeError):
+        run_module._require_confirmation(skip_confirmation=False, selection={}, projection={})
+
+
+def test_projection_only_skips_execution(monkeypatch):
+    calls = {"baseline": 0}
+
+    def fake_fetch(name, dataset_config=None, dataset_split=None, revision=None):
+        return [_task("o", "r", "b")]
+
+    def fake_projection(*args, **kwargs):
+        return {"total": {"planned": 0, "hard_cap": 0}, "localization": {}, "writer": {}}
+
+    def fake_confirm(*args, **kwargs):
+        return None
+
+    def fake_run(*args, **kwargs):
+        calls["baseline"] += 1
+        return None
+
+    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", fake_fetch)
+    monkeypatch.setattr(run_module, "_compute_projection", fake_projection)
+    monkeypatch.setattr(run_module, "_require_confirmation", fake_confirm)
+    monkeypatch.setattr(run_module, "run_hosted_localization_baseline", fake_run)
+    argv = [
+        "baseline",
+        "--config",
+        "py",
+        "--split",
+        "dev",
+        "--projection-only",
+        "--yes",
+        "--max-items",
+        "1",
+    ]
+    run_module.main(argv)
+    assert calls["baseline"] == 0, "Projection-only should exit before executing baseline run"
+
+
+def test_hf_loader_is_used(monkeypatch):
+    calls = {"loader": None, "baseline": None}
+
+    def fake_loader(name, dataset_config=None, dataset_split=None, revision=None):
+        calls["loader"] = (name, dataset_config, dataset_split, revision)
+        return [SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))]
+
+    def fake_select(tasks, max_items, offset):
+        return tasks, {"selected_count": 1, "offset": offset, "limit": max_items, "total_available": 1, "preview": ["t1"]}
+
+    def fake_projection(count):
+        return {"total": {"planned": 0, "hard_cap": 0}, "localization": {}, "writer": {}}
+
+    def fake_confirm(skip_confirmation, selection, projection):
+        calls["baseline"] = True
+
+    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", fake_loader)
+    monkeypatch.setattr(run_module, "_select_tasks", fake_select)
+    monkeypatch.setattr(run_module, "_compute_projection", fake_projection)
+    monkeypatch.setattr(run_module, "_require_confirmation", fake_confirm)
+    monkeypatch.setattr(run_module, "run_hosted_localization_baseline", lambda *args, **kwargs: None)
+
+    run_module.main(["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--yes"])
+    assert calls["loader"] == ("JetBrains-Research/lca-bug-localization", "py", "dev", None)
+
+
+def test_requests_do_not_expose_dataset_source():
+    req = HostedLocalizationBaselineRequest(dataset="d", dataset_config="c", dataset_split="s")
+    assert "dataset_source" not in req.model_fields
+</file>
+
 <file path="tests_harness/test_datasets.py">
 from __future__ import annotations
 
@@ -7484,7 +7682,6 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
         dataset_config="c",
         dataset_split="s",
         session=None,
-        dataset_source=experiments.HostedLocalizationRunRequest.model_fields["dataset_source"].default,
     )
     result = experiments.run_hosted_localization_experiment(req, materializer=None)
     assert calls
@@ -9267,50 +9464,37 @@ from __future__ import annotations
 
 import sys
 
-from harness.localization.evaluation_backend import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-from harness.localization.models import LocalizationMetrics, LCATask
+import pytest
+
+from types import SimpleNamespace
+
+from harness.localization.models import LCATask
 import run as run_module
 
 
-def test_cli_single_routes_through_backend(monkeypatch, tmp_path):
+def test_auto_approve_requires_max_items(monkeypatch, tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
-    calls = []
-
-    def fake_backend(req):
-        calls.append(req)
-        task = req.tasks[0] if req.tasks else LCATask.model_validate({})
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=["a.py"],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
-
-    monkeypatch.setattr(run_module, "evaluate_localization_batch", fake_backend)
+    # Stub dataset fetch and projection to reach the yes/max-items validation quickly.
+    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", lambda *args, **kwargs: [SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))])
+    monkeypatch.setattr(
+        run_module,
+        "_select_tasks",
+        lambda tasks, max_items, offset: (tasks, {"selected_count": 1, "offset": offset, "limit": max_items, "total_available": 1, "preview": ["t1"]}),
+    )
+    monkeypatch.setattr(run_module, "_compute_projection", lambda *args, **kwargs: {"total": {"planned": 0, "hard_cap": 0}, "localization": {}, "writer": {}})
+    monkeypatch.setattr(run_module, "_require_confirmation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     argv = [
-        "--mode",
-        "localization-single",
-        "--repo-path",
-        str(repo_dir),
-        "--changed-file",
-        "a.py",
+        "baseline",
+        "--config",
+        "py",
+        "--split",
+        "dev",
+        "--yes",
     ]
-    # Capture stdout to avoid polluting test output
-    monkeypatch.setattr(sys, "argv", ["run.py", *argv])
-    run_module.main(argv)
-    assert calls, "CLI single-task path should route through shared backend"
+    with pytest.raises(ValueError):
+        run_module.main(argv)
 </file>
 
 <file path="tests_harness/test_session_policy.py">
@@ -11444,33 +11628,107 @@ from __future__ import annotations
 
 """
 Localization-first CLI entrypoint: parse arguments, build typed requests, and run LCA bug localization flows.
+Adds dataset guardrails: deterministic selection, cost projection, confirmation gating, and automation safety.
 """
 
 import argparse
 import logging
-from pathlib import Path
-from typing import Any
+import sys
+from contextlib import contextmanager
+from typing import Any, Iterable
+try:
+    import tty  # type: ignore
+    import termios  # type: ignore
+except ImportError:
+    tty = None  # type: ignore
+    termios = None  # type: ignore
 
 from harness.localization.evaluation_backend import (
     LocalizationEvaluationRequest,
     evaluate_localization_batch as _evaluate_localization_batch,
 )
-from harness.localization.models import LCAContext, LCAGold, LCATaskIdentity
+from harness.localization.models import LCATask
 from harness.localization.hf_materializer import HuggingFaceRepoMaterializer
-from harness.observability.baselines import load_baseline_bundle, save_baseline_bundle
-from harness.observability.experiments import (
-    run_hosted_localization_baseline,
-    run_hosted_localization_experiment,
-)
-from harness.observability.requests import (
-    HostedLocalizationBaselineRequest,
-    HostedLocalizationRunRequest,
-    LocalizationAdHocRequest,
-    LocalizationDatasetSource,
-)
-from harness.observability.hf_lca import HFDatasetLoadError
-from harness.observability.session_policy import SessionConfig, resolve_session_id
+from harness.observability.baselines import run_hosted_localization_baseline
+from harness.observability.experiments import run_hosted_localization_experiment
+from harness.observability.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
+from harness.observability.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
+from harness.observability.session_policy import SessionConfig
 from harness.observability.langfuse import flush_langfuse
+from harness.observability.cerebras_pricing import cost_details_for_usage
+
+
+WARNING_THRESHOLD = 50
+HF_DATASET_NAME = "JetBrains-Research/lca-bug-localization"
+HF_DATASET_SOURCE = "huggingface"
+REMOVED_FLAGS = {
+    "--mode",
+    "--dataset",
+    "--dataset-source",
+    "--dataset_source",
+    "--repo-owner",
+    "--repo-name",
+    "--base-sha",
+    "--repo-path",
+    "--issue-url",
+    "--pull-url",
+    "--issue-title",
+    "--issue-body",
+    "--diff",
+    "--diff-url",
+    "--changed-file",
+    "--baseline-path",
+    "--assume-input-tokens",
+    "--assume-output-tokens",
+    "--assume-calls-per-item",
+    "--assume-model",
+    "--assume-price-input-per-million",
+    "--assume-price-output-per-million",
+}
+
+# Runner shape and iteration bounds
+DEFAULT_OPTIMIZATION_ITERATIONS = 5
+MAX_POLICY_REPAIRS_PER_ITERATION = 3
+WRITER_INTERNAL_ATTEMPTS_PER_REPAIR = 3
+
+# Localization hard caps (llama3.1-8b)
+LOCALIZATION_MODEL = "llama3.1-8b"
+LOCALIZATION_PLANNED_CALLS_PER_ITEM = 6  # 5 explore + 1 finalize
+LOCALIZATION_MAX_CALLS_PER_ITEM = 11  # retry-aware
+LOCALIZATION_INPUT_TOKENS_PER_ITEM_PLANNED = 75_000
+LOCALIZATION_OUTPUT_TOKENS_PER_ITEM_PLANNED = 10_000
+LOCALIZATION_INPUT_TOKENS_PER_ITEM_MAX = 110_000
+LOCALIZATION_OUTPUT_TOKENS_PER_ITEM_MAX = 14_000
+
+# Writer hard caps (gpt-oss-120b)
+WRITER_MODEL = "gpt-oss-120b"
+WRITER_INPUT_TOKENS_PER_CALL = 20_000
+WRITER_OUTPUT_TOKENS_PER_CALL = 4_096
+WRITER_MAX_CALLS_PER_ITERATION = MAX_POLICY_REPAIRS_PER_ITERATION * WRITER_INTERNAL_ATTEMPTS_PER_REPAIR  # 9
+WRITER_MAX_CALLS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_CALLS_PER_ITERATION  # 45
+WRITER_PLANNED_CALLS_PER_ITERATION = 1
+WRITER_PLANNED_CALLS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_PLANNED_CALLS_PER_ITERATION
+WRITER_MAX_INPUT_TOKENS_PER_ITERATION = WRITER_MAX_CALLS_PER_ITERATION * WRITER_INPUT_TOKENS_PER_CALL
+WRITER_MAX_OUTPUT_TOKENS_PER_ITERATION = WRITER_MAX_CALLS_PER_ITERATION * WRITER_OUTPUT_TOKENS_PER_CALL
+WRITER_MAX_INPUT_TOKENS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_INPUT_TOKENS_PER_ITERATION
+WRITER_MAX_OUTPUT_TOKENS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_OUTPUT_TOKENS_PER_ITERATION
+
+
+@contextmanager
+def _raw_mode(file_obj):
+    """
+    Best-effort raw mode for single-key reads; falls back to normal mode on failure.
+    """
+    if termios is None or tty is None:
+        yield
+        return
+    fd = file_obj.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def evaluate_localization_batch(req: LocalizationEvaluationRequest):
@@ -11481,46 +11739,40 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest):
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Localization-native LCA runner")
-    parser.add_argument(
-        "--mode",
-        choices=["localization-single", "localization-baseline", "localization-experiment"],
-        default="localization-single",
-        help="Localization mode: single task, dataset baseline, or dataset experiment",
-    )
-    parser.add_argument("--dataset", help="Localization dataset name (required for baseline/experiment)")
-    parser.add_argument("--version", help="Dataset version")
-    parser.add_argument("--config", dest="dataset_config", help="Dataset config (e.g., py/java/kt)")
-    parser.add_argument("--split", dest="dataset_split", help="Dataset split (e.g., dev/train/test)")
-    parser.add_argument(
-        "--dataset-source",
-        choices=[source.value for source in LocalizationDatasetSource],
-        default=LocalizationDatasetSource.LANGFUSE.value,
-        help="Dataset source: langfuse (default) or huggingface",
-    )
-    parser.add_argument("--repo-owner", required=False, help="Repository owner for LCA eval")
-    parser.add_argument("--repo-name", required=False, help="Repository name for LCA eval")
-    parser.add_argument("--base-sha", required=False, help="Base SHA (bug-reproducible snapshot) for LCA eval")
-    parser.add_argument("--repo-path", required=False, help="Local path to repository to analyze (required without materializer)")
-    parser.add_argument("--issue-url", help="Issue URL for LCA eval")
-    parser.add_argument("--pull-url", help="Pull URL for LCA eval")
-    parser.add_argument("--issue-title", help="Issue title for context", default="")
-    parser.add_argument("--issue-body", help="Issue body for context", default="")
-    parser.add_argument("--diff", help="Inline diff content", default=None)
-    parser.add_argument("--diff-url", help="Diff URL", default=None)
-    parser.add_argument("--changed-file", action="append", dest="changed_files", help="Gold changed file (repeatable)")
-    parser.add_argument("--baseline-path", help="Path to load/save baseline bundle JSON")
-    parser.add_argument(
-        "--session-scope",
-        choices=["run", "item"],
-        help="Session scope (default run for single, item for dataset)",
-    )
-    parser.add_argument("--session-id", help="Optional explicit session id")
-    parser.add_argument(
-        "--allow-session-fallback",
-        action="store_true",
-        help="Allow deterministic fallback session id generation at entrypoints",
-    )
+    argv = argv or []
+    for flag in REMOVED_FLAGS:
+        if flag in argv:
+            raise SystemExit(f"{flag} is no longer supported; use HF baseline/experiment subcommands with --config/--split/--revision/--max-items/--offset.")
+    parser = argparse.ArgumentParser(description="HF LCA localization runner (baseline/experiment)")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def _add_common(sub):
+        sub.add_argument("--config", required=True, help="HF dataset config (e.g., py/java/kt)")
+        sub.add_argument("--split", required=True, help="HF dataset split (e.g., dev/test/train)")
+        sub.add_argument("--revision", help="HF dataset revision pin")
+        sub.add_argument("--max-items", type=int, help="Maximum number of dataset items to evaluate")
+        sub.add_argument("--offset", type=int, default=0, help="Offset into the dataset before selection window")
+        sub.add_argument(
+            "--projection-only",
+            action="store_true",
+            help="Compute selection and cost projection, then exit after confirmation without executing runs",
+        )
+        sub.add_argument(
+            "--yes",
+            dest="yes",
+            action="store_true",
+            help="Bypass interactive confirmation (requires --max-items)",
+        )
+        sub.add_argument("--session-id", help="Optional explicit session id")
+        sub.add_argument(
+            "--allow-session-fallback",
+            action="store_true",
+            help="Allow deterministic fallback session id generation at entrypoints",
+        )
+
+    _add_common(subparsers.add_parser("baseline"))
+    _add_common(subparsers.add_parser("experiment"))
+
     return parser.parse_args(argv)
 
 
@@ -11535,124 +11787,243 @@ def _fmt_identity(identity: Any) -> str:
     return str(identity)
 
 
-def _build_identity(args: argparse.Namespace) -> LCATaskIdentity:
-    dataset_name = args.dataset or "adhoc-localization"
-    dataset_config = args.dataset_config or "adhoc-config"
-    dataset_split = args.dataset_split or "adhoc-split"
-    repo_owner = args.repo_owner or "unknown-owner"
-    repo_name = args.repo_name or "unknown-repo"
-    base_sha = args.base_sha or "unknown-base-sha"
-    return LCATaskIdentity(
-        dataset_name=dataset_name,
-        dataset_config=dataset_config,
-        dataset_split=dataset_split,
-        repo_owner=repo_owner,
-        repo_name=repo_name,
-        base_sha=base_sha,
-        issue_url=args.issue_url,
-        pull_url=args.pull_url,
+def _sort_tasks_deterministically(tasks: Iterable[LCATask]) -> list[LCATask]:
+    return sorted(list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id())
+
+
+def _select_tasks(tasks: list[LCATask], max_items: int | None, offset: int) -> tuple[list[LCATask], dict[str, object]]:
+    if offset < 0:
+        raise ValueError("--offset must be >= 0")
+    sorted_tasks = _sort_tasks_deterministically(tasks)
+    total_available = len(sorted_tasks)
+    if max_items is not None and max_items <= 0:
+        raise ValueError("--max-items must be > 0")
+    start = min(offset, total_available)
+    end = total_available if max_items is None else min(start + max_items, total_available)
+    selected = sorted_tasks[start:end]
+    preview = [getattr(t, "task_id", None) or t.identity.task_id() for t in selected[:5]]
+    selection_info: dict[str, object] = {
+        "total_available": total_available,
+        "offset": offset,
+        "limit": max_items,
+        "selected_count": len(selected),
+        "preview": preview,
+    }
+    return selected, selection_info
+
+
+def _print_selection(dataset: str, dataset_config: str | None, dataset_split: str | None, source: str, selection: dict[str, object]) -> None:
+    limit = selection.get("limit")
+    offset = selection.get("offset")
+    selected_count = selection.get("selected_count")
+    total_available = selection.get("total_available")
+    preview = selection.get("preview") or []
+    print(
+        "[SELECT] dataset=%s config=%s split=%s source=%s offset=%s limit=%s selected=%s total=%s"
+        % (dataset, dataset_config, dataset_split, source, offset, limit, selected_count, total_available)
+    )
+    if preview:
+        print(f"[SELECT] preview identities (up to 5): {preview}")
+
+
+def _warn_if_unbounded(selection: dict[str, object], max_items: int | None) -> None:
+    selected_count = int(selection.get("selected_count") or 0)
+    total_available = int(selection.get("total_available") or 0)
+    if max_items is None and total_available > WARNING_THRESHOLD:
+        print(f"[WARN] No --max-items provided; {total_available} items available. Run is unbounded.")
+    if selected_count > WARNING_THRESHOLD:
+        print(f"[WARN] Large selection: {selected_count} items will run.")
+
+
+def _price_tokens(model: str, input_tokens: int, output_tokens: int) -> float:
+    costs = cost_details_for_usage(model, {"input": input_tokens, "output": output_tokens})
+    if not costs or "total" not in costs:
+        raise ValueError(f"Unknown pricing for model/provider '{model}'; ensure Cerebras pricing covers it.")
+    return float(costs.get("total") or 0.0)
+
+
+def _compute_projection(selected_count: int) -> dict[str, Any]:
+    if selected_count <= 0:
+        raise ValueError("No items selected for projection; adjust --max-items/--offset.")
+
+    loc_input_planned = selected_count * LOCALIZATION_INPUT_TOKENS_PER_ITEM_PLANNED
+    loc_output_planned = selected_count * LOCALIZATION_OUTPUT_TOKENS_PER_ITEM_PLANNED
+    loc_input_max = selected_count * LOCALIZATION_INPUT_TOKENS_PER_ITEM_MAX
+    loc_output_max = selected_count * LOCALIZATION_OUTPUT_TOKENS_PER_ITEM_MAX
+
+    writer_input_planned = WRITER_PLANNED_CALLS_PER_RUN * WRITER_INPUT_TOKENS_PER_CALL
+    writer_output_planned = WRITER_PLANNED_CALLS_PER_RUN * WRITER_OUTPUT_TOKENS_PER_CALL
+    writer_input_max = WRITER_MAX_CALLS_PER_RUN * WRITER_INPUT_TOKENS_PER_CALL
+    writer_output_max = WRITER_MAX_CALLS_PER_RUN * WRITER_OUTPUT_TOKENS_PER_CALL
+
+    loc_cost_planned = _price_tokens(LOCALIZATION_MODEL, loc_input_planned, loc_output_planned)
+    loc_cost_max = _price_tokens(LOCALIZATION_MODEL, loc_input_max, loc_output_max)
+    writer_cost_planned = _price_tokens(WRITER_MODEL, writer_input_planned, writer_output_planned)
+    writer_cost_max = _price_tokens(WRITER_MODEL, writer_input_max, writer_output_max)
+
+    return {
+        "localization": {
+            "model": LOCALIZATION_MODEL,
+            "planned": {"input_tokens": loc_input_planned, "output_tokens": loc_output_planned, "cost": loc_cost_planned},
+            "hard_cap": {"input_tokens": loc_input_max, "output_tokens": loc_output_max, "cost": loc_cost_max},
+        },
+        "writer": {
+            "model": WRITER_MODEL,
+            "planned": {"input_tokens": writer_input_planned, "output_tokens": writer_output_planned, "cost": writer_cost_planned},
+            "hard_cap": {"input_tokens": writer_input_max, "output_tokens": writer_output_max, "cost": writer_cost_max},
+        },
+        "total": {
+            "planned": loc_cost_planned + writer_cost_planned,
+            "hard_cap": loc_cost_max + writer_cost_max,
+        },
+    }
+
+
+def _print_projection(selection: dict[str, object], projection: dict[str, Any]) -> None:
+    print(f"[PROJECTION] selected_items={selection.get('selected_count')}")
+    loc = projection["localization"]
+    writer = projection["writer"]
+    print(
+        "[PROJECTION] localization model=%s planned_input=%s planned_output=%s planned_cost=%.4f hardcap_input=%s hardcap_output=%s hardcap_cost=%.4f"
+        % (
+            loc["model"],
+            loc["planned"]["input_tokens"],
+            loc["planned"]["output_tokens"],
+            loc["planned"]["cost"],
+            loc["hard_cap"]["input_tokens"],
+            loc["hard_cap"]["output_tokens"],
+            loc["hard_cap"]["cost"],
+        )
+    )
+    print(
+        "[PROJECTION] writer model=%s planned_input=%s planned_output=%s planned_cost=%.4f hardcap_input=%s hardcap_output=%s hardcap_cost=%.4f"
+        % (
+            writer["model"],
+            writer["planned"]["input_tokens"],
+            writer["planned"]["output_tokens"],
+            writer["planned"]["cost"],
+            writer["hard_cap"]["input_tokens"],
+            writer["hard_cap"]["output_tokens"],
+            writer["hard_cap"]["cost"],
+        )
+    )
+    print(
+        "[PROJECTION] totals planned=%.4f hardcap=%.4f"
+        % (projection["total"]["planned"], projection["total"]["hard_cap"])
     )
 
 
-def _load_baseline(path: str | None):  # pyright: ignore[reportUnusedFunction]
-    if not path:
-        return None
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Baseline bundle not found at {path}")
-    return load_baseline_bundle(p)
+def _require_confirmation(skip_confirmation: bool, selection: dict[str, object], projection: dict[str, float | int | str]) -> None:
+    if skip_confirmation:
+        print("[CONFIRM] --yes set; proceeding without interactive confirmation.")
+        return
+    if not sys.stdin.isatty():
+        raise RuntimeError("Interactive confirmation required on TTY; rerun with --yes and --max-items if automation is intended.")
+    prompt = "Press SPACE to continue with the run (or Ctrl+C to cancel). "
+    try:
+        with _raw_mode(sys.stdin):
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            ch = sys.stdin.read(1)
+            if ch == " ":
+                print("\n[CONFIRM] Proceeding.")
+                return
+            else:
+                print("\n[CONFIRM] Input not accepted; please press SPACE to continue.")
+                return _require_confirmation(skip_confirmation, selection, projection)
+    except Exception:
+        # Fallback to line-based confirmation
+        response = input("Type 'space' to confirm and continue (or Ctrl+C to cancel): ").strip().lower()
+        if response == "space" or response == "yes":
+            print("[CONFIRM] Proceeding.")
+            return
+        print("[CONFIRM] Input not accepted; please confirm explicitly.")
+        return _require_confirmation(skip_confirmation, selection, projection)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    dataset_source = LocalizationDatasetSource(args.dataset_source)
-    materializer = HuggingFaceRepoMaterializer() if dataset_source == LocalizationDatasetSource.HUGGINGFACE else None
+    materializer = HuggingFaceRepoMaterializer()
     session_cfg = SessionConfig(
         session_id=args.session_id,
-        session_scope=(args.session_scope or ("item" if args.mode != "localization-single" else "run")),  # type: ignore[arg-type]
+        session_scope="item",  # dataset-backed runs use item scope
         allow_generated_fallback=args.allow_session_fallback,
     )
 
     try:
-        if args.mode == "localization-baseline":
-            if not args.dataset:
-                raise ValueError("--dataset is required for localization-baseline")
-            print(f"[RUN] Hosted localization baseline for dataset '{args.dataset}'")
+        if args.command == "baseline":
+            print(f"[RUN] HF localization baseline for dataset '{HF_DATASET_NAME}'")
+            tasks = fetch_hf_localization_dataset(
+                HF_DATASET_NAME,
+                dataset_config=args.config,
+                dataset_split=args.split,
+                revision=args.revision,
+            )
+            if not tasks:
+                raise RuntimeError("No localization tasks available for baseline run")
+            selected_tasks, selection_info = _select_tasks(tasks, args.max_items, args.offset)
+            _warn_if_unbounded(selection_info, args.max_items)
+            _print_selection(HF_DATASET_NAME, args.config, args.split, HF_DATASET_SOURCE, selection_info)
+            projection = _compute_projection(int(selection_info["selected_count"]))
+            _print_projection(selection_info, projection)
+            if args.yes and not args.max_items:
+                raise ValueError("--yes requires --max-items to be set for safety.")
+            _require_confirmation(args.yes, selection_info, projection)
+            if args.projection_only:
+                print("[RUN] Projection-only mode: exiting before execution.")
+                return
             req = HostedLocalizationBaselineRequest(
-                dataset=args.dataset,
-                version=args.version,
-                dataset_config=args.dataset_config,
-                dataset_split=args.dataset_split,
+                dataset=HF_DATASET_NAME,
+                version=args.revision,
+                dataset_config=args.config,
+                dataset_split=args.split,
                 session=session_cfg,
-                dataset_source=dataset_source,
+                max_items=args.max_items,
+                offset=args.offset,
+                selection=selection_info,
+                projection=projection,
             )
-            bundle = run_hosted_localization_baseline(req, materializer=materializer)
-            if args.baseline_path:
-                save_baseline_bundle(bundle, Path(args.baseline_path))
-                print(f"[RUN] Baseline bundle saved to {args.baseline_path}")
+            bundle = run_hosted_localization_baseline(req, materializer=materializer, tasks=selected_tasks)
             print(f"[RUN] Baselines computed: {len(bundle.items)}")
-            if dataset_source == LocalizationDatasetSource.HUGGINGFACE:
-                for snap in bundle.items:
-                    _print_mat_summary("baseline", snap.identity, snap.materialization)
-        elif args.mode == "localization-experiment":
-            if not args.dataset:
-                raise ValueError("--dataset is required for localization-experiment")
-            print(f"[RUN] Hosted localization experiment for dataset '{args.dataset}'")
+            for snap in bundle.items:
+                _print_mat_summary("baseline", snap.identity, snap.materialization)
+        elif args.command == "experiment":
+            print(f"[RUN] HF localization experiment for dataset '{HF_DATASET_NAME}'")
+            tasks = fetch_hf_localization_dataset(
+                HF_DATASET_NAME,
+                dataset_config=args.config,
+                dataset_split=args.split,
+                revision=args.revision,
+            )
+            if not tasks:
+                raise RuntimeError("No localization tasks available for experiment run")
+            selected_tasks, selection_info = _select_tasks(tasks, args.max_items, args.offset)
+            _warn_if_unbounded(selection_info, args.max_items)
+            _print_selection(HF_DATASET_NAME, args.config, args.split, HF_DATASET_SOURCE, selection_info)
+            projection = _compute_projection(int(selection_info["selected_count"]))
+            _print_projection(selection_info, projection)
+            if args.yes and not args.max_items:
+                raise ValueError("--yes requires --max-items to be set for safety.")
+            _require_confirmation(args.yes, selection_info, projection)
+            if args.projection_only:
+                print("[RUN] Projection-only mode: exiting before execution.")
+                return
             req = HostedLocalizationRunRequest(
-                dataset=args.dataset,
-                version=args.version,
-                dataset_config=args.dataset_config,
-                dataset_split=args.dataset_split,
+                dataset=HF_DATASET_NAME,
+                version=args.revision,
+                dataset_config=args.config,
+                dataset_split=args.split,
                 session=session_cfg,
-                dataset_source=dataset_source,
+                max_items=args.max_items,
+                offset=args.offset,
+                selection=selection_info,
+                projection=projection,
             )
-            results = run_hosted_localization_experiment(req, materializer=materializer)
+            results = run_hosted_localization_experiment(req, materializer=materializer, tasks=selected_tasks)
             print(f"[RUN] Localization items completed: {len(results.items)}")
-            if dataset_source == LocalizationDatasetSource.HUGGINGFACE:
-                for item in results.items:
-                    _print_mat_summary("experiment", _fmt_identity(item.task.get("identity")), item.materialization)
-        else:
-            identity = _build_identity(args)
-            gold = LCAGold(changed_files=args.changed_files or [])
-            context = LCAContext(
-                issue_title=args.issue_title,
-                issue_body=args.issue_body,
-                diff=args.diff,
-                diff_url=args.diff_url,
-                repo_language=None,
-                repo_languages=[],
-                repo_license=None,
-                repo_stars=None,
-            )
-            req = LocalizationAdHocRequest(
-                identity=identity,
-                context=context,
-                gold=gold,
-                repo=args.repo_path,
-                session=session_cfg,
-                dataset_source=dataset_source,
-            )
-            resolved_session = resolve_session_id(session_cfg, run_id=identity.task_id())
-            print(f"[RUN] Ad hoc localization run for {identity.repo_owner}/{identity.repo_name}@{identity.base_sha}")
-            eval_result = evaluate_localization_batch(
-                LocalizationEvaluationRequest(
-                    tasks=[req.to_task()],
-                    dataset_source=dataset_source.value,
-                    materializer=materializer,
-                    parent_trace=None,
-                )
-            )
-            if eval_result.failure or not eval_result.items:
-                category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
-                message = eval_result.failure.message if eval_result.failure else "evaluation_failed"
-                raise RuntimeError(f"Localization evaluation failed ({category}): {message}")
-            task_result = eval_result.items[0]
-            print(f"[RUN] Prediction: {task_result.prediction}")
-            print(f"[RUN] Metrics: {task_result.metrics.model_dump()}")
-            print(f"[RUN] Session: {resolved_session}")
-            if task_result.materialization:
-                _print_mat_summary("single", identity.task_id, task_result.materialization)
+            for item in results.items:
+                _print_mat_summary("experiment", _fmt_identity(item.task.get("identity")), item.materialization)
     except HFDatasetLoadError as exc:
         print(f"[ERROR] HF dataset load failed (category={exc.category}): {exc}")
         raise

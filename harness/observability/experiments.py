@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -8,7 +8,7 @@ from harness.localization.evaluation_backend import LocalizationEvaluationReques
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
 from harness.localization.materializer import RepoMaterializationResult, RepoMaterializer
 from harness.observability.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
-from harness.observability.datasets import fetch_localization_dataset_from_source
+from harness.observability.hf_lca import fetch_hf_localization_dataset
 from harness.observability.langfuse import flush_langfuse, propagate_context
 from harness.observability.session_policy import resolve_session_id
 
@@ -30,25 +30,57 @@ class LocalizationRunResult(BaseModel):
 
 
 def _resolve_items(req: HostedLocalizationRunRequest) -> list[LCATask]:
-    return fetch_localization_dataset_from_source(
-        source=req.dataset_source,
-        name=req.dataset,
-        version=req.version,
+    return fetch_hf_localization_dataset(
+        req.dataset,
         dataset_config=req.dataset_config,
         dataset_split=req.dataset_split,
+        revision=req.version,
     )
 
 
-def run_hosted_localization_baseline(req: HostedLocalizationBaselineRequest, materializer: RepoMaterializer | None = None) -> BaselineBundle:
-    tasks = fetch_localization_dataset_from_source(
-        source=req.dataset_source,
-        name=req.dataset,
-        version=req.version,
+def select_localization_tasks(
+    tasks: Sequence[LCATask],
+    max_items: int | None = None,
+    offset: int = 0,
+) -> tuple[list[LCATask], dict[str, object]]:
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    if max_items is not None and max_items <= 0:
+        raise ValueError("max_items must be > 0 when provided")
+    sorted_tasks = sorted(list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id())
+    total_available = len(sorted_tasks)
+    start = min(offset, total_available)
+    end = total_available if max_items is None else min(start + max_items, total_available)
+    selected = sorted_tasks[start:end]
+    preview = [getattr(t, "task_id", None) or t.identity.task_id() for t in selected[:5]]
+    selection_info: dict[str, object] = {
+        "total_available": total_available,
+        "offset": offset,
+        "limit": max_items,
+        "selected_count": len(selected),
+        "preview": preview,
+    }
+    return selected, selection_info
+
+
+def run_hosted_localization_baseline(
+    req: HostedLocalizationBaselineRequest,
+    materializer: RepoMaterializer | None = None,
+    tasks: list[LCATask] | None = None,
+) -> BaselineBundle:
+    tasks = tasks or fetch_hf_localization_dataset(
+        req.dataset,
         dataset_config=req.dataset_config,
         dataset_split=req.dataset_split,
+        revision=req.version,
     )
     if not tasks:
         raise RuntimeError("No localization tasks available for baseline run")
+    if req.selection:
+        selected_tasks = list(tasks)
+        selection_info = req.selection
+    else:
+        selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
     snapshots: list[BaselineSnapshot] = []
     with propagate_context(
         trace_name="localization_baseline_dataset",
@@ -59,16 +91,18 @@ def run_hosted_localization_baseline(req: HostedLocalizationBaselineRequest, mat
             "dataset_config": req.dataset_config,
             "dataset_split": req.dataset_split,
             "run_kind": "localization_baseline",
-            "dataset_source": req.dataset_source.value,
+            "dataset_source": "huggingface",
+            "selection": selection_info,
+            "projection": req.projection,
         },
     ) as trace:
-        for task in tasks:
+        for task in selected_tasks:
             snapshots.append(
                 compute_baseline_for_task(
                     task,
                     dataset_version=req.version,
                     parent_trace=trace,
-                    dataset_source=req.dataset_source.value,
+                    dataset_source="huggingface",
                     materializer=materializer,
                 )
             )
@@ -81,10 +115,19 @@ def run_hosted_localization_baseline(req: HostedLocalizationBaselineRequest, mat
     )
 
 
-def run_hosted_localization_experiment(req: HostedLocalizationRunRequest, materializer: RepoMaterializer | None = None) -> LocalizationRunResult:
-    tasks = _resolve_items(req)
+def run_hosted_localization_experiment(
+    req: HostedLocalizationRunRequest,
+    materializer: RepoMaterializer | None = None,
+    tasks: list[LCATask] | None = None,
+) -> LocalizationRunResult:
+    tasks = tasks or _resolve_items(req)
     if not tasks:
         raise RuntimeError("No localization tasks available for experiment run")
+    if req.selection:
+        selected_tasks = list(tasks)
+        selection_info = req.selection
+    else:
+        selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
     results: list[LocalizationRunItemResult] = []
     with propagate_context(
         trace_name="localization_experiment",
@@ -95,10 +138,12 @@ def run_hosted_localization_experiment(req: HostedLocalizationRunRequest, materi
             "dataset_config": req.dataset_config,
             "dataset_split": req.dataset_split,
             "run_kind": "localization_experiment",
-            "dataset_source": req.dataset_source.value,
+            "dataset_source": "huggingface",
+            "selection": selection_info,
+            "projection": req.projection,
         },
     ) as trace:
-        for task in tasks:
+        for task in selected_tasks:
             if isinstance(task, Mapping):
                 task_payload: Mapping[str, object] = task
             elif hasattr(task, "model_dump"):
@@ -108,7 +153,7 @@ def run_hosted_localization_experiment(req: HostedLocalizationRunRequest, materi
             eval_result = evaluate_localization_batch(
                 LocalizationEvaluationRequest(
                     tasks=[task],
-                    dataset_source=req.dataset_source.value,
+                    dataset_source="huggingface",
                     materializer=materializer,
                     parent_trace=trace,
                 )

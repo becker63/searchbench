@@ -101,7 +101,8 @@ def fetch_localization_dataset_from_source(
     token: str | None = None,
 ) -> list[LCATask]:
     """
-    Branching loader that supports Langfuse (default) and Hugging Face sources.
+    Branching loader that supports Langfuse or Hugging Face; retained for internal use.
+    Public CLI should call the HF loader directly.
     """
     if source == LocalizationDatasetSource.HUGGINGFACE:
         try:
