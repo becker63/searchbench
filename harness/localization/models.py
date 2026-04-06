@@ -121,9 +121,12 @@ class LCATask(BaseModel):
     @property
     def task_id(self) -> str:
         """
-        Deterministic task identifier (delegates to identity).
+        Deterministic task identifier (delegates to identity and includes repo when available).
         """
-        return self.identity.task_id()
+        base_id = self.identity.task_id()
+        if self.repo:
+            return f"{base_id}:{self.repo}"
+        return base_id
 
     @property
     def changed_files(self) -> List[str]:

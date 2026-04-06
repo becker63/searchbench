@@ -1,10 +1,10 @@
-This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
 
 <file_summary>
 This section contains a summary of this file.
 
 <purpose>
-This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+This file contains a packed representation of the entire repository's contents.
 It is designed to be easily consumable by AI systems for analysis, code review,
 or other automated processes.
 </purpose>
@@ -32,7 +32,6 @@ The content is organized as follows:
 <notes>
 - Some files may have been excluded based on .gitignore rules and Repomix's configuration
 - Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
-- Files matching these patterns are excluded: openspec
 - Files matching patterns in .gitignore are excluded
 - Files matching default ignore patterns are excluded
 - Files are sorted by Git change count (files with more changes are at the bottom)
@@ -186,10 +185,9 @@ This section contains the contents of the repository's files.
 - CLI logs: dataset/config/split, dataset source (langfuse|huggingface), cache hit/miss, git fetch/worktree/verification status, checkout `base_sha`, ready path, summary printed to stdout.
 - Telemetry: includes dataset source and materialization events; failure categories surfaced (lock, auth/fetch, checkout verification, cache corruption).
 
-## Dataset Sources
-- **Langfuse (default)**: hosted datasets fetched via `fetch_localization_dataset`.
-- **Hugging Face**: `--dataset-source huggingface` (or request dataset_source=huggingface) loads `JetBrains-Research/lca-bug-localization` by config/split/revision, normalizes rows to `LCATask`, and materializes repos via git mirror/worktree. Networked tests are opt-in (`HF_NETWORK_TESTS=1`).
-  - Recommended to pin dataset revision and surface it in logs; cache keys include dataset/config/split + repo + base_sha.
+## Dataset Source (HF-only public CLI)
+- Public CLI baseline/experiment commands use the Hugging Face LCA dataset (`JetBrains-Research/lca-bug-localization`) directly, resolved via config/split/revision.
+- Repo materialization still locks/cache-validates HF mirrors/worktrees per task (repo + base_sha), and logs materialization events as before.
 
 ## CLI Examples (HF-only)
 - Baseline: `python run.py baseline --config py --split dev --max-items 25`
@@ -202,9 +200,10 @@ This section contains the contents of the repository's files.
 - **Deterministic selection:** Tasks are sorted by task_id (dataset/config/split + repo owner/name + base_sha + issue/pull) before applying `--offset` (default 0) and `--max-items`. Selection metadata (offset, limit, selected count, total, identity preview) is printed and propagated.
 - **Limits:** `--max-items N` bounds the window; `--offset K` skips K items before the window. Negative/zero limits are rejected. If `--max-items` is omitted, the run is unbounded.
 - **Warnings:** If selection is unbounded or resolves to >50 items, the CLI emits a warning before projection/confirmation.
-- **Cost projection (always-on):** Before running, the CLI prints planned and hard-cap projections using fixed constants: localization (llama3.1-8b) 75k/10k tokens per item (planned) and 110k/14k (hard cap); writer (gpt-oss-120b) 20k/4096 tokens per call with 9 calls/iteration and 5 iterations hard cap. Pricing uses Cerebras tables only; unknown pricing fails closed. No user-provided assumptions or price overrides are accepted.
+- **Cost projection (always-on):** Before running, the CLI prints planned and hard-cap projections using fixed bounds: localization (llama3.1-8b) 75k/10k tokens per item (planned) and 110k/14k (hard cap); writer (gpt-oss-120b) 20k/4096 tokens per call with 9 calls/iteration and 5 iterations hard cap. Pricing uses Cerebras tables only; unknown pricing fails closed. No user-provided assumptions or price overrides are accepted.
 - **Confirmation:** After projection, the CLI requires confirmation (spacebar semantics). On TTY it reads a single key; if raw capture is unavailable it falls back to a line prompt requiring an explicit token (not a bare Enter). Ctrl+C/EOF aborts. Non-interactive runs must set `--yes` **and** `--max-items`.
 - **Projection-only:** `--projection-only` prints selection + projection, runs confirmation/bypass logic, and exits without executing tasks.
+- **Parallel workers:** `--max-workers` (default 1) controls only the outer dataset task execution after selection/projection/confirmation. Effective workers are `min(max-workers, selected_count)`; ordering is restored to deterministic selection order. A missing parent trace in worker execution is treated as an error rather than creating a new root span.
 
 ## Shared Evaluation Backend (Machine + Hosted)
 - A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.
@@ -258,7 +257,7 @@ By default both machines are rendered; use `--machine optimization` or `--machin
   - Qwen 3 235B Instruct — input $0.60/M, output $1.20/M; regex `(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct`
 - Sync helper: `observability.cerebras_pricing.sync_cerebras_models()` calls `client.api.models.create` for each entry (requires Langfuse Cloud credentials).
 - Generations must include `model` and `usage_details` (OpenAI-style prompt/completion/total) so Langfuse can infer cost. If the provider omits usage, supply it explicitly or add an estimator; do not emit zeroed usage.
-- Projection vs observed costs: CLI projections for dataset-backed runs are tagged separately as projection metadata (selection window + assumptions + projected totals). Do not mix projected values into observed Langfuse usage/cost fields. If pricing is unknown and no explicit overrides are provided, projection fails closed instead of emitting a pseudo-cost.
+- Projection vs observed costs: CLI projections for dataset-backed runs are tagged separately as projection metadata (selection window + fixed planned/hard-cap totals). Do not mix projected values into observed Langfuse usage/cost fields. If pricing is unknown, projection fails closed instead of emitting a pseudo-cost.
 
 ## Sessions (where and how)
 
@@ -276,6 +275,7 @@ By default both machines are rendered; use `--machine optimization` or `--machin
 - Allowed leaf spans: writer attempts, backend/model/tool calls, usage/cost/latency, pipeline steps, baseline items — all attached to provided parents.
 - Disallowed patterns: leaf-created roots, competing iteration/repair spans, split ownership of high-level scores, silent root creation when no parent is provided.
 - Shared evaluation backend is the canonical evaluation path for machine and hosted runs; tracing follows the machine-owned evaluation span → backend child spans layering.
+- Parallel dataset execution uses the hosted orchestration wrappers for worker pools only; workers MUST attach to the provided parent observation and fail/guard if no parent is available. Projection metadata stays separate from observed usage/cost telemetry.
 </file>
 
 <file path="localization/__init__.py">
@@ -4755,11 +4755,18 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
+import concurrent.futures
+from concurrent.futures import FIRST_COMPLETED
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.localization.evaluation_backend import LocalizationEvaluationRequest, evaluate_localization_batch
+from harness.localization.evaluation_backend import (
+    LocalizationEvaluationFailure,
+    LocalizationEvaluationRequest,
+    evaluate_localization_batch,
+)
 from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
@@ -4802,6 +4809,7 @@ class BaselineBundle(BaseModel):
     created_at: str | None = None
     items: list[BaselineSnapshot] = Field(default_factory=list)
     metadata: dict[str, object] = Field(default_factory=dict)
+    failure: LocalizationEvaluationFailure | None = None
 
 
 def baseline_key(task: LCATask) -> str:
@@ -4842,9 +4850,12 @@ def compute_baseline_for_task(
             )
         )
         if eval_result.failure or not eval_result.items:
-            category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
-            message = eval_result.failure.message if eval_result.failure else "baseline_evaluation_failed"
-            raise RuntimeError(f"Baseline evaluation failed ({category}): {message}")
+            failure = eval_result.failure or LocalizationEvaluationFailure(
+                category=LocalizationFailureCategory.UNKNOWN, message="baseline_evaluation_failed", task_id=task.task_id
+            )
+            raise LocalizationEvaluationError(
+                failure.category, failure.message, task_id=failure.task_id or task.task_id  # type: ignore[arg-type]
+            )
         task_result = eval_result.items[0]
         prediction = LocalizationPrediction(predicted_files=task_result.prediction)
         metrics = task_result.metrics
@@ -4912,6 +4923,7 @@ def make_baseline_bundle(
     dataset_name: str,
     dataset_version: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    failure: LocalizationEvaluationFailure | None = None,
 ) -> BaselineBundle:
     snapshot_models = [
         snap if isinstance(snap, BaselineSnapshot) else BaselineSnapshot.model_validate(snap) for snap in snapshots
@@ -4922,6 +4934,7 @@ def make_baseline_bundle(
         created_at=datetime.now(tz=timezone.utc).isoformat(),
         items=snapshot_models,
         metadata=dict(metadata) if metadata else {},
+        failure=failure,
     )
 
 
@@ -5245,13 +5258,20 @@ def local_dataset(
 <file path="observability/experiments.py">
 from __future__ import annotations
 
+import concurrent.futures
+from concurrent.futures import FIRST_COMPLETED
 from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
-from harness.localization.evaluation_backend import LocalizationEvaluationRequest, evaluate_localization_batch
+from harness.localization.evaluation_backend import (
+    LocalizationEvaluationFailure,
+    LocalizationEvaluationRequest,
+    evaluate_localization_batch,
+)
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
 from harness.localization.materializer import RepoMaterializationResult, RepoMaterializer
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.observability.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
 from harness.observability.hf_lca import fetch_hf_localization_dataset
 from harness.observability.langfuse import flush_langfuse, propagate_context
@@ -5272,6 +5292,7 @@ class LocalizationRunResult(BaseModel):
     dataset_name: str
     dataset_version: str | None = None
     items: list[LocalizationRunItemResult] = Field(default_factory=list)
+    failure: LocalizationEvaluationFailure | None = None
 
 
 def _resolve_items(req: HostedLocalizationRunRequest) -> list[LCATask]:
@@ -5308,6 +5329,32 @@ def select_localization_tasks(
     return selected, selection_info
 
 
+class _TaskFailure(Exception):
+    def __init__(self, index: int, task_id: str | None, category: LocalizationFailureCategory | str, message: str):
+        super().__init__(message)
+        self.index = index
+        self.task_id = task_id
+        self.category = category
+        self.message = message
+
+
+def _effective_workers(requested: int, selected_count: int) -> int:
+    if requested is None or requested <= 0:
+        raise ValueError("max_workers must be a positive integer")
+    if selected_count <= 0:
+        raise ValueError("No tasks selected for execution")
+    return max(1, min(requested, selected_count))
+
+
+def _normalize_failure_category(category: LocalizationFailureCategory | str) -> LocalizationFailureCategory:
+    if isinstance(category, LocalizationFailureCategory):
+        return category
+    try:
+        return LocalizationFailureCategory(category)
+    except Exception:
+        return LocalizationFailureCategory.UNKNOWN
+
+
 def run_hosted_localization_baseline(
     req: HostedLocalizationBaselineRequest,
     materializer: RepoMaterializer | None = None,
@@ -5327,6 +5374,8 @@ def run_hosted_localization_baseline(
     else:
         selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
     snapshots: list[BaselineSnapshot] = []
+    failure: LocalizationEvaluationFailure | None = None
+    effective_workers = _effective_workers(req.max_workers or 1, len(selected_tasks))
     with propagate_context(
         trace_name="localization_baseline_dataset",
         session_id=resolve_session_id(req.session, run_id=req.dataset),
@@ -5341,15 +5390,26 @@ def run_hosted_localization_baseline(
             "projection": req.projection,
         },
     ) as trace:
-        for task in selected_tasks:
-            snapshots.append(
-                compute_baseline_for_task(
-                    task,
-                    dataset_version=req.version,
-                    parent_trace=trace,
-                    dataset_source="huggingface",
-                    materializer=materializer,
+        if trace is None:
+            raise RuntimeError("parent trace required for baseline execution")
+        if effective_workers == 1:
+            for task in selected_tasks:
+                snapshots.append(
+                    compute_baseline_for_task(
+                        task,
+                        dataset_version=req.version,
+                        parent_trace=trace,
+                        dataset_source="huggingface",
+                        materializer=materializer,
+                    )
                 )
+        else:
+            snapshots, failure = _run_baseline_parallel(
+                selected_tasks,
+                effective_workers,
+                trace,
+                materializer,
+                req.version,
             )
     flush_langfuse()
     return make_baseline_bundle(
@@ -5357,8 +5417,178 @@ def run_hosted_localization_baseline(
         dataset_name=req.dataset,
         dataset_version=req.version,
         metadata={"run_kind": "localization_baseline"},
+        failure=failure,
     )
 
+
+def _baseline_worker(
+    index: int,
+    task: LCATask,
+    parent_trace: object,
+    materializer: RepoMaterializer | None,
+    dataset_version: str | None,
+) -> BaselineSnapshot:
+    if parent_trace is None:
+        raise _TaskFailure(index, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, "missing parent trace")
+    try:
+        return compute_baseline_for_task(
+            task,
+            dataset_version=dataset_version,
+            parent_trace=parent_trace,
+            dataset_source="huggingface",
+            materializer=materializer,
+        )
+    except LocalizationEvaluationError as exc:
+        category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
+        raise _TaskFailure(index, getattr(task, "task_id", None), category, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _TaskFailure(index, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc)) from exc
+
+
+def _run_baseline_parallel(
+    tasks: list[LCATask],
+    effective_workers: int,
+    parent_trace: object,
+    materializer: RepoMaterializer | None,
+    dataset_version: str | None,
+) -> tuple[list[BaselineSnapshot], LocalizationEvaluationFailure | None]:
+    results: list[BaselineSnapshot | None] = [None] * len(tasks)
+    failure: _TaskFailure | None = None
+    next_index = 0
+    inflight: dict[concurrent.futures.Future[BaselineSnapshot], int] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        def _submit(idx: int) -> None:
+            future = executor.submit(_baseline_worker, idx, tasks[idx], parent_trace, materializer, dataset_version)
+            inflight[future] = idx
+
+        while next_index < len(tasks) and len(inflight) < effective_workers:
+            _submit(next_index)
+            next_index += 1
+
+        while inflight:
+            done, _ = concurrent.futures.wait(inflight.keys(), return_when=FIRST_COMPLETED)
+            for future in done:
+                idx = inflight.pop(future)
+                try:
+                    results[idx] = future.result()
+                except _TaskFailure as exc:
+                    if failure is None or exc.index < failure.index:
+                        failure = exc
+                except Exception as exc:  # noqa: BLE001
+                    fallback = _TaskFailure(idx, getattr(tasks[idx], "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc))
+                    if failure is None or idx < failure.index:
+                        failure = fallback
+                if failure is None and next_index < len(tasks):
+                    _submit(next_index)
+                    next_index += 1
+
+    failure_payload: LocalizationEvaluationFailure | None = None
+    if failure is not None:
+        failure_payload = LocalizationEvaluationFailure(
+            category=_normalize_failure_category(failure.category),
+            message=failure.message,
+            task_id=failure.task_id,
+        )
+    ordered_results = [r for r in results if r is not None]
+    return ordered_results, failure_payload
+
+
+def _normalize_task_payload(task: LCATask | Mapping[str, object]) -> Mapping[str, object]:
+    if isinstance(task, Mapping):
+        return task
+    if hasattr(task, "model_dump"):
+        return task.model_dump()
+    raise RuntimeError("Localization task must be a mapping or Pydantic model")
+
+
+def _run_experiment_task(
+    task: LCATask | Mapping[str, object],
+    parent_trace: object,
+    materializer: RepoMaterializer | None,
+) -> LocalizationRunItemResult:
+    if parent_trace is None:
+        raise _TaskFailure(-1, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, "missing parent trace")
+    task_payload = _normalize_task_payload(task)
+    normalized_task = normalize_lca_task(task_payload)
+    try:
+        eval_result = evaluate_localization_batch(
+            LocalizationEvaluationRequest(
+                tasks=[normalized_task],
+                dataset_source="huggingface",
+                materializer=materializer,
+                parent_trace=parent_trace,
+            )
+        )
+        if eval_result.failure or not eval_result.items:
+            failure = eval_result.failure or LocalizationEvaluationFailure(
+                category=LocalizationFailureCategory.UNKNOWN, message="experiment_evaluation_failed", task_id=normalized_task.task_id
+            )
+            raise _TaskFailure(-1, failure.task_id, failure.category, failure.message)
+        task_result = eval_result.items[0]
+        return LocalizationRunItemResult(
+            task=normalized_task.model_dump(),
+            metrics=task_result.metrics,
+            prediction=task_result.prediction,
+            trace_id=getattr(parent_trace, "id", None),
+            materialization=task_result.materialization,
+        )
+    except _TaskFailure:
+        raise
+    except LocalizationEvaluationError as exc:
+        category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
+        raise _TaskFailure(-1, getattr(normalized_task, "task_id", None), category, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _TaskFailure(-1, getattr(normalized_task, "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc)) from exc
+
+
+def _run_experiment_parallel(
+    tasks: list[LCATask],
+    effective_workers: int,
+    parent_trace: object,
+    materializer: RepoMaterializer | None,
+) -> tuple[list[LocalizationRunItemResult], LocalizationEvaluationFailure | None]:
+    results: list[LocalizationRunItemResult | None] = [None] * len(tasks)
+    failure: _TaskFailure | None = None
+    next_index = 0
+    inflight: dict[concurrent.futures.Future[LocalizationRunItemResult], int] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        def _submit(idx: int) -> None:
+            future = executor.submit(_run_experiment_task, tasks[idx], parent_trace, materializer)
+            inflight[future] = idx
+
+        while next_index < len(tasks) and len(inflight) < effective_workers:
+            _submit(next_index)
+            next_index += 1
+
+        while inflight:
+            done, _ = concurrent.futures.wait(inflight.keys(), return_when=FIRST_COMPLETED)
+            for future in done:
+                idx = inflight.pop(future)
+                try:
+                    results[idx] = future.result()
+                except _TaskFailure as exc:
+                    indexed_failure = _TaskFailure(idx, exc.task_id, exc.category, exc.message)
+                    if failure is None or indexed_failure.index < failure.index:
+                        failure = indexed_failure
+                except Exception as exc:  # noqa: BLE001
+                    fallback = _TaskFailure(idx, getattr(tasks[idx], "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc))
+                    if failure is None or idx < failure.index:
+                        failure = fallback
+                if failure is None and next_index < len(tasks):
+                    _submit(next_index)
+                    next_index += 1
+
+    failure_payload: LocalizationEvaluationFailure | None = None
+    if failure is not None:
+        failure_payload = LocalizationEvaluationFailure(
+            category=_normalize_failure_category(failure.category),
+            message=failure.message,
+            task_id=failure.task_id,
+        )
+    ordered_results = [r for r in results if r is not None]
+    return ordered_results, failure_payload
 
 def run_hosted_localization_experiment(
     req: HostedLocalizationRunRequest,
@@ -5374,6 +5604,8 @@ def run_hosted_localization_experiment(
     else:
         selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
     results: list[LocalizationRunItemResult] = []
+    failure: LocalizationEvaluationFailure | None = None
+    effective_workers = _effective_workers(req.max_workers or 1, len(selected_tasks))
     with propagate_context(
         trace_name="localization_experiment",
         session_id=resolve_session_id(req.session, run_id=req.dataset),
@@ -5388,37 +5620,26 @@ def run_hosted_localization_experiment(
             "projection": req.projection,
         },
     ) as trace:
-        for task in selected_tasks:
-            if isinstance(task, Mapping):
-                task_payload: Mapping[str, object] = task
-            elif hasattr(task, "model_dump"):
-                task_payload = task.model_dump()
-            else:
-                raise RuntimeError("Localization task must be a mapping or Pydantic model")
-            eval_result = evaluate_localization_batch(
-                LocalizationEvaluationRequest(
-                    tasks=[task],
-                    dataset_source="huggingface",
-                    materializer=materializer,
-                    parent_trace=trace,
+        if trace is None:
+            raise RuntimeError("parent trace required for experiment execution")
+        if effective_workers == 1:
+            for task in selected_tasks:
+                results.append(
+                    _run_experiment_task(
+                        task=task,
+                        parent_trace=trace,
+                        materializer=materializer,
+                    )
                 )
-            )
-            if eval_result.failure or not eval_result.items:
-                category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
-                message = eval_result.failure.message if eval_result.failure else "experiment_evaluation_failed"
-                raise RuntimeError(f"Experiment evaluation failed ({category}): {message}")
-            task_result = eval_result.items[0]
-            results.append(
-                LocalizationRunItemResult(
-                    task=normalize_lca_task(task_payload).model_dump(),
-                    metrics=task_result.metrics,
-                    prediction=task_result.prediction,
-                    trace_id=getattr(trace, "id", None),
-                    materialization=task_result.materialization,
-                )
+        else:
+            results, failure = _run_experiment_parallel(
+                selected_tasks,
+                effective_workers,
+                trace,
+                materializer,
             )
     flush_langfuse()
-    return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results)
+    return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results, failure=failure)
 </file>
 
 <file path="observability/hf_lca.py">
@@ -5840,7 +6061,7 @@ __all__ = [
 <file path="observability/requests.py">
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from .session_policy import SessionConfig
 
@@ -5857,8 +6078,16 @@ class HostedLocalizationBaselineRequest(BaseModel):
     session: SessionConfig | None = None
     max_items: int | None = None
     offset: int = 0
+    max_workers: int = 1
     selection: dict[str, object] | None = None
     projection: dict[str, object] | None = None
+
+    @field_validator("max_workers")
+    @classmethod
+    def _validate_workers(cls, value: int) -> int:
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError("max_workers must be a positive integer")
+        return value
 
 
 class HostedLocalizationRunRequest(BaseModel):
@@ -5873,8 +6102,16 @@ class HostedLocalizationRunRequest(BaseModel):
     session: SessionConfig | None = None
     max_items: int | None = None
     offset: int = 0
+    max_workers: int = 1
     selection: dict[str, object] | None = None
     projection: dict[str, object] | None = None
+
+    @field_validator("max_workers")
+    @classmethod
+    def _validate_workers(cls, value: int) -> int:
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError("max_workers must be a positive integer")
+        return value
 </file>
 
 <file path="observability/score_emitter.py">
@@ -7528,6 +7765,12 @@ def test_hf_loader_is_used(monkeypatch):
 def test_requests_do_not_expose_dataset_source():
     req = HostedLocalizationBaselineRequest(dataset="d", dataset_config="c", dataset_split="s")
     assert "dataset_source" not in req.model_fields
+
+
+def test_max_workers_validation():
+    argv = ["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--max-workers", "0"]
+    with pytest.raises(ValueError):
+        run_module.main(argv)
 </file>
 
 <file path="tests_harness/test_datasets.py">
@@ -7625,7 +7868,13 @@ def test_score_task_failure_is_typed(tmp_path, monkeypatch):
 <file path="tests_harness/test_experiments_backend.py">
 from __future__ import annotations
 
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+import time
+
+import pytest
+
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
+from harness.localization.evaluation_backend import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity, LocalizationMetrics
 from harness.observability import experiments
 
 
@@ -7686,6 +7935,146 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     result = experiments.run_hosted_localization_experiment(req, materializer=None)
     assert calls
     assert result.items[0].prediction == ["a.py"]
+
+
+def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    t1 = _task(str(repo_root / "r1"))
+    t2 = _task(str(repo_root / "r2"))
+    tasks = [t2, t1]  # intentionally unsorted to exercise deterministic selection
+    durations = {t1.task_id: 0.05, t2.task_id: 0.01}
+
+    def fake_backend(req):
+        task = req.tasks[0]
+        time.sleep(durations[task.task_id])
+        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+        return LocalizationEvaluationResult(
+            aggregate_score=1.0,
+            aggregate_metrics=metrics,
+            machine_score=1.0,
+            items=[
+                LocalizationEvaluationTaskResult(
+                    task=task,
+                    metrics=metrics,
+                    prediction=[task.task_id],
+                    evidence=None,
+                    materialization=None,
+                    trace_id=None,
+                )
+            ],
+            failure=None,
+        )
+
+    monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
+    req = experiments.HostedLocalizationRunRequest(
+        dataset="d",
+        version="v1",
+        dataset_config="c",
+        dataset_split="s",
+        session=None,
+        max_workers=2,
+    )
+    result = experiments.run_hosted_localization_experiment(req, materializer=None, tasks=tasks)
+    assert [item.prediction[0] for item in result.items] == [t1.task_id, t2.task_id]
+    assert result.failure is None
+
+
+def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    t1 = _task(str(repo_root / "r1"))
+    t2 = _task(str(repo_root / "r2"))
+    calls = []
+
+    def fake_backend(req):
+        task = req.tasks[0]
+        calls.append(task.task_id)
+        if task.task_id == t2.task_id:
+            raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, "runner failed", task_id=task.task_id)
+        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+        return LocalizationEvaluationResult(
+            aggregate_score=1.0,
+            aggregate_metrics=metrics,
+            machine_score=1.0,
+            items=[
+                LocalizationEvaluationTaskResult(
+                    task=task,
+                    metrics=metrics,
+                    prediction=[task.task_id],
+                    evidence=None,
+                    materialization=None,
+                    trace_id=None,
+                )
+            ],
+            failure=None,
+        )
+
+    monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
+    req = experiments.HostedLocalizationRunRequest(
+        dataset="d",
+        version="v1",
+        dataset_config="c",
+        dataset_split="s",
+        session=None,
+        max_workers=2,
+    )
+    result = experiments.run_hosted_localization_experiment(req, materializer=None, tasks=[t1, t2])
+    assert result.failure is not None
+    assert result.failure.task_id == t2.task_id
+    # Only the successful task (t1) should be in results, ordered
+    assert [item.prediction[0] for item in result.items] == [t1.task_id]
+
+
+def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    t1 = _task(str(repo_root / "r1"))
+    t2 = _task(str(repo_root / "r2"))
+    calls = []
+
+    def fake_backend(req):
+        task = req.tasks[0]
+        calls.append(task.task_id)
+        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+        return LocalizationEvaluationResult(
+            aggregate_score=1.0,
+            aggregate_metrics=metrics,
+            machine_score=1.0,
+            items=[
+                LocalizationEvaluationTaskResult(
+                    task=task,
+                    metrics=metrics,
+                    prediction=[task.task_id],
+                    evidence=None,
+                    materialization=None,
+                    trace_id=None,
+                )
+            ],
+            failure=None,
+        )
+
+    monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
+    req = experiments.HostedLocalizationRunRequest(
+        dataset="d",
+        version="v1",
+        dataset_config="c",
+        dataset_split="s",
+        session=None,
+        max_workers=1,
+    )
+    result = experiments.run_hosted_localization_experiment(req, materializer=None, tasks=[t2, t1])
+    assert calls == [t1.task_id, t2.task_id]
+    assert [item.prediction[0] for item in result.items] == [t1.task_id, t2.task_id]
+    assert result.failure is None
+
+
+def test_missing_parent_trace_guard(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    task = _task(str(repo_root / "r1"))
+    with pytest.raises(experiments._TaskFailure):
+        experiments._run_experiment_task(task=task, parent_trace=None, materializer=None)
 </file>
 
 <file path="tests_harness/test_failure_context_budget.py">
@@ -7804,6 +8193,7 @@ def test_hf_loader_missing_required_fields_raises(monkeypatch):
 
 <file path="tests_harness/test_hf_materializer.py">
 from __future__ import annotations
+import concurrent.futures
 import shutil
 import subprocess
 from pathlib import Path
@@ -7984,6 +8374,29 @@ def test_materialization_summary_mentions_git_states(tmp_path):
     assert "mirror_fetched" in summary_text
     assert "worktree_created" in summary_text
     assert "checkout_verified" in summary_text
+
+
+def test_materializer_parallel_calls_share_cache(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+
+    def _materialize():
+        return materializer.materialize(request)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: _materialize(), range(2)))
+
+    assert len(results) == 2
+    assert results[0].local_path == results[1].local_path
+    assert (results[0].local_path / ".complete").exists()
 </file>
 
 <file path="tests_harness/test_hf_network_optin.py">
@@ -11753,6 +12166,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         sub.add_argument("--max-items", type=int, help="Maximum number of dataset items to evaluate")
         sub.add_argument("--offset", type=int, default=0, help="Offset into the dataset before selection window")
         sub.add_argument(
+            "--max-workers",
+            type=int,
+            default=1,
+            help="Maximum parallel workers for outer dataset task execution (>=1, applied after selection)",
+        )
+        sub.add_argument(
             "--projection-only",
             action="store_true",
             help="Compute selection and cost projection, then exit after confirmation without executing runs",
@@ -11944,6 +12363,8 @@ def _require_confirmation(skip_confirmation: bool, selection: dict[str, object],
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO)
+    if args.max_workers is not None and args.max_workers <= 0:
+        raise ValueError("--max-workers must be a positive integer")
     materializer = HuggingFaceRepoMaterializer()
     session_cfg = SessionConfig(
         session_id=args.session_id,
@@ -11981,11 +12402,15 @@ def main(argv: list[str] | None = None) -> None:
                 session=session_cfg,
                 max_items=args.max_items,
                 offset=args.offset,
+                max_workers=args.max_workers,
                 selection=selection_info,
                 projection=projection,
             )
             bundle = run_hosted_localization_baseline(req, materializer=materializer, tasks=selected_tasks)
             print(f"[RUN] Baselines computed: {len(bundle.items)}")
+            if getattr(bundle, "failure", None):
+                failure = bundle.failure
+                print(f"[RUN] Baseline run reported failure category={getattr(failure.category, 'value', failure.category)} task_id={failure.task_id} message={failure.message}")
             for snap in bundle.items:
                 _print_mat_summary("baseline", snap.identity, snap.materialization)
         elif args.command == "experiment":
@@ -12017,11 +12442,15 @@ def main(argv: list[str] | None = None) -> None:
                 session=session_cfg,
                 max_items=args.max_items,
                 offset=args.offset,
+                max_workers=args.max_workers,
                 selection=selection_info,
                 projection=projection,
             )
             results = run_hosted_localization_experiment(req, materializer=materializer, tasks=selected_tasks)
             print(f"[RUN] Localization items completed: {len(results.items)}")
+            if getattr(results, "failure", None):
+                failure = results.failure
+                print(f"[RUN] Experiment run reported failure category={getattr(failure.category, 'value', failure.category)} task_id={failure.task_id} message={failure.message}")
             for item in results.items:
                 _print_mat_summary("experiment", _fmt_identity(item.task.get("identity")), item.materialization)
     except HFDatasetLoadError as exc:

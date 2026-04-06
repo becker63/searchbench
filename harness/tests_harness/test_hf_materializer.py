@@ -1,4 +1,5 @@
 from __future__ import annotations
+import concurrent.futures
 import shutil
 import subprocess
 from pathlib import Path
@@ -179,3 +180,26 @@ def test_materialization_summary_mentions_git_states(tmp_path):
     assert "mirror_fetched" in summary_text
     assert "worktree_created" in summary_text
     assert "checkout_verified" in summary_text
+
+
+def test_materializer_parallel_calls_share_cache(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+
+    def _materialize():
+        return materializer.materialize(request)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: _materialize(), range(2)))
+
+    assert len(results) == 2
+    assert results[0].local_path == results[1].local_path
+    assert (results[0].local_path / ".complete").exists()

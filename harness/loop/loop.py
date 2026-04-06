@@ -36,8 +36,10 @@ from harness.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 
 if TYPE_CHECKING:
-    from harness.localization.evaluation_backend import LocalizationEvaluationRequest
+    from harness.localization.evaluation_backend import LocalizationEvaluationRequest as LocalizationEvaluationRequestType
     from harness.observability.baselines import BaselineSnapshot
+else:
+    LocalizationEvaluationRequestType = object
 
 from .loop_machine import OptimizationStateMachine
 from .loop_types import (
@@ -91,7 +93,7 @@ _REEXPORTED = (
 )
 
 
-def evaluate_localization_batch(req: "LocalizationEvaluationRequest"):
+def evaluate_localization_batch(req: "LocalizationEvaluationRequestType"):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
     """
@@ -100,7 +102,9 @@ def evaluate_localization_batch(req: "LocalizationEvaluationRequest"):
     return _evaluate_localization_batch(req)
 
 
-def LocalizationEvaluationRequest(*args, **kwargs):
+def LocalizationEvaluationRequest(
+    *args: object, **kwargs: object
+) -> "LocalizationEvaluationRequestType":
     """
     Lazy proxy for the evaluation request model so tests can monkeypatch the symbol on this module.
     """

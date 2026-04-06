@@ -7,8 +7,13 @@ from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.localization.evaluation_backend import LocalizationEvaluationRequest, evaluate_localization_batch
+from harness.localization.evaluation_backend import (
+    LocalizationEvaluationFailure,
+    LocalizationEvaluationRequest,
+    evaluate_localization_batch,
+)
 from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
@@ -51,6 +56,7 @@ class BaselineBundle(BaseModel):
     created_at: str | None = None
     items: list[BaselineSnapshot] = Field(default_factory=list)
     metadata: dict[str, object] = Field(default_factory=dict)
+    failure: LocalizationEvaluationFailure | None = None
 
 
 def baseline_key(task: LCATask) -> str:
@@ -91,9 +97,12 @@ def compute_baseline_for_task(
             )
         )
         if eval_result.failure or not eval_result.items:
-            category = getattr(eval_result.failure.category, "value", eval_result.failure.category) if eval_result.failure else "unknown"
-            message = eval_result.failure.message if eval_result.failure else "baseline_evaluation_failed"
-            raise RuntimeError(f"Baseline evaluation failed ({category}): {message}")
+            failure = eval_result.failure or LocalizationEvaluationFailure(
+                category=LocalizationFailureCategory.UNKNOWN, message="baseline_evaluation_failed", task_id=task.task_id
+            )
+            raise LocalizationEvaluationError(
+                failure.category, failure.message, task_id=failure.task_id or task.task_id  # type: ignore[arg-type]
+            )
         task_result = eval_result.items[0]
         prediction = LocalizationPrediction(predicted_files=task_result.prediction)
         metrics = task_result.metrics
@@ -161,6 +170,7 @@ def make_baseline_bundle(
     dataset_name: str,
     dataset_version: str | None = None,
     metadata: Mapping[str, object] | None = None,
+    failure: LocalizationEvaluationFailure | None = None,
 ) -> BaselineBundle:
     snapshot_models = [
         snap if isinstance(snap, BaselineSnapshot) else BaselineSnapshot.model_validate(snap) for snap in snapshots
@@ -171,6 +181,7 @@ def make_baseline_bundle(
         created_at=datetime.now(tz=timezone.utc).isoformat(),
         items=snapshot_models,
         metadata=dict(metadata) if metadata else {},
+        failure=failure,
     )
 
 

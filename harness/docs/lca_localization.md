@@ -43,6 +43,7 @@
 - **Cost projection (always-on):** Before running, the CLI prints planned and hard-cap projections using fixed bounds: localization (llama3.1-8b) 75k/10k tokens per item (planned) and 110k/14k (hard cap); writer (gpt-oss-120b) 20k/4096 tokens per call with 9 calls/iteration and 5 iterations hard cap. Pricing uses Cerebras tables only; unknown pricing fails closed. No user-provided assumptions or price overrides are accepted.
 - **Confirmation:** After projection, the CLI requires confirmation (spacebar semantics). On TTY it reads a single key; if raw capture is unavailable it falls back to a line prompt requiring an explicit token (not a bare Enter). Ctrl+C/EOF aborts. Non-interactive runs must set `--yes` **and** `--max-items`.
 - **Projection-only:** `--projection-only` prints selection + projection, runs confirmation/bypass logic, and exits without executing tasks.
+- **Parallel workers:** `--max-workers` (default 1) controls only the outer dataset task execution after selection/projection/confirmation. Effective workers are `min(max-workers, selected_count)`; ordering is restored to deterministic selection order. A missing parent trace in worker execution is treated as an error rather than creating a new root span.
 
 ## Shared Evaluation Backend (Machine + Hosted)
 - A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.

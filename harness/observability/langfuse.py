@@ -8,7 +8,11 @@ from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
 from pydantic import BaseModel, ConfigDict
 
-from ..utils.env import get_langfuse_env
+try:
+    # Prefer absolute import so observability can be used as a top-level package in tests.
+    from utils.env import get_langfuse_env
+except ImportError:  # pragma: no cover
+    from harness.utils.env import get_langfuse_env
 
 _client: Optional[Langfuse] = None
 

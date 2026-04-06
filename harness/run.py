@@ -9,7 +9,7 @@ import argparse
 import logging
 import sys
 from contextlib import contextmanager
-from typing import Any, Iterable
+from typing import IO, Any, Iterable, Iterator
 try:
     import tty  # type: ignore
     import termios  # type: ignore
@@ -23,8 +23,10 @@ from harness.localization.evaluation_backend import (
 )
 from harness.localization.models import LCATask
 from harness.localization.hf_materializer import HuggingFaceRepoMaterializer
-from harness.observability.baselines import run_hosted_localization_baseline
-from harness.observability.experiments import run_hosted_localization_experiment
+from harness.observability.experiments import (
+    run_hosted_localization_baseline,
+    run_hosted_localization_experiment,
+)
 from harness.observability.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
 from harness.observability.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
 from harness.observability.session_policy import SessionConfig
@@ -89,7 +91,7 @@ WRITER_MAX_OUTPUT_TOKENS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_
 
 
 @contextmanager
-def _raw_mode(file_obj):
+def _raw_mode(file_obj: IO[Any]) -> Iterator[None]:
     """
     Best-effort raw mode for single-key reads; falls back to normal mode on failure.
     """
@@ -120,12 +122,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="HF LCA localization runner (baseline/experiment)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    def _add_common(sub):
+    def _add_common(sub: argparse.ArgumentParser) -> None:
         sub.add_argument("--config", required=True, help="HF dataset config (e.g., py/java/kt)")
         sub.add_argument("--split", required=True, help="HF dataset split (e.g., dev/test/train)")
         sub.add_argument("--revision", help="HF dataset revision pin")
         sub.add_argument("--max-items", type=int, help="Maximum number of dataset items to evaluate")
         sub.add_argument("--offset", type=int, default=0, help="Offset into the dataset before selection window")
+        sub.add_argument(
+            "--max-workers",
+            type=int,
+            default=1,
+            help="Maximum parallel workers for outer dataset task execution (>=1, applied after selection)",
+        )
         sub.add_argument(
             "--projection-only",
             action="store_true",
@@ -159,6 +167,19 @@ def _fmt_identity(identity: Any) -> str:
     if isinstance(identity, dict):
         return str(identity.get("id") or identity.get("task_id") or identity.get("repo") or identity)
     return str(identity)
+
+
+def _coerce_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
 
 
 def _sort_tasks_deterministically(tasks: Iterable[LCATask]) -> list[LCATask]:
@@ -201,8 +222,8 @@ def _print_selection(dataset: str, dataset_config: str | None, dataset_split: st
 
 
 def _warn_if_unbounded(selection: dict[str, object], max_items: int | None) -> None:
-    selected_count = int(selection.get("selected_count") or 0)
-    total_available = int(selection.get("total_available") or 0)
+    selected_count = _coerce_int(selection.get("selected_count"))
+    total_available = _coerce_int(selection.get("total_available"))
     if max_items is None and total_available > WARNING_THRESHOLD:
         print(f"[WARN] No --max-items provided; {total_available} items available. Run is unbounded.")
     if selected_count > WARNING_THRESHOLD:
@@ -255,35 +276,37 @@ def _compute_projection(selected_count: int) -> dict[str, Any]:
 
 def _print_projection(selection: dict[str, object], projection: dict[str, Any]) -> None:
     print(f"[PROJECTION] selected_items={selection.get('selected_count')}")
-    loc = projection["localization"]
-    writer = projection["writer"]
+    loc = projection.get("localization") or {}
+    writer = projection.get("writer") or {}
+    total = projection.get("total") or {}
+
+    def _fmt_block(block: dict[str, Any]) -> tuple[Any, ...]:
+        planned = block.get("planned") or {}
+        hard_cap = block.get("hard_cap") or {}
+        return (
+            block.get("model", "unknown"),
+            planned.get("input_tokens", 0),
+            planned.get("output_tokens", 0),
+            float(planned.get("cost", 0) or 0.0),
+            hard_cap.get("input_tokens", 0),
+            hard_cap.get("output_tokens", 0),
+            float(hard_cap.get("cost", 0) or 0.0),
+        )
+
+    loc_values = _fmt_block(loc)
+    writer_values = _fmt_block(writer)
+
     print(
         "[PROJECTION] localization model=%s planned_input=%s planned_output=%s planned_cost=%.4f hardcap_input=%s hardcap_output=%s hardcap_cost=%.4f"
-        % (
-            loc["model"],
-            loc["planned"]["input_tokens"],
-            loc["planned"]["output_tokens"],
-            loc["planned"]["cost"],
-            loc["hard_cap"]["input_tokens"],
-            loc["hard_cap"]["output_tokens"],
-            loc["hard_cap"]["cost"],
-        )
+        % loc_values
     )
     print(
         "[PROJECTION] writer model=%s planned_input=%s planned_output=%s planned_cost=%.4f hardcap_input=%s hardcap_output=%s hardcap_cost=%.4f"
-        % (
-            writer["model"],
-            writer["planned"]["input_tokens"],
-            writer["planned"]["output_tokens"],
-            writer["planned"]["cost"],
-            writer["hard_cap"]["input_tokens"],
-            writer["hard_cap"]["output_tokens"],
-            writer["hard_cap"]["cost"],
-        )
+        % writer_values
     )
     print(
         "[PROJECTION] totals planned=%.4f hardcap=%.4f"
-        % (projection["total"]["planned"], projection["total"]["hard_cap"])
+        % (float(total.get("planned", 0) or 0.0), float(total.get("hard_cap", 0) or 0.0))
     )
 
 
@@ -318,6 +341,8 @@ def _require_confirmation(skip_confirmation: bool, selection: dict[str, object],
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO)
+    if args.max_workers is not None and args.max_workers <= 0:
+        raise ValueError("--max-workers must be a positive integer")
     materializer = HuggingFaceRepoMaterializer()
     session_cfg = SessionConfig(
         session_id=args.session_id,
@@ -339,7 +364,7 @@ def main(argv: list[str] | None = None) -> None:
             selected_tasks, selection_info = _select_tasks(tasks, args.max_items, args.offset)
             _warn_if_unbounded(selection_info, args.max_items)
             _print_selection(HF_DATASET_NAME, args.config, args.split, HF_DATASET_SOURCE, selection_info)
-            projection = _compute_projection(int(selection_info["selected_count"]))
+            projection = _compute_projection(_coerce_int(selection_info.get("selected_count")))
             _print_projection(selection_info, projection)
             if args.yes and not args.max_items:
                 raise ValueError("--yes requires --max-items to be set for safety.")
@@ -355,11 +380,19 @@ def main(argv: list[str] | None = None) -> None:
                 session=session_cfg,
                 max_items=args.max_items,
                 offset=args.offset,
+                max_workers=args.max_workers,
                 selection=selection_info,
                 projection=projection,
             )
             bundle = run_hosted_localization_baseline(req, materializer=materializer, tasks=selected_tasks)
+            if bundle is None:
+                print("[RUN] Baseline run returned no bundle; skipping summary.")
+                return
             print(f"[RUN] Baselines computed: {len(bundle.items)}")
+            failure = getattr(bundle, "failure", None)
+            if failure is not None:
+                category = getattr(failure.category, "value", failure.category)
+                print(f"[RUN] Baseline run reported failure category={category} task_id={failure.task_id} message={failure.message}")
             for snap in bundle.items:
                 _print_mat_summary("baseline", snap.identity, snap.materialization)
         elif args.command == "experiment":
@@ -375,7 +408,7 @@ def main(argv: list[str] | None = None) -> None:
             selected_tasks, selection_info = _select_tasks(tasks, args.max_items, args.offset)
             _warn_if_unbounded(selection_info, args.max_items)
             _print_selection(HF_DATASET_NAME, args.config, args.split, HF_DATASET_SOURCE, selection_info)
-            projection = _compute_projection(int(selection_info["selected_count"]))
+            projection = _compute_projection(_coerce_int(selection_info.get("selected_count")))
             _print_projection(selection_info, projection)
             if args.yes and not args.max_items:
                 raise ValueError("--yes requires --max-items to be set for safety.")
@@ -391,11 +424,16 @@ def main(argv: list[str] | None = None) -> None:
                 session=session_cfg,
                 max_items=args.max_items,
                 offset=args.offset,
+                max_workers=args.max_workers,
                 selection=selection_info,
                 projection=projection,
             )
             results = run_hosted_localization_experiment(req, materializer=materializer, tasks=selected_tasks)
             print(f"[RUN] Localization items completed: {len(results.items)}")
+            failure = getattr(results, "failure", None)
+            if failure is not None:
+                category = getattr(failure.category, "value", failure.category)
+                print(f"[RUN] Experiment run reported failure category={category} task_id={failure.task_id} message={failure.message}")
             for item in results.items:
                 _print_mat_summary("experiment", _fmt_identity(item.task.get("identity")), item.materialization)
     except HFDatasetLoadError as exc:

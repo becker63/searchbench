@@ -36,3 +36,4 @@
 - Allowed leaf spans: writer attempts, backend/model/tool calls, usage/cost/latency, pipeline steps, baseline items — all attached to provided parents.
 - Disallowed patterns: leaf-created roots, competing iteration/repair spans, split ownership of high-level scores, silent root creation when no parent is provided.
 - Shared evaluation backend is the canonical evaluation path for machine and hosted runs; tracing follows the machine-owned evaluation span → backend child spans layering.
+- Parallel dataset execution uses the hosted orchestration wrappers for worker pools only; workers MUST attach to the provided parent observation and fail/guard if no parent is available. Projection metadata stays separate from observed usage/cost telemetry.

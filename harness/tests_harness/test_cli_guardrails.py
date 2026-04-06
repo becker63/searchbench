@@ -156,3 +156,9 @@ def test_hf_loader_is_used(monkeypatch):
 def test_requests_do_not_expose_dataset_source():
     req = HostedLocalizationBaselineRequest(dataset="d", dataset_config="c", dataset_split="s")
     assert "dataset_source" not in req.model_fields
+
+
+def test_max_workers_validation():
+    argv = ["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--max-workers", "0"]
+    with pytest.raises(ValueError):
+        run_module.main(argv)
