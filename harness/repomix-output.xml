@@ -55,6 +55,7 @@ localization/
   models.py
   scoring.py
   telemetry.py
+  token_usage.py
 loop/
   __init__.py
   agent_common.py
@@ -71,6 +72,7 @@ observability/
   experiments.py
   hf_lca.py
   langfuse.py
+  policy_reducer.py
   requests.py
   score_emitter.py
   session_policy.py
@@ -111,6 +113,7 @@ tests_harness/
   test_pipeline_steps_scope.py
   test_pipeline_warning_semantics.py
   test_policy_loader.py
+  test_policy_reducer.py
   test_prompt_templates.py
   test_pytest_scope.py
   test_repo_resolution_execution.py
@@ -211,6 +214,7 @@ This section contains the contents of the repository's files.
 - Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they continue to emit localization-native metrics and outputs.
 - Machine-facing scores use explicit `machine_score` semantics: by default `machine_score == aggregate_score`; derivation policies may select precision/recall/f1/hit while raw localization metrics remain canonical (`predicted_files` vs `changed_files`, F1/score).
 - Rollback should be treated as an implementation revert/emergency only, not a co-equal path; the shared backend remains the canonical evaluation route.
+- Post-hoc policy-selection reducers run outside the loop to compare candidate policies; they consume canonical metrics plus token-usage metadata with explicit availability flags. Reducer outputs are parallel to localization metrics/control scores and do not alter loop control.
 </file>
 
 <file path="docs/loop_viz.md">
@@ -414,6 +418,7 @@ from harness.localization.executor import run_localization_task
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
 from harness.localization.models import LCATask, LocalizationEvidence, LocalizationMetrics, normalize_lca_task
+from harness.localization.token_usage import TokenUsageRecord
 
 LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]]
 
@@ -455,6 +460,7 @@ class LocalizationEvaluationTaskResult(BaseModel):
     evidence: LocalizationEvidence | None = None
     materialization: RepoMaterializationResult | None = None
     trace_id: str | None = None
+    token_usage: TokenUsageRecord | None = None
 
 
 class LocalizationEvaluationResult(BaseModel):
@@ -488,7 +494,7 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
     task_results: list[LocalizationEvaluationTaskResult] = []
     for task in tasks:
         try:
-            prediction, metrics, evidence, materialization = run_localization_task(
+            prediction, metrics, evidence, materialization, usage = run_localization_task(
                 task,
                 dataset_source=req.dataset_source,
                 materializer=req.materializer,
@@ -503,6 +509,7 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
                     evidence=evidence,
                     materialization=materialization,
                     trace_id=getattr(req.parent_trace, "id", None),
+                    token_usage=usage,
                 )
             )
         except LocalizationEvaluationError as exc:
@@ -578,6 +585,7 @@ from harness.localization.materializer import (
     RepoMaterializer,
 )
 from harness.localization.models import LCAPrediction, LCATask, LocalizationEvidence, LocalizationMetrics
+from harness.localization.token_usage import TokenUsage, TokenUsageRecord
 from harness.localization.telemetry import build_localization_telemetry
 from harness.observability.langfuse import start_observation
 from harness.observability.score_emitter import emit_score_for_handle
@@ -621,10 +629,10 @@ def _run_runner(
     repo_path: Path,
     trace: object | None,
     runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None,
-) -> list[str]:
+) -> tuple[list[str], Mapping[str, object] | None]:
     runner_fn = runner or _default_runner
     try:
-        predicted_files, _runner_result = runner_fn(task, str(repo_path), trace)
+        predicted_files, runner_result = runner_fn(task, str(repo_path), trace)
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
@@ -635,7 +643,8 @@ def _run_runner(
             "Localization runner produced no predicted_files",
             task_id=task.task_id,
         )
-    return predicted_files
+    result_map = runner_result if isinstance(runner_result, Mapping) else None
+    return predicted_files, result_map
 
 
 def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) -> tuple[list[str], Mapping[str, object] | None]:
@@ -673,6 +682,37 @@ def _score_task(task: LCATask, prediction: LCAPrediction, repo_path: Path) -> Lo
         raise
     except Exception as exc:
         raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, str(exc), task_id=task.task_id) from exc
+
+
+def _extract_usage_record(result: Mapping[str, object] | None) -> TokenUsageRecord:
+    """
+    Extract token usage details from runner results.
+    Observations may contain ``usage_details`` produced by the agent runner.
+    """
+    observations = result.get("observations") if isinstance(result, Mapping) else None
+    if isinstance(observations, list):
+        for obs in observations:
+            if not isinstance(obs, Mapping):
+                continue
+            usage_raw = obs.get("usage_details")
+            if isinstance(usage_raw, Mapping):
+                prompt = usage_raw.get("prompt_tokens") or usage_raw.get("input")
+                completion = usage_raw.get("completion_tokens") or usage_raw.get("output")
+                total = usage_raw.get("total_tokens") or usage_raw.get("total")
+                model_name = usage_raw.get("model") if isinstance(usage_raw.get("model"), str) else None
+                usage = TokenUsage(
+                    prompt_tokens=float(prompt) if isinstance(prompt, (int, float)) else None,
+                    completion_tokens=float(completion) if isinstance(completion, (int, float)) else None,
+                    total_tokens=float(total) if isinstance(total, (int, float)) else None,
+                )
+                return TokenUsageRecord(
+                    available=True,
+                    usage=usage,
+                    model=model_name,
+                    source="runner",
+                    details=usage_raw,
+                )
+    return TokenUsageRecord(available=False, usage=None, source="runner")
 
 
 def _emit_telemetry(
@@ -719,7 +759,7 @@ def run_localization_task(
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
-) -> Tuple[LCAPrediction, LocalizationMetrics, LocalizationEvidence | None, RepoMaterializationResult | None]:
+) -> Tuple[LCAPrediction, LocalizationMetrics, LocalizationEvidence | None, RepoMaterializationResult | None, TokenUsageRecord]:
     """
     Execute a single localization task end to end (leaf helper):
     - materialize repo at base_sha (if a materializer is provided)
@@ -747,9 +787,10 @@ def run_localization_task(
         except Exception as exc:
             raise LocalizationEvaluationError(LocalizationFailureCategory.MATERIALIZATION, str(exc), task_id=task.task_id) from exc
         repo_path = _resolve_repo_path(task, materialization_result)
-        predicted_files = _run_runner(task, repo_path, trace, runner)
+        predicted_files, runner_result = _run_runner(task, repo_path, trace, runner)
         prediction = LCAPrediction(predicted_files=predicted_files)
         metrics = _score_task(task, prediction, repo_path)
+        usage = _extract_usage_record(runner_result if isinstance(runner_result, Mapping) else None)
         _emit_telemetry(
             task=task,
             metrics=metrics,
@@ -758,7 +799,7 @@ def run_localization_task(
             dataset_source=dataset_source,
             trace=trace,
         )
-        return prediction, metrics, task.evidence, materialization_result
+        return prediction, metrics, task.evidence, materialization_result, usage
 </file>
 
 <file path="localization/hf_materializer.py">
@@ -1248,9 +1289,12 @@ class LCATask(BaseModel):
     @property
     def task_id(self) -> str:
         """
-        Deterministic task identifier (delegates to identity).
+        Deterministic task identifier (delegates to identity and includes repo when available).
         """
-        return self.identity.task_id()
+        base_id = self.identity.task_id()
+        if self.repo:
+            return f"{base_id}:{self.repo}"
+        return base_id
 
     @property
     def changed_files(self) -> List[str]:
@@ -1656,6 +1700,57 @@ def build_localization_telemetry(
         repo_language=repo_language,
         repo_license=repo_license,
     )
+</file>
+
+<file path="localization/token_usage.py">
+from __future__ import annotations
+
+from typing import Mapping
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class TokenUsage(BaseModel):
+    """Raw token counts for a single request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_tokens: float | None = None
+    completion_tokens: float | None = None
+    total_tokens: float | None = None
+
+
+class TokenUsageRecord(BaseModel):
+    """Token usage plus availability metadata to distinguish missing from zero."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool = False
+    usage: TokenUsage | None = None
+    model: str | None = None
+    source: str | None = None
+    details: Mapping[str, object] | None = Field(default=None, description="Raw provider usage payload if available")
+
+    @model_validator(mode="after")
+    def _normalize_usage(self) -> "TokenUsageRecord":
+        if not self.available:
+            self.usage = None
+        return self
+
+    def normalized_total(self) -> float | None:
+        """Prefer explicit total_tokens; otherwise sum prompt+completion when available."""
+        if not self.available or self.usage is None:
+            return None
+        if self.usage.total_tokens is not None:
+            return float(self.usage.total_tokens)
+        prompt = self.usage.prompt_tokens
+        completion = self.usage.completion_tokens
+        if prompt is None and completion is None:
+            return None
+        return float((prompt or 0.0) + (completion or 0.0))
+
+
+__all__ = ["TokenUsage", "TokenUsageRecord"]
 </file>
 
 <file path="loop/__init__.py">
@@ -3171,8 +3266,10 @@ from harness.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 
 if TYPE_CHECKING:
-    from harness.localization.evaluation_backend import LocalizationEvaluationRequest
+    from harness.localization.evaluation_backend import LocalizationEvaluationRequest as LocalizationEvaluationRequestType
     from harness.observability.baselines import BaselineSnapshot
+else:
+    LocalizationEvaluationRequestType = object
 
 from .loop_machine import OptimizationStateMachine
 from .loop_types import (
@@ -3226,7 +3323,7 @@ _REEXPORTED = (
 )
 
 
-def evaluate_localization_batch(req: "LocalizationEvaluationRequest"):
+def evaluate_localization_batch(req: "LocalizationEvaluationRequestType"):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
     """
@@ -3235,7 +3332,9 @@ def evaluate_localization_batch(req: "LocalizationEvaluationRequest"):
     return _evaluate_localization_batch(req)
 
 
-def LocalizationEvaluationRequest(*args, **kwargs):
+def LocalizationEvaluationRequest(
+    *args: object, **kwargs: object
+) -> "LocalizationEvaluationRequestType":
     """
     Lazy proxy for the evaluation request model so tests can monkeypatch the symbol on this module.
     """
@@ -4755,8 +4854,6 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
-import concurrent.futures
-from concurrent.futures import FIRST_COMPLETED
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -4775,6 +4872,7 @@ from harness.localization.models import (
     LocalizationPrediction,
     normalize_lca_task,
 )
+from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.telemetry import build_localization_telemetry
 from harness.observability.langfuse import start_observation
 from harness.observability.score_emitter import emit_score_for_handle
@@ -4799,6 +4897,7 @@ class BaselineSnapshot(BaseModel):
     evidence: LocalizationEvidence | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
     materialization: RepoMaterializationResult | None = None
+    token_usage: TokenUsageRecord | None = None
 
 
 class BaselineBundle(BaseModel):
@@ -4897,6 +4996,7 @@ def compute_baseline_for_task(
             trace_id=getattr(trace, "id", None),
             experiment_run_id=dataset_run_id,
             evidence=evidence,
+            token_usage=task_result.token_usage,
             metadata={
                 "telemetry": telemetry.model_dump(exclude_none=True),
                 "run_kind": "localization_baseline",
@@ -5260,6 +5360,7 @@ from __future__ import annotations
 
 import concurrent.futures
 from concurrent.futures import FIRST_COMPLETED
+from types import SimpleNamespace
 from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
@@ -5270,12 +5371,14 @@ from harness.localization.evaluation_backend import (
     evaluate_localization_batch,
 )
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
+from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.materializer import RepoMaterializationResult, RepoMaterializer
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.observability.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
 from harness.observability.hf_lca import fetch_hf_localization_dataset
 from harness.observability.langfuse import flush_langfuse, propagate_context
 from harness.observability.session_policy import resolve_session_id
+from harness.observability.policy_reducer import PolicyReducerSummary, build_task_input, reduce_global
 
 from .requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
 
@@ -5286,6 +5389,7 @@ class LocalizationRunItemResult(BaseModel):
     prediction: list[str] = Field(default_factory=list)
     trace_id: str | None = None
     materialization: RepoMaterializationResult | None = None
+    token_usage: TokenUsageRecord | None = None
 
 
 class LocalizationRunResult(BaseModel):
@@ -5293,6 +5397,7 @@ class LocalizationRunResult(BaseModel):
     dataset_version: str | None = None
     items: list[LocalizationRunItemResult] = Field(default_factory=list)
     failure: LocalizationEvaluationFailure | None = None
+    reducer_summary: PolicyReducerSummary | None = None
 
 
 def _resolve_items(req: HostedLocalizationRunRequest) -> list[LCATask]:
@@ -5390,15 +5495,14 @@ def run_hosted_localization_baseline(
             "projection": req.projection,
         },
     ) as trace:
-        if trace is None:
-            raise RuntimeError("parent trace required for baseline execution")
+        parent_trace = trace or SimpleNamespace(id="trace")
         if effective_workers == 1:
             for task in selected_tasks:
                 snapshots.append(
                     compute_baseline_for_task(
                         task,
                         dataset_version=req.version,
-                        parent_trace=trace,
+                        parent_trace=parent_trace,
                         dataset_source="huggingface",
                         materializer=materializer,
                     )
@@ -5407,7 +5511,7 @@ def run_hosted_localization_baseline(
             snapshots, failure = _run_baseline_parallel(
                 selected_tasks,
                 effective_workers,
-                trace,
+                parent_trace,
                 materializer,
                 req.version,
             )
@@ -5532,6 +5636,7 @@ def _run_experiment_task(
             prediction=task_result.prediction,
             trace_id=getattr(parent_trace, "id", None),
             materialization=task_result.materialization,
+            token_usage=task_result.token_usage,
         )
     except _TaskFailure:
         raise
@@ -5620,26 +5725,44 @@ def run_hosted_localization_experiment(
             "projection": req.projection,
         },
     ) as trace:
-        if trace is None:
-            raise RuntimeError("parent trace required for experiment execution")
+        parent_trace = trace or SimpleNamespace(id="trace")
         if effective_workers == 1:
             for task in selected_tasks:
-                results.append(
-                    _run_experiment_task(
-                        task=task,
-                        parent_trace=trace,
-                        materializer=materializer,
-                    )
-                )
+                results.append(_run_experiment_task(task=task, parent_trace=parent_trace, materializer=materializer))
         else:
             results, failure = _run_experiment_parallel(
                 selected_tasks,
                 effective_workers,
-                trace,
+                parent_trace,
                 materializer,
             )
     flush_langfuse()
-    return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results, failure=failure)
+    reducer_summary = _build_reducer_summary(results)
+    return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results, failure=failure, reducer_summary=reducer_summary)
+
+
+def _build_reducer_summary(results: list[LocalizationRunItemResult]) -> PolicyReducerSummary | None:
+    if not results:
+        return None
+    task_inputs = []
+    for item in results:
+        try:
+            normalized_task = normalize_lca_task(item.task)
+        except Exception:
+            continue
+        task_inputs.append(
+            build_task_input(
+                identity=normalized_task.identity,
+                task_id=normalized_task.task_id,
+                metrics=item.metrics,
+                candidate_usage=item.token_usage,
+                baseline_usage=None,
+                quality_floor=0.0,
+            )
+        )
+    if not task_inputs:
+        return None
+    return reduce_global(task_inputs)
 </file>
 
 <file path="observability/hf_lca.py">
@@ -5754,7 +5877,11 @@ from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
 from pydantic import BaseModel, ConfigDict
 
-from ..utils.env import get_langfuse_env
+try:
+    # Prefer absolute import so observability can be used as a top-level package in tests.
+    from utils.env import get_langfuse_env
+except ImportError:  # pragma: no cover
+    from harness.utils.env import get_langfuse_env
 
 _client: Optional[Langfuse] = None
 
@@ -6058,12 +6185,152 @@ __all__ = [
 ]
 </file>
 
+<file path="observability/policy_reducer.py">
+from __future__ import annotations
+
+from collections import defaultdict
+from statistics import median
+from typing import Iterable, Sequence
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from harness.localization.models import LCATaskIdentity, LocalizationMetrics
+from harness.localization.token_usage import TokenUsageRecord
+
+
+def repo_key_from_identity(identity: LCATaskIdentity) -> str:
+    """Deterministic repo key for reducer grouping."""
+    return f"{identity.repo_owner}/{identity.repo_name}@{identity.base_sha}"
+
+
+class PolicyReducerTaskInput(BaseModel):
+    """Task-level reducer input."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    repo_key: str
+    dataset_name: str
+    dataset_config: str
+    dataset_split: str
+    metrics: LocalizationMetrics
+    baseline_usage: TokenUsageRecord = Field(default_factory=TokenUsageRecord)
+    candidate_usage: TokenUsageRecord = Field(default_factory=TokenUsageRecord)
+    quality_ok: bool = True
+    quality_reasons: list[str] = Field(default_factory=list)
+    token_delta: float | None = None
+
+
+class RepoReducerResult(BaseModel):
+    """Repo-level reducer output."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repo_key: str
+    score: float | None
+    task_count: int
+    valid_count: int
+    missing_baseline_tokens: int = 0
+    missing_candidate_tokens: int = 0
+    dropped_for_quality: int = 0
+
+
+class PolicyReducerSummary(BaseModel):
+    """Global reducer summary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    global_score: float | None
+    repo_results: list[RepoReducerResult] = Field(default_factory=list)
+    repo_count: int = 0
+    valid_repo_count: int = 0
+
+
+def _compute_token_delta(baseline: TokenUsageRecord, candidate: TokenUsageRecord) -> float | None:
+    base_total = baseline.normalized_total() if baseline else None
+    cand_total = candidate.normalized_total() if candidate else None
+    if not baseline or not baseline.available:
+        return None
+    if not candidate or not candidate.available:
+        return None
+    if base_total is None or base_total <= 0 or cand_total is None:
+        return None
+    return (base_total - cand_total) / base_total
+
+
+def build_task_input(
+    *,
+    identity: LCATaskIdentity,
+    task_id: str,
+    metrics: LocalizationMetrics,
+    candidate_usage: TokenUsageRecord | None,
+    baseline_usage: TokenUsageRecord | None = None,
+    quality_floor: float = 0.0,
+) -> PolicyReducerTaskInput:
+    baseline_record = baseline_usage or TokenUsageRecord(available=False, usage=None, source="baseline")
+    candidate_record = candidate_usage or TokenUsageRecord(available=False, usage=None, source="candidate")
+    token_delta = _compute_token_delta(baseline_record, candidate_record)
+    quality_ok = metrics.score > quality_floor
+    reasons: list[str] = []
+    if not quality_ok:
+        reasons.append("score_below_floor")
+    return PolicyReducerTaskInput(
+        task_id=task_id,
+        repo_key=repo_key_from_identity(identity),
+        dataset_name=identity.dataset_name,
+        dataset_config=identity.dataset_config,
+        dataset_split=identity.dataset_split,
+        metrics=metrics,
+        baseline_usage=baseline_record,
+        candidate_usage=candidate_record,
+        quality_ok=quality_ok,
+        quality_reasons=reasons,
+        token_delta=token_delta,
+    )
+
+
+def reduce_repo(tasks: Sequence[PolicyReducerTaskInput]) -> RepoReducerResult:
+    valid_deltas = [t.token_delta for t in tasks if t.quality_ok and t.token_delta is not None]
+    score = median(valid_deltas) if valid_deltas else None
+    return RepoReducerResult(
+        repo_key=tasks[0].repo_key if tasks else "unknown",
+        score=score,
+        task_count=len(tasks),
+        valid_count=len(valid_deltas),
+        missing_baseline_tokens=sum(1 for t in tasks if not t.baseline_usage.available),
+        missing_candidate_tokens=sum(1 for t in tasks if not t.candidate_usage.available),
+        dropped_for_quality=sum(1 for t in tasks if not t.quality_ok),
+    )
+
+
+def reduce_global(tasks: Iterable[PolicyReducerTaskInput]) -> PolicyReducerSummary:
+    grouped: dict[str, list[PolicyReducerTaskInput]] = defaultdict(list)
+    for task in tasks:
+        grouped[task.repo_key].append(task)
+    repo_results = [reduce_repo(items) for items in grouped.values()]
+    repo_scores = [r.score for r in repo_results if r.score is not None]
+    global_score = sum(repo_scores) / len(repo_scores) if repo_scores else None
+    return PolicyReducerSummary(
+        global_score=global_score,
+        repo_results=sorted(repo_results, key=lambda r: r.repo_key),
+        repo_count=len(repo_results),
+        valid_repo_count=len(repo_scores),
+    )
+</file>
+
 <file path="observability/requests.py">
 from __future__ import annotations
+
+from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from .session_policy import SessionConfig
+
+
+class LocalizationDatasetSource(str, Enum):
+    LANGFUSE = "langfuse"
+    HUGGINGFACE = "huggingface"
 
 
 class HostedLocalizationBaselineRequest(BaseModel):
@@ -8796,7 +9063,7 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
         yield type("S", (), {"id": "span", "metadata": {}, "end": lambda self, **kw: None})()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    prediction, metrics, _evidence, _mat = run_localization_task(
+    prediction, metrics, _evidence, _mat, _usage = run_localization_task(
         lca_task,
         runner=lambda *_args: (["predicted.py"], {"source": "runner"}),
     )
@@ -9626,6 +9893,98 @@ def test_adapt_score_fn_rejects_unsupported_arities():
 
     with pytest.raises(RuntimeError):
         policy_loader.adapt_score_fn(score_four)
+</file>
+
+<file path="tests_harness/test_policy_reducer.py">
+from __future__ import annotations
+
+from harness.localization.models import LCATaskIdentity, LocalizationMetrics
+from harness.localization.token_usage import TokenUsage, TokenUsageRecord
+from harness.observability.policy_reducer import (
+    build_task_input,
+    reduce_global,
+    reduce_repo,
+)
+
+
+def _identity(repo: str) -> LCATaskIdentity:
+    owner, name = repo.split("/")
+    return LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner=owner,
+        repo_name=name,
+        base_sha="abc",
+    )
+
+
+def _usage(total: float) -> TokenUsageRecord:
+    return TokenUsageRecord(available=True, usage=TokenUsage(total_tokens=total))
+
+
+def test_equal_repo_weighting_and_order_independence():
+    metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+    tasks = [
+        build_task_input(
+            identity=_identity("o1/r1"),
+            task_id="t1",
+            metrics=metrics,
+            baseline_usage=_usage(100),
+            candidate_usage=_usage(50),
+        ),
+        build_task_input(
+            identity=_identity("o1/r1"),
+            task_id="t2",
+            metrics=metrics,
+            baseline_usage=_usage(100),
+            candidate_usage=_usage(40),
+        ),
+        build_task_input(
+            identity=_identity("o2/r2"),
+            task_id="t3",
+            metrics=metrics,
+            baseline_usage=_usage(100),
+            candidate_usage=_usage(90),
+        ),
+    ]
+    # Shuffle input order to prove determinism
+    reordered = [tasks[2], tasks[0], tasks[1]]
+    summary = reduce_global(reordered)
+    repo_scores = {r.repo_key: r.score for r in summary.repo_results}
+    # Repo1 median reduction: (0.5, 0.6) -> 0.55; Repo2: 0.1; global average (equal weight) -> (0.55 + 0.1)/2
+    assert repo_scores["o1/r1@abc"] == 0.55
+    assert repo_scores["o2/r2@abc"] == 0.1
+    assert summary.global_score == 0.325
+
+
+def test_missing_tokens_handled_explicitly():
+    metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+    task = build_task_input(
+        identity=_identity("o3/r3"),
+        task_id="t_missing",
+        metrics=metrics,
+        baseline_usage=_usage(100),
+        candidate_usage=TokenUsageRecord(available=False, usage=None),
+    )
+    repo_result = reduce_repo([task])
+    assert repo_result.score is None
+    assert repo_result.missing_candidate_tokens == 1
+    assert repo_result.valid_count == 0
+
+
+def test_quality_floor_drops_zero_score_tasks():
+    zero_metrics = LocalizationMetrics(precision=0.0, recall=0.0, f1=0.0, hit=0.0, score=0.0)
+    task = build_task_input(
+        identity=_identity("o4/r4"),
+        task_id="t_zero",
+        metrics=zero_metrics,
+        baseline_usage=_usage(50),
+        candidate_usage=_usage(25),
+    )
+    repo_result = reduce_repo([task])
+    assert repo_result.valid_count == 0
+    assert repo_result.dropped_for_quality == 1
 </file>
 
 <file path="tests_harness/test_prompt_templates.py">
@@ -12048,7 +12407,7 @@ import argparse
 import logging
 import sys
 from contextlib import contextmanager
-from typing import Any, Iterable
+from typing import IO, Any, Iterable, Iterator
 try:
     import tty  # type: ignore
     import termios  # type: ignore
@@ -12062,8 +12421,10 @@ from harness.localization.evaluation_backend import (
 )
 from harness.localization.models import LCATask
 from harness.localization.hf_materializer import HuggingFaceRepoMaterializer
-from harness.observability.baselines import run_hosted_localization_baseline
-from harness.observability.experiments import run_hosted_localization_experiment
+from harness.observability.experiments import (
+    run_hosted_localization_baseline,
+    run_hosted_localization_experiment,
+)
 from harness.observability.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
 from harness.observability.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
 from harness.observability.session_policy import SessionConfig
@@ -12128,7 +12489,7 @@ WRITER_MAX_OUTPUT_TOKENS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_
 
 
 @contextmanager
-def _raw_mode(file_obj):
+def _raw_mode(file_obj: IO[Any]) -> Iterator[None]:
     """
     Best-effort raw mode for single-key reads; falls back to normal mode on failure.
     """
@@ -12159,7 +12520,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="HF LCA localization runner (baseline/experiment)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    def _add_common(sub):
+    def _add_common(sub: argparse.ArgumentParser) -> None:
         sub.add_argument("--config", required=True, help="HF dataset config (e.g., py/java/kt)")
         sub.add_argument("--split", required=True, help="HF dataset split (e.g., dev/test/train)")
         sub.add_argument("--revision", help="HF dataset revision pin")
@@ -12206,6 +12567,19 @@ def _fmt_identity(identity: Any) -> str:
     return str(identity)
 
 
+def _coerce_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
 def _sort_tasks_deterministically(tasks: Iterable[LCATask]) -> list[LCATask]:
     return sorted(list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id())
 
@@ -12246,8 +12620,8 @@ def _print_selection(dataset: str, dataset_config: str | None, dataset_split: st
 
 
 def _warn_if_unbounded(selection: dict[str, object], max_items: int | None) -> None:
-    selected_count = int(selection.get("selected_count") or 0)
-    total_available = int(selection.get("total_available") or 0)
+    selected_count = _coerce_int(selection.get("selected_count"))
+    total_available = _coerce_int(selection.get("total_available"))
     if max_items is None and total_available > WARNING_THRESHOLD:
         print(f"[WARN] No --max-items provided; {total_available} items available. Run is unbounded.")
     if selected_count > WARNING_THRESHOLD:
@@ -12300,35 +12674,37 @@ def _compute_projection(selected_count: int) -> dict[str, Any]:
 
 def _print_projection(selection: dict[str, object], projection: dict[str, Any]) -> None:
     print(f"[PROJECTION] selected_items={selection.get('selected_count')}")
-    loc = projection["localization"]
-    writer = projection["writer"]
+    loc = projection.get("localization") or {}
+    writer = projection.get("writer") or {}
+    total = projection.get("total") or {}
+
+    def _fmt_block(block: dict[str, Any]) -> tuple[Any, ...]:
+        planned = block.get("planned") or {}
+        hard_cap = block.get("hard_cap") or {}
+        return (
+            block.get("model", "unknown"),
+            planned.get("input_tokens", 0),
+            planned.get("output_tokens", 0),
+            float(planned.get("cost", 0) or 0.0),
+            hard_cap.get("input_tokens", 0),
+            hard_cap.get("output_tokens", 0),
+            float(hard_cap.get("cost", 0) or 0.0),
+        )
+
+    loc_values = _fmt_block(loc)
+    writer_values = _fmt_block(writer)
+
     print(
         "[PROJECTION] localization model=%s planned_input=%s planned_output=%s planned_cost=%.4f hardcap_input=%s hardcap_output=%s hardcap_cost=%.4f"
-        % (
-            loc["model"],
-            loc["planned"]["input_tokens"],
-            loc["planned"]["output_tokens"],
-            loc["planned"]["cost"],
-            loc["hard_cap"]["input_tokens"],
-            loc["hard_cap"]["output_tokens"],
-            loc["hard_cap"]["cost"],
-        )
+        % loc_values
     )
     print(
         "[PROJECTION] writer model=%s planned_input=%s planned_output=%s planned_cost=%.4f hardcap_input=%s hardcap_output=%s hardcap_cost=%.4f"
-        % (
-            writer["model"],
-            writer["planned"]["input_tokens"],
-            writer["planned"]["output_tokens"],
-            writer["planned"]["cost"],
-            writer["hard_cap"]["input_tokens"],
-            writer["hard_cap"]["output_tokens"],
-            writer["hard_cap"]["cost"],
-        )
+        % writer_values
     )
     print(
         "[PROJECTION] totals planned=%.4f hardcap=%.4f"
-        % (projection["total"]["planned"], projection["total"]["hard_cap"])
+        % (float(total.get("planned", 0) or 0.0), float(total.get("hard_cap", 0) or 0.0))
     )
 
 
@@ -12386,7 +12762,7 @@ def main(argv: list[str] | None = None) -> None:
             selected_tasks, selection_info = _select_tasks(tasks, args.max_items, args.offset)
             _warn_if_unbounded(selection_info, args.max_items)
             _print_selection(HF_DATASET_NAME, args.config, args.split, HF_DATASET_SOURCE, selection_info)
-            projection = _compute_projection(int(selection_info["selected_count"]))
+            projection = _compute_projection(_coerce_int(selection_info.get("selected_count")))
             _print_projection(selection_info, projection)
             if args.yes and not args.max_items:
                 raise ValueError("--yes requires --max-items to be set for safety.")
@@ -12407,10 +12783,14 @@ def main(argv: list[str] | None = None) -> None:
                 projection=projection,
             )
             bundle = run_hosted_localization_baseline(req, materializer=materializer, tasks=selected_tasks)
+            if bundle is None:
+                print("[RUN] Baseline run returned no bundle; skipping summary.")
+                return
             print(f"[RUN] Baselines computed: {len(bundle.items)}")
-            if getattr(bundle, "failure", None):
-                failure = bundle.failure
-                print(f"[RUN] Baseline run reported failure category={getattr(failure.category, 'value', failure.category)} task_id={failure.task_id} message={failure.message}")
+            failure = getattr(bundle, "failure", None)
+            if failure is not None:
+                category = getattr(failure.category, "value", failure.category)
+                print(f"[RUN] Baseline run reported failure category={category} task_id={failure.task_id} message={failure.message}")
             for snap in bundle.items:
                 _print_mat_summary("baseline", snap.identity, snap.materialization)
         elif args.command == "experiment":
@@ -12426,7 +12806,7 @@ def main(argv: list[str] | None = None) -> None:
             selected_tasks, selection_info = _select_tasks(tasks, args.max_items, args.offset)
             _warn_if_unbounded(selection_info, args.max_items)
             _print_selection(HF_DATASET_NAME, args.config, args.split, HF_DATASET_SOURCE, selection_info)
-            projection = _compute_projection(int(selection_info["selected_count"]))
+            projection = _compute_projection(_coerce_int(selection_info.get("selected_count")))
             _print_projection(selection_info, projection)
             if args.yes and not args.max_items:
                 raise ValueError("--yes requires --max-items to be set for safety.")
@@ -12448,9 +12828,10 @@ def main(argv: list[str] | None = None) -> None:
             )
             results = run_hosted_localization_experiment(req, materializer=materializer, tasks=selected_tasks)
             print(f"[RUN] Localization items completed: {len(results.items)}")
-            if getattr(results, "failure", None):
-                failure = results.failure
-                print(f"[RUN] Experiment run reported failure category={getattr(failure.category, 'value', failure.category)} task_id={failure.task_id} message={failure.message}")
+            failure = getattr(results, "failure", None)
+            if failure is not None:
+                category = getattr(failure.category, "value", failure.category)
+                print(f"[RUN] Experiment run reported failure category={category} task_id={failure.task_id} message={failure.message}")
             for item in results.items:
                 _print_mat_summary("experiment", _fmt_identity(item.task.get("identity")), item.materialization)
     except HFDatasetLoadError as exc:

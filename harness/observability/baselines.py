@@ -22,6 +22,7 @@ from harness.localization.models import (
     LocalizationPrediction,
     normalize_lca_task,
 )
+from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.telemetry import build_localization_telemetry
 from harness.observability.langfuse import start_observation
 from harness.observability.score_emitter import emit_score_for_handle
@@ -46,6 +47,7 @@ class BaselineSnapshot(BaseModel):
     evidence: LocalizationEvidence | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
     materialization: RepoMaterializationResult | None = None
+    token_usage: TokenUsageRecord | None = None
 
 
 class BaselineBundle(BaseModel):
@@ -144,6 +146,7 @@ def compute_baseline_for_task(
             trace_id=getattr(trace, "id", None),
             experiment_run_id=dataset_run_id,
             evidence=evidence,
+            token_usage=task_result.token_usage,
             metadata={
                 "telemetry": telemetry.model_dump(exclude_none=True),
                 "run_kind": "localization_baseline",

@@ -18,6 +18,7 @@
   - Qwen 3 235B Instruct — input $0.60/M, output $1.20/M; regex `(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct`
 - Sync helper: `observability.cerebras_pricing.sync_cerebras_models()` calls `client.api.models.create` for each entry (requires Langfuse Cloud credentials).
 - Generations must include `model` and `usage_details` (OpenAI-style prompt/completion/total) so Langfuse can infer cost. If the provider omits usage, supply it explicitly or add an estimator; do not emit zeroed usage.
+- Token usage extraction is deterministic and explicit: readers look for `usage_details`/`usage` at the top level, in `raw`, or in observations; absence stays `available=False` with null fields and is never coerced to zero.
 - Projection vs observed costs: CLI projections for dataset-backed runs are tagged separately as projection metadata (selection window + fixed planned/hard-cap totals). Do not mix projected values into observed Langfuse usage/cost fields. If pricing is unknown, projection fails closed instead of emitting a pseudo-cost.
 
 ## Sessions (where and how)

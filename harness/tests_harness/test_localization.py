@@ -150,7 +150,7 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
         yield type("S", (), {"id": "span", "metadata": {}, "end": lambda self, **kw: None})()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    prediction, metrics, _evidence, _mat = run_localization_task(
+    prediction, metrics, _evidence, _mat, _usage = run_localization_task(
         lca_task,
         runner=lambda *_args: (["predicted.py"], {"source": "runner"}),
     )

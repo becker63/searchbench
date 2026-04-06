@@ -10,6 +10,7 @@ from harness.localization.executor import run_localization_task
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
 from harness.localization.models import LCATask, LocalizationEvidence, LocalizationMetrics, normalize_lca_task
+from harness.localization.token_usage import TokenUsageRecord
 
 LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]]
 
@@ -51,6 +52,7 @@ class LocalizationEvaluationTaskResult(BaseModel):
     evidence: LocalizationEvidence | None = None
     materialization: RepoMaterializationResult | None = None
     trace_id: str | None = None
+    token_usage: TokenUsageRecord | None = None
 
 
 class LocalizationEvaluationResult(BaseModel):
@@ -84,7 +86,7 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
     task_results: list[LocalizationEvaluationTaskResult] = []
     for task in tasks:
         try:
-            prediction, metrics, evidence, materialization = run_localization_task(
+            prediction, metrics, evidence, materialization, usage = run_localization_task(
                 task,
                 dataset_source=req.dataset_source,
                 materializer=req.materializer,
@@ -99,6 +101,7 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
                     evidence=evidence,
                     materialization=materialization,
                     trace_id=getattr(req.parent_trace, "id", None),
+                    token_usage=usage,
                 )
             )
         except LocalizationEvaluationError as exc:

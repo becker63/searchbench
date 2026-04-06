@@ -13,12 +13,14 @@ from harness.localization.evaluation_backend import (
     evaluate_localization_batch,
 )
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
+from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.materializer import RepoMaterializationResult, RepoMaterializer
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.observability.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
 from harness.observability.hf_lca import fetch_hf_localization_dataset
 from harness.observability.langfuse import flush_langfuse, propagate_context
 from harness.observability.session_policy import resolve_session_id
+from harness.observability.policy_reducer import PolicyReducerSummary, build_task_input, reduce_global
 
 from .requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
 
@@ -29,6 +31,7 @@ class LocalizationRunItemResult(BaseModel):
     prediction: list[str] = Field(default_factory=list)
     trace_id: str | None = None
     materialization: RepoMaterializationResult | None = None
+    token_usage: TokenUsageRecord | None = None
 
 
 class LocalizationRunResult(BaseModel):
@@ -36,6 +39,7 @@ class LocalizationRunResult(BaseModel):
     dataset_version: str | None = None
     items: list[LocalizationRunItemResult] = Field(default_factory=list)
     failure: LocalizationEvaluationFailure | None = None
+    reducer_summary: PolicyReducerSummary | None = None
 
 
 def _resolve_items(req: HostedLocalizationRunRequest) -> list[LCATask]:
@@ -274,6 +278,7 @@ def _run_experiment_task(
             prediction=task_result.prediction,
             trace_id=getattr(parent_trace, "id", None),
             materialization=task_result.materialization,
+            token_usage=task_result.token_usage,
         )
     except _TaskFailure:
         raise
@@ -374,4 +379,28 @@ def run_hosted_localization_experiment(
                 materializer,
             )
     flush_langfuse()
-    return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results, failure=failure)
+    reducer_summary = _build_reducer_summary(results)
+    return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results, failure=failure, reducer_summary=reducer_summary)
+
+
+def _build_reducer_summary(results: list[LocalizationRunItemResult]) -> PolicyReducerSummary | None:
+    if not results:
+        return None
+    task_inputs = []
+    for item in results:
+        try:
+            normalized_task = normalize_lca_task(item.task)
+        except Exception:
+            continue
+        task_inputs.append(
+            build_task_input(
+                identity=normalized_task.identity,
+                task_id=normalized_task.task_id,
+                metrics=item.metrics,
+                candidate_usage=item.token_usage,
+                baseline_usage=None,
+            )
+        )
+    if not task_inputs:
+        return None
+    return reduce_global(task_inputs)
