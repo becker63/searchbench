@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from pydantic import BaseModel, ConfigDict, model_validator
 
 
@@ -55,25 +57,38 @@ def emit_score(
     from .langfuse import get_langfuse_client  # local import to avoid circularity
 
     resolved_type = _infer_data_type(value, data_type)
-    client = get_langfuse_client()
+    try:
+        client = get_langfuse_client()
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Langfuse score emission skipped: %s", exc)
+        return
     scores_api = getattr(getattr(client, "api", None), "scores", None)
     create_fn = getattr(scores_api, "create", None) if scores_api else getattr(client, "create_score", None)
     if not callable(create_fn):
-        raise RuntimeError("Langfuse client unavailable for scoring")
-    payload = ScorePayload(
-        name=name,
-        value=value,
-        data_type=resolved_type,
-        trace_id=trace_id,
-        observation_id=observation_id,
-        dataset_run_id=dataset_run_id,
-        session_id=session_id,
-        config_id=config_id,
-        comment=comment,
-        score_id=score_id,
-    )
+        logging.debug("Langfuse score emission unavailable: missing create_score API")
+        return
+    try:
+        payload = ScorePayload(
+            name=name,
+            value=value,
+            data_type=resolved_type,
+            trace_id=trace_id,
+            observation_id=observation_id,
+            dataset_run_id=dataset_run_id,
+            session_id=session_id,
+            config_id=config_id,
+            comment=comment,
+            score_id=score_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Langfuse score payload invalid; skipping score %s: %s", name, exc)
+        return
     cleaned = payload.model_dump(exclude_none=True)
-    create_fn(**cleaned)  # type: ignore[arg-type]
+    try:
+        create_fn(**cleaned)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Langfuse score emission failed for %s: %s", name, exc)
+        return
 
 
 def emit_score_for_handle(

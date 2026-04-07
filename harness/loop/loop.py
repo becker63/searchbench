@@ -17,6 +17,7 @@ from harness.loop.runner_agent import run_ic_iteration
 from harness.observability.langfuse import (
     flush_langfuse,
     propagate_context,
+    _safe_end_observation,
     start_observation,
 )
 from harness.observability.score_emitter import emit_score
@@ -233,13 +234,10 @@ def prepare_iteration_tasks(
             repo_id = str(result.get("repo", ""))
             jc_repo_id = repo_id
             if index_obs:
-                index_obs.end(metadata={"repo": repo_id})
+                _safe_end_observation(index_obs, metadata={"repo": repo_id})
         except Exception as e:  # noqa: BLE001
             if index_obs:
-                try:
-                    index_obs.end(error=e)
-                except Exception:
-                    pass
+                _safe_end_observation(index_obs, error=e)
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
     ic_task = ICTaskPayload(
@@ -643,12 +641,7 @@ def run_loop(
             history = machine.run()
         except KeyboardInterrupt:
             run_trace = opt_model.context.run_trace
-            end_fn = getattr(run_trace, "end", None)
-            if callable(end_fn):
-                try:
-                    end_fn(error="interrupted")
-                except Exception:
-                    pass
+            _safe_end_observation(run_trace, error="interrupted")
         finally:
             flush_langfuse_fn = cast(Callable[[], None], _pkg_attr("flush_langfuse"))
             flush_langfuse_fn()

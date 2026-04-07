@@ -1,10 +1,10 @@
-This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
 
 <file_summary>
 This section contains a summary of this file.
 
 <purpose>
-This file contains a packed representation of the entire repository's contents.
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
 It is designed to be easily consumable by AI systems for analysis, code review,
 or other automated processes.
 </purpose>
@@ -32,6 +32,7 @@ The content is organized as follows:
 <notes>
 - Some files may have been excluded based on .gitignore rules and Repomix's configuration
 - Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: openspec
 - Files matching patterns in .gitignore are excluded
 - Files matching default ignore patterns are excluded
 - Files are sorted by Git change count (files with more changes are at the bottom)
@@ -589,21 +590,34 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Mapping, Tuple, cast
 
+from harness.localization.errors import (
+    LocalizationEvaluationError,
+    LocalizationFailureCategory,
+)
 from harness.localization.eval import build_file_localization_eval_record
-from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materializer import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
     RepoMaterializer,
 )
-from harness.localization.models import LCAPrediction, LCATask, LocalizationEvidence, LocalizationMetrics
-from harness.localization.token_usage import TokenUsageRecord, extract_token_usage_record
+from harness.localization.models import (
+    LCAPrediction,
+    LCATask,
+    LocalizationEvidence,
+    LocalizationMetrics,
+)
 from harness.localization.telemetry import build_localization_telemetry
+from harness.localization.token_usage import (
+    TokenUsageRecord,
+    extract_token_usage_record,
+)
 from harness.observability.langfuse import start_observation
 from harness.observability.score_emitter import emit_score_for_handle
 
 
-def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> RepoMaterializationResult | None:
+def _materialize_repo(
+    task: LCATask, materializer: RepoMaterializer | None
+) -> RepoMaterializationResult | None:
     if materializer is None:
         return None
     request = RepoMaterializationRequest(
@@ -617,8 +631,12 @@ def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> R
     return materializer.materialize(request)
 
 
-def _resolve_repo_path(task: LCATask, materialization_result: RepoMaterializationResult | None) -> Path:
-    repo_path: Path | None = materialization_result.local_path if materialization_result else None
+def _resolve_repo_path(
+    task: LCATask, materialization_result: RepoMaterializationResult | None
+) -> Path:
+    repo_path: Path | None = (
+        materialization_result.local_path if materialization_result else None
+    )
     if repo_path is None and task.repo:
         repo_path = Path(task.repo).expanduser()
     if repo_path is None:
@@ -640,7 +658,10 @@ def _run_runner(
     task: LCATask,
     repo_path: Path,
     trace: object | None,
-    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None,
+    runner: Callable[
+        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+    ]
+    | None,
 ) -> tuple[list[str], Mapping[str, object] | None]:
     runner_fn = runner or _default_runner
     try:
@@ -648,7 +669,9 @@ def _run_runner(
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
-        raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, str(exc), task_id=task.task_id) from exc
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.RUNNER, str(exc), task_id=task.task_id
+        ) from exc
     if not predicted_files:
         raise LocalizationEvaluationError(
             LocalizationFailureCategory.RUNNER,
@@ -659,7 +682,9 @@ def _run_runner(
     return predicted_files, result_map
 
 
-def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) -> tuple[list[str], Mapping[str, object] | None]:
+def _default_runner(
+    lca_task: LCATask, repo_path: str, parent: object | None
+) -> tuple[list[str], Mapping[str, object] | None]:
     from harness import loop as loop_pkg
 
     run_ic_iteration_fn = getattr(loop_pkg, "run_ic_iteration")
@@ -684,16 +709,24 @@ def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) ->
     return predictions, result
 
 
-def _score_task(task: LCATask, prediction: LCAPrediction, repo_path: Path) -> LocalizationMetrics:
+def _score_task(
+    task: LCATask, prediction: LCAPrediction, repo_path: Path
+) -> LocalizationMetrics:
     try:
         eval_record = build_file_localization_eval_record(
-            task.identity, prediction, task.gold, evidence=task.evidence, repo_path=repo_path
+            task.identity,
+            prediction,
+            task.gold,
+            evidence=task.evidence,
+            repo_path=repo_path,
         )
         return eval_record.metrics
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
-        raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, str(exc), task_id=task.task_id) from exc
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.SCORING, str(exc), task_id=task.task_id
+        ) from exc
 
 
 def _emit_telemetry(
@@ -724,12 +757,17 @@ def _emit_telemetry(
             value=float(metric_value),
             data_type="NUMERIC",
             dataset_run_id=dataset_run_id,
-            score_id=f"{getattr(trace, 'id', None)}-localization.{metric_name}" if getattr(trace, "id", None) else None,
+            score_id=f"{getattr(trace, 'id', None)}-localization.{metric_name}"
+            if getattr(trace, "id", None)
+            else None,
         )
     if trace:
         try:
             trace_any = cast(Any, trace)
-            trace_any.metadata = {**getattr(trace_any, "metadata", {}), "telemetry": telemetry.model_dump(exclude_none=True)}
+            trace_any.metadata = {
+                **getattr(trace_any, "metadata", {}),
+                "telemetry": telemetry.model_dump(exclude_none=True),
+            }
         except Exception:
             pass
 
@@ -739,8 +777,17 @@ def run_localization_task(
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
-    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
-) -> Tuple[LCAPrediction, LocalizationMetrics, LocalizationEvidence | None, RepoMaterializationResult | None, TokenUsageRecord]:
+    runner: Callable[
+        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+    ]
+    | None = None,
+) -> Tuple[
+    LCAPrediction,
+    LocalizationMetrics,
+    LocalizationEvidence | None,
+    RepoMaterializationResult | None,
+    TokenUsageRecord,
+]:
     """
     Execute a single localization task end to end (leaf helper):
     - materialize repo at base_sha (if a materializer is provided)
@@ -766,12 +813,19 @@ def run_localization_task(
         try:
             materialization_result = _materialize_repo(task, materializer)
         except Exception as exc:
-            raise LocalizationEvaluationError(LocalizationFailureCategory.MATERIALIZATION, str(exc), task_id=task.task_id) from exc
+            raise LocalizationEvaluationError(
+                LocalizationFailureCategory.MATERIALIZATION,
+                str(exc),
+                task_id=task.task_id,
+            ) from exc
         repo_path = _resolve_repo_path(task, materialization_result)
         predicted_files, runner_result = _run_runner(task, repo_path, trace, runner)
         prediction = LCAPrediction(predicted_files=predicted_files)
         metrics = _score_task(task, prediction, repo_path)
-        usage = extract_token_usage_record(runner_result if isinstance(runner_result, Mapping) else None, source="runner")
+        usage = extract_token_usage_record(
+            runner_result if isinstance(runner_result, Mapping) else None,
+            source="runner",
+        )
         _emit_telemetry(
             task=task,
             metrics=metrics,
@@ -2052,24 +2106,10 @@ from typing import Any, Mapping, cast
 
 from statemachine import State
 
+from harness.observability.langfuse import _safe_end_observation
 from harness.observability.score_emitter import emit_score_for_handle
 
 from .loop_types import IterationRecord
-
-
-def _safe_end_span(span: object | None, **kwargs: object) -> None:
-    """Best-effort guard for Langfuse span termination."""
-    if span is None or not hasattr(span, "end"):
-        return
-    try:
-        end_kwargs: dict[str, object] = {}
-        metadata = kwargs.pop("metadata", None)
-        if isinstance(metadata, Mapping):
-            end_kwargs.update(dict(metadata))
-        end_kwargs.update(kwargs)
-        cast(Any, span).end(**end_kwargs)
-    except Exception:
-        pass
 
 
 class RepairTracingListener:
@@ -2114,7 +2154,7 @@ class RepairTracingListener:
             metadata["pipeline_passed"] = False
         if getattr(ctx, "error", None):
             metadata["error"] = ctx.error  # type: ignore[attr-defined]
-        _safe_end_span(ctx.repair_observation, metadata=metadata)
+        _safe_end_observation(ctx.repair_observation, metadata=metadata)
         ctx.repair_observation = None
 
 
@@ -2181,7 +2221,7 @@ class OptimizationTracingListener:
             failure_val = failure_val or (record.writer_error if record else None)
             if failure_val:
                 metadata["error"] = failure_val
-            _safe_end_span(span, metadata=metadata)
+            _safe_end_observation(span, metadata=metadata)
         machine.model.current_iteration_span = None  # type: ignore[attr-defined]  # noqa: SLF001
 
     def _record_iteration_scores(
@@ -2239,8 +2279,9 @@ if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
     setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.observability.langfuse import _safe_end_observation
 
-from .loop_listeners import OptimizationTracingListener, RepairTracingListener, _safe_end_span as safe_end_span  # pyright: ignore[reportPrivateUsage]
+from .loop_listeners import OptimizationTracingListener, RepairTracingListener
 from .loop_types import (
     AcceptedPolicy,
     EvaluationMetrics,
@@ -2541,7 +2582,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         metadata: dict[str, object] = {"iterations_completed": len(self.context.history)}
         if status:
             metadata["status"] = status
-        safe_end_span(span, metadata=metadata)
+        _safe_end_observation(span, metadata=metadata)
         self.context.run_trace = None
 
     # Preparation ---------------------------------------------------------
@@ -2597,17 +2638,11 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
                 eval_span,
                 self.context.current_iteration,
             )
-            if eval_span is not None and hasattr(eval_span, "end"):
-                try:
-                    cast(Any, eval_span).end(metadata={"status": "ok"})
-                except Exception:
-                    pass
+            if eval_span is not None:
+                _safe_end_observation(eval_span, metadata={"status": "ok"})
         except Exception as exc:  # noqa: BLE001
-            if eval_span is not None and hasattr(eval_span, "end"):
-                try:
-                    cast(Any, eval_span).end(error=exc)
-                except Exception:
-                    pass
+            if eval_span is not None:
+                _safe_end_observation(eval_span, error=exc)
             raise
         self.raise_("evaluation_done")  # type: ignore[call-arg]
 
@@ -3310,6 +3345,7 @@ from harness.loop.runner_agent import run_ic_iteration
 from harness.observability.langfuse import (
     flush_langfuse,
     propagate_context,
+    _safe_end_observation,
     start_observation,
 )
 from harness.observability.score_emitter import emit_score
@@ -3526,13 +3562,10 @@ def prepare_iteration_tasks(
             repo_id = str(result.get("repo", ""))
             jc_repo_id = repo_id
             if index_obs:
-                index_obs.end(metadata={"repo": repo_id})
+                _safe_end_observation(index_obs, metadata={"repo": repo_id})
         except Exception as e:  # noqa: BLE001
             if index_obs:
-                try:
-                    index_obs.end(error=e)
-                except Exception:
-                    pass
+                _safe_end_observation(index_obs, error=e)
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
     ic_task = ICTaskPayload(
@@ -3936,12 +3969,7 @@ def run_loop(
             history = machine.run()
         except KeyboardInterrupt:
             run_trace = opt_model.context.run_trace
-            end_fn = getattr(run_trace, "end", None)
-            if callable(end_fn):
-                try:
-                    end_fn(error="interrupted")
-                except Exception:
-                    pass
+            _safe_end_observation(run_trace, error="interrupted")
         finally:
             flush_langfuse_fn = cast(Callable[[], None], _pkg_attr("flush_langfuse"))
             flush_langfuse_fn()
@@ -3994,7 +4022,12 @@ import json
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from harness.observability.langfuse import UsageDetails, get_tracing_openai_client, start_observation
+from harness.observability.langfuse import (
+    UsageDetails,
+    _safe_end_observation,
+    get_tracing_openai_client,
+    start_observation,
+)
 from harness.observability.score_emitter import emit_score_for_handle
 from harness.prompts import SystemPromptContext
 from harness.tools.backends.ic_backend import IterativeContextBackend
@@ -4272,6 +4305,11 @@ def _build_model_messages(agent_task: dict[str, object], tool_specs: list[OpenAI
     return messages
 
 
+def _ensure_non_empty_messages(messages: list[dict[str, object]] | None, caller: str) -> None:
+    if not messages:
+        raise RuntimeError(f"{caller}: empty messages payload")
+
+
 def _collect_tool_results(
     observations: list[dict[str, object]],
     dispatch_tool_call: Callable[[str, dict[str, Any]], object],
@@ -4395,6 +4433,9 @@ def run_agent(
                 observations.extend(tool_results)
             messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt)
             try:
+                if not messages:
+                    messages = _build_model_messages(agent_task, tool_specs, system_prompt)
+                _ensure_non_empty_messages(messages, caller=backend_name or "runner agent")
                 completion = client.chat.completions.create(
                     messages=messages,
                     model=model,
@@ -4407,6 +4448,9 @@ def run_agent(
                 if not _is_context_error(exc):
                     raise
                 retry_messages = _make_retry_messages(agent_task, observations, system_prompt, aggressive=True)
+                if not retry_messages:
+                    retry_messages = _build_model_messages(agent_task, tool_specs, system_prompt)
+                _ensure_non_empty_messages(retry_messages, caller=backend_name or "runner agent retry")
                 completion = client.chat.completions.create(
                     messages=retry_messages,
                     model=model,
@@ -4484,7 +4528,10 @@ def run_agent_with_retry(
         if not _is_context_error(exc):
             raise
         retry_messages = _make_retry_messages(agent_task, [], system_prompt, aggressive=True)
+        if not retry_messages:
+            retry_messages = _build_model_messages(agent_task, tool_specs, system_prompt)
         client, model = _make_client()
+        _ensure_non_empty_messages(retry_messages, caller=backend_name or "runner agent retry")
         completion = client.chat.completions.create(
             messages=retry_messages,
             model=model,
@@ -4759,7 +4806,7 @@ def run_ic_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            backend_obs.end(error=str(exc))
+            _safe_end_observation(backend_obs, error=str(exc))
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
@@ -4826,7 +4873,7 @@ def run_jc_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            backend_obs.end(error=str(exc))
+            _safe_end_observation(backend_obs, error=str(exc))
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
@@ -4864,19 +4911,21 @@ __all__ = [
 </file>
 
 <file path="observability/__init__.py">
+from importlib import import_module
+from typing import Any
+
 from .langfuse import (  # noqa: F401
     flush_langfuse,
     get_langfuse_client,
     get_tracing_openai_client,
     is_langfuse_enabled,
     propagate_context,
-    start_observation,
     start_child_observation,
+    start_observation,
     start_root_observation,
 )
 from .score_emitter import ScorePayload, emit_score, emit_score_for_handle  # noqa: F401
 from .datasets import LocalizationDataset, fetch_localization_dataset, local_dataset, normalize_localization_task  # noqa: F401
-from .baselines import BaselineBundle, BaselineSnapshot, baseline_key, compute_baseline_for_task, make_baseline_bundle, require_baseline, resolve_baseline  # noqa: F401
 
 __all__ = [
     "flush_langfuse",
@@ -4894,6 +4943,7 @@ __all__ = [
     "fetch_localization_dataset",
     "local_dataset",
     "normalize_localization_task",
+    # Baseline exports are loaded lazily to avoid circular imports during package init.
     "BaselineBundle",
     "BaselineSnapshot",
     "baseline_key",
@@ -4902,6 +4952,24 @@ __all__ = [
     "require_baseline",
     "resolve_baseline",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """
+    Lazily import baseline helpers to avoid circular imports when submodules depend on localization.
+    """
+    if name in {
+        "BaselineBundle",
+        "BaselineSnapshot",
+        "baseline_key",
+        "compute_baseline_for_task",
+        "make_baseline_bundle",
+        "require_baseline",
+        "resolve_baseline",
+    }:
+        module = import_module("harness.observability.baselines")
+        return getattr(module, name)
+    raise AttributeError(f"module 'harness.observability' has no attribute {name!r}")
 </file>
 
 <file path="observability/baselines.py">
@@ -5927,7 +5995,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from types import TracebackType
-from typing import Any, Mapping, Optional, cast
+from typing import Any, Iterator, Mapping, Optional, cast
 
 from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
@@ -6061,6 +6129,50 @@ def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
     return LangfuseOpenAI(base_url=base_url, api_key=api_key)
 
 
+def _compact_metadata_value(key: str, value: object, limit: int = 180) -> object:
+    """
+    Summarize oversized propagation values without losing key counts.
+    """
+    if key in {"selection", "projection"}:
+        try:
+            if isinstance(value, Mapping):
+                preview = value.get("preview")
+                def _trim_preview_item(item: object) -> object:
+                    text = str(item)
+                    return text if len(text) <= 60 else text[:60] + "..."
+
+                preview_list = None
+                if isinstance(preview, list):
+                    preview_list = [_trim_preview_item(item) for item in preview[:3]]
+                return {
+                    "offset": value.get("offset"),
+                    "limit": value.get("limit"),
+                    "selected_count": value.get("selected_count"),
+                    "total_available": value.get("total_available"),
+                    "preview": preview_list or preview,
+                }
+            if isinstance(value, (list, tuple)):
+                trimmed = list(value)[:3]
+                return trimmed if len(str(trimmed)) <= limit else str(trimmed)[:limit] + "..."
+            text = str(value)
+            return text if len(text) <= limit else text[:limit] + "..."
+        except Exception:
+            return str(value)[:limit]
+    text_val = str(value)
+    if len(text_val) > limit:
+        return text_val[:limit] + "..."
+    return value
+
+
+def _compact_metadata(meta: Mapping[str, object] | None) -> Mapping[str, object] | None:
+    if meta is None:
+        return None
+    compacted: dict[str, object] = {}
+    for key, value in meta.items():
+        compacted[key] = _compact_metadata_value(str(key), value)
+    return compacted
+
+
 def propagate_context(
     *,
     trace_name: str | None = None,
@@ -6083,12 +6195,63 @@ def propagate_context(
     coerced_tags = _coerce_tags(tags)
     if coerced_tags:
         kwargs["tags"] = coerced_tags
-    coerced_metadata = ObservationMetadata(data=metadata).to_langfuse() if metadata else None
+    compact_meta = _compact_metadata(metadata)
+    coerced_metadata = ObservationMetadata(data=compact_meta).to_langfuse() if compact_meta else None
     if coerced_metadata:
         kwargs["metadata"] = coerced_metadata
     if version:
         kwargs["version"] = version
     return propagate_attributes(**kwargs)
+
+
+@contextmanager
+def _observation_scope(started: Any) -> Iterator[Any]:
+    """
+    Normalize Langfuse start return values to a context manager.
+    """
+    if hasattr(started, "__enter__") and hasattr(started, "__exit__"):
+        with started as observation:
+            yield observation
+        return
+
+    try:
+        yield started
+    finally:
+        end = getattr(started, "end", None)
+        if callable(end):
+            end()
+
+
+def _safe_end_observation(
+    observation: Any,
+    *,
+    error: object | None = None,
+    metadata: Mapping[str, object] | None = None,
+    output: object | None = None,
+) -> None:
+    """
+    End an observation without assuming keyword support on .end().
+    """
+    if observation is None:
+        return
+    update = getattr(observation, "update", None)
+    extra_meta: dict[str, object] = {}
+    if metadata:
+        extra_meta.update(metadata)
+    if error is not None:
+        extra_meta.setdefault("error", error)
+    payload: dict[str, object] = {}
+    if extra_meta:
+        payload["metadata"] = extra_meta
+    if output is not None:
+        payload["output"] = output
+    try:
+        if callable(update) and payload:
+            update(**payload)
+    finally:
+        end = getattr(observation, "end", None)
+        if callable(end):
+            end()
 
 
 @contextmanager
@@ -6116,41 +6279,40 @@ def start_root_observation(
     start_fn = getattr(client_any, "start_as_current_observation", None)
     if callable(start_fn):
         start_ctx = cast(Any, start_fn)(**envelope.to_start_kwargs())
-        with start_ctx as observation:
+        with _observation_scope(start_ctx) as observation:
             yield observation
-    else:
-        # Fallback for stubbed clients in tests.
-        class _DummyObs:
-            def __init__(self):
-                self.id = "trace"
-                self.trace_id = "trace"
+        return
 
-            def start_observation(self, **kwargs: object) -> Any:
-                return self
+    # Fallback for stubbed clients in tests.
+    class _DummyObs:
+        def __init__(self):
+            self.id = "trace"
+            self.trace_id = "trace"
 
-            def __enter__(self):
-                return self
+        def start_observation(self, **kwargs: object) -> Any:
+            return self
 
-            def __exit__(
-                self,
-                exc_type: type[BaseException] | None,
-                exc: BaseException | None,
-                tb: TracebackType | None,
-            ) -> bool:
-                return False
+        def __enter__(self):
+            return self
 
-            def end(self, **kwargs: object) -> None:
-                return None
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> bool:
+            self.end()
+            return False
 
-            def update(self, **kwargs: object) -> None:
-                return None
+        def end(self, **kwargs: object) -> None:
+            return None
 
-        obs = _DummyObs()
-        try:
-            yield obs
-        finally:
-            if hasattr(obs, "end"):
-                obs.end()
+        def update(self, **kwargs: object) -> None:
+            return None
+
+    obs = _DummyObs()
+    with _observation_scope(obs) as observation:
+        yield observation
 
 
 @contextmanager
@@ -6177,7 +6339,8 @@ def start_child_observation(
         metadata=ObservationMetadata(data=metadata) if metadata else None,
         usage_details=usage_details,
     )
-    with parent.start_observation(**envelope.to_start_kwargs()) as observation:
+    started = parent.start_observation(**envelope.to_start_kwargs())
+    with _observation_scope(started) as observation:
         yield observation
 
 
@@ -6461,6 +6624,8 @@ class HostedLocalizationRunRequest(BaseModel):
 <file path="observability/score_emitter.py">
 from __future__ import annotations
 
+import logging
+
 from pydantic import BaseModel, ConfigDict, model_validator
 
 
@@ -6516,25 +6681,38 @@ def emit_score(
     from .langfuse import get_langfuse_client  # local import to avoid circularity
 
     resolved_type = _infer_data_type(value, data_type)
-    client = get_langfuse_client()
+    try:
+        client = get_langfuse_client()
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Langfuse score emission skipped: %s", exc)
+        return
     scores_api = getattr(getattr(client, "api", None), "scores", None)
     create_fn = getattr(scores_api, "create", None) if scores_api else getattr(client, "create_score", None)
     if not callable(create_fn):
-        raise RuntimeError("Langfuse client unavailable for scoring")
-    payload = ScorePayload(
-        name=name,
-        value=value,
-        data_type=resolved_type,
-        trace_id=trace_id,
-        observation_id=observation_id,
-        dataset_run_id=dataset_run_id,
-        session_id=session_id,
-        config_id=config_id,
-        comment=comment,
-        score_id=score_id,
-    )
+        logging.debug("Langfuse score emission unavailable: missing create_score API")
+        return
+    try:
+        payload = ScorePayload(
+            name=name,
+            value=value,
+            data_type=resolved_type,
+            trace_id=trace_id,
+            observation_id=observation_id,
+            dataset_run_id=dataset_run_id,
+            session_id=session_id,
+            config_id=config_id,
+            comment=comment,
+            score_id=score_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Langfuse score payload invalid; skipping score %s: %s", name, exc)
+        return
     cleaned = payload.model_dump(exclude_none=True)
-    create_fn(**cleaned)  # type: ignore[arg-type]
+    try:
+        create_fn(**cleaned)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Langfuse score emission failed for %s: %s", name, exc)
+        return
 
 
 def emit_score_for_handle(
@@ -9807,8 +9985,7 @@ def test_emit_score_for_handle_requires_identifier(monkeypatch):
             pass
 
     monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
-    with pytest.raises(ValueError):
-        score_emitter.emit_score_for_handle(None, name="metric", value=1.0)
+    score_emitter.emit_score_for_handle(None, name="metric", value=1.0)
 
 
 def test_emit_score_for_handle_allows_dataset_only(monkeypatch):
@@ -9822,6 +9999,158 @@ def test_emit_score_for_handle_allows_dataset_only(monkeypatch):
     score_emitter.emit_score_for_handle(None, name="metric", value=1.0, dataset_run_id="run123")
 
     assert calls and calls[0]["dataset_run_id"] == "run123"
+
+
+def test_start_observation_accepts_context_manager(monkeypatch):
+    class CMObservation:
+        def __init__(self):
+            self.id = "cm"
+            self.trace_id = "trace"
+            self.exited = 0
+            self.end_called = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.exited += 1
+            return False
+
+        def end(self):
+            self.end_called += 1
+
+    monkeypatch.setattr(
+        "harness.observability.langfuse.get_langfuse_client",
+        lambda: type("C", (), {"start_as_current_observation": lambda *a, **k: CMObservation()})(),
+    )
+
+    with lf.start_observation(name="root") as obs:
+        assert isinstance(obs, CMObservation)
+        assert obs.id == "cm"
+    assert obs.exited == 1
+    assert obs.end_called == 0
+
+
+def test_start_observation_handles_plain_root_object(monkeypatch):
+    class PlainObservation:
+        def __init__(self):
+            self.id = "plain-root"
+            self.trace_id = "trace"
+            self.end_called = 0
+
+        def end(self):
+            self.end_called += 1
+
+    monkeypatch.setattr(
+        "harness.observability.langfuse.get_langfuse_client",
+        lambda: type("C", (), {"start_as_current_observation": lambda *a, **k: PlainObservation()})(),
+    )
+
+    with lf.start_observation(name="root") as obs:
+        assert isinstance(obs, PlainObservation)
+        assert obs.id == "plain-root"
+        assert obs.end_called == 0
+    assert obs.end_called == 1
+
+
+def test_start_child_observation_handles_plain_object_parent():
+    class PlainChild:
+        def __init__(self, session_id: str | None):
+            self.id = "child"
+            self.session_id = session_id
+            self.end_called = 0
+
+        def end(self):
+            self.end_called += 1
+
+    class PlainParent:
+        def __init__(self, session_id: str | None):
+            self.session_id = session_id
+            self.started = 0
+
+        def start_observation(self, **kwargs):
+            self.started += 1
+            meta = kwargs.get("metadata") or {}
+            child_session = meta.get("session_id") or self.session_id
+            return PlainChild(child_session)
+
+    parent = PlainParent("parent-session")
+
+    with lf.start_observation(name="child", parent=parent) as child:
+        assert isinstance(child, PlainChild)
+        assert child.session_id == "parent-session"
+        assert child.end_called == 0
+
+    assert parent.started == 1
+    assert child.end_called == 1
+
+
+def test_safe_end_observation_records_error_and_ends_once():
+    class PlainObs:
+        def __init__(self):
+            self.updated: list[dict[str, object]] = []
+            self.end_called = 0
+
+        def update(self, **kwargs):
+            self.updated.append(kwargs)
+
+        def end(self):
+            self.end_called += 1
+
+    obs = PlainObs()
+
+    lf._safe_end_observation(obs, error="boom", metadata={"key": "value"}, output={"out": True})
+
+    assert obs.end_called == 1
+    assert obs.updated
+    payload = obs.updated[0]
+    assert payload.get("output") == {"out": True}
+    meta = payload.get("metadata") or {}
+    assert meta.get("key") == "value"
+    assert meta.get("error") == "boom"
+
+
+def test_emit_score_best_effort_when_client_missing(monkeypatch):
+    monkeypatch.setattr(
+        "harness.observability.langfuse.get_langfuse_client",
+        lambda: (_ for _ in ()).throw(RuntimeError("no client")),
+    )
+    # Should not raise
+    score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
+
+
+def test_emit_score_handles_missing_api(monkeypatch):
+    class DummyClient:
+        api = type("A", (), {})()
+
+    monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
+    # Should not raise even though no create_score API
+    score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
+
+
+def test_propagate_context_compacts_metadata(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_propagate_attributes(**kwargs):
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(lf, "propagate_attributes", fake_propagate_attributes)
+    long_selection = {
+        "offset": 0,
+        "limit": 1,
+        "selected_count": 1,
+        "total_available": 10,
+        "preview": ["a" * 300, "b"],
+    }
+    long_projection = "x" * 400
+
+    lf.propagate_context(metadata={"selection": long_selection, "projection": long_projection})
+
+    meta = captured.get("metadata") or {}
+    assert isinstance(meta, dict)
+    assert len(str(meta.get("selection", ""))) <= 220
+    assert len(str(meta.get("projection", ""))) <= 220
 </file>
 
 <file path="tests_harness/test_pipeline_models.py">
@@ -11093,6 +11422,18 @@ def test_run_agent_requires_usage(monkeypatch):
             parent_trace=object(),
             backend_name="test",
         )
+
+
+def test_runner_validates_non_empty_messages():
+    with pytest.raises(RuntimeError) as excinfo:
+        runner._ensure_non_empty_messages([], "runner-test")
+    assert "runner-test" in str(excinfo.value)
+
+
+def test_writer_validates_non_empty_messages():
+    with pytest.raises(RuntimeError) as excinfo:
+        writer._ensure_non_empty_messages([], "writer-test")
+    assert "writer-test" in str(excinfo.value)
 </file>
 
 <file path="tests_harness/test_type_loader.py">
@@ -12072,7 +12413,6 @@ def interpret_diff(diff: DiffSummary) -> str:
 <file path="utils/env.py">
 from __future__ import annotations
 
-
 from dotenv import load_dotenv
 
 _loaded = False
@@ -12103,7 +12443,7 @@ def getenv_bool(key: str, default: bool = False) -> bool:
 
 
 def get_runner_model() -> str:
-    return getenv("RUNNER_MODEL", "llama3.1-8b") or "llama3.1-8b"
+    return getenv("RUNNER_MODEL", "gpt-oss-120b") or "gpt-oss-120b"
 
 
 def get_writer_model() -> str:
@@ -12731,29 +13071,37 @@ import logging
 import sys
 from contextlib import contextmanager
 from typing import IO, Any, Iterable, Iterator
+
 try:
-    import tty  # type: ignore
     import termios  # type: ignore
+    import tty  # type: ignore
 except ImportError:
     tty = None  # type: ignore
     termios = None  # type: ignore
 
 from harness.localization.evaluation_backend import (
     LocalizationEvaluationRequest,
+)
+from harness.localization.evaluation_backend import (
     evaluate_localization_batch as _evaluate_localization_batch,
 )
-from harness.localization.models import LCATask
 from harness.localization.hf_materializer import HuggingFaceRepoMaterializer
+from harness.localization.models import LCATask
+from harness.observability.cerebras_pricing import cost_details_for_usage
 from harness.observability.experiments import (
     run_hosted_localization_baseline,
     run_hosted_localization_experiment,
 )
-from harness.observability.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
-from harness.observability.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
-from harness.observability.session_policy import SessionConfig
+from harness.observability.hf_lca import (
+    HFDatasetLoadError,
+    fetch_hf_localization_dataset,
+)
 from harness.observability.langfuse import flush_langfuse
-from harness.observability.cerebras_pricing import cost_details_for_usage
-
+from harness.observability.requests import (
+    HostedLocalizationBaselineRequest,
+    HostedLocalizationRunRequest,
+)
+from harness.observability.session_policy import SessionConfig
 
 WARNING_THRESHOLD = 50
 HF_DATASET_NAME = "JetBrains-Research/lca-bug-localization"
@@ -12789,7 +13137,7 @@ MAX_POLICY_REPAIRS_PER_ITERATION = 3
 WRITER_INTERNAL_ATTEMPTS_PER_REPAIR = 3
 
 # Localization hard caps (llama3.1-8b)
-LOCALIZATION_MODEL = "llama3.1-8b"
+LOCALIZATION_MODEL = "gpt-oss-120b"
 LOCALIZATION_PLANNED_CALLS_PER_ITEM = 6  # 5 explore + 1 finalize
 LOCALIZATION_MAX_CALLS_PER_ITEM = 11  # retry-aware
 LOCALIZATION_INPUT_TOKENS_PER_ITEM_PLANNED = 75_000
@@ -12801,14 +13149,28 @@ LOCALIZATION_OUTPUT_TOKENS_PER_ITEM_MAX = 14_000
 WRITER_MODEL = "gpt-oss-120b"
 WRITER_INPUT_TOKENS_PER_CALL = 20_000
 WRITER_OUTPUT_TOKENS_PER_CALL = 4_096
-WRITER_MAX_CALLS_PER_ITERATION = MAX_POLICY_REPAIRS_PER_ITERATION * WRITER_INTERNAL_ATTEMPTS_PER_REPAIR  # 9
-WRITER_MAX_CALLS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_CALLS_PER_ITERATION  # 45
+WRITER_MAX_CALLS_PER_ITERATION = (
+    MAX_POLICY_REPAIRS_PER_ITERATION * WRITER_INTERNAL_ATTEMPTS_PER_REPAIR
+)  # 9
+WRITER_MAX_CALLS_PER_RUN = (
+    DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_CALLS_PER_ITERATION
+)  # 45
 WRITER_PLANNED_CALLS_PER_ITERATION = 1
-WRITER_PLANNED_CALLS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_PLANNED_CALLS_PER_ITERATION
-WRITER_MAX_INPUT_TOKENS_PER_ITERATION = WRITER_MAX_CALLS_PER_ITERATION * WRITER_INPUT_TOKENS_PER_CALL
-WRITER_MAX_OUTPUT_TOKENS_PER_ITERATION = WRITER_MAX_CALLS_PER_ITERATION * WRITER_OUTPUT_TOKENS_PER_CALL
-WRITER_MAX_INPUT_TOKENS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_INPUT_TOKENS_PER_ITERATION
-WRITER_MAX_OUTPUT_TOKENS_PER_RUN = DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_OUTPUT_TOKENS_PER_ITERATION
+WRITER_PLANNED_CALLS_PER_RUN = (
+    DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_PLANNED_CALLS_PER_ITERATION
+)
+WRITER_MAX_INPUT_TOKENS_PER_ITERATION = (
+    WRITER_MAX_CALLS_PER_ITERATION * WRITER_INPUT_TOKENS_PER_CALL
+)
+WRITER_MAX_OUTPUT_TOKENS_PER_ITERATION = (
+    WRITER_MAX_CALLS_PER_ITERATION * WRITER_OUTPUT_TOKENS_PER_CALL
+)
+WRITER_MAX_INPUT_TOKENS_PER_RUN = (
+    DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_INPUT_TOKENS_PER_ITERATION
+)
+WRITER_MAX_OUTPUT_TOKENS_PER_RUN = (
+    DEFAULT_OPTIMIZATION_ITERATIONS * WRITER_MAX_OUTPUT_TOKENS_PER_ITERATION
+)
 
 
 @contextmanager
@@ -12836,19 +13198,35 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest):
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    argv = argv or []
+    # Default to real CLI arguments when caller does not supply an override.
+    argv = argv if argv is not None else sys.argv[1:]
     for flag in REMOVED_FLAGS:
         if flag in argv:
-            raise SystemExit(f"{flag} is no longer supported; use HF baseline/experiment subcommands with --config/--split/--revision/--max-items/--offset.")
-    parser = argparse.ArgumentParser(description="HF LCA localization runner (baseline/experiment)")
+            raise SystemExit(
+                f"{flag} is no longer supported; use HF baseline/experiment subcommands with --config/--split/--revision/--max-items/--offset."
+            )
+    parser = argparse.ArgumentParser(
+        description="HF LCA localization runner (baseline/experiment)"
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def _add_common(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--config", required=True, help="HF dataset config (e.g., py/java/kt)")
-        sub.add_argument("--split", required=True, help="HF dataset split (e.g., dev/test/train)")
+        sub.add_argument(
+            "--config", required=True, help="HF dataset config (e.g., py/java/kt)"
+        )
+        sub.add_argument(
+            "--split", required=True, help="HF dataset split (e.g., dev/test/train)"
+        )
         sub.add_argument("--revision", help="HF dataset revision pin")
-        sub.add_argument("--max-items", type=int, help="Maximum number of dataset items to evaluate")
-        sub.add_argument("--offset", type=int, default=0, help="Offset into the dataset before selection window")
+        sub.add_argument(
+            "--max-items", type=int, help="Maximum number of dataset items to evaluate"
+        )
+        sub.add_argument(
+            "--offset",
+            type=int,
+            default=0,
+            help="Offset into the dataset before selection window",
+        )
         sub.add_argument(
             "--max-workers",
             type=int,
@@ -12886,7 +13264,12 @@ def _print_mat_summary(prefix: str, identity: Any, materialization: Any) -> None
 
 def _fmt_identity(identity: Any) -> str:
     if isinstance(identity, dict):
-        return str(identity.get("id") or identity.get("task_id") or identity.get("repo") or identity)
+        return str(
+            identity.get("id")
+            or identity.get("task_id")
+            or identity.get("repo")
+            or identity
+        )
     return str(identity)
 
 
@@ -12904,10 +13287,14 @@ def _coerce_int(value: object, default: int = 0) -> int:
 
 
 def _sort_tasks_deterministically(tasks: Iterable[LCATask]) -> list[LCATask]:
-    return sorted(list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id())
+    return sorted(
+        list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id()
+    )
 
 
-def _select_tasks(tasks: list[LCATask], max_items: int | None, offset: int) -> tuple[list[LCATask], dict[str, object]]:
+def _select_tasks(
+    tasks: list[LCATask], max_items: int | None, offset: int
+) -> tuple[list[LCATask], dict[str, object]]:
     if offset < 0:
         raise ValueError("--offset must be >= 0")
     sorted_tasks = _sort_tasks_deterministically(tasks)
@@ -12915,9 +13302,15 @@ def _select_tasks(tasks: list[LCATask], max_items: int | None, offset: int) -> t
     if max_items is not None and max_items <= 0:
         raise ValueError("--max-items must be > 0")
     start = min(offset, total_available)
-    end = total_available if max_items is None else min(start + max_items, total_available)
+    end = (
+        total_available
+        if max_items is None
+        else min(start + max_items, total_available)
+    )
     selected = sorted_tasks[start:end]
-    preview = [getattr(t, "task_id", None) or t.identity.task_id() for t in selected[:5]]
+    preview = [
+        getattr(t, "task_id", None) or t.identity.task_id() for t in selected[:5]
+    ]
     selection_info: dict[str, object] = {
         "total_available": total_available,
         "offset": offset,
@@ -12928,7 +13321,13 @@ def _select_tasks(tasks: list[LCATask], max_items: int | None, offset: int) -> t
     return selected, selection_info
 
 
-def _print_selection(dataset: str, dataset_config: str | None, dataset_split: str | None, source: str, selection: dict[str, object]) -> None:
+def _print_selection(
+    dataset: str,
+    dataset_config: str | None,
+    dataset_split: str | None,
+    source: str,
+    selection: dict[str, object],
+) -> None:
     limit = selection.get("limit")
     offset = selection.get("offset")
     selected_count = selection.get("selected_count")
@@ -12936,7 +13335,16 @@ def _print_selection(dataset: str, dataset_config: str | None, dataset_split: st
     preview = selection.get("preview") or []
     print(
         "[SELECT] dataset=%s config=%s split=%s source=%s offset=%s limit=%s selected=%s total=%s"
-        % (dataset, dataset_config, dataset_split, source, offset, limit, selected_count, total_available)
+        % (
+            dataset,
+            dataset_config,
+            dataset_split,
+            source,
+            offset,
+            limit,
+            selected_count,
+            total_available,
+        )
     )
     if preview:
         print(f"[SELECT] preview identities (up to 5): {preview}")
@@ -12946,21 +13354,29 @@ def _warn_if_unbounded(selection: dict[str, object], max_items: int | None) -> N
     selected_count = _coerce_int(selection.get("selected_count"))
     total_available = _coerce_int(selection.get("total_available"))
     if max_items is None and total_available > WARNING_THRESHOLD:
-        print(f"[WARN] No --max-items provided; {total_available} items available. Run is unbounded.")
+        print(
+            f"[WARN] No --max-items provided; {total_available} items available. Run is unbounded."
+        )
     if selected_count > WARNING_THRESHOLD:
         print(f"[WARN] Large selection: {selected_count} items will run.")
 
 
 def _price_tokens(model: str, input_tokens: int, output_tokens: int) -> float:
-    costs = cost_details_for_usage(model, {"input": input_tokens, "output": output_tokens})
+    costs = cost_details_for_usage(
+        model, {"input": input_tokens, "output": output_tokens}
+    )
     if not costs or "total" not in costs:
-        raise ValueError(f"Unknown pricing for model/provider '{model}'; ensure Cerebras pricing covers it.")
+        raise ValueError(
+            f"Unknown pricing for model/provider '{model}'; ensure Cerebras pricing covers it."
+        )
     return float(costs.get("total") or 0.0)
 
 
 def _compute_projection(selected_count: int) -> dict[str, Any]:
     if selected_count <= 0:
-        raise ValueError("No items selected for projection; adjust --max-items/--offset.")
+        raise ValueError(
+            "No items selected for projection; adjust --max-items/--offset."
+        )
 
     loc_input_planned = selected_count * LOCALIZATION_INPUT_TOKENS_PER_ITEM_PLANNED
     loc_output_planned = selected_count * LOCALIZATION_OUTPUT_TOKENS_PER_ITEM_PLANNED
@@ -12972,21 +13388,41 @@ def _compute_projection(selected_count: int) -> dict[str, Any]:
     writer_input_max = WRITER_MAX_CALLS_PER_RUN * WRITER_INPUT_TOKENS_PER_CALL
     writer_output_max = WRITER_MAX_CALLS_PER_RUN * WRITER_OUTPUT_TOKENS_PER_CALL
 
-    loc_cost_planned = _price_tokens(LOCALIZATION_MODEL, loc_input_planned, loc_output_planned)
+    loc_cost_planned = _price_tokens(
+        LOCALIZATION_MODEL, loc_input_planned, loc_output_planned
+    )
     loc_cost_max = _price_tokens(LOCALIZATION_MODEL, loc_input_max, loc_output_max)
-    writer_cost_planned = _price_tokens(WRITER_MODEL, writer_input_planned, writer_output_planned)
+    writer_cost_planned = _price_tokens(
+        WRITER_MODEL, writer_input_planned, writer_output_planned
+    )
     writer_cost_max = _price_tokens(WRITER_MODEL, writer_input_max, writer_output_max)
 
     return {
         "localization": {
             "model": LOCALIZATION_MODEL,
-            "planned": {"input_tokens": loc_input_planned, "output_tokens": loc_output_planned, "cost": loc_cost_planned},
-            "hard_cap": {"input_tokens": loc_input_max, "output_tokens": loc_output_max, "cost": loc_cost_max},
+            "planned": {
+                "input_tokens": loc_input_planned,
+                "output_tokens": loc_output_planned,
+                "cost": loc_cost_planned,
+            },
+            "hard_cap": {
+                "input_tokens": loc_input_max,
+                "output_tokens": loc_output_max,
+                "cost": loc_cost_max,
+            },
         },
         "writer": {
             "model": WRITER_MODEL,
-            "planned": {"input_tokens": writer_input_planned, "output_tokens": writer_output_planned, "cost": writer_cost_planned},
-            "hard_cap": {"input_tokens": writer_input_max, "output_tokens": writer_output_max, "cost": writer_cost_max},
+            "planned": {
+                "input_tokens": writer_input_planned,
+                "output_tokens": writer_output_planned,
+                "cost": writer_cost_planned,
+            },
+            "hard_cap": {
+                "input_tokens": writer_input_max,
+                "output_tokens": writer_output_max,
+                "cost": writer_cost_max,
+            },
         },
         "total": {
             "planned": loc_cost_planned + writer_cost_planned,
@@ -13027,16 +13463,25 @@ def _print_projection(selection: dict[str, object], projection: dict[str, Any]) 
     )
     print(
         "[PROJECTION] totals planned=%.4f hardcap=%.4f"
-        % (float(total.get("planned", 0) or 0.0), float(total.get("hard_cap", 0) or 0.0))
+        % (
+            float(total.get("planned", 0) or 0.0),
+            float(total.get("hard_cap", 0) or 0.0),
+        )
     )
 
 
-def _require_confirmation(skip_confirmation: bool, selection: dict[str, object], projection: dict[str, float | int | str]) -> None:
+def _require_confirmation(
+    skip_confirmation: bool,
+    selection: dict[str, object],
+    projection: dict[str, float | int | str],
+) -> None:
     if skip_confirmation:
         print("[CONFIRM] --yes set; proceeding without interactive confirmation.")
         return
     if not sys.stdin.isatty():
-        raise RuntimeError("Interactive confirmation required on TTY; rerun with --yes and --max-items if automation is intended.")
+        raise RuntimeError(
+            "Interactive confirmation required on TTY; rerun with --yes and --max-items if automation is intended."
+        )
     prompt = "Press SPACE to continue with the run (or Ctrl+C to cancel). "
     try:
         with _raw_mode(sys.stdin):
@@ -13051,7 +13496,11 @@ def _require_confirmation(skip_confirmation: bool, selection: dict[str, object],
                 return _require_confirmation(skip_confirmation, selection, projection)
     except Exception:
         # Fallback to line-based confirmation
-        response = input("Type 'space' to confirm and continue (or Ctrl+C to cancel): ").strip().lower()
+        response = (
+            input("Type 'space' to confirm and continue (or Ctrl+C to cancel): ")
+            .strip()
+            .lower()
+        )
         if response == "space" or response == "yes":
             print("[CONFIRM] Proceeding.")
             return
@@ -13082,10 +13531,20 @@ def main(argv: list[str] | None = None) -> None:
             )
             if not tasks:
                 raise RuntimeError("No localization tasks available for baseline run")
-            selected_tasks, selection_info = _select_tasks(tasks, args.max_items, args.offset)
+            selected_tasks, selection_info = _select_tasks(
+                tasks, args.max_items, args.offset
+            )
             _warn_if_unbounded(selection_info, args.max_items)
-            _print_selection(HF_DATASET_NAME, args.config, args.split, HF_DATASET_SOURCE, selection_info)
-            projection = _compute_projection(_coerce_int(selection_info.get("selected_count")))
+            _print_selection(
+                HF_DATASET_NAME,
+                args.config,
+                args.split,
+                HF_DATASET_SOURCE,
+                selection_info,
+            )
+            projection = _compute_projection(
+                _coerce_int(selection_info.get("selected_count"))
+            )
             _print_projection(selection_info, projection)
             if args.yes and not args.max_items:
                 raise ValueError("--yes requires --max-items to be set for safety.")
@@ -13105,7 +13564,9 @@ def main(argv: list[str] | None = None) -> None:
                 selection=selection_info,
                 projection=projection,
             )
-            bundle = run_hosted_localization_baseline(req, materializer=materializer, tasks=selected_tasks)
+            bundle = run_hosted_localization_baseline(
+                req, materializer=materializer, tasks=selected_tasks
+            )
             if bundle is None:
                 print("[RUN] Baseline run returned no bundle; skipping summary.")
                 return
@@ -13113,7 +13574,9 @@ def main(argv: list[str] | None = None) -> None:
             failure = getattr(bundle, "failure", None)
             if failure is not None:
                 category = getattr(failure.category, "value", failure.category)
-                print(f"[RUN] Baseline run reported failure category={category} task_id={failure.task_id} message={failure.message}")
+                print(
+                    f"[RUN] Baseline run reported failure category={category} task_id={failure.task_id} message={failure.message}"
+                )
             for snap in bundle.items:
                 _print_mat_summary("baseline", snap.identity, snap.materialization)
         elif args.command == "experiment":
@@ -13126,10 +13589,20 @@ def main(argv: list[str] | None = None) -> None:
             )
             if not tasks:
                 raise RuntimeError("No localization tasks available for experiment run")
-            selected_tasks, selection_info = _select_tasks(tasks, args.max_items, args.offset)
+            selected_tasks, selection_info = _select_tasks(
+                tasks, args.max_items, args.offset
+            )
             _warn_if_unbounded(selection_info, args.max_items)
-            _print_selection(HF_DATASET_NAME, args.config, args.split, HF_DATASET_SOURCE, selection_info)
-            projection = _compute_projection(_coerce_int(selection_info.get("selected_count")))
+            _print_selection(
+                HF_DATASET_NAME,
+                args.config,
+                args.split,
+                HF_DATASET_SOURCE,
+                selection_info,
+            )
+            projection = _compute_projection(
+                _coerce_int(selection_info.get("selected_count"))
+            )
             _print_projection(selection_info, projection)
             if args.yes and not args.max_items:
                 raise ValueError("--yes requires --max-items to be set for safety.")
@@ -13149,14 +13622,22 @@ def main(argv: list[str] | None = None) -> None:
                 selection=selection_info,
                 projection=projection,
             )
-            results = run_hosted_localization_experiment(req, materializer=materializer, tasks=selected_tasks)
+            results = run_hosted_localization_experiment(
+                req, materializer=materializer, tasks=selected_tasks
+            )
             print(f"[RUN] Localization items completed: {len(results.items)}")
             failure = getattr(results, "failure", None)
             if failure is not None:
                 category = getattr(failure.category, "value", failure.category)
-                print(f"[RUN] Experiment run reported failure category={category} task_id={failure.task_id} message={failure.message}")
+                print(
+                    f"[RUN] Experiment run reported failure category={category} task_id={failure.task_id} message={failure.message}"
+                )
             for item in results.items:
-                _print_mat_summary("experiment", _fmt_identity(item.task.get("identity")), item.materialization)
+                _print_mat_summary(
+                    "experiment",
+                    _fmt_identity(item.task.get("identity")),
+                    item.materialization,
+                )
     except HFDatasetLoadError as exc:
         print(f"[ERROR] HF dataset load failed (category={exc.category}): {exc}")
         raise
@@ -13406,7 +13887,7 @@ from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .observability.langfuse import get_tracing_openai_client, start_observation
+from .observability.langfuse import _safe_end_observation, get_tracing_openai_client, start_observation
 from .observability.score_emitter import emit_score_for_handle
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
@@ -13462,6 +13943,11 @@ def _safe_update(span: object | None, **kwargs: object) -> None:
             updater(**kwargs)
         except Exception:
             pass
+
+
+def _ensure_non_empty_messages(messages: list[dict[str, object]] | None, caller: str) -> None:
+    if not messages:
+        raise RuntimeError(f"{caller}: empty messages payload")
 
 
 def _extract_policy_code(response: Any) -> str:
@@ -13642,6 +14128,17 @@ def generate_policy(
             ) as attempt_obs:
                 try:
                     system_content, user_content = prompt_content.split("===USER===", 1)
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": system_content.strip(),
+                        },
+                        {
+                            "role": "user",
+                            "content": user_content.strip(),
+                        },
+                    ]
+                    _ensure_non_empty_messages(messages, caller="writer")
                     response = client.chat.completions.create(
                         model=model,
                         response_format={
@@ -13658,16 +14155,7 @@ def generate_policy(
                             },
                         },
                         max_completion_tokens=completion_tokens,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": system_content.strip(),
-                            },
-                            {
-                                "role": "user",
-                                "content": user_content.strip(),
-                            },
-                        ],
+                        messages=messages,
                     )
                     latency_ms = (time.perf_counter() - start_time) * 1000
                     usage_env = usage_from_response(response)
@@ -13687,14 +14175,10 @@ def generate_policy(
                     )
                     break
                 except Exception as e:  # noqa: BLE001
-                    end_fn = getattr(attempt_obs, "end", None)
-                    if callable(end_fn):
-                        end_fn(error=e)
+                    _safe_end_observation(attempt_obs, error=e)
                     time.sleep(2 * (attempt + 1))
         else:
-            end_fn = getattr(writer_obs, "end", None)
-            if callable(end_fn):
-                end_fn(error="writer_failed")
+            _safe_end_observation(writer_obs, error="writer_failed")
             raise RuntimeError("Writer failed after retries")
 
         try:
@@ -13708,7 +14192,7 @@ def generate_policy(
                 comment=json.dumps({"model": model}),
             )
         except Exception as exc:  # noqa: BLE001
-            writer_obs.end(error=exc, metadata={"model": model})
+            _safe_end_observation(writer_obs, error=exc, metadata={"model": model})
             raise
         emit_score_for_handle(
             writer_obs,

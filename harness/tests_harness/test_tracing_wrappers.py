@@ -459,3 +459,15 @@ def test_run_agent_requires_usage(monkeypatch):
             parent_trace=object(),
             backend_name="test",
         )
+
+
+def test_runner_validates_non_empty_messages():
+    with pytest.raises(RuntimeError) as excinfo:
+        runner._ensure_non_empty_messages([], "runner-test")
+    assert "runner-test" in str(excinfo.value)
+
+
+def test_writer_validates_non_empty_messages():
+    with pytest.raises(RuntimeError) as excinfo:
+        writer._ensure_non_empty_messages([], "writer-test")
+    assert "writer-test" in str(excinfo.value)

@@ -20,8 +20,9 @@ if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
     setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.observability.langfuse import _safe_end_observation
 
-from .loop_listeners import OptimizationTracingListener, RepairTracingListener, _safe_end_span as safe_end_span  # pyright: ignore[reportPrivateUsage]
+from .loop_listeners import OptimizationTracingListener, RepairTracingListener
 from .loop_types import (
     AcceptedPolicy,
     EvaluationMetrics,
@@ -322,7 +323,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         metadata: dict[str, object] = {"iterations_completed": len(self.context.history)}
         if status:
             metadata["status"] = status
-        safe_end_span(span, metadata=metadata)
+        _safe_end_observation(span, metadata=metadata)
         self.context.run_trace = None
 
     # Preparation ---------------------------------------------------------
@@ -378,17 +379,11 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
                 eval_span,
                 self.context.current_iteration,
             )
-            if eval_span is not None and hasattr(eval_span, "end"):
-                try:
-                    cast(Any, eval_span).end(metadata={"status": "ok"})
-                except Exception:
-                    pass
+            if eval_span is not None:
+                _safe_end_observation(eval_span, metadata={"status": "ok"})
         except Exception as exc:  # noqa: BLE001
-            if eval_span is not None and hasattr(eval_span, "end"):
-                try:
-                    cast(Any, eval_span).end(error=exc)
-                except Exception:
-                    pass
+            if eval_span is not None:
+                _safe_end_observation(eval_span, error=exc)
             raise
         self.raise_("evaluation_done")  # type: ignore[call-arg]
 

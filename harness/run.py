@@ -137,7 +137,8 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest):
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    argv = argv or []
+    # Default to real CLI arguments when caller does not supply an override.
+    argv = argv if argv is not None else sys.argv[1:]
     for flag in REMOVED_FLAGS:
         if flag in argv:
             raise SystemExit(

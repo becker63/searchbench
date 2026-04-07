@@ -9,7 +9,12 @@ import json
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from harness.observability.langfuse import UsageDetails, get_tracing_openai_client, start_observation
+from harness.observability.langfuse import (
+    UsageDetails,
+    _safe_end_observation,
+    get_tracing_openai_client,
+    start_observation,
+)
 from harness.observability.score_emitter import emit_score_for_handle
 from harness.prompts import SystemPromptContext
 from harness.tools.backends.ic_backend import IterativeContextBackend
@@ -287,6 +292,11 @@ def _build_model_messages(agent_task: dict[str, object], tool_specs: list[OpenAI
     return messages
 
 
+def _ensure_non_empty_messages(messages: list[dict[str, object]] | None, caller: str) -> None:
+    if not messages:
+        raise RuntimeError(f"{caller}: empty messages payload")
+
+
 def _collect_tool_results(
     observations: list[dict[str, object]],
     dispatch_tool_call: Callable[[str, dict[str, Any]], object],
@@ -410,6 +420,9 @@ def run_agent(
                 observations.extend(tool_results)
             messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt)
             try:
+                if not messages:
+                    messages = _build_model_messages(agent_task, tool_specs, system_prompt)
+                _ensure_non_empty_messages(messages, caller=backend_name or "runner agent")
                 completion = client.chat.completions.create(
                     messages=messages,
                     model=model,
@@ -422,6 +435,9 @@ def run_agent(
                 if not _is_context_error(exc):
                     raise
                 retry_messages = _make_retry_messages(agent_task, observations, system_prompt, aggressive=True)
+                if not retry_messages:
+                    retry_messages = _build_model_messages(agent_task, tool_specs, system_prompt)
+                _ensure_non_empty_messages(retry_messages, caller=backend_name or "runner agent retry")
                 completion = client.chat.completions.create(
                     messages=retry_messages,
                     model=model,
@@ -499,7 +515,10 @@ def run_agent_with_retry(
         if not _is_context_error(exc):
             raise
         retry_messages = _make_retry_messages(agent_task, [], system_prompt, aggressive=True)
+        if not retry_messages:
+            retry_messages = _build_model_messages(agent_task, tool_specs, system_prompt)
         client, model = _make_client()
+        _ensure_non_empty_messages(retry_messages, caller=backend_name or "runner agent retry")
         completion = client.chat.completions.create(
             messages=retry_messages,
             model=model,
@@ -774,7 +793,7 @@ def run_ic_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            backend_obs.end(error=str(exc))
+            _safe_end_observation(backend_obs, error=str(exc))
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
@@ -841,7 +860,7 @@ def run_jc_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            backend_obs.end(error=str(exc))
+            _safe_end_observation(backend_obs, error=str(exc))
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))

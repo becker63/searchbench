@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .observability.langfuse import get_tracing_openai_client, start_observation
+from .observability.langfuse import _safe_end_observation, get_tracing_openai_client, start_observation
 from .observability.score_emitter import emit_score_for_handle
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
@@ -67,6 +67,11 @@ def _safe_update(span: object | None, **kwargs: object) -> None:
             updater(**kwargs)
         except Exception:
             pass
+
+
+def _ensure_non_empty_messages(messages: list[dict[str, object]] | None, caller: str) -> None:
+    if not messages:
+        raise RuntimeError(f"{caller}: empty messages payload")
 
 
 def _extract_policy_code(response: Any) -> str:
@@ -247,6 +252,17 @@ def generate_policy(
             ) as attempt_obs:
                 try:
                     system_content, user_content = prompt_content.split("===USER===", 1)
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": system_content.strip(),
+                        },
+                        {
+                            "role": "user",
+                            "content": user_content.strip(),
+                        },
+                    ]
+                    _ensure_non_empty_messages(messages, caller="writer")
                     response = client.chat.completions.create(
                         model=model,
                         response_format={
@@ -263,16 +279,7 @@ def generate_policy(
                             },
                         },
                         max_completion_tokens=completion_tokens,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": system_content.strip(),
-                            },
-                            {
-                                "role": "user",
-                                "content": user_content.strip(),
-                            },
-                        ],
+                        messages=messages,
                     )
                     latency_ms = (time.perf_counter() - start_time) * 1000
                     usage_env = usage_from_response(response)
@@ -292,14 +299,10 @@ def generate_policy(
                     )
                     break
                 except Exception as e:  # noqa: BLE001
-                    end_fn = getattr(attempt_obs, "end", None)
-                    if callable(end_fn):
-                        end_fn(error=e)
+                    _safe_end_observation(attempt_obs, error=e)
                     time.sleep(2 * (attempt + 1))
         else:
-            end_fn = getattr(writer_obs, "end", None)
-            if callable(end_fn):
-                end_fn(error="writer_failed")
+            _safe_end_observation(writer_obs, error="writer_failed")
             raise RuntimeError("Writer failed after retries")
 
         try:
@@ -313,7 +316,7 @@ def generate_policy(
                 comment=json.dumps({"model": model}),
             )
         except Exception as exc:  # noqa: BLE001
-            writer_obs.end(error=exc, metadata={"model": model})
+            _safe_end_observation(writer_obs, error=exc, metadata={"model": model})
             raise
         emit_score_for_handle(
             writer_obs,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from types import TracebackType
-from typing import Any, Mapping, Optional, cast
+from typing import Any, Iterator, Mapping, Optional, cast
 
 from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
@@ -136,6 +136,50 @@ def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
     return LangfuseOpenAI(base_url=base_url, api_key=api_key)
 
 
+def _compact_metadata_value(key: str, value: object, limit: int = 180) -> object:
+    """
+    Summarize oversized propagation values without losing key counts.
+    """
+    if key in {"selection", "projection"}:
+        try:
+            if isinstance(value, Mapping):
+                preview = value.get("preview")
+                def _trim_preview_item(item: object) -> object:
+                    text = str(item)
+                    return text if len(text) <= 60 else text[:60] + "..."
+
+                preview_list = None
+                if isinstance(preview, list):
+                    preview_list = [_trim_preview_item(item) for item in preview[:3]]
+                return {
+                    "offset": value.get("offset"),
+                    "limit": value.get("limit"),
+                    "selected_count": value.get("selected_count"),
+                    "total_available": value.get("total_available"),
+                    "preview": preview_list or preview,
+                }
+            if isinstance(value, (list, tuple)):
+                trimmed = list(value)[:3]
+                return trimmed if len(str(trimmed)) <= limit else str(trimmed)[:limit] + "..."
+            text = str(value)
+            return text if len(text) <= limit else text[:limit] + "..."
+        except Exception:
+            return str(value)[:limit]
+    text_val = str(value)
+    if len(text_val) > limit:
+        return text_val[:limit] + "..."
+    return value
+
+
+def _compact_metadata(meta: Mapping[str, object] | None) -> Mapping[str, object] | None:
+    if meta is None:
+        return None
+    compacted: dict[str, object] = {}
+    for key, value in meta.items():
+        compacted[key] = _compact_metadata_value(str(key), value)
+    return compacted
+
+
 def propagate_context(
     *,
     trace_name: str | None = None,
@@ -158,12 +202,63 @@ def propagate_context(
     coerced_tags = _coerce_tags(tags)
     if coerced_tags:
         kwargs["tags"] = coerced_tags
-    coerced_metadata = ObservationMetadata(data=metadata).to_langfuse() if metadata else None
+    compact_meta = _compact_metadata(metadata)
+    coerced_metadata = ObservationMetadata(data=compact_meta).to_langfuse() if compact_meta else None
     if coerced_metadata:
         kwargs["metadata"] = coerced_metadata
     if version:
         kwargs["version"] = version
     return propagate_attributes(**kwargs)
+
+
+@contextmanager
+def _observation_scope(started: Any) -> Iterator[Any]:
+    """
+    Normalize Langfuse start return values to a context manager.
+    """
+    if hasattr(started, "__enter__") and hasattr(started, "__exit__"):
+        with started as observation:
+            yield observation
+        return
+
+    try:
+        yield started
+    finally:
+        end = getattr(started, "end", None)
+        if callable(end):
+            end()
+
+
+def _safe_end_observation(
+    observation: Any,
+    *,
+    error: object | None = None,
+    metadata: Mapping[str, object] | None = None,
+    output: object | None = None,
+) -> None:
+    """
+    End an observation without assuming keyword support on .end().
+    """
+    if observation is None:
+        return
+    update = getattr(observation, "update", None)
+    extra_meta: dict[str, object] = {}
+    if metadata:
+        extra_meta.update(metadata)
+    if error is not None:
+        extra_meta.setdefault("error", error)
+    payload: dict[str, object] = {}
+    if extra_meta:
+        payload["metadata"] = extra_meta
+    if output is not None:
+        payload["output"] = output
+    try:
+        if callable(update) and payload:
+            update(**payload)
+    finally:
+        end = getattr(observation, "end", None)
+        if callable(end):
+            end()
 
 
 @contextmanager
@@ -191,41 +286,40 @@ def start_root_observation(
     start_fn = getattr(client_any, "start_as_current_observation", None)
     if callable(start_fn):
         start_ctx = cast(Any, start_fn)(**envelope.to_start_kwargs())
-        with start_ctx as observation:
+        with _observation_scope(start_ctx) as observation:
             yield observation
-    else:
-        # Fallback for stubbed clients in tests.
-        class _DummyObs:
-            def __init__(self):
-                self.id = "trace"
-                self.trace_id = "trace"
+        return
 
-            def start_observation(self, **kwargs: object) -> Any:
-                return self
+    # Fallback for stubbed clients in tests.
+    class _DummyObs:
+        def __init__(self):
+            self.id = "trace"
+            self.trace_id = "trace"
 
-            def __enter__(self):
-                return self
+        def start_observation(self, **kwargs: object) -> Any:
+            return self
 
-            def __exit__(
-                self,
-                exc_type: type[BaseException] | None,
-                exc: BaseException | None,
-                tb: TracebackType | None,
-            ) -> bool:
-                return False
+        def __enter__(self):
+            return self
 
-            def end(self, **kwargs: object) -> None:
-                return None
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> bool:
+            self.end()
+            return False
 
-            def update(self, **kwargs: object) -> None:
-                return None
+        def end(self, **kwargs: object) -> None:
+            return None
 
-        obs = _DummyObs()
-        try:
-            yield obs
-        finally:
-            if hasattr(obs, "end"):
-                obs.end()
+        def update(self, **kwargs: object) -> None:
+            return None
+
+    obs = _DummyObs()
+    with _observation_scope(obs) as observation:
+        yield observation
 
 
 @contextmanager
@@ -252,7 +346,8 @@ def start_child_observation(
         metadata=ObservationMetadata(data=metadata) if metadata else None,
         usage_details=usage_details,
     )
-    with parent.start_observation(**envelope.to_start_kwargs()) as observation:
+    started = parent.start_observation(**envelope.to_start_kwargs())
+    with _observation_scope(started) as observation:
         yield observation
 
 

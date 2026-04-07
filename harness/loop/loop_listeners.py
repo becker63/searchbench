@@ -10,24 +10,10 @@ from typing import Any, Mapping, cast
 
 from statemachine import State
 
+from harness.observability.langfuse import _safe_end_observation
 from harness.observability.score_emitter import emit_score_for_handle
 
 from .loop_types import IterationRecord
-
-
-def _safe_end_span(span: object | None, **kwargs: object) -> None:
-    """Best-effort guard for Langfuse span termination."""
-    if span is None or not hasattr(span, "end"):
-        return
-    try:
-        end_kwargs: dict[str, object] = {}
-        metadata = kwargs.pop("metadata", None)
-        if isinstance(metadata, Mapping):
-            end_kwargs.update(dict(metadata))
-        end_kwargs.update(kwargs)
-        cast(Any, span).end(**end_kwargs)
-    except Exception:
-        pass
 
 
 class RepairTracingListener:
@@ -72,7 +58,7 @@ class RepairTracingListener:
             metadata["pipeline_passed"] = False
         if getattr(ctx, "error", None):
             metadata["error"] = ctx.error  # type: ignore[attr-defined]
-        _safe_end_span(ctx.repair_observation, metadata=metadata)
+        _safe_end_observation(ctx.repair_observation, metadata=metadata)
         ctx.repair_observation = None
 
 
@@ -139,7 +125,7 @@ class OptimizationTracingListener:
             failure_val = failure_val or (record.writer_error if record else None)
             if failure_val:
                 metadata["error"] = failure_val
-            _safe_end_span(span, metadata=metadata)
+            _safe_end_observation(span, metadata=metadata)
         machine.model.current_iteration_span = None  # type: ignore[attr-defined]  # noqa: SLF001
 
     def _record_iteration_scores(
