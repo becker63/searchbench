@@ -156,6 +156,7 @@ policy_loader.py
 policy.py
 pyproject.toml
 run.py
+scoring_examples.py
 writer.py
 </directory_structure>
 
@@ -497,13 +498,21 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
     task_results: list[LocalizationEvaluationTaskResult] = []
     for task in tasks:
         try:
-            prediction, metrics, evidence, materialization, usage = run_localization_task(
+            run_result = run_localization_task(
                 task,
                 dataset_source=req.dataset_source,
                 materializer=req.materializer,
                 parent_trace=req.parent_trace,
                 runner=runner,
             )
+            if isinstance(run_result, tuple):
+                if len(run_result) < 4:
+                    raise LocalizationEvaluationError(LocalizationFailureCategory.UNKNOWN, "Runner returned insufficient values", task_id=task.task_id)
+                prediction, metrics, evidence, materialization = run_result[:4]
+                usage = run_result[4] if len(run_result) > 4 else None
+            else:
+                prediction, metrics, evidence, materialization = run_result  # type: ignore[misc]
+                usage = None
             task_results.append(
                 LocalizationEvaluationTaskResult(
                     task=task,
@@ -1732,7 +1741,8 @@ def _usage_from_mapping(data: Mapping[str, object]) -> TokenUsageRecord:
     total_raw = total_raw if isinstance(total_raw, (int, float)) else data.get("total")
 
     has_numeric = any(isinstance(val, (int, float)) for val in (prompt_raw, completion_raw, total_raw))
-    model_name = data.get("model") if isinstance(data.get("model"), str) else None
+    raw_model = data.get("model")
+    model_name: str | None = raw_model if isinstance(raw_model, str) else None
     usage = TokenUsage(
         prompt_tokens=float(prompt_raw) if isinstance(prompt_raw, (int, float)) else None,
         completion_tokens=float(completion_raw) if isinstance(completion_raw, (int, float)) else None,
@@ -2355,6 +2365,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             initial_policy=ctx.evaluation.policy_code,
             tests=ctx.feedback.tests,
             scoring_context=ctx.feedback.scoring_context,
+            scoring_context_details=ctx.feedback.scoring_context_details,
             feedback_str=ctx.feedback.feedback_str,
             guidance_hint=guidance,
             diff_str=ctx.feedback.diff_str,
@@ -2363,7 +2374,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             failure_context_str=ctx.failure_context,
             repair_attempt=ctx.attempts_used,
             parent_trace=ctx.repair_observation,
-            pipeline_feedback=ctx.last_classified.model_dump() if ctx.last_classified else None,
+            pipeline_feedback=ctx.last_classified,
         )
 
         if new_code is None:
@@ -3309,13 +3320,14 @@ from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
 from harness.utils.repo_root import find_repo_root
 from harness.utils.test_loader import format_tests_for_prompt, load_tests
-from harness.utils.type_loader import build_scorer_context, format_scoring_context, load_graph_models, load_scoring_examples, load_scoring_types
+from harness.utils.type_loader import ScorerContext, build_scorer_context, format_scoring_context, load_graph_models, load_scoring_examples, load_scoring_types
 from harness.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 
 if TYPE_CHECKING:
     from harness.localization.evaluation_backend import LocalizationEvaluationRequest as LocalizationEvaluationRequestType
     from harness.observability.baselines import BaselineSnapshot
+    from iterative_context.graph_models import Graph, GraphNode
 else:
     LocalizationEvaluationRequestType = object
 
@@ -3360,6 +3372,7 @@ _REEXPORTED = (
     find_repo_root,
     format_tests_for_prompt,
     load_tests,
+    build_scorer_context,
     format_scoring_context,
     load_scoring_examples,
     load_scoring_types,
@@ -3392,7 +3405,7 @@ def LocalizationEvaluationRequest(
     return _LocalizationEvaluationRequest(*args, **kwargs)
 
 
-def score(node: object, graph: object, step: int) -> float:
+def score(node: "GraphNode", graph: "Graph", step: int) -> float:
     """
     Delegate to policy.score while keeping a stable harness.loop.* attribute for tests/monkeypatching.
     """
@@ -3637,9 +3650,7 @@ def build_iteration_feedback(
     format_tests_for_prompt_fn = cast(
         Callable[[object], str], _pkg_attr("format_tests_for_prompt")
     )
-    load_scoring_types_fn = cast(Callable[[Path], object], _pkg_attr("load_scoring_types"))
-    load_scoring_examples_fn = cast(Callable[[Path], object], _pkg_attr("load_scoring_examples"))
-    build_scorer_context_fn = cast(Callable[[Path], object], _pkg_attr("build_scorer_context"))
+    build_scorer_context_fn = cast(Callable[[Path], ScorerContext], _pkg_attr("build_scorer_context"))
     format_scoring_context_fn = cast(Callable[..., str], _pkg_attr("format_scoring_context"))
     compute_diff_fn = cast(Callable[..., object], _pkg_attr("compute_diff"))
     format_diff_fn = cast(Callable[[object], str], _pkg_attr("format_diff"))
@@ -3647,8 +3658,6 @@ def build_iteration_feedback(
 
     tests = load_tests_fn(repo_root)
     tests_str = format_tests_for_prompt_fn(tests)
-    types_str = load_scoring_types_fn(repo_root)
-    examples_str = load_scoring_examples_fn(repo_root)
     scorer_ctx = build_scorer_context_fn(repo_root)
     scoring_ctx = format_scoring_context_fn(scorer_ctx)
 
@@ -3696,6 +3705,7 @@ def attempt_policy_generation(
     initial_policy: str,
     tests: str,
     scoring_context: str,
+    scoring_context_details: ScorerContext,
     feedback_str: str,
     guidance_hint: str,
     diff_str: str,
@@ -3720,7 +3730,7 @@ def attempt_policy_generation(
             current_policy=initial_policy,
             tests=tests,
             scoring_context=scoring_context,
-            scoring_context_details=feedback.scoring_context_details,
+            scoring_context_details=scoring_context_details,
             feedback_str=str(feedback_str),
             guidance_hint=guidance_hint,
             diff_str=diff_str,
@@ -9328,6 +9338,7 @@ from harness.loop.loop_types import (
     TaskPayload,
 )
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.utils.type_loader import ScorerContext
 
 
 class RecordingSpan:
@@ -9339,9 +9350,11 @@ class RecordingSpan:
 
 
 def _make_feedback() -> FeedbackPackage:
+    scorer_ctx = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
     return FeedbackPackage(
         tests="",
         scoring_context="",
+        scoring_context_details=scorer_ctx,
         comparison_summary=None,
         feedback=FeedbackEntries(),
         feedback_str="",
@@ -10169,7 +10182,8 @@ def test_real_writer_prompt_includes_selection_signature():
             signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
             graph_models="class GraphNode:\n    pass\nclass Graph:\n    ...",
             types="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
-            examples="def score(node, graph, step): ...",
+            examples="from iterative_context.graph_models import Graph, GraphNode\n"
+            "def score(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
             notes="Traversal calls score(node, graph, step).",
         ),
     )
@@ -11099,6 +11113,18 @@ def test_format_scoring_context_includes_selection_and_graph_models():
     assert "SelectionCallable" in rendered
     assert "GraphNode" in rendered
     assert "Graph" in rendered
+
+
+def test_load_scoring_examples_uses_local_file(tmp_path):
+    examples = (
+        "from iterative_context.graph_models import Graph, GraphNode\n"
+        "def score(node: GraphNode, graph: Graph, step: int) -> float:\n"
+        "    return 1.0\n"
+    )
+    (tmp_path / "scoring_examples.py").write_text(examples, encoding="utf-8")
+    loaded = type_loader.load_scoring_examples(tmp_path)
+    assert "GraphNode" in loaded
+    assert "score(node: GraphNode, graph: Graph, step: int)" in loaded
 </file>
 
 <file path="tests_harness/test_writer.py">
@@ -11314,7 +11340,15 @@ def test_scoring_context_is_derived_from_structured_context(monkeypatch):
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
     monkeypatch.setattr(writer, "format_scoring_context", fake_format)
     inputs = _base_inputs()
-    inputs["scoring_context"] = ""  # force derivation
+    inputs["scoring_context"] = ""  # force derivation from structured context
+    inputs["scoring_context_details"] = ScorerContext(
+        signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        graph_models="",
+        types="",
+        examples="from iterative_context.graph_models import Graph, GraphNode\n"
+        "def score(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
+        notes="",
+    )
     writer.generate_policy(**inputs)
     assert derived and derived[0] == "SelectionCallable = Callable[[GraphNode, Graph, int], float]"
 </file>
@@ -11527,6 +11561,9 @@ from harness.loop.loop_types import (
 )
 from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.utils.type_loader import ScorerContext
+
+STUB_SCORER_CTX = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
 
 
 def _stub_deps() -> LoopDependencies:
@@ -11546,6 +11583,7 @@ def _stub_deps() -> LoopDependencies:
     dummy_feedback = FeedbackPackage(
         tests="",
         scoring_context="",
+        scoring_context_details=STUB_SCORER_CTX,
         comparison_summary=None,
         feedback=FeedbackEntries(),
         feedback_str="",
@@ -11630,6 +11668,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
         feedback=FeedbackPackage(
             tests="",
             scoring_context="",
+            scoring_context_details=STUB_SCORER_CTX,
             comparison_summary=None,
             feedback=FeedbackEntries(),
             feedback_str="",
@@ -12421,7 +12460,13 @@ def load_graph_models(repo_root: Path) -> str:
     """
     Load graph model definitions for scorer context.
     """
-    models_path = repo_root / "iterative-context" / "src" / "iterative_context" / "graph_models.py"
+    models_path = (
+        repo_root
+        / "iterative-context"
+        / "src"
+        / "iterative_context"
+        / "graph_models.py"
+    )
     if not models_path.exists():
         return ""
     try:
@@ -12434,7 +12479,9 @@ def load_scoring_types(repo_root: Path) -> str:
     """
     Load canonical scoring type definitions from iterative-context.
     """
-    types_path = repo_root / "iterative-context" / "src" / "iterative_context" / "types.py"
+    types_path = (
+        repo_root / "iterative-context" / "src" / "iterative_context" / "types.py"
+    )
     if not types_path.exists():
         return ""
     try:
@@ -12444,13 +12491,18 @@ def load_scoring_types(repo_root: Path) -> str:
 
 
 def load_scoring_examples(repo_root: Path) -> str:
-    scoring_path = repo_root / "iterative-context" / "src" / "iterative_context" / "scoring.py"
-    if not scoring_path.exists():
-        return ""
-    try:
-        return scoring_path.read_text(encoding="utf-8")
-    except Exception:
-        return ""
+    scoring_paths = [
+        repo_root / "harness" / "scoring_examples.py",
+        repo_root / "scoring_examples.py",
+    ]
+    for scoring_path in scoring_paths:
+        if not scoring_path.exists():
+            continue
+        try:
+            return scoring_path.read_text(encoding="utf-8")
+        except Exception:
+            return ""
+    return ""
 
 
 def build_scorer_context(repo_root: Path) -> ScorerContext:
@@ -12470,7 +12522,10 @@ def format_scoring_context(ctx: ScorerContext, max_chars: int = 8000) -> str:
     """
     parts: list[str] = [f"# CANONICAL SIGNATURE\n{ctx.signature}"]
     if ctx.graph_models:
-        parts.append("# GRAPH MODELS (Graph, GraphNode, Node variants, Edge/Event types)\n" + ctx.graph_models)
+        parts.append(
+            "# GRAPH MODELS (Graph, GraphNode, Node variants, Edge/Event types)\n"
+            + ctx.graph_models
+        )
     if ctx.types:
         parts.append(f"# TYPES (source of truth)\n{ctx.types}")
     if ctx.examples:
@@ -12610,7 +12665,7 @@ def score(node: GraphNode, graph: Graph, step: int) -> float:
     total += degree * 0.5
 
     if node.state in ("anchor", "resolved"):
-        tokens_val = node.tokens
+        tokens_val = getattr(node, "tokens", None)
         if isinstance(tokens_val, (int, float)):
             total += min(tokens_val, 50) * 0.1
 
@@ -13115,6 +13170,226 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+</file>
+
+<file path="scoring_examples.py">
+from __future__ import annotations
+
+"""
+Example scoring policies aligned to Iterative Context's public scorer contract.
+
+This file is meant to teach policy authors and the writer model the expected
+shape of a scoring function:
+
+    score(node: GraphNode, graph: Graph, step: int) -> float
+
+It intentionally contains multiple examples with different styles:
+- `score_basic`: minimal and readable
+- `score_connectivity_first`: favors graph structure
+- `score_token_aware`: uses state narrowing and token information
+- `score_conservative`: heavily avoids pruned/resolved nodes
+- `score`: default balanced example
+
+Guidelines demonstrated here:
+- use direct typed access for stable fields like `node.id` and `node.state`
+- use explicit state narrowing for variant-specific fields like `tokens`
+- use graph methods directly when they are part of the intended contract
+- keep policies deterministic and side-effect free
+"""
+
+from iterative_context.graph_models import (  # type: ignore[import-not-found]
+    Graph,
+    GraphNode,
+)
+
+
+def _degree(node: GraphNode, graph: Graph) -> int:
+    """Return total local degree for a node."""
+    return int(graph.in_degree(node.id) + graph.out_degree(node.id))
+
+
+def _bounded_tokens(node: GraphNode, cap: float = 200.0) -> float:
+    """
+    Read token information only for node variants that actually carry it.
+    Demonstrates explicit state narrowing instead of defensive getattr usage.
+    """
+    if node.state == "anchor":
+        tokens_val = node.tokens
+        if isinstance(tokens_val, (int, float)):
+            return min(float(tokens_val), cap)
+        return 0.0
+
+    if node.state == "resolved":
+        return min(float(node.tokens), cap)
+
+    return 0.0
+
+
+def score_basic(node: GraphNode, graph: Graph, step: int) -> float:
+    """
+    Minimal example:
+    - prefer pending and anchor nodes
+    - reward local degree
+    - lightly reward tokens on anchor/resolved nodes
+    """
+    total = 0.0
+
+    if node.state == "pending":
+        total += 5.0
+    elif node.state == "anchor":
+        total += 10.0
+    elif node.state == "resolved":
+        total += 1.0
+    elif node.state == "pruned":
+        total -= 100.0
+
+    total += _degree(node, graph) * 0.5
+    total += _bounded_tokens(node, cap=50.0) * 0.1
+    total += min(float(step), 5.0) * 0.25
+
+    return float(total)
+
+
+def score_connectivity_first(node: GraphNode, graph: Graph, step: int) -> float:
+    """
+    Connectivity-heavy example:
+    - still respects state
+    - cares much more about graph structure than tokens
+    """
+    total = 0.0
+    degree = _degree(node, graph)
+
+    if node.state == "anchor":
+        total += 8.0
+    elif node.state == "pending":
+        total += 4.0
+    elif node.state == "resolved":
+        total -= 1.0
+    elif node.state == "pruned":
+        total -= 100.0
+
+    total += min(float(degree), 30.0) * 0.9
+
+    # Small iteration bonus to encourage lookahead paths later in traversal.
+    total += min(float(step), 8.0) * 0.15
+
+    return float(total)
+
+
+def score_token_aware(node: GraphNode, graph: Graph, step: int) -> float:
+    """
+    Token-aware example:
+    - prefers anchors
+    - uses token information for anchor/resolved nodes
+    - gently penalizes very large contexts
+    """
+    total = 0.0
+
+    if node.state == "anchor":
+        total += 10.0
+    elif node.state == "pending":
+        total += 6.0
+    elif node.state == "resolved":
+        total += 2.0
+    elif node.state == "pruned":
+        total -= 100.0
+
+    degree = _degree(node, graph)
+    total += min(float(degree), 20.0) * 0.35
+
+    tokens = _bounded_tokens(node, cap=500.0)
+    if tokens > 0.0:
+        # Reward presence of useful evidence/tokens, but taper off.
+        total += min(tokens, 120.0) * 0.06
+        # Slight penalty for very large token footprints.
+        if tokens > 150.0:
+            total -= (tokens - 150.0) * 0.015
+
+    total += min(float(step), 6.0) * 0.2
+
+    return float(total)
+
+
+def score_conservative(node: GraphNode, graph: Graph, step: int) -> float:
+    """
+    Conservative example:
+    - strongly prefers pending/anchor
+    - strongly demotes resolved/pruned
+    - uses degree as a secondary signal
+    """
+    total = 0.0
+
+    if node.state == "pending":
+        total += 8.0
+    elif node.state == "anchor":
+        total += 12.0
+    elif node.state == "resolved":
+        total -= 6.0
+    elif node.state == "pruned":
+        total -= 100.0
+
+    degree = _degree(node, graph)
+    total += min(float(degree), 15.0) * 0.3
+
+    if node.state == "anchor":
+        tokens = _bounded_tokens(node, cap=100.0)
+        total += tokens * 0.04
+
+    # Conservative policies often care less about step.
+    total += min(float(step), 3.0) * 0.1
+
+    return float(total)
+
+
+def score_balanced(node: GraphNode, graph: Graph, step: int) -> float:
+    """
+    Balanced example:
+    - combines state priority
+    - moderate structural reward
+    - moderate token reward
+    - mild step awareness
+    """
+    total = 0.0
+
+    if node.state == "pending":
+        total += 5.5
+    elif node.state == "anchor":
+        total += 10.5
+    elif node.state == "resolved":
+        total += 1.5
+    elif node.state == "pruned":
+        total -= 100.0
+
+    degree = _degree(node, graph)
+    total += min(float(degree), 25.0) * 0.45
+
+    tokens = _bounded_tokens(node, cap=120.0)
+    if tokens > 0.0:
+        total += tokens * 0.08
+
+    total += min(float(step), 5.0) * 0.2
+
+    return float(total)
+
+
+def score(node: GraphNode, graph: Graph, step: int) -> float:
+    """
+    Default example scoring function aligned to SelectionCallable.
+
+    Searchbench can use this as the primary example while still exposing the
+    other examples in this file for the writer to learn from.
+    """
+    return score_balanced(node, graph, step)
+
+
+__all__ = [
+    "score",
+    "score_basic",
+    "score_connectivity_first",
+    "score_token_aware",
+    "score_conservative",
+    "score_balanced",
+]
 </file>
 
 <file path="writer.py">

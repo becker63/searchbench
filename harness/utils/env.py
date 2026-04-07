@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from dotenv import load_dotenv
 
 _loaded = False
@@ -31,7 +30,7 @@ def getenv_bool(key: str, default: bool = False) -> bool:
 
 
 def get_runner_model() -> str:
-    return getenv("RUNNER_MODEL", "llama3.1-8b") or "llama3.1-8b"
+    return getenv("RUNNER_MODEL", "gpt-oss-120b") or "gpt-oss-120b"
 
 
 def get_writer_model() -> str:

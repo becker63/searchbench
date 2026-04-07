@@ -3,21 +3,34 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Mapping, Tuple, cast
 
+from harness.localization.errors import (
+    LocalizationEvaluationError,
+    LocalizationFailureCategory,
+)
 from harness.localization.eval import build_file_localization_eval_record
-from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materializer import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
     RepoMaterializer,
 )
-from harness.localization.models import LCAPrediction, LCATask, LocalizationEvidence, LocalizationMetrics
-from harness.localization.token_usage import TokenUsageRecord, extract_token_usage_record
+from harness.localization.models import (
+    LCAPrediction,
+    LCATask,
+    LocalizationEvidence,
+    LocalizationMetrics,
+)
 from harness.localization.telemetry import build_localization_telemetry
+from harness.localization.token_usage import (
+    TokenUsageRecord,
+    extract_token_usage_record,
+)
 from harness.observability.langfuse import start_observation
 from harness.observability.score_emitter import emit_score_for_handle
 
 
-def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> RepoMaterializationResult | None:
+def _materialize_repo(
+    task: LCATask, materializer: RepoMaterializer | None
+) -> RepoMaterializationResult | None:
     if materializer is None:
         return None
     request = RepoMaterializationRequest(
@@ -31,8 +44,12 @@ def _materialize_repo(task: LCATask, materializer: RepoMaterializer | None) -> R
     return materializer.materialize(request)
 
 
-def _resolve_repo_path(task: LCATask, materialization_result: RepoMaterializationResult | None) -> Path:
-    repo_path: Path | None = materialization_result.local_path if materialization_result else None
+def _resolve_repo_path(
+    task: LCATask, materialization_result: RepoMaterializationResult | None
+) -> Path:
+    repo_path: Path | None = (
+        materialization_result.local_path if materialization_result else None
+    )
     if repo_path is None and task.repo:
         repo_path = Path(task.repo).expanduser()
     if repo_path is None:
@@ -54,7 +71,10 @@ def _run_runner(
     task: LCATask,
     repo_path: Path,
     trace: object | None,
-    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None,
+    runner: Callable[
+        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+    ]
+    | None,
 ) -> tuple[list[str], Mapping[str, object] | None]:
     runner_fn = runner or _default_runner
     try:
@@ -62,7 +82,9 @@ def _run_runner(
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
-        raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, str(exc), task_id=task.task_id) from exc
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.RUNNER, str(exc), task_id=task.task_id
+        ) from exc
     if not predicted_files:
         raise LocalizationEvaluationError(
             LocalizationFailureCategory.RUNNER,
@@ -73,7 +95,9 @@ def _run_runner(
     return predicted_files, result_map
 
 
-def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) -> tuple[list[str], Mapping[str, object] | None]:
+def _default_runner(
+    lca_task: LCATask, repo_path: str, parent: object | None
+) -> tuple[list[str], Mapping[str, object] | None]:
     from harness import loop as loop_pkg
 
     run_ic_iteration_fn = getattr(loop_pkg, "run_ic_iteration")
@@ -98,16 +122,24 @@ def _default_runner(lca_task: LCATask, repo_path: str, parent: object | None) ->
     return predictions, result
 
 
-def _score_task(task: LCATask, prediction: LCAPrediction, repo_path: Path) -> LocalizationMetrics:
+def _score_task(
+    task: LCATask, prediction: LCAPrediction, repo_path: Path
+) -> LocalizationMetrics:
     try:
         eval_record = build_file_localization_eval_record(
-            task.identity, prediction, task.gold, evidence=task.evidence, repo_path=repo_path
+            task.identity,
+            prediction,
+            task.gold,
+            evidence=task.evidence,
+            repo_path=repo_path,
         )
         return eval_record.metrics
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
-        raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, str(exc), task_id=task.task_id) from exc
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.SCORING, str(exc), task_id=task.task_id
+        ) from exc
 
 
 def _emit_telemetry(
@@ -138,12 +170,17 @@ def _emit_telemetry(
             value=float(metric_value),
             data_type="NUMERIC",
             dataset_run_id=dataset_run_id,
-            score_id=f"{getattr(trace, 'id', None)}-localization.{metric_name}" if getattr(trace, "id", None) else None,
+            score_id=f"{getattr(trace, 'id', None)}-localization.{metric_name}"
+            if getattr(trace, "id", None)
+            else None,
         )
     if trace:
         try:
             trace_any = cast(Any, trace)
-            trace_any.metadata = {**getattr(trace_any, "metadata", {}), "telemetry": telemetry.model_dump(exclude_none=True)}
+            trace_any.metadata = {
+                **getattr(trace_any, "metadata", {}),
+                "telemetry": telemetry.model_dump(exclude_none=True),
+            }
         except Exception:
             pass
 
@@ -153,8 +190,17 @@ def run_localization_task(
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
-    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
-) -> Tuple[LCAPrediction, LocalizationMetrics, LocalizationEvidence | None, RepoMaterializationResult | None, TokenUsageRecord]:
+    runner: Callable[
+        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+    ]
+    | None = None,
+) -> Tuple[
+    LCAPrediction,
+    LocalizationMetrics,
+    LocalizationEvidence | None,
+    RepoMaterializationResult | None,
+    TokenUsageRecord,
+]:
     """
     Execute a single localization task end to end (leaf helper):
     - materialize repo at base_sha (if a materializer is provided)
@@ -180,12 +226,19 @@ def run_localization_task(
         try:
             materialization_result = _materialize_repo(task, materializer)
         except Exception as exc:
-            raise LocalizationEvaluationError(LocalizationFailureCategory.MATERIALIZATION, str(exc), task_id=task.task_id) from exc
+            raise LocalizationEvaluationError(
+                LocalizationFailureCategory.MATERIALIZATION,
+                str(exc),
+                task_id=task.task_id,
+            ) from exc
         repo_path = _resolve_repo_path(task, materialization_result)
         predicted_files, runner_result = _run_runner(task, repo_path, trace, runner)
         prediction = LCAPrediction(predicted_files=predicted_files)
         metrics = _score_task(task, prediction, repo_path)
-        usage = extract_token_usage_record(runner_result if isinstance(runner_result, Mapping) else None, source="runner")
+        usage = extract_token_usage_record(
+            runner_result if isinstance(runner_result, Mapping) else None,
+            source="runner",
+        )
         _emit_telemetry(
             task=task,
             metrics=metrics,
