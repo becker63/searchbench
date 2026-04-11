@@ -1015,7 +1015,7 @@ By default both machines are rendered; use `--machine optimization` or `--machin
   - GPT OSS 120B — input $0.35/M, output $0.75/M; regex `(?i)gpt[-_ ]oss[-_ ]120b`
   - Llama 3.1 8B — input $0.10/M, output $0.10/M; regex `(?i)llama[-_ ]3\.1[-_ ]8b`
   - Qwen 3 235B Instruct — input $0.60/M, output $1.20/M; regex `(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct`
-- Sync helper: `observability.cerebras_pricing.sync_cerebras_models()` calls `client.api.models.create` for each entry (requires Langfuse Cloud credentials).
+- Sync helper: `telemetry.cerebras_pricing.sync_cerebras_models()` calls `client.api.models.create` for each entry (requires Langfuse Cloud credentials).
 - Generations must include `model` and `usage_details` (OpenAI-style prompt/completion/total) so Langfuse can infer cost. If the provider omits usage, supply it explicitly or add an estimator; do not emit zeroed usage.
 - Token usage extraction is deterministic and explicit: readers look for `usage_details`/`usage` at the top level, in `raw`, or in observations; absence stays `available=False` with null fields and is never coerced to zero.
 - Projection vs observed costs: CLI projections for dataset-backed runs are tagged separately as projection metadata (selection window + fixed planned/hard-cap totals). Do not mix projected values into observed Langfuse usage/cost fields. If pricing is unknown, projection fails closed instead of emitting a pseudo-cost.
@@ -1030,9 +1030,9 @@ By default both machines are rendered; use `--machine optimization` or `--machin
 ## Tracing ownership (listener-owned)
 
 - Run/root spans are created once by orchestration bootstrap/listener layers before state machine execution; entrypoints may nest under an external parent but do not create iteration/repair roots.
-- Iteration/repair spans and high-level metrics are listener/state-machine owned; `loop.py` remains wiring-only and does not create tracing policy or roots.
+- Iteration/repair spans and high-level metrics are listener/state-machine owned; `orchestration/runtime.py` remains wiring-only and does not create tracing policy or roots.
 - Evaluation spans are opened by the machine-owned evaluation hook (state-machine layer) and passed as parents to the shared LCA evaluation backend; LCA opens child dataset/task/materialization spans under that parent.
-- Leaf modules (`loop/runner_agent.py`, `writer.py`, pipeline helpers, baselines) emit child spans only; they require a parent span and must fail/guard rather than create new roots unless an explicit, documented no-op is chosen.
+- Leaf modules (`agents/writer.py`, pipeline helpers, baselines) emit child spans only; they require a parent span and must fail/guard rather than create new roots unless an explicit, documented no-op is chosen.
 - Allowed leaf spans: writer attempts, backend/model/tool calls, usage/cost/latency, pipeline steps, baseline items — all attached to provided parents.
 - Disallowed patterns: leaf-created roots, competing iteration/repair spans, split ownership of high-level scores, silent root creation when no parent is provided.
 - Shared evaluation backend is the canonical evaluation path for machine and hosted runs; tracing follows the machine-owned evaluation span → backend child spans layering.
@@ -1065,9 +1065,6 @@ except ImportError:
     tty = None  # type: ignore
     termios = None  # type: ignore
 
-from harness.localization.evaluate import (
-    LocalizationEvaluationRequest,
-)
 from harness.localization.evaluate import (
     evaluate_localization_batch as _evaluate_localization_batch,
 )
@@ -1176,11 +1173,11 @@ def _raw_mode(file_obj: IO[Any]) -> Iterator[None]:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def evaluate_localization_batch(req: LocalizationEvaluationRequest):
+def evaluate_localization_batch(**kwargs: object):
     """
     Thin wrapper to keep monkeypatch targets stable for tests while deferring import cycles.
     """
-    return _evaluate_localization_batch(req)
+    return _evaluate_localization_batch(**kwargs)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -2714,33 +2711,30 @@ class LocalizationEvaluationResult(BaseModel):
     failure: LocalizationEvaluationFailure | None = None
 
 
-class LocalizationEvaluationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
-
-    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]]
-    dataset_source: str | None = None
-    materializer: RepoMaterializer | None = None
-    parent_trace: object | None = None
-    runner: LocalizationRunner | None = None
-    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE
-
-
-def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> LocalizationEvaluationResult:
+def evaluate_localization_batch(
+    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
+    *,
+    dataset_source: str | None = None,
+    materializer: RepoMaterializer | None = None,
+    parent_trace: object | None = None,
+    runner: LocalizationRunner | None = None,
+    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
+) -> LocalizationEvaluationResult:
     """
     Shared localization evaluation backend used by the optimization/repair machine and hosted wrappers.
     Executes each task via run_localization_task, aggregates scores, and returns typed results/failures.
     """
-    tasks = [t if isinstance(t, LCATask) else normalize_lca_task(t) for t in req.tasks]
-    runner = req.runner or DEFAULT_LOCALIZATION_RUNNER
+    normalized_tasks = [t if isinstance(t, LCATask) else normalize_lca_task(t) for t in tasks]
+    resolved_runner = runner or DEFAULT_LOCALIZATION_RUNNER
     task_results: list[LocalizationEvaluationTaskResult] = []
-    for task in tasks:
+    for task in normalized_tasks:
         try:
             run_result = run_localization_task(
                 task,
-                dataset_source=req.dataset_source,
-                materializer=req.materializer,
-                parent_trace=req.parent_trace,
-                runner=runner,
+                dataset_source=dataset_source,
+                materializer=materializer,
+                parent_trace=parent_trace,
+                runner=resolved_runner,
             )
             if isinstance(run_result, tuple):
                 if len(run_result) < 4:
@@ -2757,7 +2751,7 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
                     prediction=list(prediction.predicted_files),
                     evidence=evidence,
                     materialization=materialization,
-                    trace_id=getattr(req.parent_trace, "id", None),
+                    trace_id=getattr(parent_trace, "id", None),
                     token_usage=usage,
                 )
             )
@@ -2779,10 +2773,11 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
                 hit=_avg(res.metrics.hit for res in task_results) or 0.0,
                 score=aggregate_score,
             )
+        resolved_policy = machine_score_policy or MachineScorePolicy.AGGREGATE
         machine_score = _derive_machine_score(
             aggregate_score=aggregate_score,
             aggregate_metrics=aggregate_metrics,
-            policy=req.machine_score_policy or MachineScorePolicy.AGGREGATE,
+            policy=resolved_policy,
         )
         return LocalizationEvaluationResult(
             aggregate_score=aggregate_score,
@@ -5057,11 +5052,8 @@ from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LC
 from harness.orchestration.types import SpanHandle
 
 if TYPE_CHECKING:
-    from harness.localization.evaluate import LocalizationEvaluationRequest as LocalizationEvaluationRequestType
     from harness.telemetry.baselines import BaselineSnapshot
     from iterative_context.graph_models import Graph, GraphNode
-else:
-    LocalizationEvaluationRequestType = object
 
 from .machine import OptimizationStateMachine
 from .types import (
@@ -5091,7 +5083,7 @@ _MAX_POLICY_REPAIRS = 3
 _MAX_FAILURE_SUMMARY_CHARS = 400
 
 
-# Re-exported helpers so callers can monkeypatch harness.loop.* directly.
+# Re-exported helpers so callers can monkeypatch harness.orchestration.runtime.* directly.
 _REEXPORTED = (
     index_folder,
     load_policy,
@@ -5116,29 +5108,19 @@ _REEXPORTED = (
 )
 
 
-def evaluate_localization_batch(req: "LocalizationEvaluationRequestType"):
+def evaluate_localization_batch(**kwargs: object):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
+    Forwards keyword arguments directly to harness.localization.evaluate.evaluate_localization_batch.
     """
     from harness.localization.evaluate import evaluate_localization_batch as _evaluate_localization_batch
 
-    return _evaluate_localization_batch(req)
-
-
-def LocalizationEvaluationRequest(
-    *args: object, **kwargs: object
-) -> "LocalizationEvaluationRequestType":
-    """
-    Lazy proxy for the evaluation request model so tests can monkeypatch the symbol on this module.
-    """
-    from harness.localization.evaluate import LocalizationEvaluationRequest as _LocalizationEvaluationRequest
-
-    return _LocalizationEvaluationRequest(*args, **kwargs)
+    return _evaluate_localization_batch(**kwargs)
 
 
 def score(node: "GraphNode", graph: "Graph", step: int) -> float:
     """
-    Delegate to policy.score while keeping a stable harness.loop.* attribute for tests/monkeypatching.
+    Delegate to policy.score while keeping a stable monkeypatchable attribute on this module.
     """
     from harness.policy import score as _policy_score
 
@@ -5298,13 +5280,12 @@ def evaluate_policy_on_item(
         gold=LCAGold(changed_files=list(ic_task.changed_files)),
         repo=ic_task.repo,
     )
-    eval_req = LocalizationEvaluationRequest(
+    eval_result = evaluate_localization_batch(
         tasks=[lca_task],
         dataset_source=None,
         materializer=None,
         parent_trace=iteration_span,
     )
-    eval_result = evaluate_localization_batch(eval_req)
     if eval_result.failure:
         failure_metrics: dict[str, float | int | bool | None] = {
             "score": -10.0,
@@ -5841,7 +5822,7 @@ class FeedbackEntries(BaseModel):
 
 
 class TaskPayload(BaseModel):
-    """Localization-native task payload passed into loop/runner agents."""
+    """Localization-native task payload passed into orchestration/evaluation agents."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -7081,7 +7062,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.localization.evaluate import (
     LocalizationEvaluationFailure,
-    LocalizationEvaluationRequest,
     evaluate_localization_batch,
 )
 from harness.localization.materialize import RepoMaterializer, RepoMaterializationResult
@@ -7165,14 +7145,13 @@ def compute_baseline_for_task(
                 "identity": task.task_id,
             },
         ) as trace:
-            eval_request = LocalizationEvaluationRequest(
+            eval_result = evaluate_localization_batch(
                 tasks=[task],
                 dataset_source=dataset_source,
                 materializer=materializer,
                 parent_trace=trace,
                 runner=runner,
             )
-            eval_result = evaluate_localization_batch(eval_request)
             if eval_result.failure or not eval_result.items:
                 failure = eval_result.failure or LocalizationEvaluationFailure(
                     category=LocalizationFailureCategory.UNKNOWN, message="baseline_evaluation_failed", task_id=task.task_id
@@ -7589,7 +7568,6 @@ from pydantic import BaseModel, Field
 
 from harness.localization.evaluate import (
     LocalizationEvaluationFailure,
-    LocalizationEvaluationRequest,
     evaluate_localization_batch,
 )
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
@@ -7870,12 +7848,10 @@ def _run_experiment_task(
     try:
         with propagate_context(session_id=session_id):
             eval_result = evaluate_localization_batch(
-                LocalizationEvaluationRequest(
-                    tasks=[normalized_task],
-                    dataset_source="huggingface",
-                    materializer=materializer,
-                    parent_trace=parent_trace,
-                )
+                tasks=[normalized_task],
+                dataset_source="huggingface",
+                materializer=materializer,
+                parent_trace=parent_trace,
             )
         if eval_result.failure or not eval_result.items:
             failure = eval_result.failure or LocalizationEvaluationFailure(
@@ -9758,8 +9734,8 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
     from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
     from harness.localization.models import LocalizationMetrics, LocalizationPrediction
 
-    def fake_backend(req):
-        calls.append(req)
+    def fake_backend(**kwargs):
+        calls.append(kwargs)
         metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
         return LocalizationEvaluationResult(
             aggregate_score=1.0,
@@ -10124,8 +10100,8 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
     from harness.localization.models import LocalizationMetrics
 
-    def fake_backend(req):
-        calls.append(req)
+    def fake_backend(**kwargs):
+        calls.append(kwargs)
         metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
         return LocalizationEvaluationResult(
             aggregate_score=1.0,
@@ -10170,8 +10146,8 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
     tasks = [t2, t1]  # intentionally unsorted to exercise deterministic selection
     durations = {t1.task_id: 0.05, t2.task_id: 0.01}
 
-    def fake_backend(req):
-        task = req.tasks[0]
+    def fake_backend(**kwargs):
+        task = kwargs["tasks"][0]
         time.sleep(durations[task.task_id])
         metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
         return LocalizationEvaluationResult(
@@ -10212,8 +10188,8 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
     t2 = _task(str(repo_root / "r2"))
     calls = []
 
-    def fake_backend(req):
-        task = req.tasks[0]
+    def fake_backend(**kwargs):
+        task = kwargs["tasks"][0]
         calls.append(task.task_id)
         if task.task_id == t2.task_id:
             raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, "runner failed", task_id=task.task_id)
@@ -10258,8 +10234,8 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
     t2 = _task(str(repo_root / "r2"))
     calls = []
 
-    def fake_backend(req):
-        task = req.tasks[0]
+    def fake_backend(**kwargs):
+        task = kwargs["tasks"][0]
         calls.append(task.task_id)
         metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
         return LocalizationEvaluationResult(
@@ -10673,7 +10649,6 @@ from pathlib import Path
 
 from harness.localization.evaluate import (
     DEFAULT_LOCALIZATION_RUNNER,
-    LocalizationEvaluationRequest,
     MachineScorePolicy,
     evaluate_localization_batch,
 )
@@ -10709,7 +10684,7 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )
     assert result.failure is None
     assert result.aggregate_score == 1.0
@@ -10728,7 +10703,7 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
         raising=False,
     )
     result = evaluate_localization_batch(
-        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.RUNNER
@@ -10768,7 +10743,7 @@ def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        LocalizationEvaluationRequest(tasks=[task], dataset_source="huggingface", materializer=None, parent_trace=None)
+        tasks=[task], dataset_source="huggingface", materializer=None, parent_trace=None
     )
     assert result.failure is None
     assert result.aggregate_score == 1.0
@@ -10791,13 +10766,11 @@ def test_machine_score_policy(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        LocalizationEvaluationRequest(
-            tasks=[task],
-            dataset_source="test",
-            materializer=None,
-            parent_trace=None,
-            machine_score_policy=MachineScorePolicy.HIT,
-        )
+        tasks=[task],
+        dataset_source="test",
+        materializer=None,
+        parent_trace=None,
+        machine_score_policy=MachineScorePolicy.HIT,
     )
     assert result.failure is None
     assert result.machine_score == 1.0
@@ -10816,7 +10789,7 @@ def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING
@@ -10839,7 +10812,7 @@ def test_machine_score_policy_failure_is_typed(monkeypatch, tmp_path) -> None:
         raising=True,
     )
     result = evaluate_localization_batch(
-        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING
@@ -10862,7 +10835,7 @@ def test_aggregate_metrics_failure_is_typed(monkeypatch, tmp_path) -> None:
     )
     monkeypatch.setattr("harness.localization.evaluate.LocalizationMetrics", BadMetrics, raising=False)
     result = evaluate_localization_batch(
-        LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
+        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING
@@ -11125,7 +11098,7 @@ def test_machine_uses_machine_score(monkeypatch, tmp_path):
         failure=None,
     )
 
-    def fake_backend(req):
+    def fake_backend(**kwargs):
         return eval_result
 
     monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend)
@@ -11150,11 +11123,12 @@ def test_machine_score_policy_changes_control(monkeypatch, tmp_path):
     )
     metrics = LocalizationMetrics(precision=0.2, recall=0.8, f1=0.32, hit=1.0, score=0.32)
 
-    def fake_backend(req):
+    def fake_backend(**kwargs):
+        policy = kwargs.get("machine_score_policy", MachineScorePolicy.AGGREGATE)
         return LocalizationEvaluationResult(
             aggregate_score=metrics.score,
             aggregate_metrics=metrics,
-            machine_score=metrics.hit if req.machine_score_policy == MachineScorePolicy.HIT else metrics.score,
+            machine_score=metrics.hit if policy == MachineScorePolicy.HIT else metrics.score,
             items=[
                 LocalizationEvaluationTaskResult(
                     task=LCATask(identity=ic_task.identity, context=ic_task.context, gold=LCAGold(changed_files=["a.py"]), repo=ic_task.repo),
@@ -11167,13 +11141,14 @@ def test_machine_score_policy_changes_control(monkeypatch, tmp_path):
 
     monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend)
 
-    # Default policy uses aggregate (score)
     res_default = evaluate_policy_on_item(ic_task, None, None, 0)
     assert res_default.control_score == pytest.approx(metrics.score)
-    # Force HIT policy
-    from harness.localization.evaluate import LocalizationEvaluationRequest
 
-    monkeypatch.setattr("harness.orchestration.runtime.LocalizationEvaluationRequest", lambda **kwargs: LocalizationEvaluationRequest(machine_score_policy=MachineScorePolicy.HIT, **kwargs))
+    def fake_backend_hit(**kwargs):
+        kwargs["machine_score_policy"] = MachineScorePolicy.HIT
+        return fake_backend(**kwargs)
+
+    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend_hit)
     res_hit = evaluate_policy_on_item(ic_task, None, None, 0)
     assert res_hit.control_score == pytest.approx(metrics.hit)
     assert res_hit.metrics.get("score") == pytest.approx(metrics.score)
@@ -14345,9 +14320,9 @@ todo.md
 ## Tracing & Scoring
 
 Orchestration-scoped tracing is owned by the state machines and their listeners:
-- `loop_machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
-- `loop_listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, metric recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration metrics now record only `metrics.score` (no legacy metrics).
-- `loop.py`: thin bootstrap/wiring layer — constructs context, dependencies, and the optimization machine; converts iteration records to public output shape. Not responsible for tracing or orchestration.
+- `orchestration/machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
+- `orchestration/listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, metric recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration metrics now record only `metrics.score` (no legacy metrics).
+- `orchestration/runtime.py`: thin bootstrap/wiring layer — constructs context, dependencies, and the optimization machine; converts iteration records to public output shape. Not responsible for tracing or orchestration.
 
 Leaf-operation observability remains with:
 - `runner.py`: model calls and MCP tool invocations traced via Langfuse spans.
@@ -14360,7 +14335,7 @@ Leaf-operation observability remains with:
 - Localization baseline (hosted dataset): `python run.py --mode localization-baseline --dataset DATASET_NAME [--version v1] [--config py] [--split dev] [--baseline-path bundle.json]`
 - Localization experiment (hosted dataset): `python run.py --mode localization-experiment --dataset DATASET_NAME [--version v1] [--config py] [--split dev]`
 - Console output is concise; Langfuse stores detailed traces/scores. `flush_langfuse()` runs on exit.
-- To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.observability.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `observability/cerebras_pricing.py`.
+- To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/cerebras_pricing.py`.
 
 ## Policy Loading
 - `policy_loader.py` now loads `policy.py` and requires the public Iterative Context scorer contract `score(node: GraphNode, graph: Graph, step: int) -> float` (SelectionCallable). No sandbox or restricted execution.
