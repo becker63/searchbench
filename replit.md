@@ -66,13 +66,6 @@ harness/
   tools/               CLI tools (loop_viz, sync_cerebras_models)
 ```
 
-### Backward-Compatibility Shims
-
-The following old package paths still work via re-export shims but should not be used in new code:
-- `harness.loop` → use `harness.orchestration`
-- `harness.observability` → use `harness.telemetry`
-- `harness.tools.backends` → use `harness.backends`
-
 ### Workspace Submodules
 
 - **`iterative-context/`** — Graph-based codebase exploration (cloned directly)
