@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 """
-Agent execution and backend orchestration for iterative-context and jcodemunch flows.
-Kept within the localization-first repo shape; no legacy top-level runner wrapper.
+Localizer agent: LLM/tool-execution layer for iterative-context and jcodemunch
+bug-localization flows.  Owns message construction, model calls, tool dispatch,
+context-budget management, finalization, and retry logic.
 """
 
 import json

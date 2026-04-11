@@ -10,7 +10,7 @@ import pytest
 from mcp.types import TextContent, Tool
 
 from harness.localization.models import LCAContext, LCATaskIdentity
-from harness.localization.runtime import agent_runtime as runner
+from harness.agents import localizer as runner
 from harness.backends.ic import IterativeContextBackend
 from harness.backends.jc import JCodeMunchBackend
 from harness.backends.mcp import (

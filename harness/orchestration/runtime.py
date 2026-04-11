@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol, cast
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
-from harness.localization.runtime.agent_runtime import run_ic_iteration
+from harness.agents.localizer import run_ic_iteration
 from harness.telemetry.tracing import (
     flush_langfuse,
     propagate_context,

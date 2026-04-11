@@ -21,7 +21,7 @@ from harness.localization.runtime.records import build_file_localization_eval_re
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.runtime.execute import run_localization_task
 import harness.localization.runtime.execute as executor_module
-import harness.localization.runtime.agent_runtime as runner
+import harness.agents.localizer as runner
 
 
 def test_identity_is_deterministic():

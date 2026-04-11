@@ -33,7 +33,6 @@ harness/
       execute.py       Task execution orchestrator
       evaluate.py      Shared evaluation backend (batch scoring)
       records.py       Eval record construction
-      agent_runtime.py IC agent iteration runner
     materialization/   Repo cloning and preparation
       materialize.py   Repo materialization
       hf_materialize.py HuggingFace dataset materialization
@@ -57,6 +56,7 @@ harness/
       hf_lca.py        HuggingFace LCA loader
 
   agents/              Agent implementations
+    localizer.py       Localizer agent (IC/JC LLM+tool execution)
     writer.py          Policy generation via LLM
     common.py          Shared agent utilities (usage mapping)
 

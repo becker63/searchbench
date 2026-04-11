@@ -98,7 +98,7 @@ def _run_runner(
 def _default_runner(
     lca_task: LCATask, repo_path: str, parent: object | None
 ) -> tuple[list[str], Mapping[str, object] | None]:
-    from harness.localization.runtime.agent_runtime import run_ic_iteration as run_ic_iteration_fn
+    from harness.agents.localizer import run_ic_iteration as run_ic_iteration_fn
     result = run_ic_iteration_fn(
         {
             "identity": lca_task.identity.model_dump(),

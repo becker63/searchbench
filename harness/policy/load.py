@@ -24,7 +24,7 @@ def load_policy() -> SelectionCallable:
     """
     Load the current policy module and return its score callable aligned to SelectionCallable.
     """
-    policy_path = Path(__file__).with_name("policy.py")
+    policy_path = Path(__file__).with_name("current.py")
     if not policy_path.exists():
         raise FileNotFoundError(f"Policy file not found at {policy_path}")
 
