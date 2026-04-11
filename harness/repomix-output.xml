@@ -58,19 +58,25 @@ docs/
   loop_viz.md
   telemetry_sessions_cost.md
 entrypoints/
+  models/
+    __init__.py
+    requests.py
   __init__.py
   cli.py
-  requests.py
 localization/
+  materialization/
+    __init__.py
+    hf_materialize.py
+    materialize.py
+  runtime/
+    __init__.py
+    agent_runtime.py
+    evaluate.py
+    execute.py
+    records.py
   __init__.py
-  agent_runtime.py
   errors.py
-  evaluate.py
-  execute.py
-  hf_materialize.py
-  materialize.py
   models.py
-  records.py
   scoring.py
   telemetry.py
   token_usage.py
@@ -97,16 +103,19 @@ prompts/
   policy_writer.jinja
   prompt_models.py
 telemetry/
+  hosted/
+    __init__.py
+    baselines.py
+    datasets.py
+    experiments.py
+    hf_lca.py
+  tracing/
+    __init__.py
+    cerebras_pricing.py
+    score_emitter.py
+    session_policy.py
   __init__.py
-  baselines.py
-  cerebras_pricing.py
-  datasets.py
-  experiments.py
-  hf_lca.py
-  langfuse.py
   policy_reducer.py
-  score_emitter.py
-  session_policy.py
 tests_harness/
   conftest.py
   test_backend_adapters.py
@@ -319,8 +328,8 @@ from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from harness.telemetry.langfuse import get_tracing_openai_client, start_observation
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing import get_tracing_openai_client, start_observation
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 from harness.utils.env import get_cerebras_api_key, get_writer_model
 from harness.utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from harness.prompts import WriterPromptContext
@@ -596,7 +605,7 @@ def generate_policy(
                     )
                     if usage_details is None:
                         raise RuntimeError("Cerebras response missing usage; provide usage_details explicitly or enable provider usage output.")
-                    from harness.telemetry.cerebras_pricing import cost_details_for_usage
+                    from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
 
                     cost_details = cost_details_for_usage(model, usage_details) if usage_details else None
                     _safe_update(
@@ -1039,6 +1048,73 @@ By default both machines are rendered; use `--machine optimization` or `--machin
 - Parallel dataset execution uses the hosted orchestration wrappers for worker pools only; workers MUST attach to the provided parent observation and fail/guard if no parent is available. Projection metadata stays separate from observed usage/cost telemetry.
 </file>
 
+<file path="entrypoints/models/__init__.py">
+"""Entrypoint request/config models."""
+</file>
+
+<file path="entrypoints/models/requests.py">
+from __future__ import annotations
+
+from enum import Enum
+
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from harness.telemetry.tracing.session_policy import SessionConfig
+
+
+class LocalizationDatasetSource(str, Enum):
+    LANGFUSE = "langfuse"
+    HUGGINGFACE = "huggingface"
+
+
+class HostedLocalizationBaselineRequest(BaseModel):
+    """Public request model for hosted localization baseline experiments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str
+    version: str | None = None
+    dataset_config: str | None = None
+    dataset_split: str | None = None
+    session: SessionConfig | None = None
+    max_items: int | None = None
+    offset: int = 0
+    max_workers: int = 1
+    selection: dict[str, object] | None = None
+    projection: dict[str, object] | None = None
+
+    @field_validator("max_workers")
+    @classmethod
+    def _validate_workers(cls, value: int) -> int:
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError("max_workers must be a positive integer")
+        return value
+
+
+class HostedLocalizationRunRequest(BaseModel):
+    """Public request model for hosted localization experiments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str
+    version: str | None = None
+    dataset_config: str | None = None
+    dataset_split: str | None = None
+    session: SessionConfig | None = None
+    max_items: int | None = None
+    offset: int = 0
+    max_workers: int = 1
+    selection: dict[str, object] | None = None
+    projection: dict[str, object] | None = None
+
+    @field_validator("max_workers")
+    @classmethod
+    def _validate_workers(cls, value: int) -> int:
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError("max_workers must be a positive integer")
+        return value
+</file>
+
 <file path="entrypoints/__init__.py">
 """Entrypoints: CLI and request models."""
 </file>
@@ -1065,26 +1141,26 @@ except ImportError:
     tty = None  # type: ignore
     termios = None  # type: ignore
 
-from harness.localization.evaluate import (
+from harness.localization.runtime.evaluate import (
     evaluate_localization_batch as _evaluate_localization_batch,
 )
-from harness.localization.hf_materialize import HuggingFaceRepoMaterializer
+from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
 from harness.localization.models import LCATask
-from harness.telemetry.cerebras_pricing import cost_details_for_usage
-from harness.telemetry.experiments import (
+from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
+from harness.telemetry.hosted.experiments import (
     run_hosted_localization_baseline,
     run_hosted_localization_experiment,
 )
-from harness.telemetry.hf_lca import (
+from harness.telemetry.hosted.hf_lca import (
     HFDatasetLoadError,
     fetch_hf_localization_dataset,
 )
-from harness.telemetry.langfuse import flush_langfuse, ensure_langfuse_auth
-from harness.entrypoints.requests import (
+from harness.telemetry.tracing import flush_langfuse, ensure_langfuse_auth
+from harness.entrypoints.models.requests import (
     HostedLocalizationBaselineRequest,
     HostedLocalizationRunRequest,
 )
-from harness.telemetry.session_policy import SessionConfig
+from harness.telemetry.tracing.session_policy import SessionConfig
 
 WARNING_THRESHOLD = 50
 HF_DATASET_NAME = "JetBrains-Research/lca-bug-localization"
@@ -1641,80 +1717,378 @@ if __name__ == "__main__":
     main()
 </file>
 
-<file path="entrypoints/requests.py">
+<file path="localization/materialization/__init__.py">
+"""Localization materialization: repo cloning and preparation."""
+</file>
+
+<file path="localization/materialization/hf_materialize.py">
 from __future__ import annotations
 
-from enum import Enum
+import os
+import shutil
+import time
+from pathlib import Path
+from typing import Iterable, List, Optional
 
-from pydantic import BaseModel, ConfigDict, field_validator
-
-from harness.telemetry.session_policy import SessionConfig
-
-
-class LocalizationDatasetSource(str, Enum):
-    LANGFUSE = "langfuse"
-    HUGGINGFACE = "huggingface"
+from .materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer, describe_repo_mapping
 
 
-class HostedLocalizationBaselineRequest(BaseModel):
-    """Public request model for hosted localization baseline experiments."""
+class HuggingFaceRepoMaterializer(RepoMaterializer):
+    """
+    Repo materializer for HF-backed LCA tasks using a cached bare git mirror + per-task worktree.
+    Concurrency is enforced per cache key via a lock file; partial builds are never reused.
+    """
+
+    def __init__(
+        self,
+        cache_root: Path | None = None,
+        repo_base_url: str | None = None,
+        lock_timeout_seconds: int = 120,
+        stale_lock_timeout_seconds: int = 300,
+    ) -> None:
+        self.cache_root = cache_root or Path(os.environ.get("HF_LCA_CACHE_DIR", Path.home() / ".cache" / "harness" / "hf_repos"))
+        self.repo_base_url = repo_base_url or os.environ.get("HF_LCA_REPO_BASE", "https://github.com")
+        self.lock_timeout_seconds = lock_timeout_seconds
+        self.stale_lock_timeout_seconds = stale_lock_timeout_seconds
+
+    def materialize(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
+        cache_key = describe_repo_mapping(request).replace(":", "__").replace("/", "__")
+        worktree_root = self.cache_root / "worktrees" / cache_key
+        mirror_root = self.cache_root / "mirrors"
+        lock_path = self.cache_root / "locks" / f"{cache_key}.lock"
+        completion_marker = worktree_root / ".complete"
+        repo_url = f"{self.repo_base_url.rstrip('/')}/{request.repo_owner}/{request.repo_name}.git"
+        mirror_path = mirror_root / f"{request.repo_owner}__{request.repo_name}.git"
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        mirror_root.mkdir(parents=True, exist_ok=True)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        logs: List[str] = []
+        mirror_fetched = False
+        worktree_created = False
+        checkout_verified = False
+
+        with _Lock(
+            lock_path,
+            timeout_seconds=self.lock_timeout_seconds,
+            stale_timeout_seconds=self.stale_lock_timeout_seconds,
+            logs=logs,
+        ):
+            if worktree_root.exists() and not completion_marker.exists():
+                # Incomplete prior build: remove and rebuild
+                logs.append(f"incomplete cache detected at {worktree_root}; pruning and rebuilding")
+                shutil.rmtree(worktree_root, ignore_errors=True)
+                _prune_worktree(mirror_path, worktree_root, logs)
+            if completion_marker.exists() and not worktree_root.exists():
+                logs.append(f"cache marker present without worktree at {completion_marker}; rebuilding")
+                completion_marker.unlink(missing_ok=True)
+            if completion_marker.exists() and worktree_root.exists():
+                try:
+                    _validate_worktree(worktree_root, request.base_sha, logs)
+                    cache_logs = [f"reused cached worktree at {worktree_root}"]
+                    return RepoMaterializationResult(
+                        local_path=worktree_root,
+                        cache_hit=True,
+                        cache_validated=True,
+                        mirror_fetched=False,
+                        worktree_created=False,
+                        checkout_verified=True,
+                        logs=cache_logs,
+                        events=cache_logs,
+                    )
+                except Exception as exc:
+                    logs.append(f"cached worktree invalid: {exc}; pruning and rebuilding")
+                    shutil.rmtree(worktree_root, ignore_errors=True)
+                    _prune_worktree(mirror_path, worktree_root, logs)
+                    completion_marker.unlink(missing_ok=True)
+
+            try:
+                mirror_fetched = _ensure_mirror_has_commit(mirror_path, repo_url, request.base_sha, logs)
+            except Exception as exc:
+                logs.append(f"failed to fetch {request.base_sha} from {repo_url}: {exc}")
+                raise MaterializationError(f"fetch failed: {exc}", category="fetch") from exc
+
+            _prune_worktree(mirror_path, worktree_root, logs)
+
+            try:
+                if worktree_root.exists():
+                    shutil.rmtree(worktree_root, ignore_errors=True)
+                worktree_root.parent.mkdir(parents=True, exist_ok=True)
+                _create_worktree(mirror_path, worktree_root, request.base_sha, logs)
+                worktree_created = True
+                _verify_checkout(worktree_root, request.base_sha, logs)
+                checkout_verified = True
+                completion_marker.touch(exist_ok=True)
+            except Exception:
+                shutil.rmtree(worktree_root, ignore_errors=True)
+                _prune_worktree(mirror_path, worktree_root, logs)
+                raise
+
+        return RepoMaterializationResult(
+            local_path=worktree_root,
+            cache_hit=False,
+            cache_validated=False,
+            mirror_fetched=mirror_fetched,
+            worktree_created=worktree_created,
+            checkout_verified=checkout_verified,
+            logs=logs,
+            events=logs,
+        )
+
+
+class MaterializationError(RuntimeError):
+    def __init__(self, message: str, category: str = "materialization"):
+        super().__init__(message)
+        self.category = category
+
+
+class _Lock:
+    """
+    Simple per-key file lock using exclusive file creation and retry.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        timeout_seconds: int = 120,
+        poll_interval: float = 0.25,
+        stale_timeout_seconds: int = 300,
+        logs: Optional[List[str]] = None,
+    ) -> None:
+        self.path = path
+        self.timeout_seconds = timeout_seconds
+        self.poll_interval = poll_interval
+        self.stale_timeout_seconds = stale_timeout_seconds
+        self.logs = logs if logs is not None else []
+        self._fd: Optional[int] = None
+
+    def acquire(self) -> None:
+        deadline = time.time() + self.timeout_seconds
+        while True:
+            try:
+                self._fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.write(self._fd, f"{os.getpid()}:{int(time.time())}".encode("utf-8"))
+                return
+            except FileExistsError:
+                if self._maybe_break_stale_lock():
+                    continue
+                if time.time() > deadline:
+                    raise MaterializationError(f"Timed out acquiring lock {self.path}", category="lock")
+                time.sleep(self.poll_interval)
+
+    def release(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
+
+    def _maybe_break_stale_lock(self) -> bool:
+        try:
+            data = self.path.read_text().strip()
+            pid_str, ts_str = data.split(":")
+            pid = int(pid_str)
+            ts = int(ts_str)
+        except Exception:
+            pid = None
+            ts = None
+        now = time.time()
+        is_stale = False
+        if ts is not None and now - ts > self.stale_timeout_seconds:
+            is_stale = True
+            self.logs.append(f"stale lock detected at {self.path}, age={now - ts:.1f}s; breaking")
+        elif pid is not None and not _pid_alive(pid):
+            is_stale = True
+            self.logs.append(f"stale lock pid={pid} not alive at {self.path}; breaking")
+        if is_stale:
+            try:
+                os.remove(self.path)
+            except FileNotFoundError:
+                pass
+            return True
+        return False
+
+    def __enter__(self) -> "_Lock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None) -> None:
+        self.release()
+
+
+def _run_git(args: Iterable[str], cwd: Path | None = None, logs: List[str] | None = None) -> str:
+    import subprocess
+
+    cmd = ["git", *args]
+    completed = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {completed.stderr.strip()}")
+    out = completed.stdout.strip()
+    if logs is not None:
+        logs.append(f"git {' '.join(args)} -> {out}")
+    return out
+
+
+def _ensure_mirror_has_commit(mirror_path: Path, repo_url: str, base_sha: str, logs: List[str]) -> bool:
+    if not mirror_path.exists():
+        mirror_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_git(["init", "--bare", str(mirror_path)], logs=logs)
+        _run_git(["--git-dir", str(mirror_path), "remote", "add", "origin", repo_url], logs=logs)
+    try:
+        _run_git(["--git-dir", str(mirror_path), "cat-file", "-e", base_sha], logs=None)
+    except Exception:
+        _run_git(["--git-dir", str(mirror_path), "fetch", "--depth=1", "origin", base_sha], logs=logs)
+        return True
+    return False
+
+
+def _create_worktree(mirror_path: Path, worktree_path: Path, base_sha: str, logs: List[str]) -> None:
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    _run_git(["--git-dir", str(mirror_path), "worktree", "add", str(worktree_path), base_sha], logs=logs)
+
+
+def _verify_checkout(worktree_path: Path, base_sha: str, logs: List[str]) -> None:
+    head = _run_git(["-C", str(worktree_path), "rev-parse", "HEAD"], logs=logs)
+    if head.strip() != base_sha:
+        raise RuntimeError(f"Worktree HEAD {head} does not match expected base_sha {base_sha}")
+
+
+def _validate_worktree(worktree_path: Path, base_sha: str, logs: List[str]) -> None:
+    if not worktree_path.exists():
+        raise RuntimeError("worktree path missing")
+    _verify_checkout(worktree_path, base_sha, logs)
+
+
+def _prune_worktree(mirror_path: Path, worktree_path: Path, logs: List[str]) -> None:
+    """
+    Ensure git worktree metadata is pruned for removed paths to avoid reuse errors.
+    """
+    if mirror_path.exists():
+        try:
+            _run_git(["--git-dir", str(mirror_path), "worktree", "prune"], logs=logs)
+        except Exception:
+            # pruning is best-effort; continue
+            pass
+    if worktree_path.exists() and not (worktree_path / ".complete").exists():
+        shutil.rmtree(worktree_path, ignore_errors=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+    return True
+</file>
+
+<file path="localization/materialization/materialize.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional, Protocol, runtime_checkable
+
+from pydantic import BaseModel, ConfigDict
+
+
+class RepoMaterializationRequest(BaseModel):
+    """
+    Input contract for repo materialization/resolution.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    dataset: str
-    version: str | None = None
-    dataset_config: str | None = None
-    dataset_split: str | None = None
-    session: SessionConfig | None = None
-    max_items: int | None = None
-    offset: int = 0
-    max_workers: int = 1
-    selection: dict[str, object] | None = None
-    projection: dict[str, object] | None = None
-
-    @field_validator("max_workers")
-    @classmethod
-    def _validate_workers(cls, value: int) -> int:
-        if not isinstance(value, int) or value <= 0:
-            raise ValueError("max_workers must be a positive integer")
-        return value
+    dataset_name: str
+    dataset_config: str
+    dataset_split: str
+    repo_owner: str
+    repo_name: str
+    base_sha: str
+    archive_uri: Optional[str] = None  # e.g., HF path or local cache key
 
 
-class HostedLocalizationRunRequest(BaseModel):
-    """Public request model for hosted localization experiments."""
+class RepoMaterializationResult(BaseModel):
+    """
+    Output contract for repo materialization/resolution.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    dataset: str
-    version: str | None = None
-    dataset_config: str | None = None
-    dataset_split: str | None = None
-    session: SessionConfig | None = None
-    max_items: int | None = None
-    offset: int = 0
-    max_workers: int = 1
-    selection: dict[str, object] | None = None
-    projection: dict[str, object] | None = None
+    local_path: Optional[Path] = None
+    cache_hit: Optional[bool] = None
+    cache_validated: Optional[bool] = None
+    mirror_fetched: Optional[bool] = None
+    worktree_created: Optional[bool] = None
+    checkout_verified: Optional[bool] = None
+    logs: list[str] = []
+    events: list[str] = []
 
-    @field_validator("max_workers")
-    @classmethod
-    def _validate_workers(cls, value: int) -> int:
-        if not isinstance(value, int) or value <= 0:
-            raise ValueError("max_workers must be a positive integer")
-        return value
+    def describe_mapping(self) -> str:
+        """
+        Human-readable description of how the repo was mapped/materialized.
+        """
+        return (
+            f"path={self.local_path}, cache_hit={self.cache_hit}, cache_validated={self.cache_validated}, "
+            f"mirror_fetched={self.mirror_fetched}, worktree_created={self.worktree_created}, "
+            f"checkout_verified={self.checkout_verified}"
+        )
+
+    def summary(self) -> str:
+        """
+        Concise human-readable summary for CLI/logs.
+        """
+        path = str(self.local_path) if self.local_path else "unset"
+        status_parts = []
+        if self.cache_hit is not None:
+            status_parts.append(f"cache_hit={self.cache_hit}")
+        if self.cache_validated is not None:
+            status_parts.append(f"cache_validated={self.cache_validated}")
+        if self.mirror_fetched is not None:
+            status_parts.append(f"mirror_fetched={self.mirror_fetched}")
+        if self.worktree_created is not None:
+            status_parts.append(f"worktree_created={self.worktree_created}")
+        if self.checkout_verified is not None:
+            status_parts.append(f"checkout_verified={self.checkout_verified}")
+        status = ", ".join(status_parts) if status_parts else "status=unknown"
+        log_tail = f"; logs={self.logs[-1]}" if self.logs else ""
+        return f"{path} ({status}){log_tail}"
+
+
+@runtime_checkable
+class RepoMaterializer(Protocol):
+    """
+    Abstract interface for materializing a repository at base_sha.
+    Implementations are deferred to phase 2.
+    """
+
+    def materialize(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
+        ...
+
+
+def describe_repo_mapping(request: RepoMaterializationRequest) -> str:
+    """
+    Documented mapping rule: dataset/config/split + repo_owner/name + base_sha drive cache key and checkout target.
+    Implementations SHOULD:
+    - derive cache key from dataset/config/split + repo_owner/name + base_sha
+    - download/extract archive if cache miss
+    - checkout base_sha
+    - return local path and status flags
+    """
+    return (
+        f"cache_key={request.dataset_name}:{request.dataset_config}:{request.dataset_split}:"
+        f"{request.repo_owner}/{request.repo_name}@{request.base_sha}"
+    )
 </file>
 
-<file path="localization/__init__.py">
-# pyright: reportUnusedImport=false
-
-from .models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
-from .scoring import file_localization_metrics, score_file_localization
-from .records import build_file_localization_eval_record, localization_eval_identity
-from .materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer
-from .telemetry import build_localization_telemetry
+<file path="localization/runtime/__init__.py">
+"""Localization runtime: evaluation, execution, and agent iteration."""
 </file>
 
-<file path="localization/agent_runtime.py">
+<file path="localization/runtime/agent_runtime.py">
 from __future__ import annotations
 
 """
@@ -1726,12 +2100,12 @@ import json
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from harness.telemetry.langfuse import (
+from harness.telemetry.tracing import (
     UsageDetails,
     get_tracing_openai_client,
     start_observation,
 )
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 from harness.prompts import SystemPromptContext
 from harness.backends.ic import IterativeContextBackend
 from harness.backends.jc import JCodeMunchBackend
@@ -2619,31 +2993,7 @@ __all__ = [
 ]
 </file>
 
-<file path="localization/errors.py">
-from __future__ import annotations
-
-from enum import Enum
-
-
-class LocalizationFailureCategory(str, Enum):
-    MATERIALIZATION = "materialization"
-    RUNNER = "runner"
-    SCORING = "scoring"
-    UNKNOWN = "unknown"
-
-
-class LocalizationEvaluationError(Exception):
-    """
-    Typed localization evaluation failure.
-    """
-
-    def __init__(self, category: LocalizationFailureCategory, message: str, task_id: str | None = None):
-        super().__init__(message)
-        self.category = category
-        self.task_id = task_id
-</file>
-
-<file path="localization/evaluate.py">
+<file path="localization/runtime/evaluate.py">
 from __future__ import annotations
 
 from enum import Enum
@@ -2652,9 +3002,9 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.localization.execute import run_localization_task
+from harness.localization.runtime.execute import run_localization_task
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.materialize import RepoMaterializer, RepoMaterializationResult
+from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
 from harness.localization.models import LCATask, LocalizationEvidence, LocalizationMetrics, normalize_lca_task
 from harness.localization.token_usage import TokenUsageRecord
 
@@ -2815,7 +3165,7 @@ def _derive_machine_score(
     raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, f"Unknown machine score policy: {policy}")
 </file>
 
-<file path="localization/execute.py">
+<file path="localization/runtime/execute.py">
 from __future__ import annotations
 
 from pathlib import Path
@@ -2825,8 +3175,8 @@ from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
 )
-from harness.localization.records import build_file_localization_eval_record
-from harness.localization.materialize import (
+from harness.localization.runtime.records import build_file_localization_eval_record
+from harness.localization.materialization.materialize import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
     RepoMaterializer,
@@ -2842,8 +3192,8 @@ from harness.localization.token_usage import (
     TokenUsageRecord,
     extract_token_usage_record,
 )
-from harness.telemetry.langfuse import start_observation
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing import start_observation
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 
 
 def _materialize_repo(
@@ -2916,7 +3266,7 @@ def _run_runner(
 def _default_runner(
     lca_task: LCATask, repo_path: str, parent: object | None
 ) -> tuple[list[str], Mapping[str, object] | None]:
-    from harness.localization.agent_runtime import run_ic_iteration as run_ic_iteration_fn
+    from harness.localization.runtime.agent_runtime import run_ic_iteration as run_ic_iteration_fn
     result = run_ic_iteration_fn(
         {
             "identity": lca_task.identity.model_dump(),
@@ -3064,367 +3414,127 @@ def run_localization_task(
         return prediction, metrics, task.evidence, materialization_result, usage
 </file>
 
-<file path="localization/hf_materialize.py">
+<file path="localization/runtime/records.py">
 from __future__ import annotations
 
-import os
-import shutil
-import time
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Mapping, Optional, cast
 
-from .materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer, describe_repo_mapping
+from harness.localization.models import (
+    LCAGold,
+    LCAPrediction,
+    LCATaskIdentity,
+    LocalizationDatasetInfo,
+    LocalizationEvalRecord,
+    LocalizationEvidence,
+    LocalizationGold,
+    LocalizationMetrics,
+    LocalizationPrediction,
+    LocalizationRepoInfo,
+)
+from harness.localization.scoring import score_file_localization
 
 
-class HuggingFaceRepoMaterializer(RepoMaterializer):
+def localization_eval_identity(identity: LCATaskIdentity) -> str:
     """
-    Repo materializer for HF-backed LCA tasks using a cached bare git mirror + per-task worktree.
-    Concurrency is enforced per cache key via a lock file; partial builds are never reused.
+    Build a baseline/eval identity string keyed on dataset/config/split + repo_owner/name + base_sha + issue/pull key.
     """
-
-    def __init__(
-        self,
-        cache_root: Path | None = None,
-        repo_base_url: str | None = None,
-        lock_timeout_seconds: int = 120,
-        stale_lock_timeout_seconds: int = 300,
-    ) -> None:
-        self.cache_root = cache_root or Path(os.environ.get("HF_LCA_CACHE_DIR", Path.home() / ".cache" / "harness" / "hf_repos"))
-        self.repo_base_url = repo_base_url or os.environ.get("HF_LCA_REPO_BASE", "https://github.com")
-        self.lock_timeout_seconds = lock_timeout_seconds
-        self.stale_lock_timeout_seconds = stale_lock_timeout_seconds
-
-    def materialize(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
-        cache_key = describe_repo_mapping(request).replace(":", "__").replace("/", "__")
-        worktree_root = self.cache_root / "worktrees" / cache_key
-        mirror_root = self.cache_root / "mirrors"
-        lock_path = self.cache_root / "locks" / f"{cache_key}.lock"
-        completion_marker = worktree_root / ".complete"
-        repo_url = f"{self.repo_base_url.rstrip('/')}/{request.repo_owner}/{request.repo_name}.git"
-        mirror_path = mirror_root / f"{request.repo_owner}__{request.repo_name}.git"
-        self.cache_root.mkdir(parents=True, exist_ok=True)
-        mirror_root.mkdir(parents=True, exist_ok=True)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        logs: List[str] = []
-        mirror_fetched = False
-        worktree_created = False
-        checkout_verified = False
-
-        with _Lock(
-            lock_path,
-            timeout_seconds=self.lock_timeout_seconds,
-            stale_timeout_seconds=self.stale_lock_timeout_seconds,
-            logs=logs,
-        ):
-            if worktree_root.exists() and not completion_marker.exists():
-                # Incomplete prior build: remove and rebuild
-                logs.append(f"incomplete cache detected at {worktree_root}; pruning and rebuilding")
-                shutil.rmtree(worktree_root, ignore_errors=True)
-                _prune_worktree(mirror_path, worktree_root, logs)
-            if completion_marker.exists() and not worktree_root.exists():
-                logs.append(f"cache marker present without worktree at {completion_marker}; rebuilding")
-                completion_marker.unlink(missing_ok=True)
-            if completion_marker.exists() and worktree_root.exists():
-                try:
-                    _validate_worktree(worktree_root, request.base_sha, logs)
-                    cache_logs = [f"reused cached worktree at {worktree_root}"]
-                    return RepoMaterializationResult(
-                        local_path=worktree_root,
-                        cache_hit=True,
-                        cache_validated=True,
-                        mirror_fetched=False,
-                        worktree_created=False,
-                        checkout_verified=True,
-                        logs=cache_logs,
-                        events=cache_logs,
-                    )
-                except Exception as exc:
-                    logs.append(f"cached worktree invalid: {exc}; pruning and rebuilding")
-                    shutil.rmtree(worktree_root, ignore_errors=True)
-                    _prune_worktree(mirror_path, worktree_root, logs)
-                    completion_marker.unlink(missing_ok=True)
-
-            try:
-                mirror_fetched = _ensure_mirror_has_commit(mirror_path, repo_url, request.base_sha, logs)
-            except Exception as exc:
-                logs.append(f"failed to fetch {request.base_sha} from {repo_url}: {exc}")
-                raise MaterializationError(f"fetch failed: {exc}", category="fetch") from exc
-
-            _prune_worktree(mirror_path, worktree_root, logs)
-
-            try:
-                if worktree_root.exists():
-                    shutil.rmtree(worktree_root, ignore_errors=True)
-                worktree_root.parent.mkdir(parents=True, exist_ok=True)
-                _create_worktree(mirror_path, worktree_root, request.base_sha, logs)
-                worktree_created = True
-                _verify_checkout(worktree_root, request.base_sha, logs)
-                checkout_verified = True
-                completion_marker.touch(exist_ok=True)
-            except Exception:
-                shutil.rmtree(worktree_root, ignore_errors=True)
-                _prune_worktree(mirror_path, worktree_root, logs)
-                raise
-
-        return RepoMaterializationResult(
-            local_path=worktree_root,
-            cache_hit=False,
-            cache_validated=False,
-            mirror_fetched=mirror_fetched,
-            worktree_created=worktree_created,
-            checkout_verified=checkout_verified,
-            logs=logs,
-            events=logs,
-        )
+    return identity.task_id()
 
 
-class MaterializationError(RuntimeError):
-    def __init__(self, message: str, category: str = "materialization"):
-        super().__init__(message)
-        self.category = category
+def _coerce_paths(value: Iterable[object]) -> List[str]:
+    return [str(p) for p in value if isinstance(p, (str, Path)) or hasattr(p, "__fspath__")]
 
 
-class _Lock:
+def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> List[str]:
+    if isinstance(prediction, Mapping):
+        predicted_files_raw = prediction.get("predicted_files", [])
+        return _coerce_paths(cast(Iterable[object], predicted_files_raw))
+    return prediction.normalized_predicted_files()
+
+
+def _normalize_gold(gold: LCAGold | Mapping[str, object]) -> List[str]:
+    if isinstance(gold, Mapping):
+        changed_files_raw = gold.get("changed_files", [])
+        return _coerce_paths(cast(Iterable[object], changed_files_raw))
+    return gold.normalized_changed_files()
+
+
+def build_file_localization_eval_record(
+    identity: LCATaskIdentity,
+    prediction: LCAPrediction | Mapping[str, object],
+    gold: LCAGold | Mapping[str, object],
+    evidence: Optional[LocalizationEvidence] = None,
+    repo_path: Optional[Path] = None,
+) -> LocalizationEvalRecord:
     """
-    Simple per-key file lock using exclusive file creation and retry.
+    Build a canonical evaluation record for file-path-only predictions against LCA gold.
+
+    Evidence (if provided) is kept separate from the primary metrics/prediction and should
+    be used only for diagnostics.
     """
+    metrics = score_file_localization(prediction, gold)
+    predicted_files = _normalize_prediction(prediction)
+    changed_files = _normalize_gold(gold)
 
-    def __init__(
-        self,
-        path: Path,
-        timeout_seconds: int = 120,
-        poll_interval: float = 0.25,
-        stale_timeout_seconds: int = 300,
-        logs: Optional[List[str]] = None,
-    ) -> None:
-        self.path = path
-        self.timeout_seconds = timeout_seconds
-        self.poll_interval = poll_interval
-        self.stale_timeout_seconds = stale_timeout_seconds
-        self.logs = logs if logs is not None else []
-        self._fd: Optional[int] = None
-
-    def acquire(self) -> None:
-        deadline = time.time() + self.timeout_seconds
-        while True:
-            try:
-                self._fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                os.write(self._fd, f"{os.getpid()}:{int(time.time())}".encode("utf-8"))
-                return
-            except FileExistsError:
-                if self._maybe_break_stale_lock():
-                    continue
-                if time.time() > deadline:
-                    raise MaterializationError(f"Timed out acquiring lock {self.path}", category="lock")
-                time.sleep(self.poll_interval)
-
-    def release(self) -> None:
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
-        try:
-            os.remove(self.path)
-        except FileNotFoundError:
-            pass
-
-    def _maybe_break_stale_lock(self) -> bool:
-        try:
-            data = self.path.read_text().strip()
-            pid_str, ts_str = data.split(":")
-            pid = int(pid_str)
-            ts = int(ts_str)
-        except Exception:
-            pid = None
-            ts = None
-        now = time.time()
-        is_stale = False
-        if ts is not None and now - ts > self.stale_timeout_seconds:
-            is_stale = True
-            self.logs.append(f"stale lock detected at {self.path}, age={now - ts:.1f}s; breaking")
-        elif pid is not None and not _pid_alive(pid):
-            is_stale = True
-            self.logs.append(f"stale lock pid={pid} not alive at {self.path}; breaking")
-        if is_stale:
-            try:
-                os.remove(self.path)
-            except FileNotFoundError:
-                pass
-            return True
-        return False
-
-    def __enter__(self) -> "_Lock":
-        self.acquire()
-        return self
-
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None) -> None:
-        self.release()
-
-
-def _run_git(args: Iterable[str], cwd: Path | None = None, logs: List[str] | None = None) -> str:
-    import subprocess
-
-    cmd = ["git", *args]
-    completed = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {completed.stderr.strip()}")
-    out = completed.stdout.strip()
-    if logs is not None:
-        logs.append(f"git {' '.join(args)} -> {out}")
-    return out
-
-
-def _ensure_mirror_has_commit(mirror_path: Path, repo_url: str, base_sha: str, logs: List[str]) -> bool:
-    if not mirror_path.exists():
-        mirror_path.parent.mkdir(parents=True, exist_ok=True)
-        _run_git(["init", "--bare", str(mirror_path)], logs=logs)
-        _run_git(["--git-dir", str(mirror_path), "remote", "add", "origin", repo_url], logs=logs)
-    try:
-        _run_git(["--git-dir", str(mirror_path), "cat-file", "-e", base_sha], logs=None)
-    except Exception:
-        _run_git(["--git-dir", str(mirror_path), "fetch", "--depth=1", "origin", base_sha], logs=logs)
-        return True
-    return False
-
-
-def _create_worktree(mirror_path: Path, worktree_path: Path, base_sha: str, logs: List[str]) -> None:
-    worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    _run_git(["--git-dir", str(mirror_path), "worktree", "add", str(worktree_path), base_sha], logs=logs)
-
-
-def _verify_checkout(worktree_path: Path, base_sha: str, logs: List[str]) -> None:
-    head = _run_git(["-C", str(worktree_path), "rev-parse", "HEAD"], logs=logs)
-    if head.strip() != base_sha:
-        raise RuntimeError(f"Worktree HEAD {head} does not match expected base_sha {base_sha}")
-
-
-def _validate_worktree(worktree_path: Path, base_sha: str, logs: List[str]) -> None:
-    if not worktree_path.exists():
-        raise RuntimeError("worktree path missing")
-    _verify_checkout(worktree_path, base_sha, logs)
-
-
-def _prune_worktree(mirror_path: Path, worktree_path: Path, logs: List[str]) -> None:
-    """
-    Ensure git worktree metadata is pruned for removed paths to avoid reuse errors.
-    """
-    if mirror_path.exists():
-        try:
-            _run_git(["--git-dir", str(mirror_path), "worktree", "prune"], logs=logs)
-        except Exception:
-            # pruning is best-effort; continue
-            pass
-    if worktree_path.exists() and not (worktree_path / ".complete").exists():
-        shutil.rmtree(worktree_path, ignore_errors=True)
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return True
-    return True
+    dataset_block = LocalizationDatasetInfo(
+        name=identity.dataset_name,
+        config=identity.dataset_config,
+        split=identity.dataset_split,
+    )
+    repo_block = LocalizationRepoInfo(
+        owner=identity.repo_owner,
+        name=identity.repo_name,
+        base_sha=identity.base_sha,
+        issue_url=identity.issue_url,
+        pull_url=identity.pull_url,
+    )
+    evidence_block = evidence
+    repo_path_str = str(repo_path) if repo_path else None
+    return LocalizationEvalRecord(
+        identity=localization_eval_identity(identity),
+        dataset=dataset_block,
+        repo=repo_block,
+        prediction=LocalizationPrediction(predicted_files=predicted_files),
+        gold=LocalizationGold(changed_files=changed_files),
+        metrics=metrics if isinstance(metrics, LocalizationMetrics) else LocalizationMetrics.from_mapping(metrics),
+        evidence=evidence_block,
+        repo_path=repo_path_str,
+    )
 </file>
 
-<file path="localization/materialize.py">
+<file path="localization/__init__.py">
+# pyright: reportUnusedImport=false
+
+from .models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
+from .scoring import file_localization_metrics, score_file_localization
+from .runtime.records import build_file_localization_eval_record, localization_eval_identity
+from .materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer
+from .telemetry import build_localization_telemetry
+</file>
+
+<file path="localization/errors.py">
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
-
-from pydantic import BaseModel, ConfigDict
+from enum import Enum
 
 
-class RepoMaterializationRequest(BaseModel):
+class LocalizationFailureCategory(str, Enum):
+    MATERIALIZATION = "materialization"
+    RUNNER = "runner"
+    SCORING = "scoring"
+    UNKNOWN = "unknown"
+
+
+class LocalizationEvaluationError(Exception):
     """
-    Input contract for repo materialization/resolution.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    dataset_name: str
-    dataset_config: str
-    dataset_split: str
-    repo_owner: str
-    repo_name: str
-    base_sha: str
-    archive_uri: Optional[str] = None  # e.g., HF path or local cache key
-
-
-class RepoMaterializationResult(BaseModel):
-    """
-    Output contract for repo materialization/resolution.
+    Typed localization evaluation failure.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    local_path: Optional[Path] = None
-    cache_hit: Optional[bool] = None
-    cache_validated: Optional[bool] = None
-    mirror_fetched: Optional[bool] = None
-    worktree_created: Optional[bool] = None
-    checkout_verified: Optional[bool] = None
-    logs: list[str] = []
-    events: list[str] = []
-
-    def describe_mapping(self) -> str:
-        """
-        Human-readable description of how the repo was mapped/materialized.
-        """
-        return (
-            f"path={self.local_path}, cache_hit={self.cache_hit}, cache_validated={self.cache_validated}, "
-            f"mirror_fetched={self.mirror_fetched}, worktree_created={self.worktree_created}, "
-            f"checkout_verified={self.checkout_verified}"
-        )
-
-    def summary(self) -> str:
-        """
-        Concise human-readable summary for CLI/logs.
-        """
-        path = str(self.local_path) if self.local_path else "unset"
-        status_parts = []
-        if self.cache_hit is not None:
-            status_parts.append(f"cache_hit={self.cache_hit}")
-        if self.cache_validated is not None:
-            status_parts.append(f"cache_validated={self.cache_validated}")
-        if self.mirror_fetched is not None:
-            status_parts.append(f"mirror_fetched={self.mirror_fetched}")
-        if self.worktree_created is not None:
-            status_parts.append(f"worktree_created={self.worktree_created}")
-        if self.checkout_verified is not None:
-            status_parts.append(f"checkout_verified={self.checkout_verified}")
-        status = ", ".join(status_parts) if status_parts else "status=unknown"
-        log_tail = f"; logs={self.logs[-1]}" if self.logs else ""
-        return f"{path} ({status}){log_tail}"
-
-
-@runtime_checkable
-class RepoMaterializer(Protocol):
-    """
-    Abstract interface for materializing a repository at base_sha.
-    Implementations are deferred to phase 2.
-    """
-
-    def materialize(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
-        ...
-
-
-def describe_repo_mapping(request: RepoMaterializationRequest) -> str:
-    """
-    Documented mapping rule: dataset/config/split + repo_owner/name + base_sha drive cache key and checkout target.
-    Implementations SHOULD:
-    - derive cache key from dataset/config/split + repo_owner/name + base_sha
-    - download/extract archive if cache miss
-    - checkout base_sha
-    - return local path and status flags
-    """
-    return (
-        f"cache_key={request.dataset_name}:{request.dataset_config}:{request.dataset_split}:"
-        f"{request.repo_owner}/{request.repo_name}@{request.base_sha}"
-    )
+    def __init__(self, category: LocalizationFailureCategory, message: str, task_id: str | None = None):
+        super().__init__(message)
+        self.category = category
+        self.task_id = task_id
 </file>
 
 <file path="localization/models.py">
@@ -3846,95 +3956,6 @@ def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str
     return LCATask(identity=identity, context=context, gold=gold, repo=repo_str, evidence=evidence)
 </file>
 
-<file path="localization/records.py">
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Iterable, List, Mapping, Optional, cast
-
-from .models import (
-    LCAGold,
-    LCAPrediction,
-    LCATaskIdentity,
-    LocalizationDatasetInfo,
-    LocalizationEvalRecord,
-    LocalizationEvidence,
-    LocalizationGold,
-    LocalizationMetrics,
-    LocalizationPrediction,
-    LocalizationRepoInfo,
-)
-from .scoring import score_file_localization
-
-
-def localization_eval_identity(identity: LCATaskIdentity) -> str:
-    """
-    Build a baseline/eval identity string keyed on dataset/config/split + repo_owner/name + base_sha + issue/pull key.
-    """
-    return identity.task_id()
-
-
-def _coerce_paths(value: Iterable[object]) -> List[str]:
-    return [str(p) for p in value if isinstance(p, (str, Path)) or hasattr(p, "__fspath__")]
-
-
-def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> List[str]:
-    if isinstance(prediction, Mapping):
-        predicted_files_raw = prediction.get("predicted_files", [])
-        return _coerce_paths(cast(Iterable[object], predicted_files_raw))
-    return prediction.normalized_predicted_files()
-
-
-def _normalize_gold(gold: LCAGold | Mapping[str, object]) -> List[str]:
-    if isinstance(gold, Mapping):
-        changed_files_raw = gold.get("changed_files", [])
-        return _coerce_paths(cast(Iterable[object], changed_files_raw))
-    return gold.normalized_changed_files()
-
-
-def build_file_localization_eval_record(
-    identity: LCATaskIdentity,
-    prediction: LCAPrediction | Mapping[str, object],
-    gold: LCAGold | Mapping[str, object],
-    evidence: Optional[LocalizationEvidence] = None,
-    repo_path: Optional[Path] = None,
-) -> LocalizationEvalRecord:
-    """
-    Build a canonical evaluation record for file-path-only predictions against LCA gold.
-
-    Evidence (if provided) is kept separate from the primary metrics/prediction and should
-    be used only for diagnostics.
-    """
-    metrics = score_file_localization(prediction, gold)
-    predicted_files = _normalize_prediction(prediction)
-    changed_files = _normalize_gold(gold)
-
-    dataset_block = LocalizationDatasetInfo(
-        name=identity.dataset_name,
-        config=identity.dataset_config,
-        split=identity.dataset_split,
-    )
-    repo_block = LocalizationRepoInfo(
-        owner=identity.repo_owner,
-        name=identity.repo_name,
-        base_sha=identity.base_sha,
-        issue_url=identity.issue_url,
-        pull_url=identity.pull_url,
-    )
-    evidence_block = evidence
-    repo_path_str = str(repo_path) if repo_path else None
-    return LocalizationEvalRecord(
-        identity=localization_eval_identity(identity),
-        dataset=dataset_block,
-        repo=repo_block,
-        prediction=LocalizationPrediction(predicted_files=predicted_files),
-        gold=LocalizationGold(changed_files=changed_files),
-        metrics=metrics if isinstance(metrics, LocalizationMetrics) else LocalizationMetrics.from_mapping(metrics),
-        evidence=evidence_block,
-        repo_path=repo_path_str,
-    )
-</file>
-
 <file path="localization/scoring.py">
 from __future__ import annotations
 
@@ -4266,7 +4287,7 @@ from typing import Any, ContextManager, Protocol
 
 from statemachine import State
 
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 
 from .types import IterationRecord, OptimizationMachineModel, RepairMachineModel
 
@@ -5032,13 +5053,13 @@ from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol, cast
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
-from harness.localization.agent_runtime import run_ic_iteration
-from harness.telemetry.langfuse import (
+from harness.localization.runtime.agent_runtime import run_ic_iteration
+from harness.telemetry.tracing import (
     flush_langfuse,
     propagate_context,
     start_observation,
 )
-from harness.telemetry.score_emitter import emit_score
+from harness.telemetry.tracing.score_emitter import emit_score
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy.load import load_policy
@@ -5052,7 +5073,7 @@ from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LC
 from harness.orchestration.types import SpanHandle
 
 if TYPE_CHECKING:
-    from harness.telemetry.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import BaselineSnapshot
     from iterative_context.graph_models import Graph, GraphNode
 
 from .machine import OptimizationStateMachine
@@ -5111,9 +5132,9 @@ _REEXPORTED = (
 def evaluate_localization_batch(**kwargs: object):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
-    Forwards keyword arguments directly to harness.localization.evaluate.evaluate_localization_batch.
+    Forwards keyword arguments directly to harness.localization.runtime.evaluate.evaluate_localization_batch.
     """
-    from harness.localization.evaluate import evaluate_localization_batch as _evaluate_localization_batch
+    from harness.localization.runtime.evaluate import evaluate_localization_batch as _evaluate_localization_batch
 
     return _evaluate_localization_batch(**kwargs)
 
@@ -5687,7 +5708,7 @@ from harness.utils.type_loader import ScorerContext
 from harness.localization.models import LCAContext, LCATaskIdentity
 
 if TYPE_CHECKING:
-    from harness.telemetry.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import BaselineSnapshot
 
 
 MetricValue = int | float | bool
@@ -6175,7 +6196,7 @@ class OptimizationMachineModel(BaseModel):
 
 def _rebuild_forward_refs() -> None:
     try:
-        from harness.telemetry.baselines import BaselineSnapshot  # local import to avoid cycles
+        from harness.telemetry.hosted.baselines import BaselineSnapshot  # local import to avoid cycles
     except Exception:
         BaselineSnapshot = object  # type: ignore[misc,assignment]
     LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot, "RunMetadata": RunMetadata})
@@ -6228,8 +6249,8 @@ No CLI or session policy; receives normalized inputs only.
 from typing import Iterable, List
 from pathlib import Path
 
-from harness.telemetry.langfuse import start_observation
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing import start_observation
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
 from .types import PipelineClassification, Step, StepResult
 
@@ -6973,83 +6994,11 @@ class BackendPromptContext(BaseModel):
     available_tools: str
 </file>
 
-<file path="telemetry/__init__.py">
-"""Telemetry: tracing, scoring, datasets, and baselines."""
-
-from importlib import import_module
-from typing import Any, TYPE_CHECKING
-
-from .langfuse import (
-    flush_langfuse,
-    get_langfuse_client,
-    get_tracing_openai_client,
-    is_langfuse_enabled,
-    propagate_context,
-    start_child_observation,
-    start_observation,
-    start_root_observation,
-)
-from .score_emitter import ScorePayload, emit_score, emit_score_for_handle
-from .datasets import (
-    LocalizationDataset,
-    fetch_localization_dataset,
-    local_dataset,
-    normalize_localization_task,
-)
-
-__all__ = [
-    "flush_langfuse",
-    "get_langfuse_client",
-    "get_tracing_openai_client",
-    "is_langfuse_enabled",
-    "propagate_context",
-    "start_observation",
-    "start_root_observation",
-    "start_child_observation",
-    "emit_score",
-    "emit_score_for_handle",
-    "ScorePayload",
-    "LocalizationDataset",
-    "fetch_localization_dataset",
-    "local_dataset",
-    "normalize_localization_task",
-    "BaselineBundle",
-    "BaselineSnapshot",
-    "baseline_key",
-    "compute_baseline_for_task",
-    "make_baseline_bundle",
-    "require_baseline",
-    "resolve_baseline",
-]
-
-if TYPE_CHECKING:
-    from harness.telemetry.baselines import (
-        BaselineBundle,
-        BaselineSnapshot,
-        baseline_key,
-        compute_baseline_for_task,
-        make_baseline_bundle,
-        require_baseline,
-        resolve_baseline,
-    )
-
-
-def __getattr__(name: str) -> Any:
-    if name in {
-        "BaselineBundle",
-        "BaselineSnapshot",
-        "baseline_key",
-        "compute_baseline_for_task",
-        "make_baseline_bundle",
-        "require_baseline",
-        "resolve_baseline",
-    }:
-        module = import_module("harness.telemetry.baselines")
-        return getattr(module, name)
-    raise AttributeError(f"module 'harness.telemetry' has no attribute {name!r}")
+<file path="telemetry/hosted/__init__.py">
+"""Hosted dataset workflows: baselines, experiments, and dataset loading."""
 </file>
 
-<file path="telemetry/baselines.py">
+<file path="telemetry/hosted/baselines.py">
 from __future__ import annotations
 
 import json
@@ -7060,11 +7009,11 @@ from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.localization.evaluate import (
+from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
-from harness.localization.materialize import RepoMaterializer, RepoMaterializationResult
+from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.models import (
     LCATask,
@@ -7076,8 +7025,8 @@ from harness.localization.models import (
 )
 from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.telemetry import build_localization_telemetry
-from harness.telemetry.langfuse import propagate_context, start_observation
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing import propagate_context, start_observation
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -7261,158 +7210,7 @@ def normalize_baseline_task(data: Mapping[str, object]) -> LCATask:
     return normalize_lca_task(data)
 </file>
 
-<file path="telemetry/cerebras_pricing.py">
-from __future__ import annotations
-
-CEREBRAS_PRICING: list[dict[str, str | float]] = [
-    {
-        "name": "Zaizai GLM 4.7",
-        "match_pattern": r"(?i)zaizai.*glm.*4\.7",
-        "input_price_per_million": 2.25,
-        "output_price_per_million": 2.75,
-    },
-    {
-        "name": "GPT OSS 120B",
-        "match_pattern": r"(?i)gpt[-_ ]?oss[-_ ]?120b",
-        "input_price_per_million": 0.35,
-        "output_price_per_million": 0.75,
-    },
-    {
-        "name": "Llama 3.1 8B",
-        "match_pattern": r"(?i)llama[-_ ]?3\.1[-_ ]?8b",
-        "input_price_per_million": 0.10,
-        "output_price_per_million": 0.10,
-    },
-    {
-        "name": "Qwen 3 235B Instruct",
-        "match_pattern": r"(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct",
-        "input_price_per_million": 0.60,
-        "output_price_per_million": 1.20,
-    },
-]
-
-
-def pricing_payload() -> list[dict[str, object]]:
-    """Return a Langfuse Models API payload for Cerebras pricing."""
-    payload: list[dict[str, object]] = []
-    for entry in CEREBRAS_PRICING:
-        payload.append(
-            {
-                "model_name": entry["name"],
-                "match_pattern": entry["match_pattern"],
-                # Use pricing tiers (default tier only) to align with v4 Models API
-                "pricing_tiers": [
-                    {
-                        "name": "standard",
-                        "is_default": True,
-                        "priority": 0,
-                        "conditions": [],
-                        "prices": {
-                            "input": entry["input_price_per_million"],
-                            "output": entry["output_price_per_million"],
-                        },
-                    }
-                ],
-                "unit": "TOKENS",
-            }
-        )
-    return payload
-
-
-def cost_details_for_usage(model: str | None, usage_details: dict[str, object] | None) -> dict[str, float] | None:
-    """
-    Derive cost_details locally using the Cerebras pricing table to guarantee costs when inference lags.
-    Prices are per million tokens; usage is expected to be token counts.
-    """
-    if not model or not usage_details:
-        return None
-    price_entry = None
-    import re
-
-    for entry in CEREBRAS_PRICING:
-        pattern = entry["match_pattern"]
-        if isinstance(pattern, str) and re.search(pattern, model, flags=re.IGNORECASE):
-            price_entry = entry
-            break
-    if not price_entry:
-        return None
-    def _as_num(val: object) -> float:
-        if isinstance(val, (int, float)):
-            return float(val)
-        try:
-            return float(val)  # type: ignore[arg-type]
-        except Exception:
-            return 0.0
-
-    inp = _as_num(usage_details.get("input") or usage_details.get("prompt_tokens") or usage_details.get("total"))
-    out = _as_num(usage_details.get("output") or usage_details.get("completion_tokens") or 0)
-    input_price = float(price_entry["input_price_per_million"]) / 1_000_000
-    output_price = float(price_entry["output_price_per_million"]) / 1_000_000
-    costs: dict[str, float] = {}
-    if inp > 0:
-        costs["input"] = inp * input_price
-    if out > 0:
-        costs["output"] = out * output_price
-    total = sum(costs.values())
-    if total > 0:
-        costs["total"] = total
-    return costs or None
-
-
-def sync_cerebras_models(client: object | None = None) -> None:
-    """
-    Sync Cerebras model definitions to Langfuse Cloud Models API.
-
-    Requires a v4 Langfuse client with `api.models.create` available.
-    """
-    if client is None:
-        from .langfuse import get_langfuse_client
-
-        client = get_langfuse_client()
-    models_api = getattr(getattr(client, "api", None), "models", None)
-    create_fn = getattr(models_api, "create", None) if models_api else None
-    list_fn = getattr(models_api, "list", None) if models_api else None
-    delete_fn = getattr(models_api, "delete", None) if models_api else None
-    if not callable(create_fn):
-        raise RuntimeError("Langfuse client does not expose api.models.create; sync models via HTTP or UI.")
-    if not callable(list_fn) or not callable(delete_fn):
-        raise RuntimeError("Langfuse client does not expose api.models.list/delete; cannot upsert models.")
-
-    # Upsert: fetch existing model ids by name, delete, then recreate with current patterns/prices.
-    existing_by_name: dict[str, str | None] = {}
-    try:
-        page = 1
-        while True:
-            res = list_fn(page=page, limit=100)
-            for model in getattr(res, "data", []) or []:
-                name_val = getattr(model, "model_name", None)
-                model_id_val = getattr(model, "id", None)
-                if isinstance(name_val, str):
-                    existing_by_name[name_val] = str(model_id_val) if model_id_val is not None else None
-            meta = getattr(res, "meta", None)
-            if not meta or getattr(meta, "page", 1) >= getattr(meta, "total_pages", 1):
-                break
-            page += 1
-    except Exception:
-        existing_by_name = {}
-
-    for model_def in pricing_payload():
-        name_val = model_def.get("model_name")
-        name = str(name_val) if name_val is not None else ""
-        existing_id = existing_by_name.get(name)
-        if existing_id:
-            try:
-                delete_fn(id=str(existing_id))
-            except Exception:
-                # best-effort; continue to create if delete fails
-                pass
-        create_fn(**model_def)
-
-
-__all__ = ["CEREBRAS_PRICING", "pricing_payload", "sync_cerebras_models"]
-</file>
-
-<file path="telemetry/datasets.py">
+<file path="telemetry/hosted/datasets.py">
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -7423,10 +7221,10 @@ from pydantic import BaseModel, Field
 import logging
 
 from harness.localization.models import LCATask, normalize_lca_task
-from harness.entrypoints.requests import LocalizationDatasetSource
-from harness.telemetry.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
+from harness.entrypoints.models.requests import LocalizationDatasetSource
+from harness.telemetry.hosted.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
 
-from .langfuse import get_langfuse_client
+from harness.telemetry.tracing import get_langfuse_client
 
 
 class LocalizationDataset(BaseModel):
@@ -7557,7 +7355,7 @@ def local_dataset(
     return LocalizationDataset(name=name, version=version, items=normalized_items)
 </file>
 
-<file path="telemetry/experiments.py">
+<file path="telemetry/hosted/experiments.py">
 from __future__ import annotations
 
 import concurrent.futures
@@ -7566,21 +7364,21 @@ from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
-from harness.localization.evaluate import (
+from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
 from harness.localization.token_usage import TokenUsageRecord
-from harness.localization.materialize import RepoMaterializationResult, RepoMaterializer
+from harness.localization.materialization.materialize import RepoMaterializationResult, RepoMaterializer
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.telemetry.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
-from harness.telemetry.hf_lca import fetch_hf_localization_dataset
-from harness.telemetry.langfuse import flush_langfuse, propagate_context, start_observation
-from harness.telemetry.session_policy import resolve_session_id
+from harness.telemetry.hosted.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
+from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
+from harness.telemetry.tracing import flush_langfuse, propagate_context, start_observation
+from harness.telemetry.tracing.session_policy import resolve_session_id
 from harness.telemetry.policy_reducer import PolicyReducerSummary, build_task_input, reduce_global
 
-from harness.entrypoints.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
+from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
 
 
 class LocalizationRunItemResult(BaseModel):
@@ -8026,7 +7824,7 @@ def _build_reducer_summary(results: list[LocalizationRunItemResult]) -> PolicyRe
     return reduce_global(task_inputs)
 </file>
 
-<file path="telemetry/hf_lca.py">
+<file path="telemetry/hosted/hf_lca.py">
 from __future__ import annotations
 
 import logging
@@ -8127,7 +7925,7 @@ def fetch_hf_localization_dataset(
     return tasks
 </file>
 
-<file path="telemetry/langfuse.py">
+<file path="telemetry/tracing/__init__.py">
 from __future__ import annotations
 
 import logging
@@ -8542,6 +8340,452 @@ __all__ = [
 ]
 </file>
 
+<file path="telemetry/tracing/cerebras_pricing.py">
+from __future__ import annotations
+
+CEREBRAS_PRICING: list[dict[str, str | float]] = [
+    {
+        "name": "Zaizai GLM 4.7",
+        "match_pattern": r"(?i)zaizai.*glm.*4\.7",
+        "input_price_per_million": 2.25,
+        "output_price_per_million": 2.75,
+    },
+    {
+        "name": "GPT OSS 120B",
+        "match_pattern": r"(?i)gpt[-_ ]?oss[-_ ]?120b",
+        "input_price_per_million": 0.35,
+        "output_price_per_million": 0.75,
+    },
+    {
+        "name": "Llama 3.1 8B",
+        "match_pattern": r"(?i)llama[-_ ]?3\.1[-_ ]?8b",
+        "input_price_per_million": 0.10,
+        "output_price_per_million": 0.10,
+    },
+    {
+        "name": "Qwen 3 235B Instruct",
+        "match_pattern": r"(?i)qwen[-_ ]3[-_ ]235b[-_ ]instruct",
+        "input_price_per_million": 0.60,
+        "output_price_per_million": 1.20,
+    },
+]
+
+
+def pricing_payload() -> list[dict[str, object]]:
+    """Return a Langfuse Models API payload for Cerebras pricing."""
+    payload: list[dict[str, object]] = []
+    for entry in CEREBRAS_PRICING:
+        payload.append(
+            {
+                "model_name": entry["name"],
+                "match_pattern": entry["match_pattern"],
+                # Use pricing tiers (default tier only) to align with v4 Models API
+                "pricing_tiers": [
+                    {
+                        "name": "standard",
+                        "is_default": True,
+                        "priority": 0,
+                        "conditions": [],
+                        "prices": {
+                            "input": entry["input_price_per_million"],
+                            "output": entry["output_price_per_million"],
+                        },
+                    }
+                ],
+                "unit": "TOKENS",
+            }
+        )
+    return payload
+
+
+def cost_details_for_usage(model: str | None, usage_details: dict[str, object] | None) -> dict[str, float] | None:
+    """
+    Derive cost_details locally using the Cerebras pricing table to guarantee costs when inference lags.
+    Prices are per million tokens; usage is expected to be token counts.
+    """
+    if not model or not usage_details:
+        return None
+    price_entry = None
+    import re
+
+    for entry in CEREBRAS_PRICING:
+        pattern = entry["match_pattern"]
+        if isinstance(pattern, str) and re.search(pattern, model, flags=re.IGNORECASE):
+            price_entry = entry
+            break
+    if not price_entry:
+        return None
+    def _as_num(val: object) -> float:
+        if isinstance(val, (int, float)):
+            return float(val)
+        try:
+            return float(val)  # type: ignore[arg-type]
+        except Exception:
+            return 0.0
+
+    inp = _as_num(usage_details.get("input") or usage_details.get("prompt_tokens") or usage_details.get("total"))
+    out = _as_num(usage_details.get("output") or usage_details.get("completion_tokens") or 0)
+    input_price = float(price_entry["input_price_per_million"]) / 1_000_000
+    output_price = float(price_entry["output_price_per_million"]) / 1_000_000
+    costs: dict[str, float] = {}
+    if inp > 0:
+        costs["input"] = inp * input_price
+    if out > 0:
+        costs["output"] = out * output_price
+    total = sum(costs.values())
+    if total > 0:
+        costs["total"] = total
+    return costs or None
+
+
+def sync_cerebras_models(client: object | None = None) -> None:
+    """
+    Sync Cerebras model definitions to Langfuse Cloud Models API.
+
+    Requires a v4 Langfuse client with `api.models.create` available.
+    """
+    if client is None:
+        from . import get_langfuse_client
+
+        client = get_langfuse_client()
+    models_api = getattr(getattr(client, "api", None), "models", None)
+    create_fn = getattr(models_api, "create", None) if models_api else None
+    list_fn = getattr(models_api, "list", None) if models_api else None
+    delete_fn = getattr(models_api, "delete", None) if models_api else None
+    if not callable(create_fn):
+        raise RuntimeError("Langfuse client does not expose api.models.create; sync models via HTTP or UI.")
+    if not callable(list_fn) or not callable(delete_fn):
+        raise RuntimeError("Langfuse client does not expose api.models.list/delete; cannot upsert models.")
+
+    # Upsert: fetch existing model ids by name, delete, then recreate with current patterns/prices.
+    existing_by_name: dict[str, str | None] = {}
+    try:
+        page = 1
+        while True:
+            res = list_fn(page=page, limit=100)
+            for model in getattr(res, "data", []) or []:
+                name_val = getattr(model, "model_name", None)
+                model_id_val = getattr(model, "id", None)
+                if isinstance(name_val, str):
+                    existing_by_name[name_val] = str(model_id_val) if model_id_val is not None else None
+            meta = getattr(res, "meta", None)
+            if not meta or getattr(meta, "page", 1) >= getattr(meta, "total_pages", 1):
+                break
+            page += 1
+    except Exception:
+        existing_by_name = {}
+
+    for model_def in pricing_payload():
+        name_val = model_def.get("model_name")
+        name = str(name_val) if name_val is not None else ""
+        existing_id = existing_by_name.get(name)
+        if existing_id:
+            try:
+                delete_fn(id=str(existing_id))
+            except Exception:
+                # best-effort; continue to create if delete fails
+                pass
+        create_fn(**model_def)
+
+
+__all__ = ["CEREBRAS_PRICING", "pricing_payload", "sync_cerebras_models"]
+</file>
+
+<file path="telemetry/tracing/score_emitter.py">
+from __future__ import annotations
+
+import logging
+import os
+
+from pydantic import BaseModel, ConfigDict, model_validator
+
+_STRICT_DEBUG = bool(os.getenv("LANGFUSE_STRICT_DEBUG"))
+
+
+class ScorePayload(BaseModel):
+    """Strict payload for Langfuse score emission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: float | int | bool | str
+    data_type: str | None = None
+    trace_id: str | None = None
+    observation_id: str | None = None
+    session_id: str | None = None
+    config_id: str | None = None
+    comment: str | None = None
+    score_id: str | None = None
+
+    @model_validator(mode="after")
+    def _require_identifier(self) -> "ScorePayload":
+        if not any([self.trace_id, self.observation_id, self.session_id]):
+            raise ValueError("Score emission requires a trace, observation, or session identifier")
+        return self
+
+
+def _infer_data_type(value: float | int | bool | str, provided: str | None) -> str | None:
+    if provided is not None:
+        return provided
+    if isinstance(value, bool):
+        return "BOOLEAN"
+    if isinstance(value, (int, float)):
+        return "NUMERIC"
+    if isinstance(value, str):
+        return "CATEGORICAL"
+    return None
+
+
+def emit_score(
+    *,
+    name: str,
+    value: float | int | bool | str,
+    data_type: str | None = None,
+    trace_id: str | None = None,
+    observation_id: str | None = None,
+    session_id: str | None = None,
+    config_id: str | None = None,
+    comment: str | None = None,
+    score_id: str | None = None,
+) -> None:
+    """Submit a score via Langfuse SDK using hosted run identifiers."""
+    from . import get_langfuse_client  # local import to avoid circularity
+    from . import ensure_langfuse_auth  # avoid circularity lint
+
+    resolved_type = _infer_data_type(value, data_type)
+    try:
+        client = get_langfuse_client()
+        ensure_langfuse_auth()
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Langfuse score emission skipped: %s", exc)
+        return
+    try:
+        create_fn = client.create_score
+    except AttributeError as exc:
+        if _STRICT_DEBUG:
+            raise RuntimeError("Langfuse client missing create_score API") from exc
+        logging.debug("Langfuse score emission unavailable: missing create_score API")
+        return
+    try:
+        payload = ScorePayload(
+            name=name,
+            value=value,
+            data_type=resolved_type,
+            trace_id=trace_id,
+            observation_id=observation_id,
+            session_id=session_id,
+            config_id=config_id,
+            comment=comment,
+            score_id=score_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _STRICT_DEBUG:
+            raise
+        logging.debug("Langfuse score payload invalid; skipping score %s: %s", name, exc)
+        return
+    cleaned = payload.model_dump(exclude_none=True)
+    try:
+        create_fn(**cleaned)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001
+        if _STRICT_DEBUG:
+            raise
+        logging.debug("Langfuse score emission failed for %s: %s", name, exc)
+        return
+
+
+def emit_score_for_handle(
+    handle: object | None,
+    *,
+    name: str,
+    value: float | int | bool | str,
+    data_type: str | None = None,
+    session_id: str | None = None,
+    config_id: str | None = None,
+    comment: str | None = None,
+    score_id: str | None = None,
+) -> None:
+    """Emit a score using IDs derived from a Langfuse trace/span handle."""
+    # Prefer the SDK surface on the active observation when possible.
+    if handle is not None:
+        try:
+            handle.score(  # type: ignore[call-arg]
+                name=name,
+                value=value,
+                data_type=data_type,
+                comment=comment,
+                config_id=config_id,
+                score_id=score_id,
+            )
+            return
+        except AttributeError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            if _STRICT_DEBUG:
+                raise
+            logging.debug("Langfuse handle.score failed for %s: %s", name, exc)
+    # Fall back to explicit identifier-based emission (for handles without score()).
+    trace_id = None
+    observation_id = None
+    try:
+        trace_id = handle.trace_id  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            trace_id = handle.id  # type: ignore[attr-defined]
+        except Exception:
+            trace_id = None
+    try:
+        observation_id = handle.id  # type: ignore[attr-defined]
+    except Exception:
+        observation_id = None
+    emit_score(
+        name=name,
+        value=value,
+        data_type=data_type,
+        trace_id=trace_id,
+        observation_id=observation_id,
+        session_id=session_id,
+        config_id=config_id,
+        comment=comment,
+        score_id=score_id,
+    )
+
+
+__all__ = ["emit_score", "emit_score_for_handle", "ScorePayload"]
+</file>
+
+<file path="telemetry/tracing/session_policy.py">
+from __future__ import annotations
+
+import hashlib
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict
+
+SessionScope = Literal["run", "item"]
+
+
+class SessionConfig(BaseModel):
+    """Session policy at public entrypoints."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str | None = None
+    session_scope: SessionScope = "run"
+    allow_generated_fallback: bool = True
+
+
+def _derive_id(*parts: str) -> str:
+    joined = "::".join(p for p in parts if p)
+    digest = hashlib.sha256(joined.encode()).hexdigest()[:12]
+    return f"session-{digest}"
+
+
+def resolve_session_id(
+    config: SessionConfig | None,
+    *,
+    run_id: str | None = None,
+    item_id: str | None = None,
+) -> str | None:
+    """
+    Resolve the effective session id at the entrypoint boundary.
+
+    Precedence:
+    1) Explicit session_id in config
+    2) If allow_generated_fallback is True, derive based on scope and context
+    3) Otherwise None
+    """
+    if config is None:
+        return None
+    if config.session_id:
+        return config.session_id
+    if not config.allow_generated_fallback:
+        return None
+    if config.session_scope == "item" and item_id:
+        return _derive_id(run_id or "", item_id)
+    if config.session_scope == "run" and run_id:
+        return _derive_id(run_id)
+    return None
+
+
+__all__ = ["SessionScope", "SessionConfig", "resolve_session_id"]
+</file>
+
+<file path="telemetry/__init__.py">
+"""Telemetry: tracing, scoring, datasets, and baselines."""
+
+from importlib import import_module
+from typing import Any, TYPE_CHECKING
+
+from .tracing import (
+    flush_langfuse,
+    get_langfuse_client,
+    get_tracing_openai_client,
+    is_langfuse_enabled,
+    propagate_context,
+    start_child_observation,
+    start_observation,
+    start_root_observation,
+)
+from .tracing.score_emitter import ScorePayload, emit_score, emit_score_for_handle
+from .hosted.datasets import (
+    LocalizationDataset,
+    fetch_localization_dataset,
+    local_dataset,
+    normalize_localization_task,
+)
+
+__all__ = [
+    "flush_langfuse",
+    "get_langfuse_client",
+    "get_tracing_openai_client",
+    "is_langfuse_enabled",
+    "propagate_context",
+    "start_observation",
+    "start_root_observation",
+    "start_child_observation",
+    "emit_score",
+    "emit_score_for_handle",
+    "ScorePayload",
+    "LocalizationDataset",
+    "fetch_localization_dataset",
+    "local_dataset",
+    "normalize_localization_task",
+    "BaselineBundle",
+    "BaselineSnapshot",
+    "baseline_key",
+    "compute_baseline_for_task",
+    "make_baseline_bundle",
+    "require_baseline",
+    "resolve_baseline",
+]
+
+if TYPE_CHECKING:
+    from harness.telemetry.hosted.baselines import (
+        BaselineBundle,
+        BaselineSnapshot,
+        baseline_key,
+        compute_baseline_for_task,
+        make_baseline_bundle,
+        require_baseline,
+        resolve_baseline,
+    )
+
+
+def __getattr__(name: str) -> Any:
+    if name in {
+        "BaselineBundle",
+        "BaselineSnapshot",
+        "baseline_key",
+        "compute_baseline_for_task",
+        "make_baseline_bundle",
+        "require_baseline",
+        "resolve_baseline",
+    }:
+        module = import_module("harness.telemetry.hosted.baselines")
+        return getattr(module, name)
+    raise AttributeError(f"module 'harness.telemetry' has no attribute {name!r}")
+</file>
+
 <file path="telemetry/policy_reducer.py">
 from __future__ import annotations
 
@@ -8696,225 +8940,6 @@ def reduce_global(tasks: Iterable[PolicyReducerTaskInput]) -> PolicyReducerSumma
     )
 </file>
 
-<file path="telemetry/score_emitter.py">
-from __future__ import annotations
-
-import logging
-import os
-
-from pydantic import BaseModel, ConfigDict, model_validator
-
-_STRICT_DEBUG = bool(os.getenv("LANGFUSE_STRICT_DEBUG"))
-
-
-class ScorePayload(BaseModel):
-    """Strict payload for Langfuse score emission."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    value: float | int | bool | str
-    data_type: str | None = None
-    trace_id: str | None = None
-    observation_id: str | None = None
-    session_id: str | None = None
-    config_id: str | None = None
-    comment: str | None = None
-    score_id: str | None = None
-
-    @model_validator(mode="after")
-    def _require_identifier(self) -> "ScorePayload":
-        if not any([self.trace_id, self.observation_id, self.session_id]):
-            raise ValueError("Score emission requires a trace, observation, or session identifier")
-        return self
-
-
-def _infer_data_type(value: float | int | bool | str, provided: str | None) -> str | None:
-    if provided is not None:
-        return provided
-    if isinstance(value, bool):
-        return "BOOLEAN"
-    if isinstance(value, (int, float)):
-        return "NUMERIC"
-    if isinstance(value, str):
-        return "CATEGORICAL"
-    return None
-
-
-def emit_score(
-    *,
-    name: str,
-    value: float | int | bool | str,
-    data_type: str | None = None,
-    trace_id: str | None = None,
-    observation_id: str | None = None,
-    session_id: str | None = None,
-    config_id: str | None = None,
-    comment: str | None = None,
-    score_id: str | None = None,
-) -> None:
-    """Submit a score via Langfuse SDK using hosted run identifiers."""
-    from .langfuse import get_langfuse_client  # local import to avoid circularity
-    from .langfuse import ensure_langfuse_auth  # avoid circularity lint
-
-    resolved_type = _infer_data_type(value, data_type)
-    try:
-        client = get_langfuse_client()
-        ensure_langfuse_auth()
-    except Exception as exc:  # noqa: BLE001
-        logging.debug("Langfuse score emission skipped: %s", exc)
-        return
-    try:
-        create_fn = client.create_score
-    except AttributeError as exc:
-        if _STRICT_DEBUG:
-            raise RuntimeError("Langfuse client missing create_score API") from exc
-        logging.debug("Langfuse score emission unavailable: missing create_score API")
-        return
-    try:
-        payload = ScorePayload(
-            name=name,
-            value=value,
-            data_type=resolved_type,
-            trace_id=trace_id,
-            observation_id=observation_id,
-            session_id=session_id,
-            config_id=config_id,
-            comment=comment,
-            score_id=score_id,
-        )
-    except Exception as exc:  # noqa: BLE001
-        if _STRICT_DEBUG:
-            raise
-        logging.debug("Langfuse score payload invalid; skipping score %s: %s", name, exc)
-        return
-    cleaned = payload.model_dump(exclude_none=True)
-    try:
-        create_fn(**cleaned)  # type: ignore[arg-type]
-    except Exception as exc:  # noqa: BLE001
-        if _STRICT_DEBUG:
-            raise
-        logging.debug("Langfuse score emission failed for %s: %s", name, exc)
-        return
-
-
-def emit_score_for_handle(
-    handle: object | None,
-    *,
-    name: str,
-    value: float | int | bool | str,
-    data_type: str | None = None,
-    session_id: str | None = None,
-    config_id: str | None = None,
-    comment: str | None = None,
-    score_id: str | None = None,
-) -> None:
-    """Emit a score using IDs derived from a Langfuse trace/span handle."""
-    # Prefer the SDK surface on the active observation when possible.
-    if handle is not None:
-        try:
-            handle.score(  # type: ignore[call-arg]
-                name=name,
-                value=value,
-                data_type=data_type,
-                comment=comment,
-                config_id=config_id,
-                score_id=score_id,
-            )
-            return
-        except AttributeError:
-            pass
-        except Exception as exc:  # noqa: BLE001
-            if _STRICT_DEBUG:
-                raise
-            logging.debug("Langfuse handle.score failed for %s: %s", name, exc)
-    # Fall back to explicit identifier-based emission (for handles without score()).
-    trace_id = None
-    observation_id = None
-    try:
-        trace_id = handle.trace_id  # type: ignore[attr-defined]
-    except Exception:
-        try:
-            trace_id = handle.id  # type: ignore[attr-defined]
-        except Exception:
-            trace_id = None
-    try:
-        observation_id = handle.id  # type: ignore[attr-defined]
-    except Exception:
-        observation_id = None
-    emit_score(
-        name=name,
-        value=value,
-        data_type=data_type,
-        trace_id=trace_id,
-        observation_id=observation_id,
-        session_id=session_id,
-        config_id=config_id,
-        comment=comment,
-        score_id=score_id,
-    )
-
-
-__all__ = ["emit_score", "emit_score_for_handle", "ScorePayload"]
-</file>
-
-<file path="telemetry/session_policy.py">
-from __future__ import annotations
-
-import hashlib
-from typing import Literal
-
-from pydantic import BaseModel, ConfigDict
-
-SessionScope = Literal["run", "item"]
-
-
-class SessionConfig(BaseModel):
-    """Session policy at public entrypoints."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: str | None = None
-    session_scope: SessionScope = "run"
-    allow_generated_fallback: bool = True
-
-
-def _derive_id(*parts: str) -> str:
-    joined = "::".join(p for p in parts if p)
-    digest = hashlib.sha256(joined.encode()).hexdigest()[:12]
-    return f"session-{digest}"
-
-
-def resolve_session_id(
-    config: SessionConfig | None,
-    *,
-    run_id: str | None = None,
-    item_id: str | None = None,
-) -> str | None:
-    """
-    Resolve the effective session id at the entrypoint boundary.
-
-    Precedence:
-    1) Explicit session_id in config
-    2) If allow_generated_fallback is True, derive based on scope and context
-    3) Otherwise None
-    """
-    if config is None:
-        return None
-    if config.session_id:
-        return config.session_id
-    if not config.allow_generated_fallback:
-        return None
-    if config.session_scope == "item" and item_id:
-        return _derive_id(run_id or "", item_id)
-    if config.session_scope == "run" and run_id:
-        return _derive_id(run_id)
-    return None
-
-
-__all__ = ["SessionScope", "SessionConfig", "resolve_session_id"]
-</file>
-
 <file path="tests_harness/conftest.py">
 from __future__ import annotations
 
@@ -8929,7 +8954,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
-from harness import observability
+from harness import telemetry
 
 
 class TestSpan(BaseModel):
@@ -8971,8 +8996,8 @@ def _stub_langfuse_client(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
         return
     if request.node.get_closest_marker("no_langfuse_stub"):
         return
-    import harness.telemetry.langfuse as lf
-    import harness.telemetry.score_emitter as se
+    import harness.telemetry.tracing as lf
+    import harness.telemetry.tracing.score_emitter as se
 
     monkeypatch.setattr(lf, "_STRICT_DEBUG", False)
     monkeypatch.setattr(se, "_STRICT_DEBUG", False)
@@ -9041,7 +9066,7 @@ import pytest
 from mcp.types import TextContent, Tool
 
 from harness.localization.models import LCAContext, LCATaskIdentity
-from harness.localization import agent_runtime as runner
+from harness.localization.runtime import agent_runtime as runner
 from harness.backends.ic import IterativeContextBackend
 from harness.backends.jc import JCodeMunchBackend
 from harness.backends.mcp import (
@@ -9647,7 +9672,7 @@ def test_jc_backend_initializes_local_repo(monkeypatch, tmp_path):
 from __future__ import annotations
 
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
-from harness.telemetry import baselines
+from harness.telemetry.hosted import baselines
 
 
 def _install_dummy_langfuse(monkeypatch):
@@ -9669,7 +9694,7 @@ def _install_dummy_langfuse(monkeypatch):
         def start_as_current_observation(self, **kwargs):
             return _CM()
 
-    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
 
 
 def _task(repo: str | None = None) -> LCATask:
@@ -9731,7 +9756,7 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
     task = _task(str(repo_dir))
     calls = []
 
-    from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+    from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
     from harness.localization.models import LocalizationMetrics, LocalizationPrediction
 
     def fake_backend(**kwargs):
@@ -9762,7 +9787,7 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
 </file>
 
 <file path="tests_harness/test_cerebras_pricing.py">
-from harness.telemetry.cerebras_pricing import (
+from harness.telemetry.tracing.cerebras_pricing import (
     CEREBRAS_PRICING,
     cost_details_for_usage,
     pricing_payload,
@@ -9817,7 +9842,7 @@ from types import SimpleNamespace
 import pytest
 
 import run as run_module
-from harness.entrypoints.requests import HostedLocalizationBaselineRequest
+from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 
 
@@ -9977,7 +10002,7 @@ def test_max_workers_validation():
 <file path="tests_harness/test_datasets.py">
 from __future__ import annotations
 
-from harness.telemetry import datasets
+from harness.telemetry.hosted import datasets
 from harness.localization.models import LCATaskIdentity
 
 
@@ -10009,7 +10034,7 @@ import pytest
 from pathlib import Path
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.execute import (
+from harness.localization.runtime.execute import (
     _resolve_repo_path,
     _run_runner,
     _score_task,
@@ -10060,7 +10085,7 @@ def test_score_task_failure_is_typed(tmp_path, monkeypatch):
     def bad_eval(*_a, **_k):
         raise ValueError("score fail")
 
-    monkeypatch.setattr("harness.localization.execute.build_file_localization_eval_record", bad_eval)
+    monkeypatch.setattr("harness.localization.runtime.execute.build_file_localization_eval_record", bad_eval)
     with pytest.raises(LocalizationEvaluationError) as exc:
         _score_task(task, LCAPrediction(predicted_files=["a.py"]), repo)
     assert exc.value.category == LocalizationFailureCategory.SCORING
@@ -10074,9 +10099,9 @@ import time
 import pytest
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity, LocalizationMetrics
-from harness.telemetry import experiments
+from harness.telemetry.hosted import experiments
 
 
 def _task(repo: str) -> LCATask:
@@ -10097,7 +10122,7 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     task = _task(str(tmp_path / "repo"))
     calls = []
 
-    from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+    from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
     from harness.localization.models import LocalizationMetrics
 
     def fake_backend(**kwargs):
@@ -10321,7 +10346,7 @@ import types
 
 import pytest
 
-from harness.telemetry.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
+from harness.telemetry.hosted.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
 
 
 class _FakeDatasets:
@@ -10353,7 +10378,7 @@ def test_hf_loader_normalizes_rows(monkeypatch):
 
     fake_module = types.SimpleNamespace(utils=types.SimpleNamespace(AuthenticationError=Exception))
     monkeypatch.setattr(
-        "harness.telemetry.hf_lca._require_dependency",
+        "harness.telemetry.hosted.hf_lca._require_dependency",
         lambda: types.SimpleNamespace(load_dataset=_FakeDatasets(rows).load_dataset, utils=fake_module.utils),
     )
 
@@ -10384,7 +10409,7 @@ def test_hf_loader_missing_required_fields_raises(monkeypatch):
     ]
     fake_module = types.SimpleNamespace(utils=types.SimpleNamespace(AuthenticationError=Exception))
     monkeypatch.setattr(
-        "harness.telemetry.hf_lca._require_dependency",
+        "harness.telemetry.hosted.hf_lca._require_dependency",
         lambda: types.SimpleNamespace(load_dataset=_FakeDatasets(rows).load_dataset, utils=fake_module.utils),
     )
     with pytest.raises(HFDatasetLoadError) as excinfo:
@@ -10399,8 +10424,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from harness.localization.hf_materialize import HuggingFaceRepoMaterializer
-from harness.localization.materialize import RepoMaterializationRequest, RepoMaterializationResult, describe_repo_mapping
+from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
+from harness.localization.materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, describe_repo_mapping
 
 
 def _run_git(args: list[str], cwd: Path | None = None) -> str:
@@ -10608,9 +10633,9 @@ from pathlib import Path
 
 import pytest
 
-from harness.localization.hf_materialize import HuggingFaceRepoMaterializer
-from harness.localization.materialize import RepoMaterializationRequest
-from harness.telemetry.hf_lca import fetch_hf_localization_dataset
+from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
+from harness.localization.materialization.materialize import RepoMaterializationRequest
+from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
 
 
 @pytest.mark.skipif(not os.environ.get("HF_NETWORK_TESTS"), reason="HF network tests are opt-in via HF_NETWORK_TESTS env")
@@ -10647,7 +10672,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from harness.localization.evaluate import (
+from harness.localization.runtime.evaluate import (
     DEFAULT_LOCALIZATION_RUNNER,
     MachineScorePolicy,
     evaluate_localization_batch,
@@ -10679,7 +10704,7 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
@@ -10698,7 +10723,7 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
         raise RuntimeError("runner failed")
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         failing_runner,
         raising=False,
     )
@@ -10714,7 +10739,7 @@ def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
@@ -10738,7 +10763,7 @@ def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
@@ -10756,7 +10781,7 @@ def test_machine_score_policy(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.run_localization_task",
+        "harness.localization.runtime.evaluate.run_localization_task",
         lambda *a, **k: (
             LCAPrediction(predicted_files=["a.py"]),
             LocalizationMetrics(precision=0.5, recall=0.5, f1=0.5, hit=1.0, score=0.5),
@@ -10784,7 +10809,7 @@ def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
         raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "scoring failed")
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         failing_runner,
         raising=False,
     )
@@ -10802,12 +10827,12 @@ def test_machine_score_policy_failure_is_typed(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
     monkeypatch.setattr(
-        "harness.localization.evaluate._derive_machine_score",
+        "harness.localization.runtime.evaluate._derive_machine_score",
         lambda **kwargs: (_ for _ in ()).throw(LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "bad policy")),
         raising=True,
     )
@@ -10829,11 +10854,11 @@ def test_aggregate_metrics_failure_is_typed(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
-    monkeypatch.setattr("harness.localization.evaluate.LocalizationMetrics", BadMetrics, raising=False)
+    monkeypatch.setattr("harness.localization.runtime.evaluate.LocalizationMetrics", BadMetrics, raising=False)
     result = evaluate_localization_batch(
         tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )
@@ -10861,11 +10886,11 @@ from harness.localization.models import (
     LocalizationTelemetryEnvelope,
 )
 from harness.localization.scoring import score_file_localization
-from harness.localization.records import build_file_localization_eval_record
+from harness.localization.runtime.records import build_file_localization_eval_record
 from harness.localization.telemetry import build_localization_telemetry
-from harness.localization.execute import run_localization_task
-import harness.localization.execute as executor_module
-import harness.localization.agent_runtime as runner
+from harness.localization.runtime.execute import run_localization_task
+import harness.localization.runtime.execute as executor_module
+import harness.localization.runtime.agent_runtime as runner
 
 
 def test_identity_is_deterministic():
@@ -11059,7 +11084,7 @@ from __future__ import annotations
 
 import pytest
 
-from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult, MachineScorePolicy
+from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult, MachineScorePolicy
 from harness.localization.models import LocalizationMetrics, LCAContext, LCATaskIdentity, LCAGold, LCATask
 from harness.orchestration.runtime import evaluate_policy_on_item
 from harness.orchestration.types import ICTaskPayload
@@ -11626,14 +11651,14 @@ from __future__ import annotations
 
 import pytest
 
-from harness.telemetry import langfuse as lf
-from harness.telemetry import score_emitter
+from harness.telemetry import tracing as lf
+from harness.telemetry.tracing import score_emitter
 
 
 @pytest.mark.no_langfuse_stub
 def test_langfuse_disabled_without_keys(monkeypatch):
     import importlib
-    import harness.telemetry.langfuse as lf
+    import harness.telemetry.tracing as lf
 
     monkeypatch.setenv("LANGFUSE_NO_STUB", "1")
     lf = importlib.reload(lf)
@@ -11654,7 +11679,7 @@ def test_emit_score_uses_client(monkeypatch):
         def create_score(self, **kwargs):
             calls.append(kwargs)
 
-    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
     score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
 
     assert calls
@@ -11669,7 +11694,7 @@ def test_emit_score_for_handle_requires_identifier(monkeypatch):
         def create_score(self, **kwargs):
             pass
 
-    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
     score_emitter.emit_score_for_handle(None, name="metric", value=1.0)
 
 
@@ -11680,7 +11705,7 @@ def test_emit_score_for_handle_allows_dataset_only(monkeypatch):
         def create_score(self, **kwargs):
             calls.append(kwargs)
 
-    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
     score_emitter.emit_score_for_handle(None, name="metric", value=1.0, session_id="sess123")
 
     assert calls
@@ -11707,7 +11732,7 @@ def test_start_observation_accepts_context_manager(monkeypatch):
             self.end_called += 1
 
     monkeypatch.setattr(
-        "harness.telemetry.langfuse.get_langfuse_client",
+        "harness.telemetry.tracing.get_langfuse_client",
         lambda: type("C", (), {"start_as_current_observation": lambda *a, **k: CMObservation()})(),
     )
 
@@ -11752,7 +11777,7 @@ def test_start_child_observation_handles_plain_object_parent():
 
 def test_emit_score_best_effort_when_client_missing(monkeypatch):
     monkeypatch.setattr(
-        "harness.telemetry.langfuse.get_langfuse_client",
+        "harness.telemetry.tracing.get_langfuse_client",
         lambda: (_ for _ in ()).throw(RuntimeError("no client")),
     )
     # Should not raise
@@ -11763,7 +11788,7 @@ def test_emit_score_handles_missing_api(monkeypatch):
     class DummyClient:
         api = type("A", (), {})()
 
-    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
     # Should not raise even though no create_score API
     score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
 
@@ -11798,7 +11823,7 @@ def test_propagate_context_strict_rejects_selection(monkeypatch):
     monkeypatch.setenv("LANGFUSE_STRICT_DEBUG", "1")
     import importlib
 
-    import harness.telemetry.langfuse as lf_mod
+    import harness.telemetry.tracing as lf_mod
 
     importlib.reload(lf_mod)
     with pytest.raises(ValueError):
@@ -12106,7 +12131,7 @@ from pathlib import Path
 
 import pytest
 
-import harness.localization.agent_runtime as runner
+import harness.localization.runtime.agent_runtime as runner
 import harness.agents.writer as writer
 from harness.utils import type_loader
 from harness.pipeline.types import StepResult
@@ -12322,7 +12347,7 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
         ic_repos.append(task.get("repo"))
         return {"observations": [{"tool": "x"}], "node_count": 1}
 
-    monkeypatch.setattr("harness.localization.agent_runtime.run_ic_iteration", fake_run_ic_iteration)
+    monkeypatch.setattr("harness.localization.runtime.agent_runtime.run_ic_iteration", fake_run_ic_iteration)
     monkeypatch.setattr("harness.orchestration.runtime.score", lambda result: {"score": 1.0, "ic_nodes": 1, "jc_nodes": 0})
     monkeypatch.setattr("harness.orchestration.runtime.load_tests", lambda repo: [])
     monkeypatch.setattr("harness.orchestration.runtime.format_tests_for_prompt", lambda tests: "")
@@ -12442,9 +12467,9 @@ import pytest
 from contextlib import contextmanager
 from typing import Any
 
-from harness.telemetry.langfuse import start_observation
-from harness.telemetry.score_emitter import emit_score
-from harness.telemetry.session_policy import SessionConfig, resolve_session_id
+from harness.telemetry.tracing import start_observation
+from harness.telemetry.tracing.score_emitter import emit_score
+from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
 
 
 @contextmanager
@@ -12465,7 +12490,7 @@ def _dummy_observation(session_id: str | None = None):
 
 def test_child_span_inherits_session(monkeypatch):
     monkeypatch.setattr(
-        "harness.telemetry.langfuse.get_langfuse_client",
+        "harness.telemetry.tracing.get_langfuse_client",
         lambda: type(
             "C",
             (),
@@ -12479,7 +12504,7 @@ def test_child_span_inherits_session(monkeypatch):
 
 def test_conflicting_child_session_raises(monkeypatch):
     monkeypatch.setattr(
-        "harness.telemetry.langfuse.get_langfuse_client",
+        "harness.telemetry.tracing.get_langfuse_client",
         lambda: type(
             "C",
             (),
@@ -12500,12 +12525,12 @@ def test_session_only_score(monkeypatch):
             calls.append(kwargs)
 
     monkeypatch.delenv("LANGFUSE_STRICT_DEBUG", raising=False)
-    import harness.telemetry.score_emitter as se
-    import harness.telemetry.langfuse as lf
+    import harness.telemetry.tracing.score_emitter as se
+    import harness.telemetry.tracing as lf
 
     monkeypatch.setattr(se, "_STRICT_DEBUG", False)
     monkeypatch.setattr(lf, "_STRICT_DEBUG", False)
-    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
     emit_score(name="metric", value=1.0, session_id="sess-only")
     assert calls and calls[0]["session_id"] == "sess-only"
 
@@ -12634,7 +12659,7 @@ from contextlib import contextmanager
 import pytest
 
 from harness.localization.models import LCAContext, LCATaskIdentity
-from harness.localization import agent_runtime as runner
+from harness.localization.runtime import agent_runtime as runner
 from harness.agents import common as agent_common
 from harness.agents import writer
 from harness.utils import type_loader
@@ -13622,7 +13647,7 @@ One-off helper to sync Cerebras pricing definitions to Langfuse Cloud Models API
 Requires LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY (and optional LANGFUSE_BASE_URL) to be set.
 """
 
-from harness.telemetry.cerebras_pricing import sync_cerebras_models
+from harness.telemetry.tracing.cerebras_pricing import sync_cerebras_models
 
 
 def main() -> None:
@@ -14335,7 +14360,7 @@ Leaf-operation observability remains with:
 - Localization baseline (hosted dataset): `python run.py --mode localization-baseline --dataset DATASET_NAME [--version v1] [--config py] [--split dev] [--baseline-path bundle.json]`
 - Localization experiment (hosted dataset): `python run.py --mode localization-experiment --dataset DATASET_NAME [--version v1] [--config py] [--split dev]`
 - Console output is concise; Langfuse stores detailed traces/scores. `flush_langfuse()` runs on exit.
-- To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/cerebras_pricing.py`.
+- To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.tracing.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/tracing/cerebras_pricing.py`.
 
 ## Policy Loading
 - `policy_loader.py` now loads `policy.py` and requires the public Iterative Context scorer contract `score(node: GraphNode, graph: Graph, step: int) -> float` (SelectionCallable). No sandbox or restricted execution.
