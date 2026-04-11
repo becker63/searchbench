@@ -15,7 +15,7 @@ class SessionConfig(BaseModel):
 
     session_id: str | None = None
     session_scope: SessionScope = "run"
-    allow_generated_fallback: bool = False
+    allow_generated_fallback: bool = True
 
 
 def _derive_id(*parts: str) -> str:

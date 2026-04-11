@@ -4,6 +4,28 @@ from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIde
 from harness.observability import baselines
 
 
+def _install_dummy_langfuse(monkeypatch):
+    class _CM:
+        def __init__(self):
+            self.id = "trace-id"
+            self.trace_id = "trace-id"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def update(self, **kwargs):
+            return None
+
+    class DummyClient:
+        def start_as_current_observation(self, **kwargs):
+            return _CM()
+
+    monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
+
+
 def _task(repo: str | None = None) -> LCATask:
     identity = LCATaskIdentity(
         dataset_name="lca-bug-localization",
@@ -25,6 +47,9 @@ def test_baseline_key_is_task_id():
 
 
 def test_resolve_and_bundle_roundtrip(tmp_path):
+    import pytest
+    monkeypatch = pytest.MonkeyPatch()
+    _install_dummy_langfuse(monkeypatch)
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     task = _task(str(repo_dir))
@@ -54,6 +79,7 @@ def test_require_baseline_errors_when_missing():
 
 
 def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
+    _install_dummy_langfuse(monkeypatch)
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     task = _task(str(repo_dir))

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 from concurrent.futures import FIRST_COMPLETED
-from types import SimpleNamespace
 from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
@@ -18,7 +17,7 @@ from harness.localization.materializer import RepoMaterializationResult, RepoMat
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.observability.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
 from harness.observability.hf_lca import fetch_hf_localization_dataset
-from harness.observability.langfuse import flush_langfuse, propagate_context
+from harness.observability.langfuse import flush_langfuse, propagate_context, start_observation
 from harness.observability.session_policy import resolve_session_id
 from harness.observability.policy_reducer import PolicyReducerSummary, build_task_input, reduce_global
 
@@ -123,9 +122,15 @@ def run_hosted_localization_baseline(
     snapshots: list[BaselineSnapshot] = []
     failure: LocalizationEvaluationFailure | None = None
     effective_workers = _effective_workers(req.max_workers or 1, len(selected_tasks))
+    selection_meta = selection_info or {
+        "selected_count": len(selected_tasks),
+        "offset": req.offset,
+        "limit": req.max_items,
+    }
+    run_session_id = resolve_session_id(req.session, run_id=req.dataset)
     with propagate_context(
         trace_name="localization_baseline_dataset",
-        session_id=resolve_session_id(req.session, run_id=req.dataset),
+        session_id=run_session_id,
         metadata={
             "dataset": req.dataset,
             "dataset_version": req.version,
@@ -133,30 +138,42 @@ def run_hosted_localization_baseline(
             "dataset_split": req.dataset_split,
             "run_kind": "localization_baseline",
             "dataset_source": "huggingface",
-            "selection": selection_info,
-            "projection": req.projection,
         },
-    ) as trace:
-        parent_trace = trace or SimpleNamespace(id="trace")
-        if effective_workers == 1:
-            for task in selected_tasks:
-                snapshots.append(
-                    compute_baseline_for_task(
-                        task,
-                        dataset_version=req.version,
-                        parent_trace=parent_trace,
-                        dataset_source="huggingface",
-                        materializer=materializer,
+    ):
+        with start_observation(
+            name="localization_baseline_dataset",
+            metadata={
+                "dataset": req.dataset,
+                "dataset_version": req.version,
+                "dataset_config": req.dataset_config,
+                "dataset_split": req.dataset_split,
+                "run_kind": "localization_baseline",
+                "dataset_source": "huggingface",
+                "selection": selection_meta,
+            },
+        ) as dataset_span:
+            parent_trace = dataset_span
+            if effective_workers == 1:
+                for task in selected_tasks:
+                    snapshots.append(
+                        compute_baseline_for_task(
+                            task,
+                            session_id=run_session_id,
+                            dataset_version=req.version,
+                            parent_trace=parent_trace,
+                            dataset_source="huggingface",
+                            materializer=materializer,
+                        )
                     )
+            else:
+                snapshots, failure = _run_baseline_parallel(
+                    selected_tasks,
+                    effective_workers,
+                    parent_trace,
+                    materializer,
+                    req.version,
+                    run_session_id,
                 )
-        else:
-            snapshots, failure = _run_baseline_parallel(
-                selected_tasks,
-                effective_workers,
-                parent_trace,
-                materializer,
-                req.version,
-            )
     flush_langfuse()
     return make_baseline_bundle(
         snapshots,
@@ -173,12 +190,14 @@ def _baseline_worker(
     parent_trace: object,
     materializer: RepoMaterializer | None,
     dataset_version: str | None,
+    session_id: str | None,
 ) -> BaselineSnapshot:
     if parent_trace is None:
         raise _TaskFailure(index, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, "missing parent trace")
     try:
         return compute_baseline_for_task(
             task,
+            session_id=session_id,
             dataset_version=dataset_version,
             parent_trace=parent_trace,
             dataset_source="huggingface",
@@ -197,6 +216,7 @@ def _run_baseline_parallel(
     parent_trace: object,
     materializer: RepoMaterializer | None,
     dataset_version: str | None,
+    session_id: str | None,
 ) -> tuple[list[BaselineSnapshot], LocalizationEvaluationFailure | None]:
     results: list[BaselineSnapshot | None] = [None] * len(tasks)
     failure: _TaskFailure | None = None
@@ -205,7 +225,15 @@ def _run_baseline_parallel(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
         def _submit(idx: int) -> None:
-            future = executor.submit(_baseline_worker, idx, tasks[idx], parent_trace, materializer, dataset_version)
+            future = executor.submit(
+                _baseline_worker,
+                idx,
+                tasks[idx],
+                parent_trace,
+                materializer,
+                dataset_version,
+                session_id,
+            )
             inflight[future] = idx
 
         while next_index < len(tasks) and len(inflight) < effective_workers:
@@ -252,20 +280,22 @@ def _run_experiment_task(
     task: LCATask | Mapping[str, object],
     parent_trace: object,
     materializer: RepoMaterializer | None,
+    session_id: str | None,
 ) -> LocalizationRunItemResult:
     if parent_trace is None:
         raise _TaskFailure(-1, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, "missing parent trace")
     task_payload = _normalize_task_payload(task)
     normalized_task = normalize_lca_task(task_payload)
     try:
-        eval_result = evaluate_localization_batch(
-            LocalizationEvaluationRequest(
-                tasks=[normalized_task],
-                dataset_source="huggingface",
-                materializer=materializer,
-                parent_trace=parent_trace,
+        with propagate_context(session_id=session_id):
+            eval_result = evaluate_localization_batch(
+                LocalizationEvaluationRequest(
+                    tasks=[normalized_task],
+                    dataset_source="huggingface",
+                    materializer=materializer,
+                    parent_trace=parent_trace,
+                )
             )
-        )
         if eval_result.failure or not eval_result.items:
             failure = eval_result.failure or LocalizationEvaluationFailure(
                 category=LocalizationFailureCategory.UNKNOWN, message="experiment_evaluation_failed", task_id=normalized_task.task_id
@@ -294,6 +324,7 @@ def _run_experiment_parallel(
     effective_workers: int,
     parent_trace: object,
     materializer: RepoMaterializer | None,
+    session_id: str | None,
 ) -> tuple[list[LocalizationRunItemResult], LocalizationEvaluationFailure | None]:
     results: list[LocalizationRunItemResult | None] = [None] * len(tasks)
     failure: _TaskFailure | None = None
@@ -302,7 +333,13 @@ def _run_experiment_parallel(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
         def _submit(idx: int) -> None:
-            future = executor.submit(_run_experiment_task, tasks[idx], parent_trace, materializer)
+            future = executor.submit(
+                _run_experiment_task,
+                tasks[idx],
+                parent_trace,
+                materializer,
+                session_id,
+            )
             inflight[future] = idx
 
         while next_index < len(tasks) and len(inflight) < effective_workers:
@@ -353,9 +390,16 @@ def run_hosted_localization_experiment(
     results: list[LocalizationRunItemResult] = []
     failure: LocalizationEvaluationFailure | None = None
     effective_workers = _effective_workers(req.max_workers or 1, len(selected_tasks))
+    selection_meta = selection_info or {
+        "selected_count": len(selected_tasks),
+        "offset": req.offset,
+        "limit": req.max_items,
+    }
+    projection_meta: dict[str, object] = {"provided": bool(req.projection)}
+    run_session_id = resolve_session_id(req.session, run_id=req.dataset)
     with propagate_context(
         trace_name="localization_experiment",
-        session_id=resolve_session_id(req.session, run_id=req.dataset),
+        session_id=run_session_id,
         metadata={
             "dataset": req.dataset,
             "dataset_version": req.version,
@@ -363,21 +407,40 @@ def run_hosted_localization_experiment(
             "dataset_split": req.dataset_split,
             "run_kind": "localization_experiment",
             "dataset_source": "huggingface",
-            "selection": selection_info,
-            "projection": req.projection,
         },
-    ) as trace:
-        parent_trace = trace or SimpleNamespace(id="trace")
-        if effective_workers == 1:
-            for task in selected_tasks:
-                results.append(_run_experiment_task(task=task, parent_trace=parent_trace, materializer=materializer))
-        else:
-            results, failure = _run_experiment_parallel(
-                selected_tasks,
-                effective_workers,
-                parent_trace,
-                materializer,
-            )
+    ):
+        with start_observation(
+            name="localization_experiment_dataset",
+            metadata={
+                "dataset": req.dataset,
+                "dataset_version": req.version,
+                "dataset_config": req.dataset_config,
+                "dataset_split": req.dataset_split,
+                "run_kind": "localization_experiment",
+                "dataset_source": "huggingface",
+                "selection": selection_meta,
+                "projection": projection_meta,
+            },
+        ) as dataset_span:
+            parent_trace = dataset_span
+            if effective_workers == 1:
+                for task in selected_tasks:
+                    results.append(
+                        _run_experiment_task(
+                            task=task,
+                            parent_trace=parent_trace,
+                            materializer=materializer,
+                            session_id=run_session_id,
+                        )
+                    )
+            else:
+                results, failure = _run_experiment_parallel(
+                    selected_tasks,
+                    effective_workers,
+                    parent_trace,
+                    materializer,
+                    run_session_id,
+                )
     flush_langfuse()
     reducer_summary = _build_reducer_summary(results)
     return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results, failure=failure, reducer_summary=reducer_summary)

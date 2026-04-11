@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from contextlib import nullcontext
 
 # Ensure the repository root (parent of the harness package) is on sys.path when executed as a script.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +34,14 @@ from harness.loop.loop_types import (
 from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import ScorerContext
+
+
+class _DummySpan:
+    def end(self, **kwargs: object) -> None:
+        return None
+
+    def update(self, **kwargs: object) -> None:
+        return None
 
 STUB_SCORER_CTX = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
 
@@ -118,7 +127,7 @@ def _stub_deps() -> LoopDependencies:
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        start_observation=lambda *a, **k: None,
+        start_observation=lambda *a, **k: nullcontext(_DummySpan()),
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),
     )

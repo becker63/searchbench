@@ -160,7 +160,6 @@ def _emit_telemetry(
         evidence=evidence,
         materialization_events=materialization.events if materialization else None,
     )
-    dataset_run_id = getattr(trace, "id", None) if trace else None
     for metric_name, metric_value in metrics.model_dump().items():
         if metric_value is None:
             continue
@@ -169,7 +168,6 @@ def _emit_telemetry(
             name=f"localization.{metric_name}",
             value=float(metric_value),
             data_type="NUMERIC",
-            dataset_run_id=dataset_run_id,
             score_id=f"{getattr(trace, 'id', None)}-localization.{metric_name}"
             if getattr(trace, "id", None)
             else None,

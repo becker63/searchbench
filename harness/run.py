@@ -8,6 +8,7 @@ Adds dataset guardrails: deterministic selection, cost projection, confirmation 
 import argparse
 import logging
 import sys
+import os
 from contextlib import contextmanager
 from typing import IO, Any, Iterable, Iterator
 
@@ -35,7 +36,7 @@ from harness.observability.hf_lca import (
     HFDatasetLoadError,
     fetch_hf_localization_dataset,
 )
-from harness.observability.langfuse import flush_langfuse
+from harness.observability.langfuse import flush_langfuse, ensure_langfuse_auth
 from harness.observability.requests import (
     HostedLocalizationBaselineRequest,
     HostedLocalizationRunRequest,
@@ -187,6 +188,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         sub.add_argument(
             "--allow-session-fallback",
             action="store_true",
+            default=True,
             help="Allow deterministic fallback session id generation at entrypoints",
         )
 
@@ -448,14 +450,18 @@ def _require_confirmation(
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Enable strict Langfuse debug behavior during migration/debugging.
+    os.environ.setdefault("LANGFUSE_STRICT_DEBUG", "1")
     args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO)
+    # Fail fast on Langfuse auth/base-url issues in the canonical path.
+    ensure_langfuse_auth()
     if args.max_workers is not None and args.max_workers <= 0:
         raise ValueError("--max-workers must be a positive integer")
     materializer = HuggingFaceRepoMaterializer()
     session_cfg = SessionConfig(
         session_id=args.session_id,
-        session_scope="item",  # dataset-backed runs use item scope
+        session_scope="run",  # dataset-backed runs use run scope
         allow_generated_fallback=args.allow_session_fallback,
     )
 

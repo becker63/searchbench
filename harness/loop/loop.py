@@ -9,7 +9,7 @@ import hashlib
 from collections.abc import Mapping, Sequence
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol, cast
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
@@ -17,7 +17,6 @@ from harness.loop.runner_agent import run_ic_iteration
 from harness.observability.langfuse import (
     flush_langfuse,
     propagate_context,
-    _safe_end_observation,
     start_observation,
 )
 from harness.observability.score_emitter import emit_score
@@ -31,6 +30,7 @@ from harness.utils.test_loader import format_tests_for_prompt, load_tests
 from harness.utils.type_loader import ScorerContext, build_scorer_context, format_scoring_context, load_graph_models, load_scoring_examples, load_scoring_types
 from harness.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
+from harness.loop.loop_types import SpanHandle
 
 if TYPE_CHECKING:
     from harness.localization.evaluation_backend import LocalizationEvaluationRequest as LocalizationEvaluationRequestType
@@ -87,7 +87,6 @@ _REEXPORTED = (
     generate_policy,
     classify_results,
     default_pipeline,
-    start_observation,
     flush_langfuse,
     emit_score,
 )
@@ -122,7 +121,7 @@ def score(node: "GraphNode", graph: "Graph", step: int) -> float:
     return _policy_score(node, graph, step)
 
 
-def _pkg_attr(name: str) -> object:
+def _pkg_attr(name: str) -> Any:
     # Access via package to pick up monkeypatching on harness.loop
     pkg = import_module("harness.loop")
     return getattr(pkg, name)
@@ -199,45 +198,38 @@ class SupportsPipelineRun(Protocol):
     def run(
         self,
         repo_root: Path,
-        observation: object | None = None,
+        observation: SpanHandle | None = None,
         allow_no_parent: bool = False,
     ) -> list[StepResult]: ...
 
 
-class SupportsSpan(Protocol):
-    def end(self, **kwargs: object) -> None: ...
-
-
 def prepare_iteration_tasks(
-    task: TaskPayload, parent_trace: object | None = None
+    task: TaskPayload, parent_trace: SpanHandle | None = None
 ) -> PreparedTasks:
     """Resolve repo paths and index JC repo once for the run."""
     repo_path_val = task.repo
     resolved_repo_path = repo_path_val
     jc_repo_id: str | None = None
-    index_obs: SupportsSpan | None = None
-    start_obs_func = cast(Callable[..., object | None], _pkg_attr("start_observation"))
-    index_folder_fn = cast(
-        Callable[[str], Mapping[str, object]], _pkg_attr("index_folder")
-    )
+    start_obs_func: Callable[..., ContextManager[SpanHandle]] = _pkg_attr("start_observation")
+    index_folder_fn: Callable[[str], Mapping[str, object]] = _pkg_attr("index_folder")
     if isinstance(repo_path_val, str):
         try:
-            index_obs = cast(
-                SupportsSpan | None,
-                start_obs_func(
-                    name="index_repo",
-                    parent=parent_trace,
-                    metadata={"repo": repo_path_val},
-                ),
-            )
-            result = index_folder_fn(repo_path_val)
-            repo_id = str(result.get("repo", ""))
-            jc_repo_id = repo_id
-            if index_obs:
-                _safe_end_observation(index_obs, metadata={"repo": repo_id})
-        except Exception as e:  # noqa: BLE001
-            if index_obs:
-                _safe_end_observation(index_obs, error=e)
+            with start_obs_func(
+                name="index_repo",
+                parent=parent_trace,
+                metadata={"repo": repo_path_val},
+            ) as index_obs:
+                result = index_folder_fn(repo_path_val)
+                repo_id = str(result.get("repo", ""))
+                jc_repo_id = repo_id
+                if hasattr(index_obs, "update"):
+                    try:
+                        index_obs.update(metadata={"repo": repo_id})  # type: ignore[call-arg]
+                    except Exception:
+                        pass
+        except Exception:
+            # Propagate failure; lifecycle handled by context manager.
+            raise
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
     ic_task = ICTaskPayload(
@@ -454,7 +446,7 @@ def attempt_policy_generation(
 def run_policy_pipeline(
     pipeline: SupportsPipelineRun,
     repo_root: Path,
-    repair_obs: object | None = None,
+    repair_obs: SpanHandle | None = None,
     allow_no_parent: bool = False,
 ) -> tuple[list[StepResult], bool]:
     try:
@@ -471,14 +463,11 @@ def run_policy_pipeline(
     ]
     trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
     observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
-    dataset_run_id = (
-        getattr(repair_obs, "dataset_run_id", None) if repair_obs is not None else None
-    )
     session_id_val = (
         getattr(repair_obs, "session_id", None) if repair_obs is not None else None
     )
     emit_score_fn = cast(Callable[..., None], _pkg_attr("emit_score"))
-    if not any([trace_id, observation_id, dataset_run_id, session_id_val]):
+    if not any([trace_id, observation_id, session_id_val]):
         pipeline_success = all(_step_succeeded(r) for r in step_results)
         return step_results, pipeline_success
     for step in step_results:
@@ -494,7 +483,6 @@ def run_policy_pipeline(
             data_type=data_type,
             trace_id=trace_id,
             observation_id=observation_id,
-            dataset_run_id=dataset_run_id,
             session_id=session_id_val,
             score_id=score_id,
         )
@@ -509,7 +497,6 @@ def run_policy_pipeline(
             data_type="BOOLEAN",
             trace_id=trace_id,
             observation_id=observation_id,
-            dataset_run_id=dataset_run_id,
             session_id=session_id_val,
             score_id=pass_score_id,
         )
@@ -563,21 +550,14 @@ def finalize_failed_repair(
 
 
 def _build_dependencies() -> LoopDependencies:
-    classify_results_fn = cast(
-        Callable[[list[StepResult]], PipelineClassification],
-        _pkg_attr("classify_results"),
-    )
+    classify_results_fn: Callable[[list[StepResult]], PipelineClassification] = _pkg_attr("classify_results")
     format_pipeline_failure_context_fn = _format_pipeline_failure_context
     read_policy_fn = _pkg_attr("_read_policy")
     write_policy_fn = _pkg_attr("_write_policy")
-    get_writer_model_fn = cast(Callable[[], str | None], _pkg_attr("get_writer_model"))
-    start_obs_fn = cast(
-        Callable[..., SupportsSpan | None], _pkg_attr("start_observation")
-    )
-    find_repo_root_fn = cast(Callable[[], Path], _pkg_attr("find_repo_root"))
-    default_pipeline_fn = cast(
-        Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline")
-    )
+    get_writer_model_fn: Callable[[], str | None] = _pkg_attr("get_writer_model")
+    start_obs_fn: Callable[..., ContextManager[SpanHandle]] = _pkg_attr("start_observation")
+    find_repo_root_fn: Callable[[], Path] = _pkg_attr("find_repo_root")
+    default_pipeline_fn: Callable[[], SupportsPipelineRun] = _pkg_attr("default_pipeline")
     return LoopDependencies(
         prepare_iteration_tasks=prepare_iteration_tasks,
         evaluate_policy_on_item=evaluate_policy_on_item,
@@ -600,7 +580,7 @@ def _build_dependencies() -> LoopDependencies:
 def run_loop(
     task: Mapping[str, object] | TaskPayload,
     iterations: int = 5,
-    parent_trace: object | None = None,
+    parent_trace: SpanHandle | None = None,
     baseline_snapshot: BaselineSnapshot | None = None,
     session_id: str | None = None,
 ) -> list[IterationRecord]:
@@ -611,40 +591,48 @@ def run_loop(
     root_meta = RunMetadata(
         task=base_task, iterations=iterations, session_id=session_id
     )
-    with propagate_context(
-        trace_name="run_loop",
-        session_id=session_id,
+    with start_observation(
+        name="run_loop",
+        parent=parent_trace,
+        input=base_task.model_dump(),
         metadata=root_meta.model_dump(),
-    ):
-        baseline_model = (
-            BaselineSnapshot.model_validate(baseline_snapshot)
-            if isinstance(baseline_snapshot, Mapping)
-            else baseline_snapshot
-        )
-        context = LoopContext(
-            task=base_task,
-            iterations=iterations,
+    ) as run_span:
+        with propagate_context(
+            trace_name="run_loop",
             session_id=session_id,
-            parent_trace=parent_trace,
-            run_metadata=root_meta,
-            baseline_snapshot=baseline_model,
-            run_trace=None,
-        )
-        opt_model = OptimizationMachineModel(
-            context=context,
-            deps=_build_dependencies(),
-            max_policy_repairs=_MAX_POLICY_REPAIRS,
-        )
-        machine = OptimizationStateMachine(opt_model)
-        history: list[IterationRecord] = []
-        try:
-            history = machine.run()
-        except KeyboardInterrupt:
-            run_trace = opt_model.context.run_trace
-            _safe_end_observation(run_trace, error="interrupted")
-        finally:
-            flush_langfuse_fn = cast(Callable[[], None], _pkg_attr("flush_langfuse"))
-            flush_langfuse_fn()
+            metadata={"iterations": iterations, "session_id": session_id},
+        ):
+            baseline_model = (
+                BaselineSnapshot.model_validate(baseline_snapshot)
+                if isinstance(baseline_snapshot, Mapping)
+                else baseline_snapshot
+            )
+            context = LoopContext(
+                task=base_task,
+                iterations=iterations,
+                session_id=session_id,
+                parent_trace=parent_trace,
+                run_metadata=root_meta,
+                baseline_snapshot=baseline_model,
+                run_trace=run_span,
+            )
+            opt_model = OptimizationMachineModel(
+                context=context,
+                deps=_build_dependencies(),
+                max_policy_repairs=_MAX_POLICY_REPAIRS,
+            )
+            machine = OptimizationStateMachine(opt_model)
+            history: list[IterationRecord] = []
+            try:
+                history = machine.run()
+            finally:
+                if hasattr(run_span, "update"):
+                    try:
+                        run_span.update(metadata={"iterations_completed": len(history)})  # type: ignore[call-arg]
+                    except Exception:
+                        pass
+                flush_langfuse_fn = cast(Callable[[], None], _pkg_attr("flush_langfuse"))
+                flush_langfuse_fn()
     if not history:
         repo_root = cast(Callable[[], Path], _pkg_attr("find_repo_root"))()
         pipeline = cast(

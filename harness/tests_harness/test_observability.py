@@ -57,9 +57,11 @@ def test_emit_score_for_handle_allows_dataset_only(monkeypatch):
             calls.append(kwargs)
 
     monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
-    score_emitter.emit_score_for_handle(None, name="metric", value=1.0, dataset_run_id="run123")
+    score_emitter.emit_score_for_handle(None, name="metric", value=1.0, session_id="sess123")
 
-    assert calls and calls[0]["dataset_run_id"] == "run123"
+    assert calls
+    emitted = calls[0]
+    assert emitted.get("session_id") == "sess123"
 
 
 def test_start_observation_accepts_context_manager(monkeypatch):
@@ -92,28 +94,6 @@ def test_start_observation_accepts_context_manager(monkeypatch):
     assert obs.end_called == 0
 
 
-def test_start_observation_handles_plain_root_object(monkeypatch):
-    class PlainObservation:
-        def __init__(self):
-            self.id = "plain-root"
-            self.trace_id = "trace"
-            self.end_called = 0
-
-        def end(self):
-            self.end_called += 1
-
-    monkeypatch.setattr(
-        "harness.observability.langfuse.get_langfuse_client",
-        lambda: type("C", (), {"start_as_current_observation": lambda *a, **k: PlainObservation()})(),
-    )
-
-    with lf.start_observation(name="root") as obs:
-        assert isinstance(obs, PlainObservation)
-        assert obs.id == "plain-root"
-        assert obs.end_called == 0
-    assert obs.end_called == 1
-
-
 def test_start_child_observation_handles_plain_object_parent():
     class PlainChild:
         def __init__(self, session_id: str | None):
@@ -144,31 +124,6 @@ def test_start_child_observation_handles_plain_object_parent():
 
     assert parent.started == 1
     assert child.end_called == 1
-
-
-def test_safe_end_observation_records_error_and_ends_once():
-    class PlainObs:
-        def __init__(self):
-            self.updated: list[dict[str, object]] = []
-            self.end_called = 0
-
-        def update(self, **kwargs):
-            self.updated.append(kwargs)
-
-        def end(self):
-            self.end_called += 1
-
-    obs = PlainObs()
-
-    lf._safe_end_observation(obs, error="boom", metadata={"key": "value"}, output={"out": True})
-
-    assert obs.end_called == 1
-    assert obs.updated
-    payload = obs.updated[0]
-    assert payload.get("output") == {"out": True}
-    meta = payload.get("metadata") or {}
-    assert meta.get("key") == "value"
-    assert meta.get("error") == "boom"
 
 
 def test_emit_score_best_effort_when_client_missing(monkeypatch):
@@ -210,5 +165,17 @@ def test_propagate_context_compacts_metadata(monkeypatch):
 
     meta = captured.get("metadata") or {}
     assert isinstance(meta, dict)
-    assert len(str(meta.get("selection", ""))) <= 220
-    assert len(str(meta.get("projection", ""))) <= 220
+    # selection/projection should be omitted/compacted and under the 200-char limit.
+    assert meta.get("selection") == "<omitted>"
+    assert meta.get("projection") == "<omitted>"
+
+
+def test_propagate_context_strict_rejects_selection(monkeypatch):
+    monkeypatch.setenv("LANGFUSE_STRICT_DEBUG", "1")
+    import importlib
+
+    import harness.observability.langfuse as lf_mod
+
+    importlib.reload(lf_mod)
+    with pytest.raises(ValueError):
+        lf_mod.propagate_context(metadata={"selection": {"preview": ["a" * 300]}})

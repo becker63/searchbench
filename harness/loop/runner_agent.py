@@ -11,7 +11,6 @@ from typing import Any, Callable, cast
 
 from harness.observability.langfuse import (
     UsageDetails,
-    _safe_end_observation,
     get_tracing_openai_client,
     start_observation,
 )
@@ -793,7 +792,10 @@ def run_ic_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            _safe_end_observation(backend_obs, error=str(exc))
+            try:
+                backend_obs.update(metadata={"error": str(exc)})
+            except Exception:
+                pass
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
@@ -860,7 +862,10 @@ def run_jc_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            _safe_end_observation(backend_obs, error=str(exc))
+            try:
+                backend_obs.update(metadata={"error": str(exc)})
+            except Exception:
+                pass
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))

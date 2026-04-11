@@ -20,8 +20,6 @@ if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
     setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
 from harness.pipeline.types import PipelineClassification, StepResult
-from harness.observability.langfuse import _safe_end_observation
-
 from .loop_listeners import OptimizationTracingListener, RepairTracingListener
 from .loop_types import (
     AcceptedPolicy,
@@ -36,6 +34,7 @@ from .loop_types import (
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
+    SpanHandle,
     TaskPayload,
 )
 
@@ -301,20 +300,8 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
     # Run root ------------------------------------------------------------
     def _ensure_run_trace(self, model: OptimizationMachineModel) -> None:
         ctx = model.context
-        if ctx.run_trace is not None:
-            return
-        start_obs = model.deps.start_observation
-        meta = (
-            ctx.run_metadata.model_dump()
-            if ctx.run_metadata
-            else {"iterations": ctx.iterations, "task": ctx.task.model_dump()}
-        )
-        ctx.run_trace = start_obs(
-            name="run_loop",
-            parent=ctx.parent_trace,
-            input=ctx.task.model_dump(),
-            metadata=meta,
-        )
+        if ctx.run_trace is None:
+            raise RuntimeError("run_trace is required before starting the optimization state machine")
 
     def _finalize_run_trace(self, status: str | None) -> None:
         span = self.context.run_trace
@@ -323,8 +310,12 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         metadata: dict[str, object] = {"iterations_completed": len(self.context.history)}
         if status:
             metadata["status"] = status
-        _safe_end_observation(span, metadata=metadata)
-        self.context.run_trace = None
+        updater = getattr(span, "update", None)
+        if callable(updater):
+            try:
+                updater(metadata=metadata)
+            except Exception:
+                pass
 
     # Preparation ---------------------------------------------------------
     def _prepare_context(self) -> None:
@@ -360,31 +351,26 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             return
 
         iteration_tasks = prepared_tasks.build_iteration_tasks()
-        eval_span = None
-        try:
-            eval_span = self.deps.start_observation(
-                name="localization_evaluation",
-                parent=self.model.current_iteration_span,
-                metadata={
-                    "iteration": self.context.current_iteration,
-                    "task": iteration_tasks.ic_task.identity.task_id(),
-                },
-            )
-        except Exception:
-            eval_span = self.model.current_iteration_span
-        try:
+        eval_metadata = {
+            "iteration": self.context.current_iteration,
+            "task": iteration_tasks.ic_task.identity.task_id(),
+        }
+        with self.deps.start_observation(
+            name="localization_evaluation",
+            parent=self.model.current_iteration_span,
+            metadata=eval_metadata,
+        ) as eval_span:
             self.model.current_evaluation = self.deps.evaluate_policy_on_item(
                 iteration_tasks.ic_task,
                 self.context.baseline_snapshot,
                 eval_span,
                 self.context.current_iteration,
             )
-            if eval_span is not None:
-                _safe_end_observation(eval_span, metadata={"status": "ok"})
-        except Exception as exc:  # noqa: BLE001
-            if eval_span is not None:
-                _safe_end_observation(eval_span, error=exc)
-            raise
+            if hasattr(eval_span, "update"):
+                try:
+                    eval_span.update(metadata={"status": "ok"})  # type: ignore[call-arg]
+                except Exception:
+                    pass
         self.raise_("evaluation_done")  # type: ignore[call-arg]
 
     # Repair --------------------------------------------------------------
@@ -441,7 +427,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         repo_root: Path,
         evaluation: EvaluationResult,
         feedback: FeedbackPackage,
-        iteration_span: object | None,
+        iteration_span: SpanHandle | None,
     ) -> RepairOutcome:
         repair_ctx = RepairContext(
             repo_root=repo_root,

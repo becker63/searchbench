@@ -62,6 +62,12 @@ def test_session_only_score(monkeypatch):
         def create_score(self, **kwargs):
             calls.append(kwargs)
 
+    monkeypatch.delenv("LANGFUSE_STRICT_DEBUG", raising=False)
+    import harness.observability.score_emitter as se
+    import harness.observability.langfuse as lf
+
+    monkeypatch.setattr(se, "_STRICT_DEBUG", False)
+    monkeypatch.setattr(lf, "_STRICT_DEBUG", False)
     monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
     emit_score(name="metric", value=1.0, session_id="sess-only")
     assert calls and calls[0]["session_id"] == "sess-only"

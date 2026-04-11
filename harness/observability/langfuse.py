@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import contextmanager
-from types import TracebackType
-from typing import Any, Iterator, Mapping, Optional, cast
+from typing import Any, Mapping, Optional, ContextManager, Iterator
 
 from langfuse import Langfuse, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
 from pydantic import BaseModel, ConfigDict
 
-try:
-    # Prefer absolute import so observability can be used as a top-level package in tests.
-    from utils.env import get_langfuse_env
-except ImportError:  # pragma: no cover
-    from harness.utils.env import get_langfuse_env
+from harness.utils.env import get_langfuse_env
 
 _client: Optional[Langfuse] = None
+
+_PROPAGATION_MAX_LEN = 200
+_LOGGER = logging.getLogger(__name__)
+_STRICT_DEBUG = bool(os.getenv("LANGFUSE_STRICT_DEBUG"))
+_PK_PREFIX_LEN = 12
 
 
 class ObservationMetadata(BaseModel):
@@ -95,6 +97,31 @@ def _coerce_tags(tags: list[str] | None) -> list[str] | None:
     return [tag for tag in tags if isinstance(tag, str) and tag]
 
 
+def _truncate_value(val: str, key: str) -> str:
+    if len(val) <= _PROPAGATION_MAX_LEN:
+        return val
+    if _STRICT_DEBUG:
+        raise ValueError(f"Propagated metadata for key '{key}' exceeds {_PROPAGATION_MAX_LEN} chars in strict mode")
+    _LOGGER.warning("Truncating propagated metadata for key '%s' to %s chars", key, _PROPAGATION_MAX_LEN)
+    return val[:_PROPAGATION_MAX_LEN]
+
+
+def _coerce_metadata(metadata: Mapping[str, object] | None) -> dict[str, str] | None:
+    if metadata is None:
+        return None
+    coerced: dict[str, str] = {}
+    for key, value in metadata.items():
+        key_str = str(key)
+        if key_str in {"selection", "projection"}:
+            if _STRICT_DEBUG:
+                raise ValueError(f"Propagated metadata key '{key_str}' is forbidden in strict mode")
+            coerced[key_str] = "<omitted>"
+            continue
+        text = "" if value is None else str(value)
+        coerced[key_str] = _truncate_value(text, key_str)
+    return coerced
+
+
 def _build_client() -> Langfuse:
     env = get_langfuse_env()
     public, secret = env.get("public_key"), env.get("secret_key")
@@ -133,51 +160,15 @@ def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
     """
     Require Langfuse's OpenAI integration for tracing.
     """
-    return LangfuseOpenAI(base_url=base_url, api_key=api_key)
-
-
-def _compact_metadata_value(key: str, value: object, limit: int = 180) -> object:
-    """
-    Summarize oversized propagation values without losing key counts.
-    """
-    if key in {"selection", "projection"}:
+    try:
+        return LangfuseOpenAI(base_url=base_url, api_key=api_key)
+    except Exception as exc:  # pragma: no cover - fallback path
+        _LOGGER.warning("Langfuse OpenAI client unavailable, falling back to plain OpenAI: %s", exc)
         try:
-            if isinstance(value, Mapping):
-                preview = value.get("preview")
-                def _trim_preview_item(item: object) -> object:
-                    text = str(item)
-                    return text if len(text) <= 60 else text[:60] + "..."
-
-                preview_list = None
-                if isinstance(preview, list):
-                    preview_list = [_trim_preview_item(item) for item in preview[:3]]
-                return {
-                    "offset": value.get("offset"),
-                    "limit": value.get("limit"),
-                    "selected_count": value.get("selected_count"),
-                    "total_available": value.get("total_available"),
-                    "preview": preview_list or preview,
-                }
-            if isinstance(value, (list, tuple)):
-                trimmed = list(value)[:3]
-                return trimmed if len(str(trimmed)) <= limit else str(trimmed)[:limit] + "..."
-            text = str(value)
-            return text if len(text) <= limit else text[:limit] + "..."
+            from openai import OpenAI
         except Exception:
-            return str(value)[:limit]
-    text_val = str(value)
-    if len(text_val) > limit:
-        return text_val[:limit] + "..."
-    return value
-
-
-def _compact_metadata(meta: Mapping[str, object] | None) -> Mapping[str, object] | None:
-    if meta is None:
-        return None
-    compacted: dict[str, object] = {}
-    for key, value in meta.items():
-        compacted[key] = _compact_metadata_value(str(key), value)
-    return compacted
+            raise
+        return OpenAI(base_url=base_url, api_key=api_key)
 
 
 def propagate_context(
@@ -188,7 +179,7 @@ def propagate_context(
     tags: list[str] | None = None,
     metadata: Mapping[str, object] | None = None,
     version: str | None = None,
-):
+) -> ContextManager[Any]:
     """
     Apply correlating attributes to all observations created in the current context.
     """
@@ -202,63 +193,12 @@ def propagate_context(
     coerced_tags = _coerce_tags(tags)
     if coerced_tags:
         kwargs["tags"] = coerced_tags
-    compact_meta = _compact_metadata(metadata)
-    coerced_metadata = ObservationMetadata(data=compact_meta).to_langfuse() if compact_meta else None
+    coerced_metadata = _coerce_metadata(metadata)
     if coerced_metadata:
         kwargs["metadata"] = coerced_metadata
     if version:
         kwargs["version"] = version
     return propagate_attributes(**kwargs)
-
-
-@contextmanager
-def _observation_scope(started: Any) -> Iterator[Any]:
-    """
-    Normalize Langfuse start return values to a context manager.
-    """
-    if hasattr(started, "__enter__") and hasattr(started, "__exit__"):
-        with started as observation:
-            yield observation
-        return
-
-    try:
-        yield started
-    finally:
-        end = getattr(started, "end", None)
-        if callable(end):
-            end()
-
-
-def _safe_end_observation(
-    observation: Any,
-    *,
-    error: object | None = None,
-    metadata: Mapping[str, object] | None = None,
-    output: object | None = None,
-) -> None:
-    """
-    End an observation without assuming keyword support on .end().
-    """
-    if observation is None:
-        return
-    update = getattr(observation, "update", None)
-    extra_meta: dict[str, object] = {}
-    if metadata:
-        extra_meta.update(metadata)
-    if error is not None:
-        extra_meta.setdefault("error", error)
-    payload: dict[str, object] = {}
-    if extra_meta:
-        payload["metadata"] = extra_meta
-    if output is not None:
-        payload["output"] = output
-    try:
-        if callable(update) and payload:
-            update(**payload)
-    finally:
-        end = getattr(observation, "end", None)
-        if callable(end):
-            end()
 
 
 @contextmanager
@@ -270,55 +210,25 @@ def start_root_observation(
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
     usage_details: UsageDetails | None = None,
-) -> Any:
+) -> Iterator[Any]:
     """
     Start a root observation as the current observation.
     """
-    client_any: Any = get_langfuse_client()
+    meta = ObservationMetadata(data=_coerce_metadata(metadata)) if metadata else None
     envelope = ObservationEnvelope(
         name=name,
         as_type=as_type,
         input=input,
         model=model,
-        metadata=ObservationMetadata(data=metadata) if metadata else None,
+        metadata=meta,
         usage_details=usage_details,
     )
-    start_fn = getattr(client_any, "start_as_current_observation", None)
-    if callable(start_fn):
-        start_ctx = cast(Any, start_fn)(**envelope.to_start_kwargs())
-        with _observation_scope(start_ctx) as observation:
-            yield observation
-        return
-
-    # Fallback for stubbed clients in tests.
-    class _DummyObs:
-        def __init__(self):
-            self.id = "trace"
-            self.trace_id = "trace"
-
-        def start_observation(self, **kwargs: object) -> Any:
-            return self
-
-        def __enter__(self):
-            return self
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc: BaseException | None,
-            tb: TracebackType | None,
-        ) -> bool:
-            self.end()
-            return False
-
-        def end(self, **kwargs: object) -> None:
-            return None
-
-        def update(self, **kwargs: object) -> None:
-            return None
-
-    obs = _DummyObs()
-    with _observation_scope(obs) as observation:
+    client_any: Any = get_langfuse_client()
+    try:
+        cm = client_any.start_as_current_observation(**envelope.to_start_kwargs())
+    except AttributeError as exc:
+        raise RuntimeError("Langfuse client missing start_as_current_observation") from exc
+    with cm as observation:
         yield observation
 
 
@@ -332,22 +242,56 @@ def start_child_observation(
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
     usage_details: UsageDetails | None = None,
-) -> Any:
+) -> Iterator[Any]:
     """
     Start a child observation from a parent observation.
     """
     if parent is None or not hasattr(parent, "start_observation"):
         raise RuntimeError("Parent observation is required to start a child observation")
+    parent_session = getattr(parent, "session_id", None)
+    parent_meta = getattr(parent, "metadata", {}) if hasattr(parent, "metadata") else {}
+    if isinstance(parent_meta, Mapping) and parent_session is None:
+        parent_session = parent_meta.get("session_id")
+    effective_metadata: dict[str, object] = dict(metadata) if metadata else {}
+    if "session_id" in effective_metadata and parent_session and effective_metadata["session_id"] != parent_session:
+        raise RuntimeError("session_id conflict")
+    if "session_id" not in effective_metadata and parent_session:
+        effective_metadata["session_id"] = parent_session
+    merged_metadata: Mapping[str, object] | None = effective_metadata if effective_metadata else metadata
+    meta = ObservationMetadata(data=_coerce_metadata(merged_metadata)) if merged_metadata else None
     envelope = ObservationEnvelope(
         name=name,
         as_type=as_type,
         input=input,
         model=model,
-        metadata=ObservationMetadata(data=metadata) if metadata else None,
+        metadata=meta,
         usage_details=usage_details,
     )
-    started = parent.start_observation(**envelope.to_start_kwargs())
-    with _observation_scope(started) as observation:
+    # Prefer a managed child if available; otherwise manage lifecycle manually.
+    try:
+        cm = parent.start_as_current_observation(**envelope.to_start_kwargs())
+    except AttributeError:
+        child = parent.start_observation(**envelope.to_start_kwargs())
+        if hasattr(child, "__enter__") and hasattr(child, "__exit__"):
+            cm = child
+        else:
+
+            @contextmanager
+            def _child_cm():
+                try:
+                    yield child
+                finally:
+                    try:
+                        child.end()
+                    except AttributeError as exc:  # pragma: no cover
+                        raise RuntimeError("Child observation missing end()") from exc
+                    except Exception:
+                        if _STRICT_DEBUG:
+                            raise
+                        _LOGGER.warning("Langfuse child end failed", exc_info=True)
+
+            cm = _child_cm()
+    with cm as observation:
         yield observation
 
 
@@ -361,12 +305,11 @@ def start_observation(
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
     usage_details: UsageDetails | None = None,
-):
+) -> Iterator[Any]:
     """
     Convenience wrapper to start a root or child observation based on parent presence.
     """
-    parent_ctx = parent if parent is not None and hasattr(parent, "start_observation") else None
-    if parent_ctx is None:
+    if parent is None or not hasattr(parent, "start_observation"):
         with start_root_observation(
             name,
             as_type=as_type,
@@ -378,7 +321,7 @@ def start_observation(
             yield observation
     else:
         with start_child_observation(
-            parent_ctx,
+            parent,
             name,
             as_type=as_type,
             input=input,
@@ -391,12 +334,69 @@ def start_observation(
 
 def flush_langfuse() -> None:
     client = get_langfuse_client()
-    flush = getattr(client, "flush", None)
-    if callable(flush):
-        flush()
-    shutdown = getattr(client, "shutdown", None)
-    if callable(shutdown):
-        shutdown()
+    try:
+        client.flush()
+    except AttributeError:
+        msg = "Langfuse client missing flush()"
+        if _STRICT_DEBUG:
+            raise RuntimeError(msg)
+        _LOGGER.warning(msg)
+    except Exception as exc:  # pragma: no cover - best effort
+        if _STRICT_DEBUG:
+            raise
+        _LOGGER.warning("Langfuse flush failed: %s", exc)
+    try:
+        client.shutdown()
+    except AttributeError:
+        msg = "Langfuse client missing shutdown()"
+        if _STRICT_DEBUG:
+            raise RuntimeError(msg)
+        _LOGGER.warning(msg)
+    except Exception as exc:  # pragma: no cover - best effort
+        if _STRICT_DEBUG:
+            raise
+        _LOGGER.warning("Langfuse shutdown failed: %s", exc)
+
+
+def ensure_langfuse_auth() -> None:
+    """
+    Perform an explicit Langfuse auth/base-url check.
+    Raises in strict mode to surface misconfigurations instead of continuing silently.
+    """
+    client = get_langfuse_client()
+    public_prefix: str | None = None
+    host: str | None = None
+    try:
+        env = get_langfuse_env()
+        public = env.get("public_key")
+        if isinstance(public, str):
+            public_prefix = public[:_PK_PREFIX_LEN]
+        host_val = env.get("base_url")
+        host = host_val if isinstance(host_val, str) and host_val else None
+    except Exception:
+        pass
+    try:
+        ok = bool(client.auth_check())
+    except AttributeError:
+        msg = "Langfuse client does not expose auth_check; cannot verify credentials"
+        if _STRICT_DEBUG:
+            raise RuntimeError(msg)
+        _LOGGER.warning(msg)
+        return
+    except Exception as exc:  # pragma: no cover
+        detail = f"Langfuse auth_check raised: {exc}"
+        if _STRICT_DEBUG:
+            raise RuntimeError(detail) from exc
+        _LOGGER.warning(detail)
+        return
+    if not ok:
+        detail = (
+            "Langfuse auth_check failed; verify LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY "
+            f"and LANGFUSE_BASE_URL (host={host or 'unset'}, pk_prefix={public_prefix or 'unset'})"
+        )
+        if _STRICT_DEBUG:
+            raise RuntimeError(detail)
+        _LOGGER.warning(detail)
 
 
 __all__ = [
@@ -408,4 +408,5 @@ __all__ = [
     "start_root_observation",
     "start_child_observation",
     "flush_langfuse",
+    "ensure_langfuse_auth",
 ]

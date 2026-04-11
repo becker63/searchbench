@@ -7,11 +7,11 @@ No CLI or orchestration logic; only generation and validation.
 
 import json
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .observability.langfuse import _safe_end_observation, get_tracing_openai_client, start_observation
+from .observability.langfuse import get_tracing_openai_client, start_observation
 from .observability.score_emitter import emit_score_for_handle
 from .utils.env import get_cerebras_api_key, get_writer_model
 from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
@@ -69,7 +69,7 @@ def _safe_update(span: object | None, **kwargs: object) -> None:
             pass
 
 
-def _ensure_non_empty_messages(messages: list[dict[str, object]] | None, caller: str) -> None:
+def _ensure_non_empty_messages(messages: Sequence[Mapping[str, object]] | None, caller: str) -> None:
     if not messages:
         raise RuntimeError(f"{caller}: empty messages payload")
 
@@ -299,10 +299,16 @@ def generate_policy(
                     )
                     break
                 except Exception as e:  # noqa: BLE001
-                    _safe_end_observation(attempt_obs, error=e)
+                    try:
+                        attempt_obs.update(metadata={"error": str(e)})
+                    except Exception:
+                        pass
                     time.sleep(2 * (attempt + 1))
         else:
-            _safe_end_observation(writer_obs, error="writer_failed")
+            try:
+                writer_obs.update(metadata={"error": "writer_failed"})
+            except Exception:
+                pass
             raise RuntimeError("Writer failed after retries")
 
         try:
@@ -316,7 +322,10 @@ def generate_policy(
                 comment=json.dumps({"model": model}),
             )
         except Exception as exc:  # noqa: BLE001
-            _safe_end_observation(writer_obs, error=exc, metadata={"model": model})
+            try:
+                writer_obs.update(metadata={"error": str(exc), "model": model})
+            except Exception:
+                pass
             raise
         emit_score_for_handle(
             writer_obs,

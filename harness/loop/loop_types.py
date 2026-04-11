@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, ContextManager, Mapping, Protocol, Sequence, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -17,6 +17,13 @@ MetricValue = int | float | bool
 MetricsMap = Mapping[str, MetricValue | None]
 ScalarMetrics = dict[str, MetricValue | None]
 FeedbackMap = Mapping[str, str | float | int | bool | None]
+
+
+@runtime_checkable
+class SpanHandle(Protocol):
+    def end(self, **kwargs: object) -> None: ...
+
+    def update(self, **kwargs: object) -> None: ...
 
 
 class MetricEntry(BaseModel):
@@ -325,10 +332,10 @@ class LoopContext(BaseModel):
     task: TaskPayload
     iterations: int
     session_id: str | None = None
-    parent_trace: object | None = None
+    parent_trace: SpanHandle | None = None
     run_metadata: RunMetadata | None = None
     baseline_snapshot: "BaselineSnapshot | None" = None
-    run_trace: object | None
+    run_trace: SpanHandle | None
     history: list[IterationRecord] = Field(default_factory=list)
     prepared_tasks: PreparedTasks | None = None
     prev_score: float | None = None
@@ -342,8 +349,8 @@ class LoopDependencies(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    prepare_iteration_tasks: Callable[[TaskPayload, object | None], PreparedTasks]
-    evaluate_policy_on_item: Callable[[ICTaskPayload, "BaselineSnapshot | None", object | None, int | None], EvaluationResult]
+    prepare_iteration_tasks: Callable[[TaskPayload, SpanHandle | None], PreparedTasks]
+    evaluate_policy_on_item: Callable[[ICTaskPayload, "BaselineSnapshot | None", SpanHandle | None, int | None], EvaluationResult]
     build_iteration_feedback: Callable[[EvaluationResult, float | None, PipelineClassification | None, Path], FeedbackPackage]
     attempt_policy_generation: Callable[..., tuple[str | None, str | None]]
     run_policy_pipeline: Callable[..., tuple[list[StepResult], bool]]
@@ -354,7 +361,7 @@ class LoopDependencies(BaseModel):
     read_policy: Callable[[], str]
     write_policy: Callable[[str], None]
     get_writer_model: Callable[[], str | None]
-    start_observation: Callable[..., object | None]
+    start_observation: Callable[..., ContextManager[SpanHandle]]
     find_repo_root: Callable[[], Path]
     default_pipeline: Callable[[], object]
 
@@ -366,7 +373,7 @@ class RepairContext(BaseModel):
     evaluation: EvaluationResult
     feedback: FeedbackPackage
     max_repair_attempts: int
-    parent_trace: object | None
+    parent_trace: SpanHandle | None
     writer_model: str | None
     failure_context: str | None = None
     last_classified: PipelineClassification | None = None
@@ -376,7 +383,7 @@ class RepairContext(BaseModel):
     pipeline_passed: bool = False
     candidate_code: str | None = None
     pipeline: object | None = None
-    repair_observation: object | None = None
+    repair_observation: SpanHandle | None = None
     writer_error: str | None = None
     pipeline_feedback: PipelineClassification | None = None
     failed_step: str | None = None
@@ -387,6 +394,7 @@ class RepairContext(BaseModel):
     repair_attempts_reported: int | None = None
     max_policy_repairs_reported: int | None = None
     error: str | None = None
+    repair_observation_cm: ContextManager[SpanHandle] | None = None
 
 
 class AcceptedPolicyMeta(BaseModel):
@@ -482,7 +490,8 @@ class OptimizationMachineModel(BaseModel):
     max_policy_repairs: int
     state: str | None = None
     prep_ok: bool = False
-    current_iteration_span: object | None = None
+    current_iteration_span: SpanHandle | None = None
+    current_iteration_cm: ContextManager[SpanHandle] | None = None
     current_evaluation: EvaluationResult | None = None
     current_repair_outcome: RepairOutcome | None = None
 

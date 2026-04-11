@@ -1,5 +1,5 @@
 from importlib import import_module
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from .langfuse import (  # noqa: F401
     flush_langfuse,
@@ -40,6 +40,16 @@ __all__ = [
     "resolve_baseline",
 ]
 
+if TYPE_CHECKING:
+    from harness.observability.baselines import (
+        BaselineBundle,
+        BaselineSnapshot,
+        baseline_key,
+        compute_baseline_for_task,
+        make_baseline_bundle,
+        require_baseline,
+        resolve_baseline,
+    )
 
 def __getattr__(name: str) -> Any:
     """
