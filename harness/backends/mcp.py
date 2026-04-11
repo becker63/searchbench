@@ -8,7 +8,7 @@ from typing import Any, TypeVar
 
 from mcp.types import TextContent, Tool as MCPTool
 
-from ..utils.openai_schema import OpenAITool
+from harness.utils.openai_schema import OpenAITool
 
 T = TypeVar("T")
 

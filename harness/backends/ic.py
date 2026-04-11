@@ -7,8 +7,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from iterative_context.server import IterativeContextToolRuntime, list_tools
 
-from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
-from ...utils.openai_schema import OpenAITool
+from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
+from harness.utils.openai_schema import OpenAITool
 
 
 class BackendInit(BaseModel):

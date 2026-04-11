@@ -20,8 +20,8 @@ if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
     setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
 from harness.pipeline.types import PipelineClassification, StepResult
-from .loop_listeners import OptimizationTracingListener, RepairTracingListener
-from .loop_types import (
+from .listeners import OptimizationTracingListener, RepairTracingListener
+from .types import (
     AcceptedPolicy,
     EvaluationMetrics,
     EvaluationResult,

@@ -10,10 +10,10 @@ import pytest
 from mcp.types import TextContent, Tool
 
 from harness.localization.models import LCAContext, LCATaskIdentity
-from harness.loop import runner_agent as runner
-from harness.tools.backends.ic_backend import IterativeContextBackend
-from harness.tools.backends.jc_backend import JCodeMunchBackend
-from harness.tools.mcp_adapter import (
+from harness.localization import agent_runtime as runner
+from harness.backends.ic import IterativeContextBackend
+from harness.backends.jc import JCodeMunchBackend
+from harness.backends.mcp import (
     mcp_tool_to_openai_tool,
     parse_text_content_payload,
     run_async,
@@ -67,8 +67,8 @@ def test_ic_backend_uses_server_surfaces(monkeypatch, tmp_path):
             calls.append((name, arguments))
             return [TextContent(type="text", text=json.dumps({"ok": True, "name": name}))]
 
-    monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
+    monkeypatch.setattr("harness.backends.ic.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.backends.ic.IterativeContextToolRuntime", FakeRuntime)
 
     def score_fn(a, b):
         return 1.0
@@ -103,8 +103,8 @@ def test_jc_backend_uses_server_surfaces(monkeypatch, tmp_path):
         call_args.append((name, arguments))
         return [TextContent(type="text", text=json.dumps({"result": "ok", "args": arguments}))]  # type: ignore[return-value]
 
-    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+    monkeypatch.setattr("harness.backends.jc.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.backends.jc.call_tool", fake_call_tool)
 
     backend = JCodeMunchBackend(repo=str(tmp_path))
 
@@ -224,8 +224,8 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
             }
             return [TextContent(type="text", text=json.dumps(payload))]
 
-    monkeypatch.setattr("harness.tools.backends.ic_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.ic_backend.IterativeContextToolRuntime", FakeRuntime)
+    monkeypatch.setattr("harness.backends.ic.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.backends.ic.IterativeContextToolRuntime", FakeRuntime)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve_path", {"identity": "task"}))
     @contextmanager
     def span_cm():
@@ -295,8 +295,8 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
     async def fake_call_tool(name: str, arguments: dict[str, Any]):
         return [TextContent(type="text", text=json.dumps({"called": name, "args": arguments}))]  # type: ignore[return-value]
 
-    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+    monkeypatch.setattr("harness.backends.jc.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.backends.jc.call_tool", fake_call_tool)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_files", {"query": "foo"}))
     @contextmanager
     def span_cm():
@@ -548,8 +548,8 @@ def test_jc_backend_initializes_github_url(monkeypatch, tmp_path):
             return [TextContent(type="text", text=json.dumps({"repo": "id"}))]
         return []
 
-    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+    monkeypatch.setattr("harness.backends.jc.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.backends.jc.call_tool", fake_call_tool)
 
     JCodeMunchBackend(repo="https://github.com/owner/repo")
     assert called["index_repo"] == 1
@@ -569,8 +569,8 @@ def test_jc_backend_owner_repo_init(monkeypatch):
             return [TextContent(type="text", text=json.dumps({"repo": "id"}))]
         return []
 
-    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+    monkeypatch.setattr("harness.backends.jc.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.backends.jc.call_tool", fake_call_tool)
 
     JCodeMunchBackend(repo="owner/repo")
     assert called["index_repo"] == 1
@@ -580,8 +580,8 @@ def test_jc_backend_rejects_ambiguous_repo(monkeypatch):
     async def fake_list_tools():
         return []
 
-    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", lambda *args, **kwargs: [])
+    monkeypatch.setattr("harness.backends.jc.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.backends.jc.call_tool", lambda *args, **kwargs: [])
 
     with pytest.raises(RuntimeError):
         JCodeMunchBackend(repo="owner/repo/extra")
@@ -603,8 +603,8 @@ def test_jc_backend_initializes_local_repo(monkeypatch, tmp_path):
             return [TextContent(type="text", text=json.dumps({"repo": "repo-id"}))]
         return []
 
-    monkeypatch.setattr("harness.tools.backends.jc_backend.list_tools", fake_list_tools)
-    monkeypatch.setattr("harness.tools.backends.jc_backend.call_tool", fake_call_tool)
+    monkeypatch.setattr("harness.backends.jc.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.backends.jc.call_tool", fake_call_tool)
 
     backend = JCodeMunchBackend(repo=str(tmp_path))
     assert called["resolve"] == 1

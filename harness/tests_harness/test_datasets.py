@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from harness.observability import datasets
+from harness.telemetry import datasets
 from harness.localization.models import LCATaskIdentity
 
 

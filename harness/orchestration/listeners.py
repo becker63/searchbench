@@ -10,9 +10,9 @@ from typing import Any, ContextManager, Protocol
 
 from statemachine import State
 
-from harness.observability.score_emitter import emit_score_for_handle
+from harness.telemetry.score_emitter import emit_score_for_handle
 
-from .loop_types import IterationRecord, OptimizationMachineModel, RepairMachineModel
+from .types import IterationRecord, OptimizationMachineModel, RepairMachineModel
 
 
 class SpanHandle(Protocol):

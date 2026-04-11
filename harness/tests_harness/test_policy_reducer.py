@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from harness.localization.models import LCATaskIdentity, LocalizationMetrics
 from harness.localization.token_usage import TokenUsage, TokenUsageRecord
-from harness.observability.policy_reducer import (
+from harness.telemetry.policy_reducer import (
     build_task_input,
     PolicyQualityGuard,
     reduce_global,

@@ -6,7 +6,7 @@ import pytest
 
 from typing import TypedDict
 
-from harness import writer
+from harness.agents import writer
 from harness.utils.type_loader import ScorerContext
 
 

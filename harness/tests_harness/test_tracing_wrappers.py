@@ -4,9 +4,9 @@ from contextlib import contextmanager
 import pytest
 
 from harness.localization.models import LCAContext, LCATaskIdentity
-from harness.loop import runner_agent as runner
-from harness.loop import agent_common
-from harness import writer
+from harness.localization import agent_runtime as runner
+from harness.agents import common as agent_common
+from harness.agents import writer
 from harness.utils import type_loader
 
 

@@ -7,8 +7,8 @@ from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
 )
-from harness.localization.eval import build_file_localization_eval_record
-from harness.localization.materializer import (
+from harness.localization.records import build_file_localization_eval_record
+from harness.localization.materialize import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
     RepoMaterializer,
@@ -24,8 +24,8 @@ from harness.localization.token_usage import (
     TokenUsageRecord,
     extract_token_usage_record,
 )
-from harness.observability.langfuse import start_observation
-from harness.observability.score_emitter import emit_score_for_handle
+from harness.telemetry.langfuse import start_observation
+from harness.telemetry.score_emitter import emit_score_for_handle
 
 
 def _materialize_repo(
@@ -98,9 +98,7 @@ def _run_runner(
 def _default_runner(
     lca_task: LCATask, repo_path: str, parent: object | None
 ) -> tuple[list[str], Mapping[str, object] | None]:
-    from harness import loop as loop_pkg
-
-    run_ic_iteration_fn = getattr(loop_pkg, "run_ic_iteration")
+    from harness.localization.agent_runtime import run_ic_iteration as run_ic_iteration_fn
     result = run_ic_iteration_fn(
         {
             "identity": lca_task.identity.model_dump(),

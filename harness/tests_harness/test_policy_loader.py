@@ -3,7 +3,7 @@ from __future__ import annotations
 import types
 import pytest
 
-from harness import policy_loader
+from harness.policy import load as policy_loader
 
 
 def test_require_selection_callable_accepts_three_args():

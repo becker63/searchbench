@@ -19,29 +19,29 @@ except ImportError:
     tty = None  # type: ignore
     termios = None  # type: ignore
 
-from harness.localization.evaluation_backend import (
+from harness.localization.evaluate import (
     LocalizationEvaluationRequest,
 )
-from harness.localization.evaluation_backend import (
+from harness.localization.evaluate import (
     evaluate_localization_batch as _evaluate_localization_batch,
 )
-from harness.localization.hf_materializer import HuggingFaceRepoMaterializer
+from harness.localization.hf_materialize import HuggingFaceRepoMaterializer
 from harness.localization.models import LCATask
-from harness.observability.cerebras_pricing import cost_details_for_usage
-from harness.observability.experiments import (
+from harness.telemetry.cerebras_pricing import cost_details_for_usage
+from harness.telemetry.experiments import (
     run_hosted_localization_baseline,
     run_hosted_localization_experiment,
 )
-from harness.observability.hf_lca import (
+from harness.telemetry.hf_lca import (
     HFDatasetLoadError,
     fetch_hf_localization_dataset,
 )
-from harness.observability.langfuse import flush_langfuse, ensure_langfuse_auth
-from harness.observability.requests import (
+from harness.telemetry.langfuse import flush_langfuse, ensure_langfuse_auth
+from harness.entrypoints.requests import (
     HostedLocalizationBaselineRequest,
     HostedLocalizationRunRequest,
 )
-from harness.observability.session_policy import SessionConfig
+from harness.telemetry.session_policy import SessionConfig
 
 WARNING_THRESHOLD = 50
 HF_DATASET_NAME = "JetBrains-Research/lca-bug-localization"

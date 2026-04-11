@@ -11,14 +11,14 @@ from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .observability.langfuse import get_tracing_openai_client, start_observation
-from .observability.score_emitter import emit_score_for_handle
-from .utils.env import get_cerebras_api_key, get_writer_model
-from .utils.model_budgets import compute_prompt_char_budget, get_model_budget
-from .prompts import WriterPromptContext
-from .utils.template_loader import render_prompt_template
-from .loop.agent_common import usage_from_response  # reuse usage mapping for OpenAI-style responses  # pyright: ignore[reportPrivateUsage]
-from .utils.type_loader import ScorerContext, format_scoring_context
+from harness.telemetry.langfuse import get_tracing_openai_client, start_observation
+from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.utils.env import get_cerebras_api_key, get_writer_model
+from harness.utils.model_budgets import compute_prompt_char_budget, get_model_budget
+from harness.prompts import WriterPromptContext
+from harness.utils.template_loader import render_prompt_template
+from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
+from harness.utils.type_loader import ScorerContext, format_scoring_context
 
 
 class WriterRequest(BaseModel):
@@ -288,7 +288,7 @@ def generate_policy(
                     )
                     if usage_details is None:
                         raise RuntimeError("Cerebras response missing usage; provide usage_details explicitly or enable provider usage output.")
-                    from .observability.cerebras_pricing import cost_details_for_usage
+                    from harness.telemetry.cerebras_pricing import cost_details_for_usage
 
                     cost_details = cost_details_for_usage(model, usage_details) if usage_details else None
                     _safe_update(

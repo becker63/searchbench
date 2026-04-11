@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from harness.loop import _hash_tests_dir, _write_policy, _read_policy
+from harness.orchestration import _hash_tests_dir, _write_policy, _read_policy
 
 
 def test_test_directory_integrity(tmp_path: Path):
@@ -16,5 +16,5 @@ def test_test_directory_integrity(tmp_path: Path):
         if marker.exists():
             marker.unlink()
         # ensure policy restored to avoid side effects
-        policy_path = repo_root / "harness" / "policy.py"
+        policy_path = repo_root / "harness" / "policy" / "current.py"
         _write_policy(_read_policy(policy_path), policy_path)

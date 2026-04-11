@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from harness.loop.agent_common import UsageEnvelope
-from harness.loop.loop_types import EvaluationMetrics, FeedbackEntries
+from harness.agents.common import UsageEnvelope
+from harness.orchestration.types import EvaluationMetrics, FeedbackEntries
 
 
 def test_evaluation_metrics_rejects_unknown_fields():

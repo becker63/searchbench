@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-import harness.loop.runner_agent as runner
-import harness.writer as writer
+import harness.localization.agent_runtime as runner
+import harness.agents.writer as writer
 from harness.utils import type_loader
 from harness.pipeline.types import StepResult
 from harness.prompts import SystemPromptContext, WriterPromptContext

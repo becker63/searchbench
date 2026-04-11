@@ -9,8 +9,8 @@ from jcodemunch_mcp.server import call_tool, list_tools
 from mcp.types import TextContent, Tool
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from ...utils.openai_schema import OpenAITool
-from ..mcp_adapter import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
+from harness.utils.openai_schema import OpenAITool
+from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
 
 
 class BackendInit(BaseModel):

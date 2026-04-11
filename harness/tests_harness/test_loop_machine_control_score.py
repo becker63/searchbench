@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from harness.localization.evaluation_backend import LocalizationEvaluationResult, LocalizationEvaluationTaskResult, MachineScorePolicy
+from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult, MachineScorePolicy
 from harness.localization.models import LocalizationMetrics, LCAContext, LCATaskIdentity, LCAGold, LCATask
-from harness.loop.loop import evaluate_policy_on_item
-from harness.loop.loop_types import ICTaskPayload
+from harness.orchestration.runtime import evaluate_policy_on_item
+from harness.orchestration.types import ICTaskPayload
 
 
 def test_machine_uses_machine_score(monkeypatch, tmp_path):
@@ -44,7 +44,7 @@ def test_machine_uses_machine_score(monkeypatch, tmp_path):
     def fake_backend(req):
         return eval_result
 
-    monkeypatch.setattr("harness.loop.loop.evaluate_localization_batch", fake_backend)
+    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend)
     result = evaluate_policy_on_item(ic_task, None, None, 0)
     assert result.control_score == 0.5
     assert result.metrics.get("score") == 0.1
@@ -81,15 +81,15 @@ def test_machine_score_policy_changes_control(monkeypatch, tmp_path):
             failure=None,
         )
 
-    monkeypatch.setattr("harness.loop.loop.evaluate_localization_batch", fake_backend)
+    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend)
 
     # Default policy uses aggregate (score)
     res_default = evaluate_policy_on_item(ic_task, None, None, 0)
     assert res_default.control_score == pytest.approx(metrics.score)
     # Force HIT policy
-    from harness.localization.evaluation_backend import LocalizationEvaluationRequest
+    from harness.localization.evaluate import LocalizationEvaluationRequest
 
-    monkeypatch.setattr("harness.loop.loop.LocalizationEvaluationRequest", lambda **kwargs: LocalizationEvaluationRequest(machine_score_policy=MachineScorePolicy.HIT, **kwargs))
+    monkeypatch.setattr("harness.orchestration.runtime.LocalizationEvaluationRequest", lambda **kwargs: LocalizationEvaluationRequest(machine_score_policy=MachineScorePolicy.HIT, **kwargs))
     res_hit = evaluate_policy_on_item(ic_task, None, None, 0)
     assert res_hit.control_score == pytest.approx(metrics.hit)
     assert res_hit.metrics.get("score") == pytest.approx(metrics.score)

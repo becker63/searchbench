@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from .materializer import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer, describe_repo_mapping
+from .materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer, describe_repo_mapping
 
 
 class HuggingFaceRepoMaterializer(RepoMaterializer):

@@ -8,12 +8,12 @@ from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.localization.evaluation_backend import (
+from harness.localization.evaluate import (
     LocalizationEvaluationFailure,
     LocalizationEvaluationRequest,
     evaluate_localization_batch,
 )
-from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
+from harness.localization.materialize import RepoMaterializer, RepoMaterializationResult
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.models import (
     LCATask,
@@ -25,8 +25,8 @@ from harness.localization.models import (
 )
 from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.telemetry import build_localization_telemetry
-from harness.observability.langfuse import propagate_context, start_observation
-from harness.observability.score_emitter import emit_score_for_handle
+from harness.telemetry.langfuse import propagate_context, start_observation
+from harness.telemetry.score_emitter import emit_score_for_handle
 
 _LOGGER = logging.getLogger(__name__)
 

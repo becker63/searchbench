@@ -53,8 +53,8 @@ def _stub_langfuse_client(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
         return
     if request.node.get_closest_marker("no_langfuse_stub"):
         return
-    import harness.observability.langfuse as lf
-    import harness.observability.score_emitter as se
+    import harness.telemetry.langfuse as lf
+    import harness.telemetry.score_emitter as se
 
     monkeypatch.setattr(lf, "_STRICT_DEBUG", False)
     monkeypatch.setattr(se, "_STRICT_DEBUG", False)

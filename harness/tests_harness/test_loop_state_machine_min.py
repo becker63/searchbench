@@ -7,8 +7,8 @@ from typing import Any, Iterator, List
 import pytest
 
 from harness.localization.models import LCAContext, LCATaskIdentity
-from harness.loop.loop_machine import OptimizationStateMachine, RepairStateMachine
-from harness.loop.loop_types import (
+from harness.orchestration.machine import OptimizationStateMachine, RepairStateMachine
+from harness.orchestration.types import (
     AcceptedPolicyMeta,
     EvaluationMetrics,
     EvaluationResult,

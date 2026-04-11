@@ -8,26 +8,75 @@ A benchmarking and optimization harness for AI agents that navigate codebases. I
 - **Language**: Python 3.12+
 - **Project Type**: CLI tool (no frontend/web server)
 
-### Workspace Members
+### Package Layout
 
-- **`harness/`** — Core benchmarking engine (main package)
-  - `run.py` — Entry point (CLI with argparse)
-  - `loop.py` — Thin bootstrap / dependency wiring layer
-  - `loop_machine.py` — State machine orchestration core (`OptimizationStateMachine`, `RepairStateMachine`)
-  - `loop_listeners.py` — Extracted tracing listeners (`RepairTracingListener`, `OptimizationTracingListener`)
-  - `loop_types.py` — Pydantic models for machine state, context, outcomes
-  - `runner.py` — Agent execution and tool call handling
-  - `policy.py` — Active scoring policy (dynamically updated)
-  - `pipeline/` — Validation steps (Ruff, Pyright, Pytest)
-  - `observability/` — Langfuse integration for tracing and experiments
-  - `tools/` — Adapters for IC and JC backends
-  - `utils/` — Helpers for diffing, repo resolution, etc.
+```
+harness/
+  entrypoints/        CLI and request models
+    cli.py             argparse entry point (run.py delegates here)
+    requests.py        Pydantic request/config models
 
-- **`iterative-context/`** — Git submodule (graph-based codebase exploration)
-  - Populated via `git submodule update --init --recursive`
+  orchestration/       State machine and runtime coordination
+    machine.py         OptimizationStateMachine, RepairStateMachine
+    listeners.py       Tracing listeners for state transitions
+    runtime.py         Iteration loop, evaluation wiring, policy pipeline
+    types.py           Pydantic models for machine state, context, outcomes
 
-- **`jcodemunch-mcp/`** — Git submodule (MCP adapter for JCodeMunch baseline)
-  - Currently uses stub package; run `git submodule update --init --recursive` to populate
+  localization/        Bug localization execution and evaluation
+    models.py          Core domain models (LCATask, LCAContext, etc.)
+    execute.py         Task execution orchestrator
+    evaluate.py        Shared evaluation backend (batch scoring)
+    records.py         Eval record construction
+    scoring.py         File-level localization metrics
+    materialize.py     Repo materialization
+    hf_materialize.py  HuggingFace dataset materialization
+    agent_runtime.py   IC agent iteration runner
+    telemetry.py       Localization-specific telemetry envelope
+    errors.py          Typed failure categories
+    token_usage.py     Token usage tracking
+
+  backends/            Backend dispatch adapters
+    ic.py              Iterative Context backend
+    jc.py              JCodeMunch backend
+    mcp.py             MCP adapter (tool conversion, async helpers)
+
+  telemetry/           Tracing, scoring, datasets, baselines
+    langfuse.py        Langfuse client wrappers
+    score_emitter.py   Score emission helpers
+    datasets.py        Dataset loading and normalization
+    baselines.py       Baseline computation and caching
+    experiments.py     Experiment orchestration
+    hf_lca.py          HuggingFace LCA loader
+    cerebras_pricing.py  Cost tracking for Cerebras
+    policy_reducer.py  Policy reduction across tasks
+    session_policy.py  Session-level config
+
+  agents/              Agent implementations
+    writer.py          Policy generation via LLM
+    common.py          Shared agent utilities (usage mapping)
+
+  policy/              Scoring policy management
+    current.py         Active scoring function (dynamically updated)
+    load.py            Policy loader with validation
+    examples.py        Scoring examples for prompt context
+
+  pipeline/            Validation steps (Ruff, Pyright, Pytest)
+  prompts/             Prompt templates and models
+  utils/               Helpers (diffing, repo resolution, env, etc.)
+  tools/               CLI tools (loop_viz, sync_cerebras_models)
+```
+
+### Backward-Compatibility Shims
+
+The following old package paths still work via re-export shims but should not be used in new code:
+- `harness.loop` → use `harness.orchestration`
+- `harness.observability` → use `harness.telemetry`
+- `harness.tools.backends` → use `harness.backends`
+
+### Workspace Submodules
+
+- **`iterative-context/`** — Graph-based codebase exploration (cloned directly)
+- **`jcodemunch-mcp/`** — MCP adapter for JCodeMunch baseline (cloned directly)
 
 ## Backends
 
@@ -60,13 +109,10 @@ uv run python run.py --repo small --symbol expand_node --iterations 3
 
 ## Replit Migration Fixes
 
-- **loop_listeners.py**: Fixed all listener methods (`on_transition`, `on_enter_*`) to accept `model` as a direct keyword argument instead of `event_data.model` — statemachine 3.0 changed the `EventData` API; `model` is now passed as a separate kwarg
-- **loop_viz.py**: Fixed `_build_charts()` to provide a `_DummySpan()` as `run_trace` (required by `OptimizationStateMachine._ensure_run_trace`)
-- **conftest.py**: Added `start_as_current_observation`, `auth_check`, `shutdown` to `DummyClient`; added `update` to `DummySpan`; patched `_STRICT_DEBUG` to False to prevent test contamination from `run.py`'s `os.environ.setdefault("LANGFUSE_STRICT_DEBUG", "1")`
-- **test_experiments_backend.py**: Updated `_run_experiment_task` call to pass required `session_id=None` argument
-- **test_loop_state_machine_min.py**: Updated `RecordingSpan` to be a full context manager with `update`/`__enter__`/`__exit__`; fixed `start_observation` helpers to use `@contextmanager`; fixed `run_trace=RecordingSpan()` in optimization test
-- **test_repo_resolution_execution.py**: Added `update`, `__enter__`, `__exit__` to `DummySpan`
-- **iterative-context/pyproject.toml**: Lowered `requires-python` to `>=3.12` and `ruff` target to `py312`
+- **listeners.py**: Fixed all listener methods to accept `model` as a direct kwarg (statemachine 3.0 API change)
+- **loop_viz.py**: Fixed `_build_charts()` to provide a `_DummySpan()` as `run_trace`
+- **conftest.py**: Added missing `DummyClient`/`DummySpan` methods; patched `_STRICT_DEBUG`
+- **iterative-context/pyproject.toml**: Lowered `requires-python` to `>=3.12`
 
 ## Environment Variables Needed
 

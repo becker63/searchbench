@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from harness.loop import (
+from harness.orchestration import (
     OptimizationStateMachine,
     RepairStateMachine,
     AcceptedPolicyMeta,
@@ -23,7 +23,7 @@ from harness.loop import (
     RepairContext,
     RepairMachineModel,
 )
-from harness.loop.loop_types import (
+from harness.orchestration.types import (
     EvaluationMetrics,
     EvaluationResult,
     FeedbackEntries,

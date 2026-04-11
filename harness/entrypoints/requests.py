@@ -4,7 +4,7 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from .session_policy import SessionConfig
+from harness.telemetry.session_policy import SessionConfig
 
 
 class LocalizationDatasetSource(str, Enum):

@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from harness.observability import langfuse as lf
-from harness.observability import score_emitter
+from harness.telemetry import langfuse as lf
+from harness.telemetry import score_emitter
 
 
 @pytest.mark.no_langfuse_stub
 def test_langfuse_disabled_without_keys(monkeypatch):
     import importlib
-    import harness.observability.langfuse as lf
+    import harness.telemetry.langfuse as lf
 
     monkeypatch.setenv("LANGFUSE_NO_STUB", "1")
     lf = importlib.reload(lf)
@@ -30,7 +30,7 @@ def test_emit_score_uses_client(monkeypatch):
         def create_score(self, **kwargs):
             calls.append(kwargs)
 
-    monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
     score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
 
     assert calls
@@ -45,7 +45,7 @@ def test_emit_score_for_handle_requires_identifier(monkeypatch):
         def create_score(self, **kwargs):
             pass
 
-    monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
     score_emitter.emit_score_for_handle(None, name="metric", value=1.0)
 
 
@@ -56,7 +56,7 @@ def test_emit_score_for_handle_allows_dataset_only(monkeypatch):
         def create_score(self, **kwargs):
             calls.append(kwargs)
 
-    monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
     score_emitter.emit_score_for_handle(None, name="metric", value=1.0, session_id="sess123")
 
     assert calls
@@ -83,7 +83,7 @@ def test_start_observation_accepts_context_manager(monkeypatch):
             self.end_called += 1
 
     monkeypatch.setattr(
-        "harness.observability.langfuse.get_langfuse_client",
+        "harness.telemetry.langfuse.get_langfuse_client",
         lambda: type("C", (), {"start_as_current_observation": lambda *a, **k: CMObservation()})(),
     )
 
@@ -128,7 +128,7 @@ def test_start_child_observation_handles_plain_object_parent():
 
 def test_emit_score_best_effort_when_client_missing(monkeypatch):
     monkeypatch.setattr(
-        "harness.observability.langfuse.get_langfuse_client",
+        "harness.telemetry.langfuse.get_langfuse_client",
         lambda: (_ for _ in ()).throw(RuntimeError("no client")),
     )
     # Should not raise
@@ -139,7 +139,7 @@ def test_emit_score_handles_missing_api(monkeypatch):
     class DummyClient:
         api = type("A", (), {})()
 
-    monkeypatch.setattr("harness.observability.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
     # Should not raise even though no create_score API
     score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
 
@@ -174,7 +174,7 @@ def test_propagate_context_strict_rejects_selection(monkeypatch):
     monkeypatch.setenv("LANGFUSE_STRICT_DEBUG", "1")
     import importlib
 
-    import harness.observability.langfuse as lf_mod
+    import harness.telemetry.langfuse as lf_mod
 
     importlib.reload(lf_mod)
     with pytest.raises(ValueError):

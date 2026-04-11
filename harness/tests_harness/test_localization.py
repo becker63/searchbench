@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 
-from localization.models import (
+from harness.localization.models import (
     LCATaskIdentity,
     LCAPrediction,
     LCAGold,
@@ -16,12 +16,12 @@ from localization.models import (
     LocalizationRepoInfo,
     LocalizationTelemetryEnvelope,
 )
-from localization.scoring import score_file_localization
-from localization.eval import build_file_localization_eval_record
-from localization.telemetry import build_localization_telemetry
-from localization.executor import run_localization_task
-import localization.executor as executor_module
-import harness.loop.runner_agent as runner
+from harness.localization.scoring import score_file_localization
+from harness.localization.records import build_file_localization_eval_record
+from harness.localization.telemetry import build_localization_telemetry
+from harness.localization.execute import run_localization_task
+import harness.localization.execute as executor_module
+import harness.localization.agent_runtime as runner
 
 
 def test_identity_is_deterministic():

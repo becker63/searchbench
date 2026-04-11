@@ -6,9 +6,9 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.localization.executor import run_localization_task
+from harness.localization.execute import run_localization_task
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.materializer import RepoMaterializer, RepoMaterializationResult
+from harness.localization.materialize import RepoMaterializer, RepoMaterializationResult
 from harness.localization.models import LCATask, LocalizationEvidence, LocalizationMetrics, normalize_lca_task
 from harness.localization.token_usage import TokenUsageRecord
 

@@ -9,16 +9,16 @@ import json
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from harness.observability.langfuse import (
+from harness.telemetry.langfuse import (
     UsageDetails,
     get_tracing_openai_client,
     start_observation,
 )
-from harness.observability.score_emitter import emit_score_for_handle
+from harness.telemetry.score_emitter import emit_score_for_handle
 from harness.prompts import SystemPromptContext
-from harness.tools.backends.ic_backend import IterativeContextBackend
-from harness.tools.backends.jc_backend import JCodeMunchBackend
-from harness.tools.mcp_adapter import serialize_tool_result_for_model
+from harness.backends.ic import IterativeContextBackend
+from harness.backends.jc import JCodeMunchBackend
+from harness.backends.mcp import serialize_tool_result_for_model
 from harness.utils.env import get_cerebras_api_key, get_runner_model
 from harness.utils.openai_schema import OpenAITool, validate_tools
 from harness.utils.template_loader import render_prompt_template
@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from harness.localization.models import LCAContext, LCATaskIdentity
 
-from .agent_common import AgentTaskPayload, usage_from_response
+from harness.agents.common import AgentTaskPayload, usage_from_response
 
 _MAX_TOTAL_MESSAGE_CHARS = 24000
 _MAX_TOOL_CONTENT_CHARS = 4000

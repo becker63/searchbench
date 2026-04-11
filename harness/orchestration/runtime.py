@@ -13,34 +13,34 @@ from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol, cast
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
-from harness.loop.runner_agent import run_ic_iteration
-from harness.observability.langfuse import (
+from harness.localization.agent_runtime import run_ic_iteration
+from harness.telemetry.langfuse import (
     flush_langfuse,
     propagate_context,
     start_observation,
 )
-from harness.observability.score_emitter import emit_score
+from harness.telemetry.score_emitter import emit_score
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
-from harness.policy_loader import load_policy
+from harness.policy.load import load_policy
 from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
 from harness.utils.repo_root import find_repo_root
 from harness.utils.test_loader import format_tests_for_prompt, load_tests
 from harness.utils.type_loader import ScorerContext, build_scorer_context, format_scoring_context, load_graph_models, load_scoring_examples, load_scoring_types
-from harness.writer import generate_policy
+from harness.agents.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
-from harness.loop.loop_types import SpanHandle
+from harness.orchestration.types import SpanHandle
 
 if TYPE_CHECKING:
-    from harness.localization.evaluation_backend import LocalizationEvaluationRequest as LocalizationEvaluationRequestType
-    from harness.observability.baselines import BaselineSnapshot
+    from harness.localization.evaluate import LocalizationEvaluationRequest as LocalizationEvaluationRequestType
+    from harness.telemetry.baselines import BaselineSnapshot
     from iterative_context.graph_models import Graph, GraphNode
 else:
     LocalizationEvaluationRequestType = object
 
-from .loop_machine import OptimizationStateMachine
-from .loop_types import (
+from .machine import OptimizationStateMachine
+from .types import (
     AcceptedPolicyMeta,
     EvaluationMetrics,
     EvaluationResult,
@@ -62,7 +62,7 @@ from .loop_types import (
     format_failure_context_payload,
 )
 
-_POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.py"
+_POLICY_PATH = Path(__file__).resolve().parent.parent / "policy" / "current.py"
 _MAX_POLICY_REPAIRS = 3
 _MAX_FAILURE_SUMMARY_CHARS = 400
 
@@ -96,7 +96,7 @@ def evaluate_localization_batch(req: "LocalizationEvaluationRequestType"):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
     """
-    from harness.localization.evaluation_backend import evaluate_localization_batch as _evaluate_localization_batch
+    from harness.localization.evaluate import evaluate_localization_batch as _evaluate_localization_batch
 
     return _evaluate_localization_batch(req)
 
@@ -107,7 +107,7 @@ def LocalizationEvaluationRequest(
     """
     Lazy proxy for the evaluation request model so tests can monkeypatch the symbol on this module.
     """
-    from harness.localization.evaluation_backend import LocalizationEvaluationRequest as _LocalizationEvaluationRequest
+    from harness.localization.evaluate import LocalizationEvaluationRequest as _LocalizationEvaluationRequest
 
     return _LocalizationEvaluationRequest(*args, **kwargs)
 
@@ -122,9 +122,8 @@ def score(node: "GraphNode", graph: "Graph", step: int) -> float:
 
 
 def _pkg_attr(name: str) -> Any:
-    # Access via package to pick up monkeypatching on harness.loop
-    pkg = import_module("harness.loop")
-    return getattr(pkg, name)
+    mod = import_module("harness.orchestration.runtime")
+    return getattr(mod, name)
 
 
 def _as_float(value: Any) -> float:
@@ -139,7 +138,7 @@ def _read_policy(path: Path = _POLICY_PATH) -> str:
 
 
 def _write_policy(code: str, path: Path = _POLICY_PATH) -> None:  # pyright: ignore[reportUnusedFunction]
-    if path.name != "policy.py":
+    if path.name not in ("policy.py", "current.py"):
         raise RuntimeError("Unauthorized write attempt")
     tmp_path = path.with_suffix(".tmp")
     tmp_path.write_text(code, encoding="utf-8")

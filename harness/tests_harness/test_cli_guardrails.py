@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import run as run_module
-from observability.requests import HostedLocalizationBaselineRequest
+from harness.entrypoints.requests import HostedLocalizationBaselineRequest
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 
 

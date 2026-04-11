@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from harness.localization.evaluation_backend import (
+from harness.localization.evaluate import (
     DEFAULT_LOCALIZATION_RUNNER,
     LocalizationEvaluationRequest,
     MachineScorePolicy,
@@ -10,8 +10,8 @@ from harness.localization.evaluation_backend import (
 )
 from harness.localization.errors import LocalizationFailureCategory, LocalizationEvaluationError
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold, LCAPrediction, LocalizationMetrics
-from harness.loop.loop import evaluate_policy_on_item
-from harness.loop.loop_types import ICTaskPayload
+from harness.orchestration.runtime import evaluate_policy_on_item
+from harness.orchestration.types import ICTaskPayload
 
 
 def _make_task(tmp_path: Path) -> LCATask:
@@ -35,7 +35,7 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
@@ -54,7 +54,7 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
         raise RuntimeError("runner failed")
 
     monkeypatch.setattr(
-        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         failing_runner,
         raising=False,
     )
@@ -70,11 +70,11 @@ def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
-    monkeypatch.setattr("harness.loop.loop._read_policy", lambda: "policy", raising=False)
+    monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda: "policy", raising=False)
     ic_task = ICTaskPayload(
         identity=_make_task(tmp_path).identity,
         context=_make_task(tmp_path).context,
@@ -94,7 +94,7 @@ def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
@@ -112,7 +112,7 @@ def test_machine_score_policy(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluation_backend.run_localization_task",
+        "harness.localization.evaluate.run_localization_task",
         lambda *a, **k: (
             LCAPrediction(predicted_files=["a.py"]),
             LocalizationMetrics(precision=0.5, recall=0.5, f1=0.5, hit=1.0, score=0.5),
@@ -142,7 +142,7 @@ def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
         raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "scoring failed")
 
     monkeypatch.setattr(
-        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         failing_runner,
         raising=False,
     )
@@ -160,12 +160,12 @@ def test_machine_score_policy_failure_is_typed(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
     monkeypatch.setattr(
-        "harness.localization.evaluation_backend._derive_machine_score",
+        "harness.localization.evaluate._derive_machine_score",
         lambda **kwargs: (_ for _ in ()).throw(LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "bad policy")),
         raising=True,
     )
@@ -187,11 +187,11 @@ def test_aggregate_metrics_failure_is_typed(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluation_backend.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
-    monkeypatch.setattr("harness.localization.evaluation_backend.LocalizationMetrics", BadMetrics, raising=False)
+    monkeypatch.setattr("harness.localization.evaluate.LocalizationMetrics", BadMetrics, raising=False)
     result = evaluate_localization_batch(
         LocalizationEvaluationRequest(tasks=[task], dataset_source="test", materializer=None, parent_trace=None)
     )

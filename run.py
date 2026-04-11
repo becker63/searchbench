@@ -1,4 +1,4 @@
-import harness.run as harness_run
+import harness.entrypoints.cli as harness_run
 
 # Expose key callables for tests; they may be monkeypatched on this shim.
 cost_details_for_usage = harness_run.cost_details_for_usage
