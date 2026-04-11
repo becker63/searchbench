@@ -55,7 +55,18 @@ uv run python run.py --repo small --symbol expand_node --iterations 3
 
 - The `requires-python` was lowered from `>=3.13` to `>=3.12` across all workspace members to match available Replit runtime
 - `mcp` package was added to `harness/pyproject.toml` as it was an implicit dependency
-- After cloning, run `git submodule update --init --recursive` to populate submodules
+- Git submodules (`iterative-context`, `jcodemunch-mcp`) are cloned into the workspace directories directly (submodule init is a destructive git op on Replit)
+- All workspace dependencies are installed via `uv sync --all-packages`
+
+## Replit Migration Fixes
+
+- **loop_listeners.py**: Fixed all listener methods (`on_transition`, `on_enter_*`) to accept `model` as a direct keyword argument instead of `event_data.model` — statemachine 3.0 changed the `EventData` API; `model` is now passed as a separate kwarg
+- **loop_viz.py**: Fixed `_build_charts()` to provide a `_DummySpan()` as `run_trace` (required by `OptimizationStateMachine._ensure_run_trace`)
+- **conftest.py**: Added `start_as_current_observation`, `auth_check`, `shutdown` to `DummyClient`; added `update` to `DummySpan`; patched `_STRICT_DEBUG` to False to prevent test contamination from `run.py`'s `os.environ.setdefault("LANGFUSE_STRICT_DEBUG", "1")`
+- **test_experiments_backend.py**: Updated `_run_experiment_task` call to pass required `session_id=None` argument
+- **test_loop_state_machine_min.py**: Updated `RecordingSpan` to be a full context manager with `update`/`__enter__`/`__exit__`; fixed `start_observation` helpers to use `@contextmanager`; fixed `run_trace=RecordingSpan()` in optimization test
+- **test_repo_resolution_execution.py**: Added `update`, `__enter__`, `__exit__` to `DummySpan`
+- **iterative-context/pyproject.toml**: Lowered `requires-python` to `>=3.12` and `ruff` target to `py312`
 
 ## Environment Variables Needed
 

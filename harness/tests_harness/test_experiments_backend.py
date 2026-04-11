@@ -206,4 +206,4 @@ def test_missing_parent_trace_guard(monkeypatch, tmp_path):
     repo_root.mkdir()
     task = _task(str(repo_root / "r1"))
     with pytest.raises(experiments._TaskFailure):
-        experiments._run_experiment_task(task=task, parent_trace=None, materializer=None)
+        experiments._run_experiment_task(task=task, parent_trace=None, materializer=None, session_id=None)

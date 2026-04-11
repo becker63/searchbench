@@ -172,7 +172,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
         base_sha="base",
     )
     context = LCAContext(issue_title="demo", issue_body="details")
-    loop_ctx = LoopContext(task=TaskPayload(identity=identity, context=context, repo="repo", changed_files=[]), iterations=1, baseline_snapshot=None, run_trace=None)
+    loop_ctx = LoopContext(task=TaskPayload(identity=identity, context=context, repo="repo", changed_files=[]), iterations=1, baseline_snapshot=None, run_trace=_DummySpan())
     opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
     opt_chart = OptimizationStateMachine(opt_model)
     return repair_chart, opt_chart

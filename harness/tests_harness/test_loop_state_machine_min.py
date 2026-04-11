@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Iterator, List
 
 import pytest
 
@@ -38,6 +39,19 @@ class RecordingSpan:
 
     def end(self, **kwargs: Any) -> None:
         self.ended.append(dict(kwargs))
+
+    def update(self, **kwargs: Any) -> None:
+        meta = kwargs.get("metadata")
+        if isinstance(meta, dict):
+            self.ended.append(dict(meta))
+        else:
+            self.ended.append(dict(kwargs))
+
+    def __enter__(self) -> "RecordingSpan":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        pass
 
 
 def _make_feedback() -> FeedbackPackage:
@@ -135,11 +149,12 @@ def _repair_deps(
             error="pipeline_failed",
         )
 
-    def start_observation(**kwargs: Any) -> RecordingSpan:
+    @contextmanager
+    def start_observation(**kwargs: Any) -> Iterator[RecordingSpan]:
         span = RecordingSpan()
         spans.append(span)
         events.append(("span_open", span))
-        return span
+        yield span
 
     deps = LoopDependencies(
         prepare_iteration_tasks=lambda task, trace=None: PreparedTasks(
@@ -338,7 +353,7 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        start_observation=lambda **k: span,
+        start_observation=lambda **k: span,  # RecordingSpan is a context manager
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: object(),
     )
@@ -351,7 +366,7 @@ def test_optimization_completes_and_records_history() -> None:
         iterations=1,
         session_id=None,
         baseline_snapshot=None,
-        run_trace=None,
+        run_trace=RecordingSpan(),
         history=[],
         prepared_tasks=None,
     )

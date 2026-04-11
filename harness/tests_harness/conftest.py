@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 from pathlib import Path
 import sys
 
@@ -53,6 +54,10 @@ def _stub_langfuse_client(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
     if request.node.get_closest_marker("no_langfuse_stub"):
         return
     import harness.observability.langfuse as lf
+    import harness.observability.score_emitter as se
+
+    monkeypatch.setattr(lf, "_STRICT_DEBUG", False)
+    monkeypatch.setattr(se, "_STRICT_DEBUG", False)
 
     class DummyTrace:
         def __init__(self, session_id: str | None = None):
@@ -70,6 +75,9 @@ def _stub_langfuse_client(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
         def end(self, **kwargs: Any) -> None:
             return None
 
+        def update(self, **kwargs: Any) -> None:
+            return None
+
     class DummyClient:
         def __init__(self):
             self.scores: list[dict[str, object]] = []
@@ -80,7 +88,17 @@ def _stub_langfuse_client(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
         def trace(self, **kwargs: Any) -> DummyTrace:
             return DummyTrace(session_id=kwargs.get("session_id"))
 
+        @contextmanager
+        def start_as_current_observation(self, **kwargs: Any) -> Iterator[DummySpan]:
+            yield DummySpan()
+
+        def auth_check(self) -> bool:
+            return True
+
         def flush(self) -> None:
+            return None
+
+        def shutdown(self) -> None:
             return None
 
     original = getattr(lf, "get_langfuse_client", None)

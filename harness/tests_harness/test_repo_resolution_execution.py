@@ -30,6 +30,15 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
         def end(self, **kwargs):
             pass
 
+        def update(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
     repo_dir = tmp_path / "ic_repo"
     repo_dir.mkdir()
 

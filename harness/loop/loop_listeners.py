@@ -6,7 +6,7 @@ No session creation; reacts to machine events only.
 """
 
 import json
-from typing import ContextManager, Protocol
+from typing import Any, ContextManager, Protocol
 
 from statemachine import State
 
@@ -27,12 +27,10 @@ class _EventTarget(Protocol):
 
 class _RepairEventData(Protocol):
     target: _EventTarget | None
-    model: RepairMachineModel
 
 
 class _OptEventData(Protocol):
     target: _EventTarget | None
-    model: OptimizationMachineModel
 
 class RepairTracingListener:
     """Listener that owns the full repair attempt span lifecycle.
@@ -43,14 +41,16 @@ class RepairTracingListener:
     (``retrying``, ``candidate_valid``, ``repair_exhausted``).
     """
 
-    def on_transition(self, event: object, state: State, event_data: _RepairEventData, **kwargs: object) -> None:
-        target = event_data.target
-        if target is None or target.id != "generating_candidate":
+    def on_transition(self, event: object, state: State, event_data: _RepairEventData, model: Any = None, **kwargs: object) -> None:
+        target = getattr(event_data, 'target', None)
+        if target is None or getattr(target, 'id', None) != "generating_candidate":
             return
-        model = event_data.model
-        ctx = model.context
+        if model is None:
+            return
+        repair_model: RepairMachineModel = model
+        ctx = repair_model.context
         if ctx.repair_observation is None:
-            cm: ContextManager[SpanHandle] = model.deps.start_observation(
+            cm: ContextManager[SpanHandle] = repair_model.deps.start_observation(
                 name=f"policy_repair_attempt_{ctx.attempts_used}",
                 parent=ctx.parent_trace,
                 metadata={"attempt": ctx.attempts_used},
@@ -58,14 +58,17 @@ class RepairTracingListener:
             ctx.repair_observation = cm.__enter__()
             ctx.repair_observation_cm = cm
 
-    def on_enter_retrying(self, event: object, state: State, event_data: _RepairEventData, **kwargs: object) -> None:
-        self._end_attempt(event_data.model, status="retrying")
+    def on_enter_retrying(self, event: object, state: State, event_data: _RepairEventData, model: Any = None, **kwargs: object) -> None:
+        if model is not None:
+            self._end_attempt(model, status="retrying")
 
-    def on_enter_candidate_valid(self, event: object, state: State, event_data: _RepairEventData, **kwargs: object) -> None:
-        self._end_attempt(event_data.model, status="passed")
+    def on_enter_candidate_valid(self, event: object, state: State, event_data: _RepairEventData, model: Any = None, **kwargs: object) -> None:
+        if model is not None:
+            self._end_attempt(model, status="passed")
 
-    def on_enter_repair_exhausted(self, event: object, state: State, event_data: _RepairEventData, **kwargs: object) -> None:
-        self._end_attempt(event_data.model, status="failed")
+    def on_enter_repair_exhausted(self, event: object, state: State, event_data: _RepairEventData, model: Any = None, **kwargs: object) -> None:
+        if model is not None:
+            self._end_attempt(model, status="failed")
 
     def _end_attempt(self, model: RepairMachineModel, status: str) -> None:
         ctx = model.context
@@ -97,15 +100,17 @@ class OptimizationTracingListener:
     def __init__(self) -> None:
         self._last_recorded_iteration: int | None = None
 
-    def on_enter_evaluating(self, event: object, state: State, event_data: _OptEventData, **kwargs: object) -> None:
-        model = event_data.model
-        ctx = model.context
+    def on_enter_evaluating(self, event: object, state: State, event_data: _OptEventData, model: Any = None, **kwargs: object) -> None:
+        if model is None:
+            return
+        opt_model: OptimizationMachineModel = model
+        ctx = opt_model.context
         if ctx.prepared_tasks is None:
-            model.current_iteration_span = None
-            model.current_iteration_cm = None
+            opt_model.current_iteration_span = None
+            opt_model.current_iteration_cm = None
             return
         iteration_tasks = ctx.prepared_tasks.build_iteration_tasks()
-        cm: ContextManager[SpanHandle] = model.deps.start_observation(
+        cm: ContextManager[SpanHandle] = opt_model.deps.start_observation(
             name=f"iteration_{ctx.current_iteration}",
             parent=ctx.run_trace,
             metadata={
@@ -115,17 +120,20 @@ class OptimizationTracingListener:
                 "jc_repo": iteration_tasks.jc_task.repo,
             },
         )
-        model.current_iteration_span = cm.__enter__()
-        model.current_iteration_cm = cm
+        opt_model.current_iteration_span = cm.__enter__()
+        opt_model.current_iteration_cm = cm
 
-    def on_exit_accepted_round(self, event: object, state: State, event_data: _OptEventData, **kwargs: object) -> None:
-        self._finalize_iteration(event_data.model, status="complete")
+    def on_exit_accepted_round(self, event: object, state: State, event_data: _OptEventData, model: Any = None, **kwargs: object) -> None:
+        if model is not None:
+            self._finalize_iteration(model, status="complete")
 
-    def on_enter_completed(self, event: object, state: State, event_data: _OptEventData, **kwargs: object) -> None:
-        self._finalize_iteration(event_data.model, status="completed")
+    def on_enter_completed(self, event: object, state: State, event_data: _OptEventData, model: Any = None, **kwargs: object) -> None:
+        if model is not None:
+            self._finalize_iteration(model, status="completed")
 
-    def on_enter_failed(self, event: object, state: State, event_data: _OptEventData, **kwargs: object) -> None:
-        self._finalize_iteration(event_data.model, status="failed")
+    def on_enter_failed(self, event: object, state: State, event_data: _OptEventData, model: Any = None, **kwargs: object) -> None:
+        if model is not None:
+            self._finalize_iteration(model, status="failed")
 
     def _finalize_iteration(self, model: OptimizationMachineModel, status: str) -> None:
         ctx = model.context
