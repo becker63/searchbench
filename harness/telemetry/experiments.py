@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field
 
 from harness.localization.evaluate import (
     LocalizationEvaluationFailure,
-    LocalizationEvaluationRequest,
     evaluate_localization_batch,
 )
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
@@ -289,12 +288,10 @@ def _run_experiment_task(
     try:
         with propagate_context(session_id=session_id):
             eval_result = evaluate_localization_batch(
-                LocalizationEvaluationRequest(
-                    tasks=[normalized_task],
-                    dataset_source="huggingface",
-                    materializer=materializer,
-                    parent_trace=parent_trace,
-                )
+                tasks=[normalized_task],
+                dataset_source="huggingface",
+                materializer=materializer,
+                parent_trace=parent_trace,
             )
         if eval_result.failure or not eval_result.items:
             failure = eval_result.failure or LocalizationEvaluationFailure(

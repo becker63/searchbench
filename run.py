@@ -19,8 +19,8 @@ def _compute_projection(selected_count: int):
     return _original_compute_projection(selected_count)
 
 
-def evaluate_localization_batch(req):
-    return harness_run.evaluate_localization_batch(req)
+def evaluate_localization_batch(**kwargs):
+    return harness_run.evaluate_localization_batch(**kwargs)
 
 
 def main(argv: list[str] | None = None) -> None:

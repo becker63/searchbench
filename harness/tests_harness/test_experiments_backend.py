@@ -31,8 +31,8 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
     from harness.localization.models import LocalizationMetrics
 
-    def fake_backend(req):
-        calls.append(req)
+    def fake_backend(**kwargs):
+        calls.append(kwargs)
         metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
         return LocalizationEvaluationResult(
             aggregate_score=1.0,
@@ -77,8 +77,8 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
     tasks = [t2, t1]  # intentionally unsorted to exercise deterministic selection
     durations = {t1.task_id: 0.05, t2.task_id: 0.01}
 
-    def fake_backend(req):
-        task = req.tasks[0]
+    def fake_backend(**kwargs):
+        task = kwargs["tasks"][0]
         time.sleep(durations[task.task_id])
         metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
         return LocalizationEvaluationResult(
@@ -119,8 +119,8 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
     t2 = _task(str(repo_root / "r2"))
     calls = []
 
-    def fake_backend(req):
-        task = req.tasks[0]
+    def fake_backend(**kwargs):
+        task = kwargs["tasks"][0]
         calls.append(task.task_id)
         if task.task_id == t2.task_id:
             raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, "runner failed", task_id=task.task_id)
@@ -165,8 +165,8 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
     t2 = _task(str(repo_root / "r2"))
     calls = []
 
-    def fake_backend(req):
-        task = req.tasks[0]
+    def fake_backend(**kwargs):
+        task = kwargs["tasks"][0]
         calls.append(task.task_id)
         metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
         return LocalizationEvaluationResult(

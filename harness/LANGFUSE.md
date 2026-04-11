@@ -27,9 +27,9 @@
 ## Tracing & Scoring
 
 Orchestration-scoped tracing is owned by the state machines and their listeners:
-- `loop_machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
-- `loop_listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, metric recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration metrics now record only `metrics.score` (no legacy metrics).
-- `loop.py`: thin bootstrap/wiring layer — constructs context, dependencies, and the optimization machine; converts iteration records to public output shape. Not responsible for tracing or orchestration.
+- `orchestration/machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
+- `orchestration/listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, metric recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration metrics now record only `metrics.score` (no legacy metrics).
+- `orchestration/runtime.py`: thin bootstrap/wiring layer — constructs context, dependencies, and the optimization machine; converts iteration records to public output shape. Not responsible for tracing or orchestration.
 
 Leaf-operation observability remains with:
 - `runner.py`: model calls and MCP tool invocations traced via Langfuse spans.
@@ -42,7 +42,7 @@ Leaf-operation observability remains with:
 - Localization baseline (hosted dataset): `python run.py --mode localization-baseline --dataset DATASET_NAME [--version v1] [--config py] [--split dev] [--baseline-path bundle.json]`
 - Localization experiment (hosted dataset): `python run.py --mode localization-experiment --dataset DATASET_NAME [--version v1] [--config py] [--split dev]`
 - Console output is concise; Langfuse stores detailed traces/scores. `flush_langfuse()` runs on exit.
-- To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.observability.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `observability/cerebras_pricing.py`.
+- To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/cerebras_pricing.py`.
 
 ## Policy Loading
 - `policy_loader.py` now loads `policy.py` and requires the public Iterative Context scorer contract `score(node: GraphNode, graph: Graph, step: int) -> float` (SelectionCallable). No sandbox or restricted execution.

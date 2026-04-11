@@ -65,33 +65,30 @@ class LocalizationEvaluationResult(BaseModel):
     failure: LocalizationEvaluationFailure | None = None
 
 
-class LocalizationEvaluationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
-
-    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]]
-    dataset_source: str | None = None
-    materializer: RepoMaterializer | None = None
-    parent_trace: object | None = None
-    runner: LocalizationRunner | None = None
-    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE
-
-
-def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> LocalizationEvaluationResult:
+def evaluate_localization_batch(
+    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
+    *,
+    dataset_source: str | None = None,
+    materializer: RepoMaterializer | None = None,
+    parent_trace: object | None = None,
+    runner: LocalizationRunner | None = None,
+    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
+) -> LocalizationEvaluationResult:
     """
     Shared localization evaluation backend used by the optimization/repair machine and hosted wrappers.
     Executes each task via run_localization_task, aggregates scores, and returns typed results/failures.
     """
-    tasks = [t if isinstance(t, LCATask) else normalize_lca_task(t) for t in req.tasks]
-    runner = req.runner or DEFAULT_LOCALIZATION_RUNNER
+    normalized_tasks = [t if isinstance(t, LCATask) else normalize_lca_task(t) for t in tasks]
+    resolved_runner = runner or DEFAULT_LOCALIZATION_RUNNER
     task_results: list[LocalizationEvaluationTaskResult] = []
-    for task in tasks:
+    for task in normalized_tasks:
         try:
             run_result = run_localization_task(
                 task,
-                dataset_source=req.dataset_source,
-                materializer=req.materializer,
-                parent_trace=req.parent_trace,
-                runner=runner,
+                dataset_source=dataset_source,
+                materializer=materializer,
+                parent_trace=parent_trace,
+                runner=resolved_runner,
             )
             if isinstance(run_result, tuple):
                 if len(run_result) < 4:
@@ -108,7 +105,7 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
                     prediction=list(prediction.predicted_files),
                     evidence=evidence,
                     materialization=materialization,
-                    trace_id=getattr(req.parent_trace, "id", None),
+                    trace_id=getattr(parent_trace, "id", None),
                     token_usage=usage,
                 )
             )
@@ -130,10 +127,11 @@ def evaluate_localization_batch(req: LocalizationEvaluationRequest) -> Localizat
                 hit=_avg(res.metrics.hit for res in task_results) or 0.0,
                 score=aggregate_score,
             )
+        resolved_policy = machine_score_policy or MachineScorePolicy.AGGREGATE
         machine_score = _derive_machine_score(
             aggregate_score=aggregate_score,
             aggregate_metrics=aggregate_metrics,
-            policy=req.machine_score_policy or MachineScorePolicy.AGGREGATE,
+            policy=resolved_policy,
         )
         return LocalizationEvaluationResult(
             aggregate_score=aggregate_score,

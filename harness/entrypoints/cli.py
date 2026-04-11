@@ -20,9 +20,6 @@ except ImportError:
     termios = None  # type: ignore
 
 from harness.localization.evaluate import (
-    LocalizationEvaluationRequest,
-)
-from harness.localization.evaluate import (
     evaluate_localization_batch as _evaluate_localization_batch,
 )
 from harness.localization.hf_materialize import HuggingFaceRepoMaterializer
@@ -130,11 +127,11 @@ def _raw_mode(file_obj: IO[Any]) -> Iterator[None]:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def evaluate_localization_batch(req: LocalizationEvaluationRequest):
+def evaluate_localization_batch(**kwargs: object):
     """
     Thin wrapper to keep monkeypatch targets stable for tests while deferring import cycles.
     """
-    return _evaluate_localization_batch(req)
+    return _evaluate_localization_batch(**kwargs)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

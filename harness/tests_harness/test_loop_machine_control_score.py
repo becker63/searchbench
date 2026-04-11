@@ -41,7 +41,7 @@ def test_machine_uses_machine_score(monkeypatch, tmp_path):
         failure=None,
     )
 
-    def fake_backend(req):
+    def fake_backend(**kwargs):
         return eval_result
 
     monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend)
@@ -66,11 +66,12 @@ def test_machine_score_policy_changes_control(monkeypatch, tmp_path):
     )
     metrics = LocalizationMetrics(precision=0.2, recall=0.8, f1=0.32, hit=1.0, score=0.32)
 
-    def fake_backend(req):
+    def fake_backend(**kwargs):
+        policy = kwargs.get("machine_score_policy", MachineScorePolicy.AGGREGATE)
         return LocalizationEvaluationResult(
             aggregate_score=metrics.score,
             aggregate_metrics=metrics,
-            machine_score=metrics.hit if req.machine_score_policy == MachineScorePolicy.HIT else metrics.score,
+            machine_score=metrics.hit if policy == MachineScorePolicy.HIT else metrics.score,
             items=[
                 LocalizationEvaluationTaskResult(
                     task=LCATask(identity=ic_task.identity, context=ic_task.context, gold=LCAGold(changed_files=["a.py"]), repo=ic_task.repo),
@@ -83,13 +84,14 @@ def test_machine_score_policy_changes_control(monkeypatch, tmp_path):
 
     monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend)
 
-    # Default policy uses aggregate (score)
     res_default = evaluate_policy_on_item(ic_task, None, None, 0)
     assert res_default.control_score == pytest.approx(metrics.score)
-    # Force HIT policy
-    from harness.localization.evaluate import LocalizationEvaluationRequest
 
-    monkeypatch.setattr("harness.orchestration.runtime.LocalizationEvaluationRequest", lambda **kwargs: LocalizationEvaluationRequest(machine_score_policy=MachineScorePolicy.HIT, **kwargs))
+    def fake_backend_hit(**kwargs):
+        kwargs["machine_score_policy"] = MachineScorePolicy.HIT
+        return fake_backend(**kwargs)
+
+    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend_hit)
     res_hit = evaluate_policy_on_item(ic_task, None, None, 0)
     assert res_hit.control_score == pytest.approx(metrics.hit)
     assert res_hit.metrics.get("score") == pytest.approx(metrics.score)

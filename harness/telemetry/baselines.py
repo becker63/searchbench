@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.localization.evaluate import (
     LocalizationEvaluationFailure,
-    LocalizationEvaluationRequest,
     evaluate_localization_batch,
 )
 from harness.localization.materialize import RepoMaterializer, RepoMaterializationResult
@@ -94,14 +93,13 @@ def compute_baseline_for_task(
                 "identity": task.task_id,
             },
         ) as trace:
-            eval_request = LocalizationEvaluationRequest(
+            eval_result = evaluate_localization_batch(
                 tasks=[task],
                 dataset_source=dataset_source,
                 materializer=materializer,
                 parent_trace=trace,
                 runner=runner,
             )
-            eval_result = evaluate_localization_batch(eval_request)
             if eval_result.failure or not eval_result.items:
                 failure = eval_result.failure or LocalizationEvaluationFailure(
                     category=LocalizationFailureCategory.UNKNOWN, message="baseline_evaluation_failed", task_id=task.task_id

@@ -88,8 +88,8 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
     from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
     from harness.localization.models import LocalizationMetrics, LocalizationPrediction
 
-    def fake_backend(req):
-        calls.append(req)
+    def fake_backend(**kwargs):
+        calls.append(kwargs)
         metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
         return LocalizationEvaluationResult(
             aggregate_score=1.0,

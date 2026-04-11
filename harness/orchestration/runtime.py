@@ -33,11 +33,8 @@ from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LC
 from harness.orchestration.types import SpanHandle
 
 if TYPE_CHECKING:
-    from harness.localization.evaluate import LocalizationEvaluationRequest as LocalizationEvaluationRequestType
     from harness.telemetry.baselines import BaselineSnapshot
     from iterative_context.graph_models import Graph, GraphNode
-else:
-    LocalizationEvaluationRequestType = object
 
 from .machine import OptimizationStateMachine
 from .types import (
@@ -67,7 +64,7 @@ _MAX_POLICY_REPAIRS = 3
 _MAX_FAILURE_SUMMARY_CHARS = 400
 
 
-# Re-exported helpers so callers can monkeypatch harness.loop.* directly.
+# Re-exported helpers so callers can monkeypatch harness.orchestration.runtime.* directly.
 _REEXPORTED = (
     index_folder,
     load_policy,
@@ -92,29 +89,19 @@ _REEXPORTED = (
 )
 
 
-def evaluate_localization_batch(req: "LocalizationEvaluationRequestType"):
+def evaluate_localization_batch(**kwargs: object):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
+    Forwards keyword arguments directly to harness.localization.evaluate.evaluate_localization_batch.
     """
     from harness.localization.evaluate import evaluate_localization_batch as _evaluate_localization_batch
 
-    return _evaluate_localization_batch(req)
-
-
-def LocalizationEvaluationRequest(
-    *args: object, **kwargs: object
-) -> "LocalizationEvaluationRequestType":
-    """
-    Lazy proxy for the evaluation request model so tests can monkeypatch the symbol on this module.
-    """
-    from harness.localization.evaluate import LocalizationEvaluationRequest as _LocalizationEvaluationRequest
-
-    return _LocalizationEvaluationRequest(*args, **kwargs)
+    return _evaluate_localization_batch(**kwargs)
 
 
 def score(node: "GraphNode", graph: "Graph", step: int) -> float:
     """
-    Delegate to policy.score while keeping a stable harness.loop.* attribute for tests/monkeypatching.
+    Delegate to policy.score while keeping a stable monkeypatchable attribute on this module.
     """
     from harness.policy import score as _policy_score
 
@@ -274,13 +261,12 @@ def evaluate_policy_on_item(
         gold=LCAGold(changed_files=list(ic_task.changed_files)),
         repo=ic_task.repo,
     )
-    eval_req = LocalizationEvaluationRequest(
+    eval_result = evaluate_localization_batch(
         tasks=[lca_task],
         dataset_source=None,
         materializer=None,
         parent_trace=iteration_span,
     )
-    eval_result = evaluate_localization_batch(eval_req)
     if eval_result.failure:
         failure_metrics: dict[str, float | int | bool | None] = {
             "score": -10.0,

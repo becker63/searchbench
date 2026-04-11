@@ -145,7 +145,7 @@ class FeedbackEntries(BaseModel):
 
 
 class TaskPayload(BaseModel):
-    """Localization-native task payload passed into loop/runner agents."""
+    """Localization-native task payload passed into orchestration/evaluation agents."""
 
     model_config = ConfigDict(extra="forbid")
 
