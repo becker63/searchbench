@@ -14,7 +14,8 @@ A benchmarking and optimization harness for AI agents that navigate codebases. I
 harness/
   entrypoints/        CLI and request models
     cli.py             argparse entry point (run.py delegates here)
-    requests.py        Pydantic request/config models
+    models/
+      requests.py      Pydantic request/config models
 
   orchestration/       State machine and runtime coordination
     machine.py         OptimizationStateMachine, RepairStateMachine
@@ -24,16 +25,18 @@ harness/
 
   localization/        Bug localization execution and evaluation
     models.py          Core domain models (LCATask, LCAContext, etc.)
-    execute.py         Task execution orchestrator
-    evaluate.py        Shared evaluation backend (batch scoring)
-    records.py         Eval record construction
     scoring.py         File-level localization metrics
-    materialize.py     Repo materialization
-    hf_materialize.py  HuggingFace dataset materialization
-    agent_runtime.py   IC agent iteration runner
-    telemetry.py       Localization-specific telemetry envelope
     errors.py          Typed failure categories
     token_usage.py     Token usage tracking
+    telemetry.py       Localization-specific telemetry envelope
+    runtime/           Execution and evaluation
+      execute.py       Task execution orchestrator
+      evaluate.py      Shared evaluation backend (batch scoring)
+      records.py       Eval record construction
+      agent_runtime.py IC agent iteration runner
+    materialization/   Repo cloning and preparation
+      materialize.py   Repo materialization
+      hf_materialize.py HuggingFace dataset materialization
 
   backends/            Backend dispatch adapters
     ic.py              Iterative Context backend
@@ -41,15 +44,17 @@ harness/
     mcp.py             MCP adapter (tool conversion, async helpers)
 
   telemetry/           Tracing, scoring, datasets, baselines
-    langfuse.py        Langfuse client wrappers
-    score_emitter.py   Score emission helpers
-    datasets.py        Dataset loading and normalization
-    baselines.py       Baseline computation and caching
-    experiments.py     Experiment orchestration
-    hf_lca.py          HuggingFace LCA loader
-    cerebras_pricing.py  Cost tracking for Cerebras
     policy_reducer.py  Policy reduction across tasks
-    session_policy.py  Session-level config
+    tracing/           Langfuse client and scoring (was langfuse.py)
+      __init__.py      Langfuse client wrappers
+      score_emitter.py Score emission helpers
+      session_policy.py Session-level config
+      cerebras_pricing.py Cost tracking for Cerebras
+    hosted/            Dataset workflows
+      datasets.py      Dataset loading and normalization
+      baselines.py     Baseline computation and caching
+      experiments.py   Experiment orchestration
+      hf_lca.py        HuggingFace LCA loader
 
   agents/              Agent implementations
     writer.py          Policy generation via LLM

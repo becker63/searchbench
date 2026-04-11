@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult, MachineScorePolicy
+from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult, MachineScorePolicy
 from harness.localization.models import LocalizationMetrics, LCAContext, LCATaskIdentity, LCAGold, LCATask
 from harness.orchestration.runtime import evaluate_policy_on_item
 from harness.orchestration.types import ICTaskPayload

@@ -5,7 +5,7 @@ One-off helper to sync Cerebras pricing definitions to Langfuse Cloud Models API
 Requires LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY (and optional LANGFUSE_BASE_URL) to be set.
 """
 
-from harness.telemetry.cerebras_pricing import sync_cerebras_models
+from harness.telemetry.tracing.cerebras_pricing import sync_cerebras_models
 
 
 def main() -> None:

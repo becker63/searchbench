@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List, Mapping, Optional, cast
 
-from .models import (
+from harness.localization.models import (
     LCAGold,
     LCAPrediction,
     LCATaskIdentity,
@@ -15,7 +15,7 @@ from .models import (
     LocalizationPrediction,
     LocalizationRepoInfo,
 )
-from .scoring import score_file_localization
+from harness.localization.scoring import score_file_localization
 
 
 def localization_eval_identity(identity: LCATaskIdentity) -> str:

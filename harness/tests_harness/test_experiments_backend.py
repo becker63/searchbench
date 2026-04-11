@@ -5,9 +5,9 @@ import time
 import pytest
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity, LocalizationMetrics
-from harness.telemetry import experiments
+from harness.telemetry.hosted import experiments
 
 
 def _task(repo: str) -> LCATask:
@@ -28,7 +28,7 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     task = _task(str(tmp_path / "repo"))
     calls = []
 
-    from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+    from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
     from harness.localization.models import LocalizationMetrics
 
     def fake_backend(**kwargs):

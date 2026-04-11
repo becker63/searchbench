@@ -10,7 +10,7 @@ from typing import Any, ContextManager, Protocol
 
 from statemachine import State
 
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 
 from .types import IterationRecord, OptimizationMachineModel, RepairMachineModel
 

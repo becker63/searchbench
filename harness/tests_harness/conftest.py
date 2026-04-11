@@ -11,7 +11,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
-from harness import observability
+from harness import telemetry
 
 
 class TestSpan(BaseModel):
@@ -53,8 +53,8 @@ def _stub_langfuse_client(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
         return
     if request.node.get_closest_marker("no_langfuse_stub"):
         return
-    import harness.telemetry.langfuse as lf
-    import harness.telemetry.score_emitter as se
+    import harness.telemetry.tracing as lf
+    import harness.telemetry.tracing.score_emitter as se
 
     monkeypatch.setattr(lf, "_STRICT_DEBUG", False)
     monkeypatch.setattr(se, "_STRICT_DEBUG", False)

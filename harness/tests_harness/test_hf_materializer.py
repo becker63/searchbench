@@ -4,8 +4,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from harness.localization.hf_materialize import HuggingFaceRepoMaterializer
-from harness.localization.materialize import RepoMaterializationRequest, RepoMaterializationResult, describe_repo_mapping
+from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
+from harness.localization.materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, describe_repo_mapping
 
 
 def _run_git(args: list[str], cwd: Path | None = None) -> str:

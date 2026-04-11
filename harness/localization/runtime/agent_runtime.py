@@ -9,12 +9,12 @@ import json
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
-from harness.telemetry.langfuse import (
+from harness.telemetry.tracing import (
     UsageDetails,
     get_tracing_openai_client,
     start_observation,
 )
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 from harness.prompts import SystemPromptContext
 from harness.backends.ic import IterativeContextBackend
 from harness.backends.jc import JCodeMunchBackend

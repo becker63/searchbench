@@ -8,8 +8,8 @@ No CLI or session policy; receives normalized inputs only.
 from typing import Iterable, List
 from pathlib import Path
 
-from harness.telemetry.langfuse import start_observation
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing import start_observation
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
 from .types import PipelineClassification, Step, StepResult
 

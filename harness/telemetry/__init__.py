@@ -3,7 +3,7 @@
 from importlib import import_module
 from typing import Any, TYPE_CHECKING
 
-from .langfuse import (
+from .tracing import (
     flush_langfuse,
     get_langfuse_client,
     get_tracing_openai_client,
@@ -13,8 +13,8 @@ from .langfuse import (
     start_observation,
     start_root_observation,
 )
-from .score_emitter import ScorePayload, emit_score, emit_score_for_handle
-from .datasets import (
+from .tracing.score_emitter import ScorePayload, emit_score, emit_score_for_handle
+from .hosted.datasets import (
     LocalizationDataset,
     fetch_localization_dataset,
     local_dataset,
@@ -47,7 +47,7 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from harness.telemetry.baselines import (
+    from harness.telemetry.hosted.baselines import (
         BaselineBundle,
         BaselineSnapshot,
         baseline_key,
@@ -68,6 +68,6 @@ def __getattr__(name: str) -> Any:
         "require_baseline",
         "resolve_baseline",
     }:
-        module = import_module("harness.telemetry.baselines")
+        module = import_module("harness.telemetry.hosted.baselines")
         return getattr(module, name)
     raise AttributeError(f"module 'harness.telemetry' has no attribute {name!r}")

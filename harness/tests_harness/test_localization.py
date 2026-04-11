@@ -17,11 +17,11 @@ from harness.localization.models import (
     LocalizationTelemetryEnvelope,
 )
 from harness.localization.scoring import score_file_localization
-from harness.localization.records import build_file_localization_eval_record
+from harness.localization.runtime.records import build_file_localization_eval_record
 from harness.localization.telemetry import build_localization_telemetry
-from harness.localization.execute import run_localization_task
-import harness.localization.execute as executor_module
-import harness.localization.agent_runtime as runner
+from harness.localization.runtime.execute import run_localization_task
+import harness.localization.runtime.execute as executor_module
+import harness.localization.runtime.agent_runtime as runner
 
 
 def test_identity_is_deterministic():

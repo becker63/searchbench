@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
-from harness.telemetry import baselines
+from harness.telemetry.hosted import baselines
 
 
 def _install_dummy_langfuse(monkeypatch):
@@ -23,7 +23,7 @@ def _install_dummy_langfuse(monkeypatch):
         def start_as_current_observation(self, **kwargs):
             return _CM()
 
-    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
 
 
 def _task(repo: str | None = None) -> LCATask:
@@ -85,7 +85,7 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
     task = _task(str(repo_dir))
     calls = []
 
-    from harness.localization.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+    from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
     from harness.localization.models import LocalizationMetrics, LocalizationPrediction
 
     def fake_backend(**kwargs):

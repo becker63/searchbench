@@ -102,7 +102,7 @@ def sync_cerebras_models(client: object | None = None) -> None:
     Requires a v4 Langfuse client with `api.models.create` available.
     """
     if client is None:
-        from .langfuse import get_langfuse_client
+        from . import get_langfuse_client
 
         client = get_langfuse_client()
     models_api = getattr(getattr(client, "api", None), "models", None)

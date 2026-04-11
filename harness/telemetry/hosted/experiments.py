@@ -6,21 +6,21 @@ from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
-from harness.localization.evaluate import (
+from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
 from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
 from harness.localization.token_usage import TokenUsageRecord
-from harness.localization.materialize import RepoMaterializationResult, RepoMaterializer
+from harness.localization.materialization.materialize import RepoMaterializationResult, RepoMaterializer
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.telemetry.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
-from harness.telemetry.hf_lca import fetch_hf_localization_dataset
-from harness.telemetry.langfuse import flush_langfuse, propagate_context, start_observation
-from harness.telemetry.session_policy import resolve_session_id
+from harness.telemetry.hosted.baselines import BaselineBundle, BaselineSnapshot, compute_baseline_for_task, make_baseline_bundle
+from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
+from harness.telemetry.tracing import flush_langfuse, propagate_context, start_observation
+from harness.telemetry.tracing.session_policy import resolve_session_id
 from harness.telemetry.policy_reducer import PolicyReducerSummary, build_task_input, reduce_global
 
-from harness.entrypoints.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
+from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
 
 
 class LocalizationRunItemResult(BaseModel):

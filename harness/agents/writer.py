@@ -11,8 +11,8 @@ from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from harness.telemetry.langfuse import get_tracing_openai_client, start_observation
-from harness.telemetry.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing import get_tracing_openai_client, start_observation
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 from harness.utils.env import get_cerebras_api_key, get_writer_model
 from harness.utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from harness.prompts import WriterPromptContext
@@ -288,7 +288,7 @@ def generate_policy(
                     )
                     if usage_details is None:
                         raise RuntimeError("Cerebras response missing usage; provide usage_details explicitly or enable provider usage output.")
-                    from harness.telemetry.cerebras_pricing import cost_details_for_usage
+                    from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
 
                     cost_details = cost_details_for_usage(model, usage_details) if usage_details else None
                     _safe_update(

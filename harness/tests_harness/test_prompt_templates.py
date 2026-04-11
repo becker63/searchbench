@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-import harness.localization.agent_runtime as runner
+import harness.localization.runtime.agent_runtime as runner
 import harness.agents.writer as writer
 from harness.utils import type_loader
 from harness.pipeline.types import StepResult

@@ -5,9 +5,9 @@ import pytest
 from contextlib import contextmanager
 from typing import Any
 
-from harness.telemetry.langfuse import start_observation
-from harness.telemetry.score_emitter import emit_score
-from harness.telemetry.session_policy import SessionConfig, resolve_session_id
+from harness.telemetry.tracing import start_observation
+from harness.telemetry.tracing.score_emitter import emit_score
+from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
 
 
 @contextmanager
@@ -28,7 +28,7 @@ def _dummy_observation(session_id: str | None = None):
 
 def test_child_span_inherits_session(monkeypatch):
     monkeypatch.setattr(
-        "harness.telemetry.langfuse.get_langfuse_client",
+        "harness.telemetry.tracing.get_langfuse_client",
         lambda: type(
             "C",
             (),
@@ -42,7 +42,7 @@ def test_child_span_inherits_session(monkeypatch):
 
 def test_conflicting_child_session_raises(monkeypatch):
     monkeypatch.setattr(
-        "harness.telemetry.langfuse.get_langfuse_client",
+        "harness.telemetry.tracing.get_langfuse_client",
         lambda: type(
             "C",
             (),
@@ -63,12 +63,12 @@ def test_session_only_score(monkeypatch):
             calls.append(kwargs)
 
     monkeypatch.delenv("LANGFUSE_STRICT_DEBUG", raising=False)
-    import harness.telemetry.score_emitter as se
-    import harness.telemetry.langfuse as lf
+    import harness.telemetry.tracing.score_emitter as se
+    import harness.telemetry.tracing as lf
 
     monkeypatch.setattr(se, "_STRICT_DEBUG", False)
     monkeypatch.setattr(lf, "_STRICT_DEBUG", False)
-    monkeypatch.setattr("harness.telemetry.langfuse.get_langfuse_client", lambda: DummyClient())
+    monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
     emit_score(name="metric", value=1.0, session_id="sess-only")
     assert calls and calls[0]["session_id"] == "sess-only"
 

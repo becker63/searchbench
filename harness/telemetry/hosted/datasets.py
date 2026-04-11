@@ -8,10 +8,10 @@ from pydantic import BaseModel, Field
 import logging
 
 from harness.localization.models import LCATask, normalize_lca_task
-from harness.entrypoints.requests import LocalizationDatasetSource
-from harness.telemetry.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
+from harness.entrypoints.models.requests import LocalizationDatasetSource
+from harness.telemetry.hosted.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
 
-from .langfuse import get_langfuse_client
+from harness.telemetry.tracing import get_langfuse_client
 
 
 class LocalizationDataset(BaseModel):

@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from harness.telemetry.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
+from harness.telemetry.hosted.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
 
 
 class _FakeDatasets:
@@ -36,7 +36,7 @@ def test_hf_loader_normalizes_rows(monkeypatch):
 
     fake_module = types.SimpleNamespace(utils=types.SimpleNamespace(AuthenticationError=Exception))
     monkeypatch.setattr(
-        "harness.telemetry.hf_lca._require_dependency",
+        "harness.telemetry.hosted.hf_lca._require_dependency",
         lambda: types.SimpleNamespace(load_dataset=_FakeDatasets(rows).load_dataset, utils=fake_module.utils),
     )
 
@@ -67,7 +67,7 @@ def test_hf_loader_missing_required_fields_raises(monkeypatch):
     ]
     fake_module = types.SimpleNamespace(utils=types.SimpleNamespace(AuthenticationError=Exception))
     monkeypatch.setattr(
-        "harness.telemetry.hf_lca._require_dependency",
+        "harness.telemetry.hosted.hf_lca._require_dependency",
         lambda: types.SimpleNamespace(load_dataset=_FakeDatasets(rows).load_dataset, utils=fake_module.utils),
     )
     with pytest.raises(HFDatasetLoadError) as excinfo:

@@ -13,13 +13,13 @@ from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol, cast
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
-from harness.localization.agent_runtime import run_ic_iteration
-from harness.telemetry.langfuse import (
+from harness.localization.runtime.agent_runtime import run_ic_iteration
+from harness.telemetry.tracing import (
     flush_langfuse,
     propagate_context,
     start_observation,
 )
-from harness.telemetry.score_emitter import emit_score
+from harness.telemetry.tracing.score_emitter import emit_score
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy.load import load_policy
@@ -33,7 +33,7 @@ from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LC
 from harness.orchestration.types import SpanHandle
 
 if TYPE_CHECKING:
-    from harness.telemetry.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import BaselineSnapshot
     from iterative_context.graph_models import Graph, GraphNode
 
 from .machine import OptimizationStateMachine
@@ -92,9 +92,9 @@ _REEXPORTED = (
 def evaluate_localization_batch(**kwargs: object):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
-    Forwards keyword arguments directly to harness.localization.evaluate.evaluate_localization_batch.
+    Forwards keyword arguments directly to harness.localization.runtime.evaluate.evaluate_localization_batch.
     """
-    from harness.localization.evaluate import evaluate_localization_batch as _evaluate_localization_batch
+    from harness.localization.runtime.evaluate import evaluate_localization_batch as _evaluate_localization_batch
 
     return _evaluate_localization_batch(**kwargs)
 

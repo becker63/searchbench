@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from harness.localization.hf_materialize import HuggingFaceRepoMaterializer
-from harness.localization.materialize import RepoMaterializationRequest
-from harness.telemetry.hf_lca import fetch_hf_localization_dataset
+from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
+from harness.localization.materialization.materialize import RepoMaterializationRequest
+from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
 
 
 @pytest.mark.skipif(not os.environ.get("HF_NETWORK_TESTS"), reason="HF network tests are opt-in via HF_NETWORK_TESTS env")

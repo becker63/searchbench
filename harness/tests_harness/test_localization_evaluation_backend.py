@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from harness.localization.evaluate import (
+from harness.localization.runtime.evaluate import (
     DEFAULT_LOCALIZATION_RUNNER,
     MachineScorePolicy,
     evaluate_localization_batch,
@@ -34,7 +34,7 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
@@ -53,7 +53,7 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
         raise RuntimeError("runner failed")
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         failing_runner,
         raising=False,
     )
@@ -69,7 +69,7 @@ def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
@@ -93,7 +93,7 @@ def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
@@ -111,7 +111,7 @@ def test_machine_score_policy(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.run_localization_task",
+        "harness.localization.runtime.evaluate.run_localization_task",
         lambda *a, **k: (
             LCAPrediction(predicted_files=["a.py"]),
             LocalizationMetrics(precision=0.5, recall=0.5, f1=0.5, hit=1.0, score=0.5),
@@ -139,7 +139,7 @@ def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
         raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "scoring failed")
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         failing_runner,
         raising=False,
     )
@@ -157,12 +157,12 @@ def test_machine_score_policy_failure_is_typed(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
     monkeypatch.setattr(
-        "harness.localization.evaluate._derive_machine_score",
+        "harness.localization.runtime.evaluate._derive_machine_score",
         lambda **kwargs: (_ for _ in ()).throw(LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "bad policy")),
         raising=True,
     )
@@ -184,11 +184,11 @@ def test_aggregate_metrics_failure_is_typed(monkeypatch, tmp_path) -> None:
         return ["a.py"], {}
 
     monkeypatch.setattr(
-        "harness.localization.evaluate.DEFAULT_LOCALIZATION_RUNNER",
+        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
         stub_runner,
         raising=False,
     )
-    monkeypatch.setattr("harness.localization.evaluate.LocalizationMetrics", BadMetrics, raising=False)
+    monkeypatch.setattr("harness.localization.runtime.evaluate.LocalizationMetrics", BadMetrics, raising=False)
     result = evaluate_localization_batch(
         tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )

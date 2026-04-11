@@ -10,7 +10,7 @@ from harness.utils.type_loader import ScorerContext
 from harness.localization.models import LCAContext, LCATaskIdentity
 
 if TYPE_CHECKING:
-    from harness.telemetry.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import BaselineSnapshot
 
 
 MetricValue = int | float | bool
@@ -498,7 +498,7 @@ class OptimizationMachineModel(BaseModel):
 
 def _rebuild_forward_refs() -> None:
     try:
-        from harness.telemetry.baselines import BaselineSnapshot  # local import to avoid cycles
+        from harness.telemetry.hosted.baselines import BaselineSnapshot  # local import to avoid cycles
     except Exception:
         BaselineSnapshot = object  # type: ignore[misc,assignment]
     LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot, "RunMetadata": RunMetadata})

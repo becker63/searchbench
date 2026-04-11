@@ -1,4 +1,4 @@
-from harness.telemetry.cerebras_pricing import (
+from harness.telemetry.tracing.cerebras_pricing import (
     CEREBRAS_PRICING,
     cost_details_for_usage,
     pricing_payload,

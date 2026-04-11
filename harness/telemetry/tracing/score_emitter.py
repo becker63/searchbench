@@ -55,8 +55,8 @@ def emit_score(
     score_id: str | None = None,
 ) -> None:
     """Submit a score via Langfuse SDK using hosted run identifiers."""
-    from .langfuse import get_langfuse_client  # local import to avoid circularity
-    from .langfuse import ensure_langfuse_auth  # avoid circularity lint
+    from . import get_langfuse_client  # local import to avoid circularity
+    from . import ensure_langfuse_auth  # avoid circularity lint
 
     resolved_type = _infer_data_type(value, data_type)
     try:

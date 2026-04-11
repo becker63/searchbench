@@ -42,7 +42,7 @@ Leaf-operation observability remains with:
 - Localization baseline (hosted dataset): `python run.py --mode localization-baseline --dataset DATASET_NAME [--version v1] [--config py] [--split dev] [--baseline-path bundle.json]`
 - Localization experiment (hosted dataset): `python run.py --mode localization-experiment --dataset DATASET_NAME [--version v1] [--config py] [--split dev]`
 - Console output is concise; Langfuse stores detailed traces/scores. `flush_langfuse()` runs on exit.
-- To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/cerebras_pricing.py`.
+- To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.tracing.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/tracing/cerebras_pricing.py`.
 
 ## Policy Loading
 - `policy_loader.py` now loads `policy.py` and requires the public Iterative Context scorer contract `score(node: GraphNode, graph: Graph, step: int) -> float` (SelectionCallable). No sandbox or restricted execution.

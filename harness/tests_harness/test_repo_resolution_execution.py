@@ -49,7 +49,7 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
         ic_repos.append(task.get("repo"))
         return {"observations": [{"tool": "x"}], "node_count": 1}
 
-    monkeypatch.setattr("harness.localization.agent_runtime.run_ic_iteration", fake_run_ic_iteration)
+    monkeypatch.setattr("harness.localization.runtime.agent_runtime.run_ic_iteration", fake_run_ic_iteration)
     monkeypatch.setattr("harness.orchestration.runtime.score", lambda result: {"score": 1.0, "ic_nodes": 1, "jc_nodes": 0})
     monkeypatch.setattr("harness.orchestration.runtime.load_tests", lambda repo: [])
     monkeypatch.setattr("harness.orchestration.runtime.format_tests_for_prompt", lambda tests: "")
