@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Mapping, Tuple, cast
+from typing import Callable, Mapping, Tuple
 
 from harness.localization.errors import (
     LocalizationEvaluationError,
@@ -26,6 +26,15 @@ from harness.localization.token_usage import (
 )
 from harness.telemetry.tracing import start_observation
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
+
+
+def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -> None:
+    updater = getattr(span, "update", None)
+    if callable(updater):
+        try:
+            updater(metadata=metadata)
+        except Exception:
+            pass
 
 
 def _materialize_repo(
@@ -147,6 +156,8 @@ def _emit_telemetry(
     materialization: RepoMaterializationResult | None,
     dataset_source: str | None,
     trace: object | None,
+    predicted_files: list[str],
+    changed_files: list[str],
 ) -> None:
     telemetry = build_localization_telemetry(
         task.identity,
@@ -172,11 +183,12 @@ def _emit_telemetry(
         )
     if trace:
         try:
-            trace_any = cast(Any, trace)
-            trace_any.metadata = {
-                **getattr(trace_any, "metadata", {}),
+            metadata_payload = {
                 "telemetry": telemetry.model_dump(exclude_none=True),
+                "predicted_files": list(predicted_files),
+                "changed_files": list(changed_files),
             }
+            _safe_update_metadata(trace, metadata_payload)
         except Exception:
             pass
 
@@ -242,5 +254,7 @@ def run_localization_task(
             materialization=materialization_result,
             dataset_source=dataset_source,
             trace=trace,
+            predicted_files=prediction.normalized_predicted_files(),
+            changed_files=task.gold.normalized_changed_files(),
         )
         return prediction, metrics, task.evidence, materialization_result, usage

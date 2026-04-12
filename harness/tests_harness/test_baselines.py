@@ -1,7 +1,21 @@
 from __future__ import annotations
 
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+import json
+
+from contextlib import contextmanager
+
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationGold,
+    LocalizationMetrics,
+    LocalizationPrediction,
+)
 from harness.telemetry.hosted import baselines
+from harness.telemetry.hosted import experiments
+from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest
 
 
 def _install_dummy_langfuse(monkeypatch):
@@ -38,12 +52,6 @@ def _task(repo: str | None = None) -> LCATask:
     context = LCAContext(issue_title="bug", issue_body="details")
     gold = LCAGold(changed_files=["a.py"])
     return LCATask(identity=identity, context=context, gold=gold, repo=repo)
-
-
-def test_baseline_key_is_task_id():
-    task = _task()
-    key = baselines.baseline_key(task)
-    assert key == task.task_id
 
 
 def test_resolve_and_bundle_roundtrip(tmp_path):
@@ -113,3 +121,312 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
     assert calls
     assert snap.metrics.score == 1.0
     assert snap.prediction.predicted_files == ["a.py"]
+
+
+def test_baseline_dataset_span_gets_aggregates(monkeypatch):
+    task = _task()
+    snap_one = _snapshot(task, version="v1")
+    snap_two = _snapshot(task, version="v1")
+    snap_two.metrics = LocalizationMetrics(precision=0.0, recall=0.5, f1=0.25, hit=0.0, score=0.25)
+    emitted: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    class DummySpan:
+        def __init__(self):
+            self.id = "dataset-span"
+
+        def update(self, **kwargs):
+            updates.append(kwargs)
+
+    def fake_emit_score(handle, name, value, data_type, score_id=None):
+        emitted.append({"handle": handle, "name": name, "value": value, "score_id": score_id})
+
+    monkeypatch.setattr(baselines, "emit_score_for_handle", fake_emit_score)
+    baselines.emit_baseline_dataset_aggregates(DummySpan(), [snap_one, snap_two])
+    names = {item["name"] for item in emitted}
+    assert len(emitted) == 5
+    assert names == {
+        "baseline.avg_precision",
+        "baseline.avg_recall",
+        "baseline.avg_f1",
+        "baseline.avg_hit",
+        "baseline.avg_score",
+    }
+    assert updates
+    metadata = updates[-1].get("metadata")
+    assert metadata is not None
+    assert metadata["selected_count"] == 2
+    assert metadata["aggregate_metrics"]["precision"] == 0.5
+    assert metadata["aggregate_metrics"]["recall"] == 0.75
+    assert metadata["aggregate_metrics"]["f1"] == 0.625
+    assert metadata["aggregate_metrics"]["hit"] == 0.5
+    assert metadata["aggregate_metrics"]["score"] == 0.625
+
+
+def _snapshot(task: LCATask, version: str = "v1") -> baselines.BaselineSnapshot:
+    return baselines.BaselineSnapshot(
+        dataset_name=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        dataset_version=version,
+        identity=task.task_id,
+        prediction=LocalizationPrediction(predicted_files=["a.py"]),
+        gold=LocalizationGold(changed_files=["a.py"]),
+        metrics=LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0),
+        repo_owner=task.identity.repo_owner,
+        repo_name=task.identity.repo_name,
+        base_sha=task.identity.base_sha,
+    )
+
+
+def test_persist_and_load_baseline_bundle(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
+    task = _task()
+    snap = _snapshot(task, version="rev1")
+    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="rev1")
+    path = baselines.persist_baseline_bundle(
+        bundle,
+        dataset_name=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        dataset_version="rev1",
+    )
+    expected = baselines.baseline_cache_path(
+        task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        dataset_version="rev1",
+        root=tmp_path,
+    )
+    assert path == expected
+    # File is valid JSON (no PosixPath serialization issues)
+    json.loads(path.read_text())
+    loaded = baselines.load_persisted_baseline_bundle(
+        dataset_name=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        dataset_version="rev1",
+    )
+    assert loaded is not None
+    assert loaded.items and loaded.items[0].identity == snap.identity
+
+
+def test_run_hosted_localization_baseline_uses_cached_bundle(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
+    task = _task()
+    snap = _snapshot(task, version="rev2")
+    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="rev2")
+    baselines.persist_baseline_bundle(
+        bundle,
+        dataset_name=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        dataset_version="rev2",
+    )
+
+    def _raise_fetch(*args, **kwargs):
+        raise AssertionError("fetch should not be called")
+
+    def _raise_compute(*args, **kwargs):
+        raise AssertionError("compute should not be called")
+
+    monkeypatch.setattr(experiments, "fetch_hf_localization_dataset", _raise_fetch)
+    monkeypatch.setattr(experiments, "compute_baseline_for_task", _raise_compute)
+
+    req = HostedLocalizationBaselineRequest(
+        dataset=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        version="rev2",
+    )
+    result = experiments.run_hosted_localization_baseline(req)
+    assert result.items and result.items[0].identity == snap.identity
+
+
+def test_run_hosted_localization_baseline_persists_bundle(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
+    task = _task()
+    snap = _snapshot(task, version="rev3")
+    calls = {"compute": 0, "fetch": 0}
+
+    def fake_fetch(*args, **kwargs):
+        calls["fetch"] += 1
+        return [task]
+
+    def fake_compute(*args, **kwargs):
+        calls["compute"] += 1
+        return snap
+
+    monkeypatch.setattr(experiments, "fetch_hf_localization_dataset", fake_fetch)
+    monkeypatch.setattr(experiments, "compute_baseline_for_task", fake_compute)
+    monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
+
+    req = HostedLocalizationBaselineRequest(
+        dataset=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        version="rev3",
+    )
+    result = experiments.run_hosted_localization_baseline(req)
+    assert calls["fetch"] == 1
+    assert calls["compute"] == 1
+    assert result.items and result.items[0].identity == snap.identity
+
+    bundle_path = baselines.baseline_cache_path(
+        task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        dataset_version="rev3",
+        root=tmp_path,
+    )
+    assert bundle_path.exists()
+    loaded = baselines.load_persisted_baseline_bundle(
+        dataset_name=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        dataset_version="rev3",
+    )
+    assert loaded is not None
+    assert loaded.items and loaded.items[0].identity == snap.identity
+
+
+def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
+    task = _task()
+    snap = _snapshot(task, version="rev-hit")
+    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="rev-hit")
+    baselines.persist_baseline_bundle(
+        bundle,
+        dataset_name=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        dataset_version="rev-hit",
+    )
+
+    captured_scores: list[dict[str, object]] = []
+    metadata_updates: list[dict[str, object]] = []
+
+    class DummySpan:
+        def __init__(self):
+            self.id = "dataset-span"
+            self.trace_id = "trace-id"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def update(self, **kwargs):
+            metadata_updates.append(kwargs)
+
+        def score(self, **kwargs):
+            captured_scores.append(kwargs)
+
+    @contextmanager
+    def span_cm(*_args, **_kwargs):
+        yield DummySpan()
+
+    monkeypatch.setattr(experiments, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(
+        experiments,
+        "fetch_hf_localization_dataset",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch should not run")),
+    )
+    monkeypatch.setattr(baselines, "emit_score_for_handle", lambda handle, **k: captured_scores.append(k))
+
+    req = HostedLocalizationBaselineRequest(
+        dataset=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        version="rev-hit",
+    )
+    result = experiments.run_hosted_localization_baseline(req)
+    assert result.items and result.items[0].identity == task.task_id
+    names = {item["name"] for item in captured_scores}
+    assert names == {
+        "baseline.avg_precision",
+        "baseline.avg_recall",
+        "baseline.avg_f1",
+        "baseline.avg_hit",
+        "baseline.avg_score",
+    }
+    assert metadata_updates
+    metadata = metadata_updates[-1].get("metadata")
+    assert metadata and metadata.get("cache_hit") is True
+    assert metadata.get("selected_count") == 1
+    assert metadata["aggregate_metrics"]["score"] == snap.metrics.score
+
+
+def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
+    task = _task()
+    snap = _snapshot(task, version="rev-fresh")
+    captured_scores: list[dict[str, object]] = []
+    metadata_updates: list[dict[str, object]] = []
+
+    class DummySpan:
+        def __init__(self):
+            self.id = "dataset-span"
+            self.trace_id = "trace-id"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def update(self, **kwargs):
+            metadata_updates.append(kwargs)
+
+        def score(self, **kwargs):
+            captured_scores.append(kwargs)
+
+    @contextmanager
+    def span_cm(*_args, **_kwargs):
+        yield DummySpan()
+
+    monkeypatch.setattr(experiments, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(
+        experiments,
+        "fetch_hf_localization_dataset",
+        lambda *a, **k: [task],
+    )
+    monkeypatch.setattr(
+        experiments,
+        "compute_baseline_for_task",
+        lambda *a, **k: snap,
+    )
+    monkeypatch.setattr(baselines, "emit_score_for_handle", lambda handle, **k: captured_scores.append(k))
+
+    req = HostedLocalizationBaselineRequest(
+        dataset=task.identity.dataset_name,
+        dataset_config=task.identity.dataset_config,
+        dataset_split=task.identity.dataset_split,
+        version="rev-fresh",
+    )
+    result = experiments.run_hosted_localization_baseline(req)
+    assert result.items and result.items[0].identity == task.task_id
+    names = {item["name"] for item in captured_scores}
+    assert names == {
+        "baseline.avg_precision",
+        "baseline.avg_recall",
+        "baseline.avg_f1",
+        "baseline.avg_hit",
+        "baseline.avg_score",
+    }
+    metadata = metadata_updates[-1].get("metadata")
+    assert metadata and metadata.get("cache_hit") is False
+    assert metadata.get("selected_count") == 1
+
+
+def test_baseline_cache_path_respects_env_and_dataset(monkeypatch, tmp_path):
+    cache_root = tmp_path / "baseline_cache"
+    monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(cache_root))
+    path = baselines.baseline_cache_path(
+        "JetBrains-Research/lca-bug-localization", dataset_config="py", dataset_split="dev", dataset_version="rev1"
+    )
+    expected = cache_root / "JetBrains-Research__lca-bug-localization" / "py" / "dev" / "rev1.json"
+    assert path == expected

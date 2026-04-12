@@ -7,6 +7,7 @@ context-budget management, finalization, and retry logic.
 """
 
 import json
+import logging
 from collections.abc import Mapping
 from typing import Any, Callable, cast
 
@@ -20,8 +21,8 @@ from harness.prompts import SystemPromptContext
 from harness.backends.ic import IterativeContextBackend
 from harness.backends.jc import JCodeMunchBackend
 from harness.backends.mcp import serialize_tool_result_for_model
-from harness.utils.env import get_cerebras_api_key, get_runner_model
-from harness.utils.openai_schema import OpenAITool, validate_tools
+from harness.utils.env import get_cerebras_api_key, get_runner_model, getenv
+from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
 from harness.utils.template_loader import render_prompt_template
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -38,6 +39,8 @@ _AGGRESSIVE_TOTAL_CHARS = 12000
 _AGGRESSIVE_TOOL_CONTENT_CHARS = 1200
 _AGGRESSIVE_SYSTEM_CHARS = 1500
 _AGGRESSIVE_USER_CHARS = 1500
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class AgentTask(BaseModel):
@@ -108,7 +111,16 @@ def _require_parent(parent: object | None, owner: str = "runner agent") -> objec
     return parent
 
 
-def _tool_names_from_specs(tool_specs: list[OpenAITool]) -> list[str]:
+def _safe_update(span: object | None, **kwargs: object) -> None:
+    updater = getattr(span, "update", None)
+    if callable(updater):
+        try:
+            updater(**kwargs)
+        except Exception:
+            pass
+
+
+def _tool_names_from_specs(tool_specs: list[ChatCompletionToolParam]) -> list[str]:
     names: list[str] = []
     for spec in tool_specs:
         func = spec.get("function") if isinstance(spec, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
@@ -260,27 +272,39 @@ def _truncate_for_metadata(payload: object, limit: int = 2000) -> object:
         return f"{text[: limit - 4]}..." if len(text) > limit else payload
 
 
+def resolve_runner_model(model_override: str | None = None) -> str:
+    """
+    Resolve the runner model, preferring explicit overrides and falling back to env default.
+    """
+    env_model = getenv("RUNNER_MODEL")
+    resolved = model_override or env_model or get_runner_model()
+    if not resolved:
+        resolved = "gpt-oss-120b"
+    _LOGGER.info("Localization runner model resolved: %s (override=%s, env=%s)", resolved, bool(model_override), env_model)
+    return resolved
+
+
 def _make_client(model_override: str | None = None) -> tuple[Any, str]:
     api_key = get_cerebras_api_key()
     if not api_key:
         raise RuntimeError("CEREBRAS_API_KEY is required for runner agent client")
-    model_name = model_override or get_runner_model()
+    model_name = resolve_runner_model(model_override)
     return get_tracing_openai_client(base_url="https://api.cerebras.ai/v1", api_key=api_key), model_name
 
 
-def _build_ic_system_prompt(tool_specs: list[OpenAITool], aggressive: bool = False) -> str:
+def _build_ic_system_prompt(tool_specs: list[ChatCompletionToolParam], aggressive: bool = False) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
     ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
     return render_prompt_template("ic_system.jinja", ctx.model_dump())
 
 
-def _build_jc_system_prompt(tool_specs: list[OpenAITool]) -> str:
+def _build_jc_system_prompt(tool_specs: list[ChatCompletionToolParam]) -> str:
     tool_names = _tool_names_from_specs(tool_specs)
     ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
     return render_prompt_template("jc_system.jinja", ctx.model_dump())
 
 
-def _build_model_messages(agent_task: dict[str, object], tool_specs: list[OpenAITool], system_prompt: str) -> list[dict[str, object]]:
+def _build_model_messages(agent_task: dict[str, object], tool_specs: list[ChatCompletionToolParam], system_prompt: str) -> list[dict[str, object]]:
     messages: list[dict[str, object]] = [
         {"role": "system", "content": system_prompt},
         {
@@ -335,7 +359,6 @@ def _collect_tool_results(
                     {
                         "role": "tool",
                         "tool_call_id": call_map.get("id"),
-                        "name": name,
                         "content": _compact_tool_content(result),
                         "result": result,
                     }
@@ -344,10 +367,17 @@ def _collect_tool_results(
     return new_results
 
 
-def _make_retry_messages(agent_task: dict[str, object], observations: list[dict[str, object]], system_prompt: str, aggressive: bool) -> list[dict[str, object]]:
+def _make_retry_messages(
+    agent_task: dict[str, object],
+    observations: list[dict[str, object]],
+    system_prompt: str,
+    tool_specs: list[ChatCompletionToolParam],
+    aggressive: bool,
+) -> list[dict[str, object]]:
+    base_messages = _build_model_messages(agent_task, tool_specs, system_prompt)
     if aggressive:
-        return _aggressive_compact_messages(_build_model_messages(agent_task, [], system_prompt) + observations)
-    return _enforce_message_budget(_build_model_messages(agent_task, [], system_prompt) + observations)
+        return _aggressive_compact_messages(base_messages + observations)
+    return _enforce_message_budget(base_messages + observations)
 
 
 def _apply_tool_results(
@@ -355,6 +385,7 @@ def _apply_tool_results(
     observations: list[dict[str, object]],
     tool_results: list[dict[str, object]],
     system_prompt: str,
+    tool_specs: list[ChatCompletionToolParam],
 ) -> list[dict[str, object]]:
     if not tool_results:
         return observations
@@ -364,7 +395,7 @@ def _apply_tool_results(
         if obs.get("role") == "assistant" and obs.get("tool_calls"):
             new_obs.extend(tool_results)
     return _enforce_message_budget(
-        _build_model_messages(agent_task, [], system_prompt) + new_obs,
+        _build_model_messages(agent_task, tool_specs, system_prompt) + new_obs,
         max_total_chars=_AGGRESSIVE_TOTAL_CHARS,
         max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS,
         max_system_chars=_AGGRESSIVE_SYSTEM_CHARS,
@@ -393,7 +424,7 @@ def _collect_usage_details(response: Any) -> dict[str, object] | None:
 def run_agent(
     agent_task: dict[str, object],
     steps: int,
-    tool_specs: list[OpenAITool],
+    tool_specs: list[ChatCompletionToolParam],
     dispatch_tool_call: Callable[[str, dict[str, Any]], object],
     system_prompt: str,
     parent_trace: object | None = None,
@@ -401,7 +432,10 @@ def run_agent(
 ):
     parent_span = _require_parent(parent_trace, owner=backend_name or "runner agent")
     client, model = _make_client()
+    _safe_update(parent_span, metadata={"runner_model": model})
     messages = _build_model_messages(agent_task, tool_specs, system_prompt)
+    tool_choice = "required" if tool_specs else None
+    tools_payload: list[ChatCompletionToolParam] | None = tool_specs or None
     observations: list[dict[str, object]] = []
 
     for step in range(steps):
@@ -418,7 +452,7 @@ def run_agent(
             )
             if tool_results:
                 observations.extend(tool_results)
-            messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt)
+            messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt, tool_specs)
             try:
                 if not messages:
                     messages = _build_model_messages(agent_task, tool_specs, system_prompt)
@@ -427,14 +461,20 @@ def run_agent(
                     messages=messages,
                     model=model,
                     temperature=0.2,
-                    tools=tool_specs,
-                    tool_choice="auto" if tool_specs else None,
+                    tools=tools_payload,
+                    tool_choice=tool_choice,
                     extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
                 )
             except Exception as exc:  # noqa: BLE001
                 if not _is_context_error(exc):
                     raise
-                retry_messages = _make_retry_messages(agent_task, observations, system_prompt, aggressive=True)
+                retry_messages = _make_retry_messages(
+                    agent_task,
+                    observations,
+                    system_prompt,
+                    tool_specs,
+                    aggressive=True,
+                )
                 if not retry_messages:
                     retry_messages = _build_model_messages(agent_task, tool_specs, system_prompt)
                 _ensure_non_empty_messages(retry_messages, caller=backend_name or "runner agent retry")
@@ -442,6 +482,8 @@ def run_agent(
                     messages=retry_messages,
                     model=model,
                     temperature=0.2,
+                    tools=tools_payload,
+                    tool_choice=tool_choice,
                     extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
                 )
             choice = completion.choices[0]
@@ -478,7 +520,7 @@ def run_agent(
                         "content": response_message.get("content") or "",
                     }
                 )
-                messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt)
+                messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt, tool_specs)
                 continue
             else:
                 try:
@@ -494,7 +536,7 @@ def run_agent(
 def run_agent_with_retry(
     agent_task: dict[str, object],
     steps: int,
-    tool_specs: list[OpenAITool],
+    tool_specs: list[ChatCompletionToolParam],
     dispatch_tool_call: Callable[[str, dict[str, Any]], object],
     system_prompt: str,
     parent_trace: object | None = None,
@@ -514,7 +556,7 @@ def run_agent_with_retry(
     except Exception as exc:  # noqa: BLE001
         if not _is_context_error(exc):
             raise
-        retry_messages = _make_retry_messages(agent_task, [], system_prompt, aggressive=True)
+        retry_messages = _make_retry_messages(agent_task, [], system_prompt, tool_specs, aggressive=True)
         if not retry_messages:
             retry_messages = _build_model_messages(agent_task, tool_specs, system_prompt)
         client, model = _make_client()
@@ -523,6 +565,8 @@ def run_agent_with_retry(
             messages=retry_messages,
             model=model,
             temperature=0.2,
+            tools=tool_specs or None,
+            tool_choice="required" if tool_specs else None,
             extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
         )
         choice = completion.choices[0]
@@ -586,6 +630,71 @@ def _coerce_node_count(value: object) -> int | None:
     if isinstance(value, (int, float)):
         return int(value)
     return None
+
+
+def _strip_repo_root(text: str, repo_root: str | None) -> str:
+    if not repo_root or not isinstance(text, str):
+        return text
+    root = repo_root.rstrip("/\\")
+    if not root:
+        return text
+    if text.startswith(root + "/") or text.startswith(root + "\\"):
+        return text[len(root) + 1 :]
+    return text.replace(root + "/", "").replace(root + "\\", "")
+
+
+def _error_only_payload(value: object) -> bool:
+    return isinstance(value, Mapping) and set(value.keys()) == {"error"} and isinstance(value.get("error"), (str, bytes))
+
+
+def _scrub_value_for_finalization(value: object, repo_root: str | None, seen_files: set[str]) -> object:
+    if isinstance(value, str):
+        return _strip_repo_root(value, repo_root)
+    if isinstance(value, Mapping):
+        cleaned: dict[str, object] = {}
+        for key, val in value.items():
+            if _error_only_payload(val):
+                continue
+            if isinstance(val, str) and (key in {"file", "path"} or key.endswith(("_file", "_path"))):
+                rel = _strip_repo_root(val, repo_root)
+                if rel in seen_files:
+                    continue
+                seen_files.add(rel)
+                cleaned[key] = rel
+                continue
+            cleaned[key] = _scrub_value_for_finalization(val, repo_root, seen_files)
+        return cleaned
+    if isinstance(value, list):
+        cleaned_list: list[object] = []
+        for item in value:
+            if _error_only_payload(item):
+                continue
+            cleaned_item = _scrub_value_for_finalization(item, repo_root, seen_files)
+            if isinstance(cleaned_item, str) and cleaned_item in seen_files:
+                continue
+            cleaned_list.append(cleaned_item)
+        return cleaned_list
+    return value
+
+
+def _clean_observations_for_finalization(
+    observations: list[dict[str, object]], repo_root: str | None
+) -> list[dict[str, object]]:
+    cleaned: list[dict[str, object]] = []
+    seen_files: set[str] = set()
+    for obs in observations:
+        if not isinstance(obs, Mapping):
+            continue
+        content = obs.get("content")
+        result = obs.get("result")
+        if _error_only_payload(content) and (result is None or _error_only_payload(result)):
+            continue
+        if _error_only_payload(result) and (content is None or _error_only_payload(content)):
+            continue
+        cleaned_obs = _scrub_value_for_finalization(obs, repo_root, seen_files)
+        if isinstance(cleaned_obs, Mapping) and cleaned_obs:
+            cleaned.append(dict(cleaned_obs))
+    return cleaned
 
 
 def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tuple[list[str], str | None]:
@@ -712,12 +821,15 @@ def _finalize_localization(
     parent_trace: object | None = None,
 ) -> LocalizationRunnerResult:
     client, model = _make_client()
-    messages = _format_finalization_messages(agent_task, observations)
+    repo_value = agent_task.get("repo") if isinstance(agent_task, Mapping) else None
+    repo_root = repo_value if isinstance(repo_value, str) else None
+    prepared_observations = _clean_observations_for_finalization(observations, repo_root)
+    messages = _format_finalization_messages(agent_task, prepared_observations)
     schema = _localization_result_schema()
     with start_observation(
         name="localization_finalize",
         parent=_require_parent(parent_trace, owner="runner agent"),
-        metadata={"phase": "finalize"},
+        metadata={"phase": "finalize", "runner_model": model},
     ) as obs:
         completion = client.chat.completions.create(
             messages=messages,
@@ -744,7 +856,7 @@ def _finalize_localization(
             {
                 "predicted_files": parsed.get("predicted_files", []),
                 "reasoning": parsed.get("reasoning"),
-                "observations": observations,
+                "observations": prepared_observations or observations,
                 "raw": {"final": parsed},
                 "source": "finalize",
             }
@@ -774,7 +886,7 @@ def run_ic_iteration(
     agent_task = agent_task_model.to_payload()
 
     backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
-    tool_specs: list[OpenAITool] = backend.tool_specs
+    tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
     system_prompt = _build_ic_system_prompt(tool_specs)
     with start_observation(
         name="iterative_context",
@@ -844,7 +956,7 @@ def run_jc_iteration(
     agent_task = agent_task_model.to_payload()
 
     backend = JCodeMunchBackend(repo=repo)
-    tool_specs: list[OpenAITool] = backend.tool_specs
+    tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
     system_prompt = _build_jc_system_prompt(tool_specs)
     with start_observation(
         name="jcodemunch",

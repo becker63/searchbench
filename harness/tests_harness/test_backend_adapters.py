@@ -19,7 +19,7 @@ from harness.backends.mcp import (
     run_async,
     serialize_tool_result_for_model,
 )
-from harness.utils.openai_schema import OpenAITool
+from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
 
 
 async def _sample_coroutine(loop_ids: list[int] | None = None) -> str:
@@ -45,6 +45,99 @@ def test_run_async_with_running_loop_uses_separate_loop():
     assert result == "ok"
     assert loop_ids  # captured inner loop id
     assert loop_ids[0] != outer_loop_id
+
+
+def test_mcp_tool_conversion_preserves_object_schema():
+    tool = Tool(
+        name="resolve_path",
+        description="Resolve paths",
+        inputSchema={"type": "object", "properties": {"path": {"type": "string"}}},
+    )
+    spec = mcp_tool_to_openai_tool(tool)
+    validate_tools([spec])
+    params = spec["function"]["parameters"]
+    assert params["type"] == "object"
+    assert "path" in params["properties"]
+    assert params["additionalProperties"] is False
+    assert set(params.get("required", [])) == {"path"}
+    assert spec.get("strict") in (None, False)
+    assert spec["function"].get("strict") is True
+
+
+def test_mcp_tool_conversion_defaults_missing_schema():
+    tool = Tool.model_construct(name="noop", description=None, inputSchema=None)
+    spec = mcp_tool_to_openai_tool(tool)
+    validate_tools([spec])
+    params = spec["function"]["parameters"]
+    assert params["type"] == "object"
+    assert params["properties"] == {}
+    assert params["additionalProperties"] is False
+    assert spec.get("strict") in (None, False)
+    assert spec["function"].get("strict") in (None, False)
+
+
+def test_mcp_tool_conversion_normalizes_non_object_root():
+    tool = Tool(name="arrayish", description="bad schema", inputSchema={"type": "array", "items": {}})
+    spec = mcp_tool_to_openai_tool(tool)
+    validate_tools([spec])
+    params = spec["function"]["parameters"]
+    assert params["type"] == "object"
+    assert params["properties"] == {}
+    assert params["additionalProperties"] is False
+    assert spec.get("strict") in (None, False)
+    assert spec["function"].get("strict") in (None, False)
+
+
+def test_mcp_tool_conversion_handles_non_mapping_schema():
+    tool = Tool.model_construct(name="nondict", description="bad", inputSchema="oops")  # type: ignore[arg-type]
+    spec = mcp_tool_to_openai_tool(tool)
+    validate_tools([spec])
+    params = spec["function"]["parameters"]
+    assert params["type"] == "object"
+    assert params["properties"] == {}
+    assert params["additionalProperties"] is False
+    assert spec.get("strict") in (None, False)
+    assert spec["function"].get("strict") in (None, False)
+
+
+def test_mcp_tool_conversion_forces_additional_properties_false():
+    tool = Tool(
+        name="with_extra_props",
+        description="schema has additionalProperties true upstream",
+        inputSchema={
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "repo": {"type": "string"}},
+            "additionalProperties": True,
+        },
+    )
+    spec = mcp_tool_to_openai_tool(tool)
+    validate_tools([spec])
+    params = spec["function"]["parameters"]
+    assert params["type"] == "object"
+    assert params["additionalProperties"] is False
+    assert set(params.get("required", [])) == {"path", "repo"}
+    assert spec.get("strict") in (None, False)
+    assert spec["function"].get("strict") is True
+
+
+def test_validate_tools_accepts_function_strict():
+    spec: ChatCompletionToolParam = {
+        "type": "function",
+        "function": {
+            "name": "do_thing",
+            "description": "",
+            "parameters": {
+                "type": "object",
+                "properties": {"depth": {"type": "integer"}},
+                "required": ["depth"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
+    }
+    validate_tools([spec])
+    assert spec.get("strict") in (None, False)
+    assert spec["function"].get("strict") is True
 
 
 def test_ic_backend_uses_server_surfaces(monkeypatch, tmp_path):
@@ -86,6 +179,37 @@ def test_ic_backend_uses_server_surfaces(monkeypatch, tmp_path):
     result = backend.dispatch("resolve_path", {"path": "foo"})
     assert result == {"ok": True, "name": "resolve_path"}
     assert calls == [("resolve_path", {"path": "foo"})]
+
+
+def test_ic_backend_coerces_integer_arguments(monkeypatch, tmp_path):
+    dummy_tool = Tool(
+        name="expand",
+        description="expand node",
+        inputSchema={
+            "type": "object",
+            "properties": {"node_id": {"type": "string"}, "depth": {"type": "integer"}},
+        },
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_list_tools():
+        return [dummy_tool]
+
+    class FakeRuntime:
+        def __init__(self, score_fn=None, repo_root=None):
+            pass
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]):
+            calls.append((name, arguments))
+            return [TextContent(type="text", text=json.dumps({"ok": True, "args": arguments}))]  # type: ignore[return-value]
+
+    monkeypatch.setattr("harness.backends.ic.list_tools", fake_list_tools)
+    monkeypatch.setattr("harness.backends.ic.IterativeContextToolRuntime", FakeRuntime)
+
+    backend = IterativeContextBackend(repo=str(tmp_path), score_fn=None)
+    result = backend.dispatch("expand", {"node_id": "n1", "depth": "2"})
+    assert result["ok"] is True
+    assert calls == [("expand", {"node_id": "n1", "depth": 2})]
 
 
 def test_jc_backend_uses_server_surfaces(monkeypatch, tmp_path):
@@ -149,6 +273,26 @@ def test_normalize_agent_result_prefers_full_graph_then_graph():
     raw_empty = {"observations": [{"tool": "expand", "result": {"graph": {}}}]}
     normalized_empty = runner._normalize_agent_result(raw_empty)  # type: ignore[attr-defined]
     assert normalized_empty["node_count"] == 0
+
+
+def test_clean_observations_for_finalization_filters_errors_and_paths():
+    repo_root = "/tmp/repo"
+    observations = [
+        {"result": {"error": "depth must be an integer"}},
+        {"content": {"error": "depth must be an integer"}, "result": {"error": "depth must be an integer"}},
+        {"result": {"file": f"{repo_root}/src/main.py", "notes": "ok"}},
+        {"result": {"file": f"{repo_root}/src/main.py", "notes": "dup"}},
+        {"result": {"path": "/other/place/file.txt"}},
+    ]
+    cleaned = runner._clean_observations_for_finalization(observations, repo_root)  # type: ignore[attr-defined]
+    assert cleaned
+    # Error-only observations are removed.
+    assert all("error" not in (obs.get("result") or {}) for obs in cleaned)
+    # Paths are normalized and deduplicated.
+    files = [obs["result"]["file"] for obs in cleaned if "result" in obs and "file" in obs["result"]]
+    assert files == ["src/main.py"]
+    paths = [obs["result"]["path"] for obs in cleaned if "result" in obs and "path" in obs["result"]]
+    assert paths == ["/other/place/file.txt"]
 
 
 def _dummy_client(tool_name: str, args: dict[str, Any]):
@@ -368,7 +512,7 @@ def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
             captured.setdefault("dispatches", []).append((name, arguments))
             return {"ok": True}
 
-    def fake_run_agent(agent_task: dict[str, object], steps: int, tool_specs: list[OpenAITool], dispatch_tool_call, system_prompt: str, parent_trace=None, backend_name=None):
+    def fake_run_agent(agent_task: dict[str, object], steps: int, tool_specs: list[ChatCompletionToolParam], dispatch_tool_call, system_prompt: str, parent_trace=None, backend_name=None):
         captured["tool_specs"] = tool_specs
         dispatch_tool_call("resolve", {"path": "p"})
         return {"observations": [{"role": "assistant", "content": {"predicted_files": ["src/app.py"], "reasoning": "r"}}]}
@@ -510,6 +654,7 @@ def test_finalization_uses_json_schema(monkeypatch, tmp_path):
     explore_call = calls[0]
     finalize_call = calls[-1]
     assert "tools" in explore_call
+    assert explore_call.get("tool_choice") == "required"
     assert "tools" not in finalize_call or finalize_call.get("tools") in (None, [])
     rf = finalize_call.get("response_format")
     assert isinstance(rf, dict)
@@ -525,9 +670,15 @@ def test_finalization_uses_json_schema(monkeypatch, tmp_path):
 
 
 def test_jc_prompt_uses_canonical_tool_names():
-    specs: list[OpenAITool] = [
-        {"type": "function", "function": {"name": "alpha", "description": "", "parameters": {}}},
-        {"type": "function", "function": {"name": "beta", "description": "", "parameters": {}}},
+    specs: list[ChatCompletionToolParam] = [
+        {
+            "type": "function",
+            "function": {"name": "alpha", "description": "", "parameters": {"type": "object", "properties": {}}},
+        },
+        {
+            "type": "function",
+            "function": {"name": "beta", "description": "", "parameters": {"type": "object", "properties": {}}},
+        },
     ]
     prompt = runner._build_jc_system_prompt(specs)  # type: ignore[attr-defined]
     assert "- alpha" in prompt

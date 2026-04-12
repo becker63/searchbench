@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol, cast
 from jcodemunch_mcp.tools.index_folder import index_folder
 
 from harness.agents.localizer import run_ic_iteration
+from harness.localization.materialization.materialize import RepoMaterializer
+from harness.localization.runtime.evaluate import LocalizationRunner, MachineScorePolicy
 from harness.telemetry.tracing import (
     flush_langfuse,
     propagate_context,
@@ -89,14 +91,29 @@ _REEXPORTED = (
 )
 
 
-def evaluate_localization_batch(**kwargs: object):
+def evaluate_localization_batch(
+    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
+    *,
+    dataset_source: str | None = None,
+    materializer: RepoMaterializer | None = None,
+    parent_trace: object | None = None,
+    runner: LocalizationRunner | None = None,
+    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
+):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
     Forwards keyword arguments directly to harness.localization.runtime.evaluate.evaluate_localization_batch.
     """
     from harness.localization.runtime.evaluate import evaluate_localization_batch as _evaluate_localization_batch
 
-    return _evaluate_localization_batch(**kwargs)
+    return _evaluate_localization_batch(
+        tasks,
+        dataset_source=dataset_source,
+        materializer=materializer,
+        parent_trace=parent_trace,
+        runner=runner,
+        machine_score_policy=machine_score_policy,
+    )
 
 
 def score(node: "GraphNode", graph: "Graph", step: int) -> float:

@@ -8,21 +8,51 @@ from typing import Any, TypeVar
 
 from mcp.types import TextContent, Tool as MCPTool
 
-from harness.utils.openai_schema import OpenAITool
+from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
 
 T = TypeVar("T")
 
 
-def mcp_tool_to_openai_tool(tool: MCPTool) -> OpenAITool:
+def _normalize_parameters(schema: Any) -> dict[str, Any]:
+    """
+    Coerce MCP inputSchema into an object-shaped JSON schema for OpenAI tools.
+    Falls back to a safe empty object when the upstream schema is missing or malformed.
+    """
+    default: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
+    if not isinstance(schema, dict):
+        return default
+    normalized = dict(schema)
+    normalized["type"] = "object"
+    properties = normalized.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    normalized["properties"] = properties
+    normalized["additionalProperties"] = False
+    if "required" not in normalized and properties:
+        normalized["required"] = list(properties.keys())
+    return normalized
+
+
+def mcp_tool_to_openai_tool(tool: MCPTool) -> ChatCompletionToolParam:
     """Convert an MCP Tool definition into the OpenAI function tool schema."""
-    return {
+    parameters = _normalize_parameters(tool.inputSchema)
+    strict_safe = (
+        parameters.get("additionalProperties") is False
+        and isinstance(parameters.get("properties"), dict)
+        and all(isinstance(k, str) for k in parameters["properties"].keys())
+    )
+    tool_spec: ChatCompletionToolParam = {
         "type": "function",
         "function": {
             "name": tool.name,
             "description": tool.description or "",
-            "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+            "parameters": parameters,
         },
     }
+    if strict_safe and parameters.get("properties"):
+        tool_spec["function"]["strict"] = True
+    validate_tools([tool_spec])
+    return tool_spec
 
 
 def parse_text_content_payload(blocks: Iterable[TextContent] | None) -> Any:

@@ -9,6 +9,8 @@ import pytest
 import run as run_module
 from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.telemetry.hosted.baselines import baseline_cache_path
+from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
 
 
 def _task(repo_owner: str, repo_name: str, base_sha: str, dataset: str = "d", config: str = "c", split: str = "s") -> LCATask:
@@ -23,6 +25,41 @@ def _task(repo_owner: str, repo_name: str, base_sha: str, dataset: str = "d", co
     ctx = LCAContext(issue_title="t", issue_body="b")
     gold = LCAGold(changed_files=["a.py"])
     return LCATask(identity=identity, context=ctx, gold=gold)
+
+
+def _stub_cli_baseline(monkeypatch, tmp_path, run_stub, cache_root=None, baseline_root=None):
+    hf_cache_dir = cache_root or tmp_path / "hf_cache"
+    baseline_cache_dir = baseline_root or tmp_path / "baseline_cache"
+    monkeypatch.setenv("HF_LCA_CACHE_DIR", str(hf_cache_dir))
+    monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(baseline_cache_dir))
+    monkeypatch.setattr(run_module.harness_run, "ensure_langfuse_auth", lambda: None)
+    monkeypatch.setattr(run_module.harness_run, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(
+        run_module,
+        "fetch_hf_localization_dataset",
+        lambda *args, **kwargs: [
+            SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))
+        ],
+    )
+
+    def fake_select(tasks, max_items, offset):
+        return tasks, {
+            "selected_count": len(tasks),
+            "offset": offset,
+            "limit": max_items,
+            "total_available": len(tasks),
+            "preview": [getattr(tasks[0], "task_id", None) or tasks[0].identity.task_id()],
+        }
+
+    monkeypatch.setattr(run_module, "_select_tasks", fake_select)
+    monkeypatch.setattr(
+        run_module,
+        "_compute_projection",
+        lambda *args, **kwargs: {"total": {"planned": 0, "hard_cap": 0}, "localization": {}, "writer": {}},
+    )
+    monkeypatch.setattr(run_module, "_require_confirmation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_module, "run_hosted_localization_baseline", run_stub)
+    return hf_cache_dir, baseline_cache_dir
 
 
 def test_parse_defaults():
@@ -162,3 +199,132 @@ def test_max_workers_validation():
     argv = ["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--max-workers", "0"]
     with pytest.raises(ValueError):
         run_module.main(argv)
+
+
+def test_cli_fresh_session_per_invocation(monkeypatch, tmp_path):
+    sessions: list[SessionConfig | None] = []
+
+    def fake_run(req, materializer=None, tasks=None):
+        sessions.append(req.session)
+        return SimpleNamespace(items=[], failure=None)
+
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run)
+    argv = ["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--yes"]
+
+    run_module.main(argv)
+    run_module.main(argv)
+
+    assert len(sessions) == 2
+    assert all(isinstance(sess, SessionConfig) for sess in sessions)
+    assert sessions[0].session_scope == "run"
+    assert sessions[1].session_scope == "run"
+    assert sessions[0].session_id and sessions[1].session_id
+    assert sessions[0].session_id != sessions[1].session_id
+    assert resolve_session_id(sessions[0], run_id="run-id") == sessions[0].session_id
+
+
+def test_cli_respects_explicit_session_id(monkeypatch, tmp_path):
+    sessions: list[SessionConfig | None] = []
+
+    def fake_run(req, materializer=None, tasks=None):
+        sessions.append(req.session)
+        return SimpleNamespace(items=[], failure=None)
+
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run)
+    argv = [
+        "baseline",
+        "--config",
+        "py",
+        "--split",
+        "dev",
+        "--max-items",
+        "1",
+        "--yes",
+        "--session-id",
+        "explicit-session",
+    ]
+
+    run_module.main(argv)
+    assert len(sessions) == 1
+    assert sessions[0].session_id == "explicit-session"
+    assert sessions[0].session_scope == "run"
+
+
+def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys):
+    calls = []
+
+    def fake_run(req, materializer=None, tasks=None):
+        calls.append(True)
+        return SimpleNamespace(items=[], failure=None)
+
+    hf_cache_root = tmp_path / "hf_cache_existing"
+    hf_cache_root.mkdir(parents=True, exist_ok=True)
+    (hf_cache_root / "marker.txt").write_text("cached")
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
+    bundle_path = baseline_cache_path(
+        run_module.harness_run.HF_DATASET_NAME,
+        dataset_config="py",
+        dataset_split="dev",
+        dataset_version=None,
+    )
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_text("{}")
+
+    argv = [
+        "baseline",
+        "--config",
+        "py",
+        "--split",
+        "dev",
+        "--max-items",
+        "1",
+        "--yes",
+        "--invalidate-baseline-cache",
+    ]
+
+    run_module.main(argv)
+    out = capsys.readouterr().out
+
+    assert "[CACHE] Baseline cache invalidated" in out
+    assert calls == [True]
+    assert not bundle_path.exists()
+    assert (hf_cache_root / "marker.txt").exists(), "HF cache should remain untouched"
+
+
+def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys):
+    calls = []
+
+    def fake_run(req, materializer=None, tasks=None):
+        calls.append(True)
+        return SimpleNamespace(items=[], failure=None)
+
+    hf_cache_root = tmp_path / "hf_cache_missing"
+    hf_cache_root.mkdir(parents=True, exist_ok=True)
+    (hf_cache_root / "marker.txt").write_text("cached")
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
+    bundle_path = baseline_cache_path(
+        run_module.harness_run.HF_DATASET_NAME,
+        dataset_config="py",
+        dataset_split="dev",
+        dataset_version=None,
+    )
+
+    argv = [
+        "baseline",
+        "--config",
+        "py",
+        "--split",
+        "dev",
+        "--max-items",
+        "1",
+        "--yes",
+        "--invalidate-baseline-cache",
+    ]
+
+    run_module.main(argv)
+    out = capsys.readouterr().out
+
+    assert "Baseline cache not found" in out
+    assert calls == [True]
+    assert not bundle_path.exists()
+    assert (hf_cache_root / "marker.txt").exists(), "HF cache should remain untouched"

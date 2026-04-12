@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-import logging
+import os
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
+from statistics import mean
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -26,8 +27,6 @@ from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.telemetry import build_localization_telemetry
 from harness.telemetry.tracing import propagate_context, start_observation
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
-
-_LOGGER = logging.getLogger(__name__)
 
 
 class BaselineSnapshot(BaseModel):
@@ -63,13 +62,140 @@ class BaselineBundle(BaseModel):
     failure: LocalizationEvaluationFailure | None = None
 
 
-def baseline_key(task: LCATask) -> str:
-    return task.task_id
+def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -> None:
+    updater = getattr(span, "update", None)
+    if callable(updater):
+        try:
+            updater(metadata=metadata)
+        except Exception:
+            pass
+
+
+def _aggregate_metrics(snapshots: Sequence[BaselineSnapshot]) -> LocalizationMetrics | None:
+    metrics = [snap.metrics for snap in snapshots if isinstance(snap.metrics, LocalizationMetrics)]
+    if not metrics:
+        return None
+    return LocalizationMetrics(
+        precision=mean(m.precision for m in metrics),
+        recall=mean(m.recall for m in metrics),
+        f1=mean(m.f1 for m in metrics),
+        hit=mean(m.hit for m in metrics),
+        score=mean(m.score for m in metrics),
+    )
+
+
+def emit_baseline_dataset_aggregates(
+    span: object | None,
+    snapshots: Sequence[BaselineSnapshot],
+    extra_metadata: Mapping[str, object] | None = None,
+) -> None:
+    """
+    Emit aggregate baseline metrics to the dataset/root span for observability.
+    """
+    aggregates = _aggregate_metrics(snapshots)
+    if span is None or aggregates is None:
+        return
+    metrics_payload = {
+        "precision": aggregates.precision,
+        "recall": aggregates.recall,
+        "f1": aggregates.f1,
+        "hit": aggregates.hit,
+        "score": aggregates.score,
+    }
+    for metric_name, metric_value in metrics_payload.items():
+        emit_score_for_handle(
+            span,
+            name=f"baseline.avg_{metric_name}",
+            value=float(metric_value),
+            data_type="NUMERIC",
+            score_id=f"{getattr(span, 'id', None)}-baseline.avg_{metric_name}" if getattr(span, "id", None) else None,
+        )
+    summary_metadata: dict[str, object] = {
+        "selected_count": len(snapshots),
+        "aggregate_metrics": metrics_payload,
+    }
+    if extra_metadata:
+        summary_metadata.update(dict(extra_metadata))
+    _safe_update_metadata(span, summary_metadata)
 
 
 def index_baselines(bundle: BaselineBundle | Sequence[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
     items = bundle.items if isinstance(bundle, BaselineBundle) else list(bundle)
     return {snap.identity: snap for snap in items}
+
+
+def baseline_cache_path(
+    dataset_name: str,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+    dataset_version: str | None = None,
+    root: Path | None = None,
+) -> Path:
+    """
+    Derive a deterministic baseline bundle cache path based on dataset identity.
+    """
+    base_root = Path(
+        root
+        or os.environ.get("HARNESS_BASELINE_CACHE_DIR")
+        or Path.home() / ".cache" / "harness" / "baselines"
+    )
+
+    def _clean(part: str | None, default: str) -> str:
+        raw = part or default
+        safe = raw.replace("/", "__").replace(" ", "_")
+        return safe or default
+
+    dataset_part = _clean(dataset_name, "dataset")
+    config_part = _clean(dataset_config, "config")
+    split_part = _clean(dataset_split, "split")
+    version_part = _clean(dataset_version, "latest")
+    return base_root / dataset_part / config_part / split_part / f"{version_part}.json"
+
+
+def persist_baseline_bundle(
+    bundle: BaselineBundle,
+    *,
+    dataset_name: str,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+    dataset_version: str | None = None,
+    cache_root: Path | None = None,
+) -> Path:
+    """
+    Persist a baseline bundle to the canonical cache path and return the path.
+    """
+    path = baseline_cache_path(
+        dataset_name,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        dataset_version=dataset_version,
+        root=cache_root,
+    )
+    save_baseline_bundle(bundle, path)
+    return path
+
+
+def load_persisted_baseline_bundle(
+    *,
+    dataset_name: str,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+    dataset_version: str | None = None,
+    cache_root: Path | None = None,
+) -> BaselineBundle | None:
+    """
+    Load a cached baseline bundle from the canonical path if present.
+    """
+    path = baseline_cache_path(
+        dataset_name,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        dataset_version=dataset_version,
+        root=cache_root,
+    )
+    if not path.exists():
+        return None
+    return load_baseline_bundle(path)
 
 
 def compute_baseline_for_task(
@@ -189,7 +315,7 @@ def make_baseline_bundle(
 
 
 def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
-    serializable = bundle.model_dump(exclude_none=True)
+    serializable = bundle.model_dump(exclude_none=True, mode="json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(serializable, indent=2))
 

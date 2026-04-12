@@ -14,6 +14,7 @@ from harness.localization.models import (
     LocalizationMetrics,
     LocalizationPrediction,
     LocalizationRepoInfo,
+    canonicalize_paths,
 )
 from harness.localization.scoring import score_file_localization
 
@@ -26,7 +27,8 @@ def localization_eval_identity(identity: LCATaskIdentity) -> str:
 
 
 def _coerce_paths(value: Iterable[object]) -> List[str]:
-    return [str(p) for p in value if isinstance(p, (str, Path)) or hasattr(p, "__fspath__")]
+    coerced = [str(p) for p in value if isinstance(p, (str, Path)) or hasattr(p, "__fspath__")]
+    return canonicalize_paths(coerced)
 
 
 def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> List[str]:

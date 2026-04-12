@@ -1,17 +1,40 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from pathlib import Path
+from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path, PurePosixPath
 from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+def canonicalize_path(path: str) -> str:
+    """
+    Normalize a single file path for stable comparison.
+    """
+    if path is None:
+        return ""
+    text = str(path).strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    text = text.lstrip("/")
+    if not text:
+        return ""
+    normalized = str(PurePosixPath(text))
+    return normalized.lower()
+
+
+def canonicalize_paths(paths: Iterable[str]) -> List[str]:
+    """
+    Normalize and deduplicate a collection of file paths.
+    """
+    return sorted({p for p in (canonicalize_path(path) for path in paths) if p})
 
 
 def _normalize_path_list(paths: List[str]) -> List[str]:
     """
     Canonicalize a list of file paths into a stable, duplicate-free, trimmed list.
     """
-    return sorted({p.strip() for p in paths if p and p.strip()})
+    return canonicalize_paths(paths)
 
 
 class LCATaskIdentity(BaseModel):

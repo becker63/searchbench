@@ -9,7 +9,7 @@ from jcodemunch_mcp.server import call_tool, list_tools
 from mcp.types import TextContent, Tool
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from harness.utils.openai_schema import OpenAITool
+from harness.utils.openai_schema import ChatCompletionToolParam
 from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
 
 
@@ -37,7 +37,7 @@ class JCodeMunchBackend:
             list_tools,
         )
         tools = run_async(list_tools_fn())
-        self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
+        self.tool_specs: list[ChatCompletionToolParam] = [mcp_tool_to_openai_tool(t) for t in tools]
         self._initialize_repo(init_payload.repo)
 
     def _initialize_repo(self, repo: str) -> None:

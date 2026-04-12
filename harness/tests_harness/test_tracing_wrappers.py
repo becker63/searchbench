@@ -198,6 +198,8 @@ def test_run_agent_truncates_tool_content(monkeypatch):
 
         def __init__(self):
             self.usage = self.__class__.usage
+
+
         usage = type(
             "U",
             (),
@@ -314,7 +316,9 @@ def test_run_agent_truncates_tool_content(monkeypatch):
     observations = runner.run_agent(
         _agent_payload(),
         steps=2,
-        tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
+        tool_specs=[
+            {"type": "function", "function": {"name": "tool", "description": "", "parameters": {"type": "object", "properties": {}}}}
+        ],
         dispatch_tool_call=lambda *a, **k: long_result,
         system_prompt="sys",
         parent_trace=object(),
@@ -357,11 +361,11 @@ def test_run_agent_retries_on_context_error(monkeypatch):
 
     class DummyCompletions:
         def __init__(self):
-            self.calls: list[list[dict[str, object]]] = []
+            self.calls: list[dict[str, object]] = []
             self.failed = False
 
         def create(self, **kwargs):
-            self.calls.append(kwargs["messages"])
+            self.calls.append(kwargs)
             if not self.failed:
                 self.failed = True
                 raise ContextError("Please reduce the length")
@@ -385,13 +389,20 @@ def test_run_agent_retries_on_context_error(monkeypatch):
     result = runner.run_agent(
         _agent_payload(),
         steps=1,
-        tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
+        tool_specs=[
+            {"type": "function", "function": {"name": "tool", "description": "", "parameters": {"type": "object", "properties": {}}}}
+        ],
         dispatch_tool_call=lambda *a, **k: {},
         system_prompt="sys",
         parent_trace=object(),
         backend_name="test",
     )
     assert len(completions.calls) == 2
+    first_call, retry_call = completions.calls
+    assert first_call.get("tools")
+    assert retry_call.get("tools")
+    assert first_call.get("tool_choice") == "required"
+    assert retry_call.get("tool_choice") == "required"
     assert result["observations"]
 
 
@@ -453,7 +464,12 @@ def test_run_agent_requires_usage(monkeypatch):
         runner.run_agent(
             _agent_payload(),
             steps=1,
-            tool_specs=[{"type": "function", "function": {"name": "tool", "description": "", "parameters": {}}}],
+            tool_specs=[
+                {
+                    "type": "function",
+                    "function": {"name": "tool", "description": "", "parameters": {"type": "object", "properties": {}}},
+                }
+            ],
             dispatch_tool_call=lambda *a, **k: {},
             system_prompt="sys",
             parent_trace=object(),

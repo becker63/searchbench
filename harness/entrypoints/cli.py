@@ -9,8 +9,10 @@ import argparse
 import logging
 import sys
 import os
+import uuid
 from contextlib import contextmanager
-from typing import IO, Any, Iterable, Iterator
+from pathlib import Path
+from typing import IO, Any, Iterable, Iterator, Mapping, Sequence
 
 try:
     import termios  # type: ignore
@@ -20,9 +22,12 @@ except ImportError:
     termios = None  # type: ignore
 
 from harness.localization.runtime.evaluate import (
+    MachineScorePolicy,
+    LocalizationRunner,
     evaluate_localization_batch as _evaluate_localization_batch,
 )
 from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
+from harness.localization.materialization.materialize import RepoMaterializer
 from harness.localization.models import LCATask
 from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
 from harness.telemetry.hosted.experiments import (
@@ -33,6 +38,7 @@ from harness.telemetry.hosted.hf_lca import (
     HFDatasetLoadError,
     fetch_hf_localization_dataset,
 )
+from harness.telemetry.hosted.baselines import baseline_cache_path
 from harness.telemetry.tracing import flush_langfuse, ensure_langfuse_auth
 from harness.entrypoints.models.requests import (
     HostedLocalizationBaselineRequest,
@@ -127,11 +133,26 @@ def _raw_mode(file_obj: IO[Any]) -> Iterator[None]:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def evaluate_localization_batch(**kwargs: object):
+def evaluate_localization_batch(
+    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
+    *,
+    dataset_source: str | None = None,
+    materializer: RepoMaterializer | None = None,
+    parent_trace: object | None = None,
+    runner: LocalizationRunner | None = None,
+    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
+):
     """
     Thin wrapper to keep monkeypatch targets stable for tests while deferring import cycles.
     """
-    return _evaluate_localization_batch(**kwargs)
+    return _evaluate_localization_batch(
+        tasks,
+        dataset_source=dataset_source,
+        materializer=materializer,
+        parent_trace=parent_trace,
+        runner=runner,
+        machine_score_policy=machine_score_policy,
+    )
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -189,8 +210,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             help="Allow deterministic fallback session id generation at entrypoints",
         )
 
-    _add_common(subparsers.add_parser("baseline"))
-    _add_common(subparsers.add_parser("experiment"))
+    baseline_parser = subparsers.add_parser("baseline")
+    _add_common(baseline_parser)
+    baseline_parser.add_argument(
+        "--invalidate-baseline-cache",
+        action="store_true",
+        help="Remove any cached baseline bundle before running",
+    )
+
+    experiment_parser = subparsers.add_parser("experiment")
+    _add_common(experiment_parser)
 
     return parser.parse_args(argv)
 
@@ -228,6 +257,32 @@ def _sort_tasks_deterministically(tasks: Iterable[LCATask]) -> list[LCATask]:
     return sorted(
         list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id()
     )
+
+
+def _build_session_config(
+    command: str, explicit_session_id: str | None, allow_fallback: bool
+) -> SessionConfig:
+    """
+    Build a deterministic SessionConfig for this CLI invocation.
+    """
+    session_id = explicit_session_id or f"{command}-{uuid.uuid4().hex[:8]}"
+    return SessionConfig(
+        session_id=session_id,
+        session_scope="run",
+        allow_generated_fallback=allow_fallback,
+    )
+
+
+def _invalidate_baseline_cache(bundle_path: Path) -> None:
+    """
+    Best-effort removal of the baseline bundle cache file.
+    """
+    cache_path = bundle_path.resolve()
+    if cache_path.exists():
+        cache_path.unlink(missing_ok=True)
+        print(f"[CACHE] Baseline cache invalidated at {cache_path}")
+        return
+    print(f"[CACHE] Baseline cache not found at {cache_path}; nothing to invalidate.")
 
 
 def _select_tasks(
@@ -456,11 +511,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.max_workers is not None and args.max_workers <= 0:
         raise ValueError("--max-workers must be a positive integer")
     materializer = HuggingFaceRepoMaterializer()
-    session_cfg = SessionConfig(
-        session_id=args.session_id,
-        session_scope="run",  # dataset-backed runs use run scope
-        allow_generated_fallback=args.allow_session_fallback,
+    session_cfg = _build_session_config(
+        args.command or "cli", args.session_id, args.allow_session_fallback
     )
+    baseline_bundle_path = (
+        baseline_cache_path(
+            HF_DATASET_NAME,
+            dataset_config=args.config,
+            dataset_split=args.split,
+            dataset_version=args.revision,
+        )
+        if args.command == "baseline"
+        else None
+    )
+    if baseline_bundle_path and getattr(args, "invalidate_baseline_cache", False):
+        _invalidate_baseline_cache(baseline_bundle_path)
 
     try:
         if args.command == "baseline":

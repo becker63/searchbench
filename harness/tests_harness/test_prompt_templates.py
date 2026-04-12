@@ -10,7 +10,7 @@ from harness.utils import type_loader
 from harness.pipeline.types import StepResult
 from harness.prompts import SystemPromptContext, WriterPromptContext
 from harness.utils import template_loader
-from harness.utils.openai_schema import OpenAITool
+from harness.utils.openai_schema import ChatCompletionToolParam
 
 
 def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -78,7 +78,7 @@ def test_runner_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
     (prompts_dir / "jc_system.jinja").write_text("JC Tools: {{ available_tools }}", encoding="utf-8")
     monkeypatch.setattr(template_loader, "find_repo_root", lambda: tmp_path)
 
-    tools: list[OpenAITool] = [
+    tools: list[ChatCompletionToolParam] = [
         {
             "type": "function",
             "function": {

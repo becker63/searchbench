@@ -39,7 +39,6 @@ __all__ = [
     "normalize_localization_task",
     "BaselineBundle",
     "BaselineSnapshot",
-    "baseline_key",
     "compute_baseline_for_task",
     "make_baseline_bundle",
     "require_baseline",
@@ -50,7 +49,6 @@ if TYPE_CHECKING:
     from harness.telemetry.hosted.baselines import (
         BaselineBundle,
         BaselineSnapshot,
-        baseline_key,
         compute_baseline_for_task,
         make_baseline_bundle,
         require_baseline,
@@ -62,7 +60,6 @@ def __getattr__(name: str) -> Any:
     if name in {
         "BaselineBundle",
         "BaselineSnapshot",
-        "baseline_key",
         "compute_baseline_for_task",
         "make_baseline_bundle",
         "require_baseline",

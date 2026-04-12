@@ -15,6 +15,7 @@ from harness.localization.models import (
     LocalizationPrediction,
     LocalizationRepoInfo,
     LocalizationTelemetryEnvelope,
+    canonicalize_paths,
 )
 from harness.localization.scoring import score_file_localization
 from harness.localization.runtime.records import build_file_localization_eval_record
@@ -49,6 +50,20 @@ def test_file_set_scoring_paths_only():
     assert metrics.recall == 0.5
     assert metrics.f1 == 0.5
     assert metrics.score == metrics.f1
+
+
+def test_path_normalization_variants_collapse():
+    variants = ["src/foo.py", "./src/foo.py", " SRC\\foo.py "]
+    assert canonicalize_paths(variants) == ["src/foo.py"]
+
+
+def test_file_set_scoring_normalizes_paths():
+    prediction = LCAPrediction(predicted_files=["SRC\\foo.py"])
+    gold = LCAGold(changed_files=["./src/foo.py"])
+    metrics = score_file_localization(prediction, gold)
+    assert metrics.precision == 1.0
+    assert metrics.recall == 1.0
+    assert metrics.f1 == 1.0
 
 
 def test_eval_builder_is_model_first():
@@ -156,6 +171,56 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
     )
     assert prediction.predicted_files == ["predicted.py"]
     assert metrics.precision == 0.0
+
+
+def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    gold = LCAGold(changed_files=[" ./SRC/foo.py "])
+    lca_task = executor_module.LCATask.model_validate(
+        {
+            "identity": identity.model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="body").model_dump(),
+            "gold": gold.model_dump(),
+            "repo": str(repo_dir),
+        }
+    )
+
+    from contextlib import contextmanager
+
+    updates: list[dict[str, object]] = []
+
+    @contextmanager
+    def span_cm():
+        span = type(
+            "S",
+            (),
+            {"id": "span", "metadata": {}, "update": lambda self, **kw: updates.append(kw), "end": lambda self, **kw: None},
+        )()
+        yield span
+
+    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(executor_module, "emit_score_for_handle", lambda *a, **k: None)
+    prediction, metrics, *_ = run_localization_task(
+        lca_task,
+        runner=lambda *_args: (["SRC\\foo.py"], {"source": "runner"}),
+    )
+    assert prediction.predicted_files == ["SRC\\foo.py"]
+    assert updates
+    metadata = updates[-1].get("metadata")
+    assert metadata is not None
+    assert metadata.get("predicted_files") == ["src/foo.py"]
+    assert metadata.get("changed_files") == ["src/foo.py"]
+    assert isinstance(metadata.get("telemetry"), dict)
+    assert metrics.f1 == 1.0
 
 
 def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):

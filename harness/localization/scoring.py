@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping, cast
 
-from .models import LCAGold, LCAPrediction, LocalizationMetrics
+from .models import LCAGold, LCAPrediction, LocalizationMetrics, canonicalize_paths
 
 
 def _as_path_set(paths: Iterable[str]) -> set[str]:
-    return {p.strip() for p in paths if p and p.strip()}
+    return set(canonicalize_paths(paths))
 
 
 def file_localization_metrics(predicted_files: Iterable[str], changed_files: Iterable[str]) -> LocalizationMetrics:
@@ -42,13 +42,13 @@ def score_file_localization(prediction: LCAPrediction | Mapping[str, object], go
     """
     if isinstance(prediction, Mapping):
         predicted_files_raw = prediction.get("predicted_files", [])
-        predicted_files = [str(p) for p in cast(Iterable[object], predicted_files_raw)]
+        predicted_files = canonicalize_paths([str(p) for p in cast(Iterable[object], predicted_files_raw)])
     else:
         predicted_files = prediction.normalized_predicted_files()
 
     if isinstance(gold, Mapping):
         changed_files_raw = gold.get("changed_files", [])
-        changed_files = [str(p) for p in cast(Iterable[object], changed_files_raw)]
+        changed_files = canonicalize_paths([str(p) for p in cast(Iterable[object], changed_files_raw)])
     else:
         changed_files = gold.normalized_changed_files()
 

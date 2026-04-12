@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from iterative_context.server import IterativeContextToolRuntime, list_tools
 
 from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
-from harness.utils.openai_schema import OpenAITool
+from harness.utils.openai_schema import ChatCompletionToolParam
 
 
 class BackendInit(BaseModel):
@@ -29,6 +29,32 @@ class ToolCallPayload(BaseModel):
     arguments: dict[str, Any]
 
 
+def _coerce_arguments_for_schema(arguments: dict[str, Any], tool_spec: ChatCompletionToolParam | None) -> dict[str, Any]:
+    if not isinstance(arguments, dict) or not isinstance(tool_spec, dict):
+        return arguments
+    func = tool_spec.get("function")
+    if not isinstance(func, dict):
+        return arguments
+    params = func.get("parameters")
+    if not isinstance(params, dict):
+        return arguments
+    props = params.get("properties")
+    if not isinstance(props, dict):
+        return arguments
+    coerced = dict(arguments)
+    for key, schema in props.items():
+        if key not in coerced:
+            continue
+        if isinstance(schema, dict) and schema.get("type") == "integer":
+            val = coerced[key]
+            if isinstance(val, str):
+                try:
+                    coerced[key] = int(val)
+                except ValueError:
+                    pass
+    return coerced
+
+
 class IterativeContextBackend:
     def __init__(self, repo: str, score_fn: Callable[..., float] | None):
         try:
@@ -42,9 +68,16 @@ class IterativeContextBackend:
 
         self._runtime = IterativeContextToolRuntime(score_fn=init_payload.score_fn, repo_root=repo_path)
         tools = run_async(list_tools())
-        self.tool_specs: list[OpenAITool] = [mcp_tool_to_openai_tool(t) for t in tools]
+        self.tool_specs: list[ChatCompletionToolParam] = [mcp_tool_to_openai_tool(t) for t in tools]
+        self._tool_spec_by_name: dict[str, ChatCompletionToolParam] = {}
+        for spec in self.tool_specs:
+            func = spec.get("function") if isinstance(spec, dict) else None
+            name = func.get("name") if isinstance(func, dict) else None
+            if isinstance(name, str):
+                self._tool_spec_by_name[name] = spec
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
         payload = ToolCallPayload(name=name, arguments=arguments or {})
-        result_blocks = run_async(self._runtime.call_tool(payload.name, payload.arguments))
+        coerced_args = _coerce_arguments_for_schema(payload.arguments, self._tool_spec_by_name.get(payload.name))
+        result_blocks = run_async(self._runtime.call_tool(payload.name, coerced_args))
         return parse_text_content_payload(result_blocks)
