@@ -19,6 +19,8 @@ dependencies = [
     "mcp>=1.26.0",
     "statemachine>=0.1",
     "pydot>=2.0.0",
+    "networkx>=3.0",
+    "llm-tldr>=1.5.2",
 ]
 
 [tool.uv.sources]
@@ -40,4 +42,4 @@ reportUnnecessaryIsInstance = "warning"
 reportUnnecessaryCast = "warning"
 reportUnnecessaryComparison = "warning"
 include = ["./"]
-exclude = ["tests_harness"]
+exclude = ["tests_harness", "**/tests_harness"]

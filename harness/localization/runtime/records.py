@@ -51,6 +51,7 @@ def build_file_localization_eval_record(
     gold: LCAGold | Mapping[str, object],
     evidence: Optional[LocalizationEvidence] = None,
     repo_path: Optional[Path] = None,
+    metrics: Optional[LocalizationMetrics] = None,
 ) -> LocalizationEvalRecord:
     """
     Build a canonical evaluation record for file-path-only predictions against LCA gold.
@@ -58,7 +59,7 @@ def build_file_localization_eval_record(
     Evidence (if provided) is kept separate from the primary metrics/prediction and should
     be used only for diagnostics.
     """
-    metrics = score_file_localization(prediction, gold)
+    metrics = metrics or score_file_localization(prediction, gold)
     predicted_files = _normalize_prediction(prediction)
     changed_files = _normalize_gold(gold)
 

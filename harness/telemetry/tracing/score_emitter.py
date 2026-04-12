@@ -113,36 +113,27 @@ def emit_score_for_handle(
     """Emit a score using IDs derived from a Langfuse trace/span handle."""
     # Prefer the SDK surface on the active observation when possible.
     if handle is not None:
-        try:
-            handle.score(  # type: ignore[call-arg]
-                name=name,
-                value=value,
-                data_type=data_type,
-                comment=comment,
-                config_id=config_id,
-                score_id=score_id,
-            )
-            return
-        except AttributeError:
-            pass
-        except Exception as exc:  # noqa: BLE001
-            if _STRICT_DEBUG:
-                raise
-            logging.debug("Langfuse handle.score failed for %s: %s", name, exc)
+        score_fn = getattr(handle, "score", None)
+        if callable(score_fn):
+            try:
+                score_fn(  # type: ignore[call-arg]
+                    name=name,
+                    value=value,
+                    data_type=data_type,
+                    comment=comment,
+                    config_id=config_id,
+                    score_id=score_id,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                if _STRICT_DEBUG:
+                    raise
+                logging.debug("Langfuse handle.score failed for %s: %s", name, exc)
     # Fall back to explicit identifier-based emission (for handles without score()).
-    trace_id = None
-    observation_id = None
-    try:
-        trace_id = handle.trace_id  # type: ignore[attr-defined]
-    except Exception:
-        try:
-            trace_id = handle.id  # type: ignore[attr-defined]
-        except Exception:
-            trace_id = None
-    try:
-        observation_id = handle.id  # type: ignore[attr-defined]
-    except Exception:
-        observation_id = None
+    trace_id = getattr(handle, "trace_id", None) if handle is not None else None
+    if trace_id is None and handle is not None:
+        trace_id = getattr(handle, "id", None)
+    observation_id = getattr(handle, "id", None) if handle is not None else None
     emit_score(
         name=name,
         value=value,

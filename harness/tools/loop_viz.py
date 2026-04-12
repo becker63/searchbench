@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 import sys
 from contextlib import nullcontext
+from typing import Any
 
 # Ensure the repository root (parent of the harness package) is on sys.path when executed as a script.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -178,24 +179,28 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     return repair_chart, opt_chart
 
 
-def _render(machine: object, fmt: str) -> str:
+def _render(machine: Any, fmt: str) -> str:
     # python-statemachine exposes a private graph builder; use it to support multiple formats.
-    graph = machine._graph()  # type: ignore[attr-defined]
+    graph_builder = getattr(machine, "_graph", None)
+    graph: Any = graph_builder() if callable(graph_builder) else None
+
+    def _safe_to_string(obj: Any) -> str:
+        return obj.to_string() if obj is not None and hasattr(obj, "to_string") else ""
     if fmt == "mermaid":
         try:
             return f"{machine:mermaid}"
         except Exception:
-            return graph.to_string()  # type: ignore[attr-defined]
+            return _safe_to_string(graph)
     if fmt == "dot":
         try:
             return f"{machine:dot}"
         except Exception:
-            return graph.to_string()  # type: ignore[attr-defined]
+            return _safe_to_string(graph)
     if fmt == "md":
         try:
             return f"{machine:md}"
         except Exception:
-            return graph.to_string()  # type: ignore[attr-defined]
+            return _safe_to_string(graph)
     raise ValueError(f"Unsupported format: {fmt}")
 
 

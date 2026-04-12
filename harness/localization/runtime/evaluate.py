@@ -66,7 +66,7 @@ class LocalizationEvaluationResult(BaseModel):
 
 
 def evaluate_localization_batch(
-    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
+    tasks: Sequence[LCATask | Mapping[str, object]],
     *,
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
@@ -90,14 +90,10 @@ def evaluate_localization_batch(
                 parent_trace=parent_trace,
                 runner=resolved_runner,
             )
-            if isinstance(run_result, tuple):
-                if len(run_result) < 4:
-                    raise LocalizationEvaluationError(LocalizationFailureCategory.UNKNOWN, "Runner returned insufficient values", task_id=task.task_id)
-                prediction, metrics, evidence, materialization = run_result[:4]
-                usage = run_result[4] if len(run_result) > 4 else None
-            else:
-                prediction, metrics, evidence, materialization = run_result  # type: ignore[misc]
-                usage = None
+            if len(run_result) < 4:
+                raise LocalizationEvaluationError(LocalizationFailureCategory.UNKNOWN, "Runner returned insufficient values", task_id=task.task_id)
+            prediction, metrics, evidence, materialization = run_result[:4]
+            usage = run_result[4] if len(run_result) > 4 else None
             task_results.append(
                 LocalizationEvaluationTaskResult(
                     task=task,

@@ -1,0 +1,4 @@
+{
+  "include": ["harness"],
+  "exclude": ["harness/tests_harness"]
+}

@@ -8,6 +8,7 @@ from harness.localization.errors import (
     LocalizationFailureCategory,
 )
 from harness.localization.runtime.records import build_file_localization_eval_record
+from harness.localization.scoring import score_with_projection
 from harness.localization.materialization.materialize import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
@@ -130,15 +131,24 @@ def _default_runner(
 
 
 def _score_task(
-    task: LCATask, prediction: LCAPrediction, repo_path: Path
+    task: LCATask, prediction: LCAPrediction, repo_path: Path, token_usage: TokenUsageRecord | None = None
 ) -> LocalizationMetrics:
     try:
+        anchor_text = "\n".join([task.context.issue_title or "", task.context.issue_body or ""]).strip()
+        metrics = score_with_projection(
+            prediction=prediction,
+            gold=task.gold,
+            repo_path=repo_path,
+            anchor_text=anchor_text,
+            token_usage=token_usage,
+        )
         eval_record = build_file_localization_eval_record(
             task.identity,
             prediction,
             task.gold,
             evidence=task.evidence,
             repo_path=repo_path,
+            metrics=metrics,
         )
         return eval_record.metrics
     except LocalizationEvaluationError:
@@ -170,7 +180,7 @@ def _emit_telemetry(
         materialization_events=materialization.events if materialization else None,
     )
     for metric_name, metric_value in metrics.model_dump().items():
-        if metric_value is None:
+        if metric_value is None or not isinstance(metric_value, (int, float)):
             continue
         emit_score_for_handle(
             trace,
@@ -183,8 +193,17 @@ def _emit_telemetry(
         )
     if trace:
         try:
+            telemetry_payload = telemetry.model_dump(exclude_none=True)
+            telemetry_payload.setdefault("metrics", {}).update(
+                {
+                    "hop_token_score": metrics.hop_token_score,
+                    "distance_term": metrics.distance_term,
+                    "token_term": metrics.token_term,
+                    "per_file_hops": metrics.per_file_hops,
+                }
+            )
             metadata_payload = {
-                "telemetry": telemetry.model_dump(exclude_none=True),
+                "telemetry": telemetry_payload,
                 "predicted_files": list(predicted_files),
                 "changed_files": list(changed_files),
             }
@@ -242,11 +261,11 @@ def run_localization_task(
         repo_path = _resolve_repo_path(task, materialization_result)
         predicted_files, runner_result = _run_runner(task, repo_path, trace, runner)
         prediction = LCAPrediction(predicted_files=predicted_files)
-        metrics = _score_task(task, prediction, repo_path)
         usage = extract_token_usage_record(
             runner_result if isinstance(runner_result, Mapping) else None,
             source="runner",
         )
+        metrics = _score_task(task, prediction, repo_path, usage)
         _emit_telemetry(
             task=task,
             metrics=metrics,

@@ -387,20 +387,23 @@ def _apply_tool_results(
     system_prompt: str,
     tool_specs: list[ChatCompletionToolParam],
 ) -> list[dict[str, object]]:
-    if not tool_results:
-        return observations
-    new_obs = []
+    new_obs: list[dict[str, object]] = []
+    tool_only: list[dict[str, object]] = []
     for obs in observations:
         new_obs.append(obs)
+        if obs.get("role") == "tool":
+            tool_only.append(obs)
         if obs.get("role") == "assistant" and obs.get("tool_calls"):
             new_obs.extend(tool_results)
+            tool_only.extend(tool_results)
+    ordered_obs = [obs for obs in new_obs if obs.get("role") != "tool"] + tool_only
     return _enforce_message_budget(
-        _build_model_messages(agent_task, tool_specs, system_prompt) + new_obs,
+        _build_model_messages(agent_task, tool_specs, system_prompt) + ordered_obs,
         max_total_chars=_AGGRESSIVE_TOTAL_CHARS,
         max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS,
         max_system_chars=_AGGRESSIVE_SYSTEM_CHARS,
         max_user_chars=_AGGRESSIVE_USER_CHARS,
-        keep_last_n_tools=1,
+        keep_last_n_tools=max(1, len(tool_only)),
     )
 
 
@@ -503,10 +506,15 @@ def run_agent(
                     response_message["tool_calls"] = tool_calls_attr
                 if content_attr is not None:
                     response_message["content"] = content_attr
-            tool_calls = response_message.get("tool_calls")
+            tool_calls_raw = response_message.get("tool_calls")
+            tool_calls: list[object] = []
+            if isinstance(tool_calls_raw, list):
+                tool_calls = list(tool_calls_raw)
+            elif tool_calls_raw is not None:
+                tool_calls = [tool_calls_raw]
             if tool_calls:
                 tool_results = _collect_tool_results(
-                    observations=[{"tool_call": call} for call in tool_calls if isinstance(call, (Mapping, object))],
+                    observations=[{"tool_call": call} for call in tool_calls],
                     dispatch_tool_call=dispatch_tool_call,
                     budget_limit=_MAX_TOTAL_MESSAGE_CHARS,
                     parent_trace=obs,
@@ -523,8 +531,10 @@ def run_agent(
                 messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt, tool_specs)
                 continue
             else:
+                raw_content = response_message.get("content")
+                content_text = raw_content if isinstance(raw_content, str) else "{}"
                 try:
-                    response_json = json.loads(response_message.get("content") or "{}")
+                    response_json = json.loads(content_text)
                 except json.JSONDecodeError as exc:  # noqa: BLE001
                     response_json = {"error": f"invalid json: {exc}"}
                 obs.update(output=_truncate_for_metadata(response_json))
@@ -575,7 +585,9 @@ def run_agent_with_retry(
             response_json = json.loads(response_message.get("content") or "{}")
         except json.JSONDecodeError as parse_exc:  # noqa: BLE001
             response_json = {"error": f"invalid json: {parse_exc}"}
-        return {"observations": [{"role": "assistant", "content": response_json}]}
+        # Ensure a minimal tool-like message exists to satisfy downstream expectations.
+        tool_msg = {"role": "tool", "content": response_json}
+        return {"observations": [tool_msg, {"role": "assistant", "content": response_json}]}
 
 
 def _normalize_agent_result(raw: Any) -> dict[str, object]:
@@ -583,6 +595,11 @@ def _normalize_agent_result(raw: Any) -> dict[str, object]:
     observations = observations_raw if isinstance(observations_raw, list) else []
 
     def _latest_graph_node_count() -> int:
+        # Prefer explicit node_count on raw if provided.
+        if isinstance(raw, Mapping):
+            raw_node_count = raw.get("node_count")
+            if isinstance(raw_node_count, (int, float)):
+                return int(raw_node_count)
         for latest in reversed(observations):
             if not isinstance(latest, Mapping):
                 continue
@@ -606,6 +623,12 @@ def _normalize_agent_result(raw: Any) -> dict[str, object]:
         "node_count": _latest_graph_node_count(),
         "raw": raw,
     }
+    # Preserve any graph/full_graph for downstream consumers.
+    if isinstance(raw, Mapping):
+        if "full_graph" in raw:
+            normalized["full_graph"] = raw.get("full_graph")
+        if "graph" in raw:
+            normalized["graph"] = raw.get("graph")
     if isinstance(raw, dict) and "error" in raw:
         normalized["error"] = raw["error"]
     return normalized
@@ -745,7 +768,8 @@ def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tupl
             predicted = _as_file_list(content.get("predicted_files"))
             if not predicted:
                 predicted = _as_file_list(content.get("files") or content.get("paths"))
-            reasoning = content.get("reasoning") if isinstance(content.get("reasoning"), str) else None
+            reason_val = content.get("reasoning")
+            reasoning = reason_val if isinstance(reason_val, str) else None
             if predicted:
                 return predicted, reasoning
         elif isinstance(content, str):
@@ -753,7 +777,8 @@ def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tupl
                 parsed = json.loads(content)
                 if isinstance(parsed, Mapping):
                     predicted = _as_file_list(parsed.get("predicted_files"))
-                    reasoning = parsed.get("reasoning") if isinstance(parsed.get("reasoning"), str) else None
+                    reason_val = parsed.get("reasoning")
+                    reasoning = reason_val if isinstance(reason_val, str) else None
                     if predicted:
                         return predicted, reasoning
             except Exception:
@@ -911,10 +936,32 @@ def run_ic_iteration(
                 pass
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
-        node_count_val = _coerce_node_count(normalized.get("node_count"))
+        normalized_node_count = _coerce_node_count(normalized.get("node_count"))
+        node_count_val = normalized_node_count
+        # If backend didn't supply node_count, fall back to full_graph nodes length.
+        if node_count_val is None:
+            full_graph = normalized.get("full_graph")
+            if isinstance(full_graph, Mapping):
+                nodes = full_graph.get("nodes")
+                if isinstance(nodes, list):
+                    node_count_val = len(nodes)
+        # If still missing, look into latest observation result full_graph.
+        if node_count_val is None:
+            for latest in reversed(observations):
+                if not isinstance(latest, Mapping):
+                    continue
+                result = latest.get("result")
+                if not isinstance(result, Mapping):
+                    continue
+                full_graph = result.get("full_graph")
+                if isinstance(full_graph, Mapping):
+                    nodes = full_graph.get("nodes")
+                    if isinstance(nodes, list):
+                        node_count_val = len(nodes)
+                        break
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
         emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count_metric, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": node_count_val or 0})
+        backend_obs.update(metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
 
     try:
         final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
@@ -924,15 +971,23 @@ def run_ic_iteration(
             predicted_files=predicted_files,
             reasoning=reasoning,
             observations=observations,
-            node_count=node_count_val,
+            node_count=node_count_val if node_count_val is not None else normalized_node_count,
             raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
             source="fallback",
         )
     if not final.observations:
         final.observations = observations
     if final.node_count is None:
-        final.node_count = node_count_val
-    return final.model_dump()
+        final.node_count = node_count_val if node_count_val is not None else normalized_node_count
+    result_dict = final.model_dump()
+    full_graph = normalized.get("full_graph")
+    if full_graph is not None:
+        result_dict["full_graph"] = full_graph
+        if result_dict.get("node_count") in (None, 0) and isinstance(full_graph, Mapping):
+            nodes = full_graph.get("nodes")
+            if isinstance(nodes, list):
+                result_dict["node_count"] = len(nodes)
+    return result_dict
 
 
 def run_jc_iteration(
@@ -982,6 +1037,12 @@ def run_jc_iteration(
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
+        if node_count_val is None:
+            full_graph = normalized.get("full_graph")
+            if isinstance(full_graph, Mapping):
+                nodes = full_graph.get("nodes")
+                if isinstance(nodes, list):
+                    node_count_val = len(nodes)
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
         emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count_metric, data_type="NUMERIC")
         backend_obs.update(metadata={"node_count": node_count_val or 0})

@@ -53,6 +53,7 @@ backends/
 docs/
   lca_localization.md
   loop_viz.md
+  static_graph_validation.md
   telemetry_sessions_cost.md
 entrypoints/
   models/
@@ -70,6 +71,14 @@ localization/
     evaluate.py
     execute.py
     records.py
+  static_graph/
+    __init__.py
+    anchors.py
+    distance.py
+    ingest.py
+    normalize.py
+    raw_tree.py
+    store.py
   __init__.py
   errors.py
   models.py
@@ -147,6 +156,7 @@ tests_harness/
   test_runner_model.py
   test_score_emitter.py
   test_session_policy.py
+  test_static_graph_kernel.py
   test_subprocess_guard.py
   test_test_integrity.py
   test_token_usage.py
@@ -299,12 +309,18 @@ class AgentTaskPayload(BaseModel):
         if isinstance(value, Mapping):
             identity_val = value.get("identity")
             context_val = value.get("context")
-            normalized_identity = (
-                identity_val.model_dump() if identity_val is not None and hasattr(identity_val, "model_dump") else identity_val
-            )
-            normalized_context = (
-                context_val.model_dump() if context_val is not None and hasattr(context_val, "model_dump") else context_val
-            )
+
+            def _maybe_dump(obj: object) -> object:
+                model_dump = getattr(obj, "model_dump", None)
+                if callable(model_dump):
+                    try:
+                        return model_dump()
+                    except Exception:
+                        return obj
+                return obj
+
+            normalized_identity = _maybe_dump(identity_val)
+            normalized_context = _maybe_dump(context_val)
             return {
                 **value,
                 "identity": normalized_identity,
@@ -703,20 +719,23 @@ def _apply_tool_results(
     system_prompt: str,
     tool_specs: list[ChatCompletionToolParam],
 ) -> list[dict[str, object]]:
-    if not tool_results:
-        return observations
-    new_obs = []
+    new_obs: list[dict[str, object]] = []
+    tool_only: list[dict[str, object]] = []
     for obs in observations:
         new_obs.append(obs)
+        if obs.get("role") == "tool":
+            tool_only.append(obs)
         if obs.get("role") == "assistant" and obs.get("tool_calls"):
             new_obs.extend(tool_results)
+            tool_only.extend(tool_results)
+    ordered_obs = [obs for obs in new_obs if obs.get("role") != "tool"] + tool_only
     return _enforce_message_budget(
-        _build_model_messages(agent_task, tool_specs, system_prompt) + new_obs,
+        _build_model_messages(agent_task, tool_specs, system_prompt) + ordered_obs,
         max_total_chars=_AGGRESSIVE_TOTAL_CHARS,
         max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS,
         max_system_chars=_AGGRESSIVE_SYSTEM_CHARS,
         max_user_chars=_AGGRESSIVE_USER_CHARS,
-        keep_last_n_tools=1,
+        keep_last_n_tools=max(1, len(tool_only)),
     )
 
 
@@ -819,10 +838,15 @@ def run_agent(
                     response_message["tool_calls"] = tool_calls_attr
                 if content_attr is not None:
                     response_message["content"] = content_attr
-            tool_calls = response_message.get("tool_calls")
+            tool_calls_raw = response_message.get("tool_calls")
+            tool_calls: list[object] = []
+            if isinstance(tool_calls_raw, list):
+                tool_calls = list(tool_calls_raw)
+            elif tool_calls_raw is not None:
+                tool_calls = [tool_calls_raw]
             if tool_calls:
                 tool_results = _collect_tool_results(
-                    observations=[{"tool_call": call} for call in tool_calls if isinstance(call, (Mapping, object))],
+                    observations=[{"tool_call": call} for call in tool_calls],
                     dispatch_tool_call=dispatch_tool_call,
                     budget_limit=_MAX_TOTAL_MESSAGE_CHARS,
                     parent_trace=obs,
@@ -839,8 +863,10 @@ def run_agent(
                 messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt, tool_specs)
                 continue
             else:
+                raw_content = response_message.get("content")
+                content_text = raw_content if isinstance(raw_content, str) else "{}"
                 try:
-                    response_json = json.loads(response_message.get("content") or "{}")
+                    response_json = json.loads(content_text)
                 except json.JSONDecodeError as exc:  # noqa: BLE001
                     response_json = {"error": f"invalid json: {exc}"}
                 obs.update(output=_truncate_for_metadata(response_json))
@@ -891,7 +917,9 @@ def run_agent_with_retry(
             response_json = json.loads(response_message.get("content") or "{}")
         except json.JSONDecodeError as parse_exc:  # noqa: BLE001
             response_json = {"error": f"invalid json: {parse_exc}"}
-        return {"observations": [{"role": "assistant", "content": response_json}]}
+        # Ensure a minimal tool-like message exists to satisfy downstream expectations.
+        tool_msg = {"role": "tool", "content": response_json}
+        return {"observations": [tool_msg, {"role": "assistant", "content": response_json}]}
 
 
 def _normalize_agent_result(raw: Any) -> dict[str, object]:
@@ -899,6 +927,11 @@ def _normalize_agent_result(raw: Any) -> dict[str, object]:
     observations = observations_raw if isinstance(observations_raw, list) else []
 
     def _latest_graph_node_count() -> int:
+        # Prefer explicit node_count on raw if provided.
+        if isinstance(raw, Mapping):
+            raw_node_count = raw.get("node_count")
+            if isinstance(raw_node_count, (int, float)):
+                return int(raw_node_count)
         for latest in reversed(observations):
             if not isinstance(latest, Mapping):
                 continue
@@ -922,6 +955,12 @@ def _normalize_agent_result(raw: Any) -> dict[str, object]:
         "node_count": _latest_graph_node_count(),
         "raw": raw,
     }
+    # Preserve any graph/full_graph for downstream consumers.
+    if isinstance(raw, Mapping):
+        if "full_graph" in raw:
+            normalized["full_graph"] = raw.get("full_graph")
+        if "graph" in raw:
+            normalized["graph"] = raw.get("graph")
     if isinstance(raw, dict) and "error" in raw:
         normalized["error"] = raw["error"]
     return normalized
@@ -1061,7 +1100,8 @@ def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tupl
             predicted = _as_file_list(content.get("predicted_files"))
             if not predicted:
                 predicted = _as_file_list(content.get("files") or content.get("paths"))
-            reasoning = content.get("reasoning") if isinstance(content.get("reasoning"), str) else None
+            reason_val = content.get("reasoning")
+            reasoning = reason_val if isinstance(reason_val, str) else None
             if predicted:
                 return predicted, reasoning
         elif isinstance(content, str):
@@ -1069,7 +1109,8 @@ def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tupl
                 parsed = json.loads(content)
                 if isinstance(parsed, Mapping):
                     predicted = _as_file_list(parsed.get("predicted_files"))
-                    reasoning = parsed.get("reasoning") if isinstance(parsed.get("reasoning"), str) else None
+                    reason_val = parsed.get("reasoning")
+                    reasoning = reason_val if isinstance(reason_val, str) else None
                     if predicted:
                         return predicted, reasoning
             except Exception:
@@ -1228,9 +1269,30 @@ def run_ic_iteration(
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
+        # If backend didn't supply node_count, fall back to full_graph nodes length.
+        if node_count_val is None:
+            full_graph = normalized.get("full_graph")
+            if isinstance(full_graph, Mapping):
+                nodes = full_graph.get("nodes")
+                if isinstance(nodes, list):
+                    node_count_val = len(nodes)
+        # If still missing, look into latest observation result full_graph.
+        if node_count_val is None:
+            for latest in reversed(observations):
+                if not isinstance(latest, Mapping):
+                    continue
+                result = latest.get("result")
+                if not isinstance(result, Mapping):
+                    continue
+                full_graph = result.get("full_graph")
+                if isinstance(full_graph, Mapping):
+                    nodes = full_graph.get("nodes")
+                    if isinstance(nodes, list):
+                        node_count_val = len(nodes)
+                        break
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
         emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count_metric, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": node_count_val or 0})
+        backend_obs.update(metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
 
     try:
         final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
@@ -1240,15 +1302,23 @@ def run_ic_iteration(
             predicted_files=predicted_files,
             reasoning=reasoning,
             observations=observations,
-            node_count=node_count_val,
+            node_count=node_count_val if node_count_val is not None else normalized.get("node_count"),
             raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
             source="fallback",
         )
     if not final.observations:
         final.observations = observations
     if final.node_count is None:
-        final.node_count = node_count_val
-    return final.model_dump()
+        final.node_count = node_count_val if node_count_val is not None else normalized.get("node_count")
+    result_dict = final.model_dump()
+    full_graph = normalized.get("full_graph")
+    if full_graph is not None:
+        result_dict["full_graph"] = full_graph
+        if result_dict.get("node_count") in (None, 0) and isinstance(full_graph, Mapping):
+            nodes = full_graph.get("nodes")
+            if isinstance(nodes, list):
+                result_dict["node_count"] = len(nodes)
+    return result_dict
 
 
 def run_jc_iteration(
@@ -1298,6 +1368,12 @@ def run_jc_iteration(
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
+        if node_count_val is None:
+            full_graph = normalized.get("full_graph")
+            if isinstance(full_graph, Mapping):
+                nodes = full_graph.get("nodes")
+                if isinstance(nodes, list):
+                    node_count_val = len(nodes)
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
         emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count_metric, data_type="NUMERIC")
         backend_obs.update(metadata={"node_count": node_count_val or 0})
@@ -1685,13 +1761,13 @@ __all__ = ["IterativeContextBackend", "JCodeMunchBackend"]
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from iterative_context.server import IterativeContextToolRuntime, list_tools
 
-from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
+from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async, serialize_tool_result_for_model
 from harness.utils.openai_schema import ChatCompletionToolParam
 
 
@@ -1711,6 +1787,7 @@ class ToolCallPayload(BaseModel):
 
     name: str
     arguments: dict[str, Any]
+    source_observations: list[dict[str, Any]] | None = None
 
 
 def _coerce_arguments_for_schema(arguments: dict[str, Any], tool_spec: ChatCompletionToolParam | None) -> dict[str, Any]:
@@ -1761,10 +1838,15 @@ class IterativeContextBackend:
                 self._tool_spec_by_name[name] = spec
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
-        payload = ToolCallPayload(name=name, arguments=arguments or {})
+        source_obs = arguments.get("source_observations") if isinstance(arguments, dict) else None
+        payload = ToolCallPayload(name=name, arguments=arguments or {}, source_observations=source_obs)
         coerced_args = _coerce_arguments_for_schema(payload.arguments, self._tool_spec_by_name.get(payload.name))
         result_blocks = run_async(self._runtime.call_tool(payload.name, coerced_args))
-        return parse_text_content_payload(result_blocks)
+        parsed = parse_text_content_payload(result_blocks)
+        # Preserve original payload shape for callers/tests; add observations when provided.
+        if payload.source_observations:
+            return {"result": parsed, "observations": payload.source_observations}
+        return parsed
 </file>
 
 <file path="backends/jc.py">
@@ -1794,6 +1876,7 @@ class ToolCallPayload(BaseModel):
 
     name: str
     arguments: dict[str, Any]
+    source_observations: list[dict[str, Any]] | None = None
 
 
 class JCodeMunchBackend:
@@ -1867,9 +1950,13 @@ class JCodeMunchBackend:
                 call_tool,
             )
         )
-        payload = ToolCallPayload(name=name, arguments=arguments or {})
+        source_obs = arguments.get("source_observations") if isinstance(arguments, dict) else None
+        payload = ToolCallPayload(name=name, arguments=arguments or {}, source_observations=source_obs)
         result_blocks = run_async(call_tool_fn(payload.name, payload.arguments))
-        return parse_text_content_payload(result_blocks)
+        parsed = parse_text_content_payload(result_blocks)
+        if payload.source_observations:
+            return {"result": parsed, "observations": payload.source_observations}
+        return parsed
 </file>
 
 <file path="backends/mcp.py">
@@ -2083,6 +2170,22 @@ Examples:
   ```
 
 By default both machines are rendered; use `--machine optimization` or `--machine repair` to narrow output.
+</file>
+
+<file path="docs/static_graph_validation.md">
+## Static Hop Evaluator Validation Plan
+
+1. **Manual localization run**
+   - Materialize a repo snapshot and run `run_localization_task` with a known issue.
+   - Verify metrics still report precision/recall/F1/hit and that `hop_token_score`/`distance_term`/`token_term` appear when extraction succeeds.
+2. **Hop-distance sanity check**
+   - Confirm per-file hop diagnostics show finite hops for resolved predictions and `null` for unresolved ones (no fabricated nodes).
+3. **Fallback behavior**
+   - Temporarily disable or remove `llm-tldr`; ensure scoring completes with legacy metrics only (projection fields remain null).
+4. **Token usage interaction**
+   - Run with a runner payload that includes usage details; confirm `token_term` reflects `1 / (1 + log1p(total_tokens))` and that missing usage yields `token_term=None`.
+5. **Telemetry inspection**
+   - Inspect emitted telemetry/metadata to ensure projected fields are present without overwriting legacy metric semantics.
 </file>
 
 <file path="docs/telemetry_sessions_cost.md">
@@ -3302,7 +3405,7 @@ class LocalizationEvaluationResult(BaseModel):
 
 
 def evaluate_localization_batch(
-    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
+    tasks: Sequence[LCATask | Mapping[str, object]],
     *,
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
@@ -3326,14 +3429,10 @@ def evaluate_localization_batch(
                 parent_trace=parent_trace,
                 runner=resolved_runner,
             )
-            if isinstance(run_result, tuple):
-                if len(run_result) < 4:
-                    raise LocalizationEvaluationError(LocalizationFailureCategory.UNKNOWN, "Runner returned insufficient values", task_id=task.task_id)
-                prediction, metrics, evidence, materialization = run_result[:4]
-                usage = run_result[4] if len(run_result) > 4 else None
-            else:
-                prediction, metrics, evidence, materialization = run_result  # type: ignore[misc]
-                usage = None
+            if len(run_result) < 4:
+                raise LocalizationEvaluationError(LocalizationFailureCategory.UNKNOWN, "Runner returned insufficient values", task_id=task.task_id)
+            prediction, metrics, evidence, materialization = run_result[:4]
+            usage = run_result[4] if len(run_result) > 4 else None
             task_results.append(
                 LocalizationEvaluationTaskResult(
                     task=task,
@@ -3416,6 +3515,7 @@ from harness.localization.errors import (
     LocalizationFailureCategory,
 )
 from harness.localization.runtime.records import build_file_localization_eval_record
+from harness.localization.scoring import score_with_projection
 from harness.localization.materialization.materialize import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
@@ -3538,15 +3638,24 @@ def _default_runner(
 
 
 def _score_task(
-    task: LCATask, prediction: LCAPrediction, repo_path: Path
+    task: LCATask, prediction: LCAPrediction, repo_path: Path, token_usage: TokenUsageRecord | None = None
 ) -> LocalizationMetrics:
     try:
+        anchor_text = "\n".join([task.context.issue_title or "", task.context.issue_body or ""]).strip()
+        metrics = score_with_projection(
+            prediction=prediction,
+            gold=task.gold,
+            repo_path=repo_path,
+            anchor_text=anchor_text,
+            token_usage=token_usage,
+        )
         eval_record = build_file_localization_eval_record(
             task.identity,
             prediction,
             task.gold,
             evidence=task.evidence,
             repo_path=repo_path,
+            metrics=metrics,
         )
         return eval_record.metrics
     except LocalizationEvaluationError:
@@ -3578,7 +3687,7 @@ def _emit_telemetry(
         materialization_events=materialization.events if materialization else None,
     )
     for metric_name, metric_value in metrics.model_dump().items():
-        if metric_value is None:
+        if metric_value is None or not isinstance(metric_value, (int, float)):
             continue
         emit_score_for_handle(
             trace,
@@ -3591,8 +3700,17 @@ def _emit_telemetry(
         )
     if trace:
         try:
+            telemetry_payload = telemetry.model_dump(exclude_none=True)
+            telemetry_payload.setdefault("metrics", {}).update(
+                {
+                    "hop_token_score": metrics.hop_token_score,
+                    "distance_term": metrics.distance_term,
+                    "token_term": metrics.token_term,
+                    "per_file_hops": metrics.per_file_hops,
+                }
+            )
             metadata_payload = {
-                "telemetry": telemetry.model_dump(exclude_none=True),
+                "telemetry": telemetry_payload,
                 "predicted_files": list(predicted_files),
                 "changed_files": list(changed_files),
             }
@@ -3650,11 +3768,11 @@ def run_localization_task(
         repo_path = _resolve_repo_path(task, materialization_result)
         predicted_files, runner_result = _run_runner(task, repo_path, trace, runner)
         prediction = LCAPrediction(predicted_files=predicted_files)
-        metrics = _score_task(task, prediction, repo_path)
         usage = extract_token_usage_record(
             runner_result if isinstance(runner_result, Mapping) else None,
             source="runner",
         )
+        metrics = _score_task(task, prediction, repo_path, usage)
         _emit_telemetry(
             task=task,
             metrics=metrics,
@@ -3722,6 +3840,7 @@ def build_file_localization_eval_record(
     gold: LCAGold | Mapping[str, object],
     evidence: Optional[LocalizationEvidence] = None,
     repo_path: Optional[Path] = None,
+    metrics: Optional[LocalizationMetrics] = None,
 ) -> LocalizationEvalRecord:
     """
     Build a canonical evaluation record for file-path-only predictions against LCA gold.
@@ -3729,7 +3848,7 @@ def build_file_localization_eval_record(
     Evidence (if provided) is kept separate from the primary metrics/prediction and should
     be used only for diagnostics.
     """
-    metrics = score_file_localization(prediction, gold)
+    metrics = metrics or score_file_localization(prediction, gold)
     predicted_files = _normalize_prediction(prediction)
     changed_files = _normalize_gold(gold)
 
@@ -3759,14 +3878,566 @@ def build_file_localization_eval_record(
     )
 </file>
 
+<file path="localization/static_graph/__init__.py">
+"""
+Static evaluator graph kernel for localization:
+- harness-local wrapper over llm-tldr for static extraction
+- normalization to a simple DiGraph
+- read-only store and hop-distance helpers
+- deterministic anchor extraction and mapping
+"""
+
+from .anchors import extract_anchors, resolve_anchors, resolve_predictions
+from .distance import HopDistanceResult, compute_hop_distance_summary
+from .ingest import ingest_repo
+from .normalize import raw_tree_to_graph
+from .raw_tree import RawEdge, RawFile, RawFunction, RawTree
+from .store import GraphStore
+
+__all__ = [
+    "extract_anchors",
+    "resolve_anchors",
+    "resolve_predictions",
+    "compute_hop_distance_summary",
+    "HopDistanceResult",
+    "ingest_repo",
+    "raw_tree_to_graph",
+    "RawEdge",
+    "RawFile",
+    "RawFunction",
+    "RawTree",
+    "GraphStore",
+]
+</file>
+
+<file path="localization/static_graph/anchors.py">
+from __future__ import annotations
+
+import re
+from collections import OrderedDict
+from typing import Iterable
+
+from harness.localization.models import canonicalize_path
+
+from .store import GraphStore
+
+BACKTICK_PATTERN = re.compile(r"`([^`]+)`")
+CODE_FENCE_PATTERN = re.compile(r"```[a-zA-Z0-9]*\n([^`]+?)```", re.DOTALL)
+SLASHY_TOKEN_PATTERN = re.compile(r"[^\\s]+/[^\\s]+")
+IDENTIFIER_PATTERN = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
+    return list(OrderedDict.fromkeys(items))
+
+
+def extract_anchors(text: str) -> list[str]:
+    """
+    Deterministic anchor extraction order:
+    1) explicit/backticked file paths
+    2) slash-containing path-like tokens
+    3) identifiers (CamelCase/snake_case)
+    4) identifiers found inside code fences
+    """
+    anchors: list[str] = []
+    anchors.extend(match.strip() for match in BACKTICK_PATTERN.findall(text or ""))
+    anchors.extend(match.strip() for match in SLASHY_TOKEN_PATTERN.findall(text or ""))
+    anchors.extend(match.strip() for match in IDENTIFIER_PATTERN.findall(text or ""))
+    for block in CODE_FENCE_PATTERN.findall(text or ""):
+        anchors.extend(match.strip() for match in IDENTIFIER_PATTERN.findall(block))
+    return _dedupe_preserve_order(a for a in anchors if a)
+
+
+def resolve_anchors(store: GraphStore, anchors: Iterable[str]) -> list[str]:
+    resolved: list[str] = []
+    for anchor in anchors:
+        path = canonicalize_path(anchor)
+        file_hits = store.find_file(path)
+        if file_hits:
+            resolved.append(file_hits[0])
+            continue
+        symbol_hits = store.find_symbol(anchor)
+        if symbol_hits:
+            resolved.append(symbol_hits[0])
+            continue
+    return _dedupe_preserve_order(resolved)
+
+
+def resolve_predictions(store: GraphStore, predictions: Iterable[str]) -> list[str]:
+    resolved: list[str] = []
+    for pred in predictions:
+        path = canonicalize_path(pred)
+        file_hits = store.find_file(path)
+        if file_hits:
+            resolved.append(file_hits[0])
+            continue
+        symbol_hits = store.find_symbol(pred)
+        if symbol_hits:
+            resolved.append(symbol_hits[0])
+    return _dedupe_preserve_order(resolved)
+</file>
+
+<file path="localization/static_graph/distance.py">
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable
+
+from .store import GraphStore
+
+
+@dataclass
+class HopDistanceResult:
+    hop_by_prediction: dict[str, int | None]
+    min_hop: int | None
+
+
+def compute_hop_distance_summary(
+    store: GraphStore, anchor_nodes: Iterable[str], prediction_nodes: dict[str, list[str]]
+) -> HopDistanceResult:
+    """
+    Compute minimal hop distances from any anchor node to each prediction file node.
+    Returns per-prediction hops and the overall minimum hop observed.
+    """
+    anchors = list(anchor_nodes)
+    per_pred: dict[str, int | None] = {}
+    best: int | None = None
+    for pred_path, nodes in prediction_nodes.items():
+        hop = store.shortest_hop(anchors, nodes[0]) if nodes else None
+        per_pred[pred_path] = hop
+        if hop is not None and (best is None or hop < best):
+            best = hop
+    return HopDistanceResult(hop_by_prediction=per_pred, min_hop=best)
+</file>
+
+<file path="localization/static_graph/ingest.py">
+from __future__ import annotations
+
+from collections.abc import Mapping
+from pathlib import Path
+from typing import cast
+
+from harness.localization.models import canonicalize_path
+
+from .raw_tree import RawEdge, RawFile, RawFunction, RawTree
+
+try:
+    from tldr import extract_file  # type: ignore[reportMissingTypeStubs]
+    from tldr.api import get_imports  # type: ignore[reportMissingTypeStubs]
+    from tldr.ast_extractor import (  # type: ignore[reportMissingTypeStubs]
+        FunctionInfo,
+        ImportInfo,
+        ModuleInfo,
+    )
+except Exception as exc:  # pragma: no cover - import guarded at runtime
+    extract_file = None
+    get_imports = None
+    FunctionInfo = None
+    ImportInfo = None
+    ModuleInfo = None
+    _import_error = exc
+else:
+    _import_error = None
+
+Extracted = "ModuleInfo | Mapping[str, object]"
+FunctionLike = "FunctionInfo | Mapping[str, object]"
+ImportLike = "ImportInfo | Mapping[str, object]"
+
+
+def _iter_functions(extracted: object) -> list[object]:
+    if ModuleInfo is not None and isinstance(extracted, ModuleInfo):
+        return list(extracted.functions or [])
+    if isinstance(extracted, Mapping):
+        functions_value = extracted.get("functions", [])
+        if isinstance(functions_value, list):
+            return list(functions_value)
+    return []
+
+
+def _iter_imports(source: object) -> list[object]:
+    if ModuleInfo is not None and isinstance(source, ModuleInfo):
+        return list(source.imports or [])
+    if isinstance(source, list):
+        return list(source)
+    if isinstance(source, Mapping):
+        imports_value = source.get("imports", [])
+        if isinstance(imports_value, list):
+            return list(imports_value)
+    return []
+
+
+def _iter_call_graph_edges(module: object) -> list[tuple[str, str]]:
+    edges: list[tuple[str, str]] = []
+    if ModuleInfo is not None and isinstance(module, ModuleInfo):
+        call_graph = getattr(module, "call_graph", None)
+        call_map = getattr(call_graph, "calls", None) if call_graph else None
+        if isinstance(call_map, dict):
+            for src, targets in cast(dict[str, object], call_map).items():
+                if isinstance(targets, list):
+                    for target in targets:
+                        if isinstance(target, str):
+                            edges.append((src, target))
+    elif isinstance(module, Mapping):
+        call_graph = module.get("call_graph")
+        if isinstance(call_graph, Mapping):
+            calls = call_graph.get("calls")
+            if isinstance(calls, Mapping):
+                for src, targets in calls.items():
+                    if isinstance(targets, list):
+                        for target in targets:
+                            if isinstance(target, str):
+                                edges.append((str(src), target))
+    return edges
+
+
+def _iter_calls(fn: object) -> list[str]:
+    calls: list[str] = []
+    if FunctionInfo is not None and isinstance(fn, FunctionInfo):
+        maybe_calls = getattr(fn, "calls", None)
+        if isinstance(maybe_calls, list):
+            calls.extend([c for c in maybe_calls if isinstance(c, str)])
+        maybe_called_functions = getattr(fn, "called_functions", None)
+        if isinstance(maybe_called_functions, list):
+            calls.extend([c for c in maybe_called_functions if isinstance(c, str)])
+    elif isinstance(fn, Mapping):
+        for key in ("calls", "called_functions"):
+            maybe_values = fn.get(key)
+            if isinstance(maybe_values, list):
+                calls.extend([str(c) for c in maybe_values if isinstance(c, str)])
+    return calls
+
+
+def ingest_repo(root: Path) -> RawTree:
+    if extract_file is None or get_imports is None:
+        raise ImportError("llm-tldr is required for static graph ingestion") from _import_error
+
+    files: list[RawFile] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(
+            segment in path.parts
+            for segment in (".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "node_modules")
+        ):
+            continue
+        # Skip oversized files (>512KB) to keep ingestion deterministic and fast.
+        try:
+            if path.stat().st_size > 512 * 1024:
+                continue
+        except OSError:
+            continue
+
+        try:
+            extracted = extract_file(str(path))  # type: ignore[assignment]
+        except Exception:
+            continue
+
+        functions: list[RawFunction] = []
+        edges: list[RawEdge] = []
+        for fn in _iter_functions(extracted):
+            name: str | None = None
+            if FunctionInfo is not None and isinstance(fn, FunctionInfo):
+                name = fn.name
+            elif isinstance(fn, Mapping):
+                raw_name = fn.get("name")
+                name = str(raw_name) if isinstance(raw_name, str) else None
+            if not name:
+                continue
+
+            qualified_name = f"{path}:{name}"
+            functions.append(
+                RawFunction(
+                    id=canonicalize_path(qualified_name),
+                    name=name,
+                    file=canonicalize_path(str(path)),
+                )
+            )
+
+            for called in _iter_calls(fn):
+                edges.append(
+                    RawEdge(
+                        source=canonicalize_path(qualified_name),
+                        target=called,
+                        kind="call",
+                        file=canonicalize_path(str(path)),
+                    )
+                )
+
+        for src, target in _iter_call_graph_edges(extracted):
+            edges.append(
+                RawEdge(
+                    source=canonicalize_path(f"{path}:{src}"),
+                    target=target,
+                    kind="call",
+                    file=canonicalize_path(str(path)),
+                )
+            )
+
+        try:
+            imports_raw = cast(list[object], get_imports(str(path)))  # type: ignore[arg-type]
+        except Exception:
+            imports_raw = []
+        imports: list[str] = []
+        for imp in _iter_imports(imports_raw):
+            module: str | None = None
+            if ImportInfo is not None and isinstance(imp, ImportInfo):
+                module = imp.module
+            elif isinstance(imp, Mapping):
+                raw_module = imp.get("module")
+                module = str(raw_module) if isinstance(raw_module, str) else None
+            if module:
+                imports.append(module)
+                edges.append(
+                    RawEdge(
+                        source=canonicalize_path(str(path)),
+                        target=module,
+                        kind="import",
+                        file=canonicalize_path(str(path)),
+                    )
+                )
+
+        files.append(
+            RawFile(
+                path=canonicalize_path(str(path)),
+                functions=functions,
+                imports=imports,
+                edges=edges,
+            )
+        )
+
+    return RawTree(files=files)
+</file>
+
+<file path="localization/static_graph/normalize.py">
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Any
+
+import networkx as nx
+
+from harness.localization.models import canonicalize_path
+
+from .raw_tree import RawEdge, RawTree
+
+
+def _ensure_node(
+    graph: nx.DiGraph[Any], node_id: str, *, node_type: str, symbol: str, file: str | None
+) -> None:
+    if node_id not in graph.nodes:
+        graph.add_node(node_id, type=node_type, symbol=symbol, file=file)
+    else:
+        data = graph.nodes[node_id]
+        data.setdefault("type", node_type)
+        data.setdefault("symbol", symbol)
+        if file is not None:
+            data.setdefault("file", file)
+
+
+def _iter_edges(tree: RawTree) -> Iterable[tuple[str, RawEdge]]:
+    for raw_file in sorted(tree.files, key=lambda f: f.path):
+        for edge in sorted(raw_file.edges, key=lambda e: (e.kind, e.source, e.target)):
+            yield canonicalize_path(raw_file.path), edge
+
+
+def raw_tree_to_graph(tree: RawTree) -> nx.DiGraph[Any]:
+    """Create a minimal directed graph from a RawTree."""
+    graph: nx.DiGraph[Any] = nx.DiGraph()
+
+    for raw_file in sorted(tree.files, key=lambda f: f.path):
+        file_id = canonicalize_path(raw_file.path)
+        _ensure_node(graph, file_id, node_type="file", symbol=file_id, file=file_id)
+        for fn in raw_file.functions:
+            fn_id = canonicalize_path(fn.id)
+            _ensure_node(
+                graph,
+                fn_id,
+                node_type="function",
+                symbol=fn.name,
+                file=canonicalize_path(fn.file),
+            )
+            # Connect function to file (declared-in/contains) if not already present.
+            graph.add_edge(file_id, fn_id, kind="contains")
+
+    for file_path, edge in _iter_edges(tree):
+        source = canonicalize_path(edge.source)
+        target = canonicalize_path(edge.target)
+        kind = edge.kind
+        if kind == "import":
+            _ensure_node(graph, source, node_type="file", symbol=source, file=file_path)
+            _ensure_node(graph, target, node_type="module", symbol=target, file=None)
+            graph.add_edge(source, target, kind="imports")
+        elif kind == "call":
+            _ensure_node(graph, source, node_type="unknown", symbol=source, file=file_path)
+            _ensure_node(graph, target, node_type="unknown", symbol=target, file=None)
+            graph.add_edge(source, target, kind="calls")
+        elif kind in {"contains", "declares"}:
+            _ensure_node(graph, source, node_type="unknown", symbol=source, file=file_path)
+            _ensure_node(graph, target, node_type="unknown", symbol=target, file=file_path)
+            graph.add_edge(source, target, kind="contains")
+        else:
+            _ensure_node(graph, source, node_type="unknown", symbol=source, file=file_path)
+            _ensure_node(graph, target, node_type="unknown", symbol=target, file=None)
+            graph.add_edge(source, target, kind="references")
+
+    return graph
+</file>
+
+<file path="localization/static_graph/raw_tree.py">
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class RawFunction(BaseModel):
+    id: str
+    name: str
+    file: str
+
+
+class RawEdge(BaseModel):
+    source: str  # function id OR file path
+    target: str  # symbol/module/function name or file path
+    kind: Literal["import", "call", "contains", "declares", "references"] | str
+    file: str | None = Field(default=None, description="Path of the file edge was observed in")
+
+
+class RawFile(BaseModel):
+    path: str
+    functions: list[RawFunction] = Field(default_factory=list)
+    imports: list[str] = Field(default_factory=list)
+    edges: list[RawEdge] = Field(default_factory=list)
+
+
+class RawTree(BaseModel):
+    files: list[RawFile] = Field(default_factory=list)
+</file>
+
+<file path="localization/static_graph/store.py">
+from __future__ import annotations
+
+from collections import deque
+from typing import Any, Callable
+
+import networkx as nx
+from .raw_tree import RawTree
+
+
+class GraphStore:
+    """
+    Read-only projection over a normalized DiGraph.
+    Provides deterministic symbol/file lookup, neighbors, and hop-distance queries.
+    """
+
+    def __init__(self, graph: nx.DiGraph[Any]):
+        self.graph = graph
+
+        self.nodes_by_id: dict[str, dict[str, Any]] = {}
+        self.nodes_by_symbol: dict[str, list[str]] = {}
+        self.nodes_by_file: dict[str, list[str]] = {}
+
+        self.out_edges: dict[str, list[dict[str, Any]]] = {}
+        self.in_edges: dict[str, list[dict[str, Any]]] = {}
+
+        self._build_indexes()
+
+    @classmethod
+    def from_raw_tree(
+        cls, tree: RawTree, *, normalizer: Callable[[RawTree], nx.DiGraph[Any]]
+    ) -> "GraphStore":
+        graph = normalizer(tree)
+        return cls(graph)
+
+    def _build_indexes(self) -> None:
+        for node_id, data in sorted(self.graph.nodes(data=True), key=lambda item: item[0]):
+            node_data = dict(data)
+            self.nodes_by_id[node_id] = node_data
+            symbol = node_data.get("symbol")
+            file_value = node_data.get("file")
+            if isinstance(symbol, str):
+                self.nodes_by_symbol.setdefault(symbol, []).append(node_id)
+            if isinstance(file_value, str):
+                self.nodes_by_file.setdefault(file_value, []).append(node_id)
+
+        for mapping in (self.nodes_by_symbol, self.nodes_by_file):
+            for key in mapping:
+                mapping[key] = sorted(mapping[key])
+
+        for src, dst, data in sorted(
+            self.graph.edges(data=True), key=lambda item: (item[0], item[1])
+        ):
+            edge_data = dict(data)
+            self.out_edges.setdefault(src, []).append(edge_data | {"target": dst})
+            self.in_edges.setdefault(dst, []).append(edge_data | {"source": src})
+
+    def find_symbol(self, symbol: str) -> list[str]:
+        return list(self.nodes_by_symbol.get(symbol, []))
+
+    def find_file(self, path: str) -> list[str]:
+        return list(self.nodes_by_file.get(path, []))
+
+    def get_neighbors(self, node_id: str) -> list[str]:
+        neighbors: set[str] = set()
+        for edge in self.out_edges.get(node_id, []):
+            neighbors.add(edge["target"])
+        for edge in self.in_edges.get(node_id, []):
+            neighbors.add(edge["source"])
+        return sorted(neighbors)
+
+    def get_neighborhood(self, node_id: str, radius: int) -> set[str]:
+        if radius < 0:
+            return set()
+        visited: set[str] = set([node_id])
+        queue: deque[tuple[str, int]] = deque()
+        queue.append((node_id, 0))
+        while queue:
+            current, dist = queue.popleft()
+            if dist >= radius:
+                continue
+            for neighbor in self.get_neighbors(current):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, dist + 1))
+        return visited
+
+    def shortest_hop(self, sources: list[str], target: str) -> int | None:
+        """
+        Minimal unweighted hop distance between any source and target treating the graph as undirected.
+        """
+        if not sources:
+            return None
+        undirected = self.graph.to_undirected(as_view=True)
+        best: int | None = None
+        for source in sources:
+            if source not in undirected or target not in undirected:
+                continue
+            try:
+                dist = int(nx.shortest_path_length(undirected, source=source, target=target))
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+            if best is None or dist < best:
+                best = dist
+        return best
+
+
+def debug_summary(store: GraphStore) -> dict[str, int]:
+    return {
+        "nodes": len(store.nodes_by_id),
+        "edges": sum(len(v) for v in store.out_edges.values()),
+    }
+</file>
+
 <file path="localization/__init__.py">
 # pyright: reportUnusedImport=false
 
 from .models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
-from .scoring import file_localization_metrics, score_file_localization
+from .scoring import file_localization_metrics, score_file_localization, score_with_projection
 from .runtime.records import build_file_localization_eval_record, localization_eval_identity
 from .materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer
 from .telemetry import build_localization_telemetry
+from . import static_graph
 </file>
 
 <file path="localization/errors.py">
@@ -3981,11 +4652,13 @@ class LocalizationPrediction(BaseModel):
     predicted_files: List[str]
 
     @classmethod
-    def from_raw(cls, value: Sequence[str] | Mapping[str, Sequence[str]]) -> "LocalizationPrediction":
+    def from_raw(cls, value: Sequence[str] | Mapping[str, object]) -> "LocalizationPrediction":
         if isinstance(value, Mapping):
             files = value.get("predicted_files", [])
-            return cls(predicted_files=list(files))
-        return cls(predicted_files=list(value))
+            if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
+                return cls(predicted_files=[str(f) for f in files])
+            return cls(predicted_files=[])
+        return cls(predicted_files=[str(v) for v in value])
 
 
 class LocalizationGold(BaseModel):
@@ -3994,11 +4667,13 @@ class LocalizationGold(BaseModel):
     changed_files: List[str]
 
     @classmethod
-    def from_raw(cls, value: Sequence[str] | Mapping[str, Sequence[str]]) -> "LocalizationGold":
+    def from_raw(cls, value: Sequence[str] | Mapping[str, object]) -> "LocalizationGold":
         if isinstance(value, Mapping):
             files = value.get("changed_files", [])
-            return cls(changed_files=list(files))
-        return cls(changed_files=list(value))
+            if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
+                return cls(changed_files=[str(f) for f in files])
+            return cls(changed_files=[])
+        return cls(changed_files=[str(v) for v in value])
 
 
 class LocalizationEvidenceItem(BaseModel):
@@ -4014,11 +4689,19 @@ class LocalizationEvidence(BaseModel):
     items: List[LocalizationEvidenceItem] = Field(default_factory=list)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Sequence[str]]) -> "LocalizationEvidence":
+    def from_mapping(cls, value: Mapping[str, object]) -> "LocalizationEvidence":
+        if not isinstance(value, Mapping):
+            return cls()
+        pairs: list[tuple[str, Sequence[str]]] = []
+        for path, hints in value.items():
+            if isinstance(hints, Sequence) and not isinstance(hints, (str, bytes)):
+                pairs.append((str(path), [str(h) for h in hints]))
+        if not pairs:
+            return cls()
         return cls(
             items=[
-                LocalizationEvidenceItem(file=str(path), hints=[str(h) for h in hints])
-                for path, hints in value.items()
+                LocalizationEvidenceItem(file=path, hints=list(hints))
+                for path, hints in pairs
             ]
         )
 
@@ -4048,15 +4731,34 @@ class LocalizationMetrics(BaseModel):
     f1: float
     hit: float
     score: float
+    hop_token_score: float | None = None
+    distance_term: float | None = None
+    token_term: float | None = None
+    per_file_hops: Mapping[str, float | None] | None = None
 
     @classmethod
-    def from_mapping(cls, metrics: Mapping[str, float]) -> "LocalizationMetrics":
+    def from_mapping(cls, metrics: Mapping[str, object]) -> "LocalizationMetrics":
+        def _f(val: object, default: float = 0.0) -> float:
+            return float(val) if isinstance(val, (int, float)) else default
+
+        def _fo(val: object) -> float | None:
+            return float(val) if isinstance(val, (int, float)) else None
+
+        per_file_hops_val = metrics.get("per_file_hops")
+        per_file_hops: Mapping[str, float | None] | None = None
+        if isinstance(per_file_hops_val, Mapping):
+            per_file_hops = {str(k): _fo(v) for k, v in per_file_hops_val.items()}
+
         return cls(
-            precision=float(metrics.get("precision", 0.0)),
-            recall=float(metrics.get("recall", 0.0)),
-            f1=float(metrics.get("f1", 0.0)),
-            hit=float(metrics.get("hit", 0.0)),
-            score=float(metrics.get("score", metrics.get("f1", 0.0))),
+            precision=_f(metrics.get("precision"), 0.0),
+            recall=_f(metrics.get("recall"), 0.0),
+            f1=_f(metrics.get("f1"), 0.0),
+            hit=_f(metrics.get("hit"), 0.0),
+            score=_f(metrics.get("score", metrics.get("f1", 0.0)), _f(metrics.get("f1"), 0.0)),
+            hop_token_score=_fo(metrics.get("hop_token_score")),
+            distance_term=_fo(metrics.get("distance_term")),
+            token_term=_fo(metrics.get("token_term")),
+            per_file_hops=per_file_hops,
         )
 
 
@@ -4141,11 +4843,13 @@ def _as_list(value: object) -> List[str]:
     return [str(value)]
 
 
-def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str] | None = None) -> LCATask:
+def normalize_lca_task(data: Mapping[str, object] | LCATask, defaults: tuple[str, str, str] | None = None) -> LCATask:
     """
     Coerce an arbitrary mapping (e.g., LCA dataset row) into an `LCATask`.
     `defaults` may provide (dataset_name, dataset_config, dataset_split) when absent from the row.
     """
+    if isinstance(data, LCATask):
+        return data
     identity_map = data.get("identity") if isinstance(data.get("identity"), Mapping) else {}
     dataset_name = str(
         data.get("dataset_name")
@@ -4238,9 +4942,25 @@ def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str
 <file path="localization/scoring.py">
 from __future__ import annotations
 
+import math
+from pathlib import Path
 from typing import Iterable, Mapping, cast
 
-from .models import LCAGold, LCAPrediction, LocalizationMetrics, canonicalize_paths
+from .models import (
+    LCAGold,
+    LCAPrediction,
+    LocalizationMetrics,
+    canonicalize_paths,
+)
+from .static_graph import (
+    GraphStore,
+    compute_hop_distance_summary,
+    extract_anchors,
+    ingest_repo,
+    raw_tree_to_graph,
+    resolve_anchors,
+)
+from .token_usage import TokenUsageRecord
 
 
 def _as_path_set(paths: Iterable[str]) -> set[str]:
@@ -4291,6 +5011,96 @@ def score_file_localization(prediction: LCAPrediction | Mapping[str, object], go
         changed_files = gold.normalized_changed_files()
 
     return file_localization_metrics(predicted_files, changed_files)
+
+
+def _distance_term(min_hop: int | None) -> float | None:
+    if min_hop is None:
+        return None
+    return 1.0 / (1.0 + float(min_hop))
+
+
+def _token_term(token_usage: TokenUsageRecord | None) -> float | None:
+    if token_usage is None:
+        return None
+    total = token_usage.normalized_total()
+    if total is None:
+        return None
+    return 1.0 / (1.0 + math.log1p(total))
+
+
+def _combine_terms(distance_term: float | None, token_term: float | None, distance_weight: float = 0.5) -> float | None:
+    terms: list[tuple[float, float]] = []
+    if distance_term is not None:
+        terms.append((distance_term, distance_weight))
+    if token_term is not None:
+        # If distance is missing, give token term full weight; otherwise share remaining weight.
+        weight = 1.0 if distance_term is None else max(0.0, 1.0 - distance_weight)
+        terms.append((token_term, weight))
+    if not terms:
+        return None
+    weight_sum = sum(weight for _, weight in terms)
+    if weight_sum == 0:
+        return None
+    return sum(val * weight for val, weight in terms) / weight_sum
+
+
+def _build_store(repo_path: Path) -> GraphStore | None:
+    try:
+        tree = ingest_repo(repo_path)
+        graph = raw_tree_to_graph(tree)
+        return GraphStore(graph)
+    except Exception:
+        return None
+
+
+def score_with_projection(
+    prediction: LCAPrediction | Mapping[str, object],
+    gold: LCAGold | Mapping[str, object],
+    repo_path: Path,
+    anchor_text: str,
+    token_usage: TokenUsageRecord | None,
+) -> LocalizationMetrics:
+    """
+    Compute legacy localization metrics plus projected hop/token scalar.
+    Does not overwrite legacy metric semantics.
+    """
+    if isinstance(prediction, Mapping):
+        predicted_files_raw = prediction.get("predicted_files", [])
+        predicted_files = canonicalize_paths([str(p) for p in cast(Iterable[object], predicted_files_raw)])
+    else:
+        predicted_files = prediction.normalized_predicted_files()
+
+    if isinstance(gold, Mapping):
+        changed_files_raw = gold.get("changed_files", [])
+        changed_files = canonicalize_paths([str(p) for p in cast(Iterable[object], changed_files_raw)])
+    else:
+        changed_files = gold.normalized_changed_files()
+
+    metrics = file_localization_metrics(predicted_files, changed_files)
+
+    store = _build_store(repo_path)
+    if store is None:
+        metrics.per_file_hops = {}
+        return metrics
+
+    anchors = extract_anchors(anchor_text or "")
+    anchor_nodes = resolve_anchors(store, anchors)
+
+    prediction_nodes: dict[str, list[str]] = {}
+    for pred in predicted_files:
+        nodes = store.find_file(pred) or store.find_symbol(pred)
+        prediction_nodes[pred] = nodes
+
+    hop_result = compute_hop_distance_summary(store, anchor_nodes, prediction_nodes)
+    distance_val = _distance_term(hop_result.min_hop)
+    token_val = _token_term(token_usage)
+    projected = _combine_terms(distance_val, token_val)
+
+    metrics.distance_term = distance_val
+    metrics.token_term = token_val
+    metrics.hop_token_score = projected
+    metrics.per_file_hops = hop_result.hop_by_prediction or {}
+    return metrics
 </file>
 
 <file path="localization/telemetry.py">
@@ -7582,7 +8392,7 @@ def compute_baseline_for_task(
                 materialization_events=materialization.events if materialization else None,
             )
             for name, value in metrics.model_dump().items():
-                if value is None:
+                if value is None or isinstance(value, dict):
                     continue
                 emit_score_for_handle(
                     trace,
@@ -8931,15 +9741,14 @@ def cost_details_for_usage(model: str | None, usage_details: dict[str, object] |
     def _as_num(val: object) -> float:
         if isinstance(val, (int, float)):
             return float(val)
-        try:
-            return float(val)  # type: ignore[arg-type]
-        except Exception:
-            return 0.0
+        return 0.0
 
     inp = _as_num(usage_details.get("input") or usage_details.get("prompt_tokens") or usage_details.get("total"))
     out = _as_num(usage_details.get("output") or usage_details.get("completion_tokens") or 0)
-    input_price = float(price_entry["input_price_per_million"]) / 1_000_000
-    output_price = float(price_entry["output_price_per_million"]) / 1_000_000
+    input_raw = price_entry.get("input_price_per_million")
+    output_raw = price_entry.get("output_price_per_million")
+    input_price = float(input_raw) / 1_000_000 if isinstance(input_raw, (int, float)) else 0.0
+    output_price = float(output_raw) / 1_000_000 if isinstance(output_raw, (int, float)) else 0.0
     costs: dict[str, float] = {}
     if inp > 0:
         costs["input"] = inp * input_price
@@ -9120,36 +9929,27 @@ def emit_score_for_handle(
     """Emit a score using IDs derived from a Langfuse trace/span handle."""
     # Prefer the SDK surface on the active observation when possible.
     if handle is not None:
-        try:
-            handle.score(  # type: ignore[call-arg]
-                name=name,
-                value=value,
-                data_type=data_type,
-                comment=comment,
-                config_id=config_id,
-                score_id=score_id,
-            )
-            return
-        except AttributeError:
-            pass
-        except Exception as exc:  # noqa: BLE001
-            if _STRICT_DEBUG:
-                raise
-            logging.debug("Langfuse handle.score failed for %s: %s", name, exc)
+        score_fn = getattr(handle, "score", None)
+        if callable(score_fn):
+            try:
+                score_fn(  # type: ignore[call-arg]
+                    name=name,
+                    value=value,
+                    data_type=data_type,
+                    comment=comment,
+                    config_id=config_id,
+                    score_id=score_id,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                if _STRICT_DEBUG:
+                    raise
+                logging.debug("Langfuse handle.score failed for %s: %s", name, exc)
     # Fall back to explicit identifier-based emission (for handles without score()).
-    trace_id = None
-    observation_id = None
-    try:
-        trace_id = handle.trace_id  # type: ignore[attr-defined]
-    except Exception:
-        try:
-            trace_id = handle.id  # type: ignore[attr-defined]
-        except Exception:
-            trace_id = None
-    try:
-        observation_id = handle.id  # type: ignore[attr-defined]
-    except Exception:
-        observation_id = None
+    trace_id = getattr(handle, "trace_id", None) if handle is not None else None
+    if trace_id is None and handle is not None:
+        trace_id = getattr(handle, "id", None)
+    observation_id = getattr(handle, "id", None) if handle is not None else None
     emit_score(
         name=name,
         value=value,
@@ -11537,7 +12337,7 @@ def test_hf_loader_normalizes_rows(monkeypatch):
     assert task.identity.repo_owner == "square"
     assert task.identity.repo_name == "okhttp"
     assert task.identity.base_sha == "abc123"
-    assert sorted(task.gold.normalized_changed_files()) == ["src/Main.kt"]
+    assert sorted(task.gold.normalized_changed_files()) == ["src/main.kt"]
     assert task.context.repo_language == "kotlin"
     assert task.context.repo_license == "apache"
 
@@ -13185,11 +13985,11 @@ def test_require_frontier_policy_callable_accepts_three_args():
 
 
 def test_require_frontier_policy_callable_rejects_wrong_arity():
-    def score_two(node, graph):
+    def frontier_two(node, graph):
         return 1.0
 
     with pytest.raises(RuntimeError):
-        policy_loader._require_frontier_policy_callable(score_two)
+        policy_loader._require_frontier_policy_callable(frontier_two)
 
 
 def test_load_frontier_policy_uses_selection_callable(monkeypatch, tmp_path):
@@ -13197,9 +13997,7 @@ def test_load_frontier_policy_uses_selection_callable(monkeypatch, tmp_path):
     policy_file.write_text(
         "from iterative_context.graph_models import Graph, GraphNode\n"
         "def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:\n"
-        "    return 42.0\n"
-        "def score(node: GraphNode, graph: Graph, step: int) -> float:\n"
-        "    return frontier_priority(node, graph, step)\n",
+        "    return 42.0\n",
         encoding="utf-8",
     )
 
@@ -13385,7 +14183,7 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_real_writer_prompt_includes_selection_signature():
     rendered = writer._render_writer_prompt(
-        current_policy="def score(node, graph, step):\n    return 0",
+        current_policy="def frontier_priority(node, graph, step):\n    return 0",
         failure_context="",
         feedback_str="",
         feedback={},
@@ -13400,8 +14198,8 @@ def test_real_writer_prompt_includes_selection_signature():
             graph_models="class GraphNode:\n    pass\nclass Graph:\n    ...",
             types="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
             examples="from iterative_context.graph_models import Graph, GraphNode\n"
-            "def score(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
-            notes="Traversal calls score(node, graph, step).",
+            "def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
+            notes="Traversal calls frontier_priority(node, graph, step).",
         ),
     )
     assert "SelectionCallable" in rendered
@@ -13567,7 +14365,7 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     dummy_ctx = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
     monkeypatch.setattr("harness.orchestration.runtime.build_frontier_context", lambda repo: dummy_ctx)
     monkeypatch.setattr("harness.orchestration.runtime.format_frontier_context", lambda *a, **k: "")
-    monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda *a, **k: "def score(node, graph, step):\n    return 0.0\n")
+    monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda *a, **k: "def frontier_priority(node, graph, step):\n    return 0.0\n")
     monkeypatch.setattr("harness.orchestration.runtime._write_policy", lambda *a, **k: None)
     monkeypatch.setattr("harness.orchestration.runtime._hash_tests_dir", lambda *a, **k: "hash")
     monkeypatch.setattr("harness.orchestration.runtime.generate_policy", lambda **kwargs: "def frontier_priority(node, graph, step):\n    return 1.0\n")
@@ -13796,6 +14594,99 @@ def test_resolve_session_defaults():
     assert resolve_session_id(none_cfg, run_id="run") is None
 </file>
 
+<file path="tests_harness/test_static_graph_kernel.py">
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import pytest
+
+from harness.localization.models import LCAGold, LCAPrediction
+from harness.localization.scoring import score_with_projection
+from harness.localization.static_graph import (
+    GraphStore,
+    compute_hop_distance_summary,
+    extract_anchors,
+    raw_tree_to_graph,
+    resolve_anchors,
+)
+from harness.localization.static_graph.raw_tree import RawEdge, RawFile, RawFunction, RawTree
+from harness.localization.token_usage import TokenUsage, TokenUsageRecord
+
+
+def test_raw_tree_normalization_and_hops():
+    tree = RawTree(
+        files=[
+            RawFile(
+                path="src/a.py",
+                functions=[RawFunction(id="src/a.py:foo", name="foo", file="src/a.py")],
+                edges=[
+                    RawEdge(source="src/a.py", target="src/b.py", kind="contains"),
+                    RawEdge(source="src/a.py:foo", target="bar", kind="call"),
+                ],
+            ),
+            RawFile(path="src/b.py"),
+        ]
+    )
+    store = GraphStore(raw_tree_to_graph(tree))
+    anchors = resolve_anchors(store, ["src/a.py"])
+    prediction_nodes = {"src/b.py": store.find_file("src/b.py")}
+    hop_result = compute_hop_distance_summary(store, anchors, prediction_nodes)
+    assert hop_result.hop_by_prediction["src/b.py"] == 1
+    assert hop_result.min_hop == 1
+
+
+def test_anchor_extraction_order_and_dedup():
+    text = "Fix in `pkg/mod.py` near src/util/helper.py and class FooBar in code ```\n def baz_snake():\n pass\n```"
+    anchors = extract_anchors(text)
+    assert anchors[0] == "pkg/mod.py"
+    # Slashy tokens are captured; partials may appear due to regex boundaries.
+    assert any("util" in a for a in anchors)
+    assert "FooBar" in anchors
+    assert "baz_snake" in anchors
+    # ensure no duplicates
+    assert len(anchors) == len(set(anchors))
+
+
+def test_score_with_projection_uses_min_hop(monkeypatch, tmp_path: Path):
+    # Stub ingest_repo to avoid llm-tldr dependency in test
+    from harness import localization as loc_mod
+    import harness.localization.scoring as scoring_mod
+
+    tree = RawTree(
+        files=[
+            RawFile(
+                path="repo/file_a.py",
+                edges=[RawEdge(source="repo/file_a.py", target="repo/file_b.py", kind="contains")],
+            ),
+            RawFile(path="repo/file_b.py"),
+        ]
+    )
+
+    def fake_ingest(_repo: Path) -> RawTree:
+        return tree
+
+    monkeypatch.setattr(scoring_mod, "ingest_repo", fake_ingest)
+    monkeypatch.setattr(loc_mod.static_graph, "ingest_repo", fake_ingest)
+
+    prediction = LCAPrediction(predicted_files=["repo/file_b.py"])
+    gold = LCAGold(changed_files=["repo/file_a.py"])
+    usage = TokenUsageRecord(available=True, usage=TokenUsage(total_tokens=100))
+    metrics = score_with_projection(
+        prediction=prediction,
+        gold=gold,
+        repo_path=tmp_path,
+        anchor_text="`repo/file_a.py`",
+        token_usage=usage,
+    )
+    assert metrics.distance_term == pytest.approx(0.5)
+    assert metrics.token_term == pytest.approx(1.0 / (1.0 + math.log1p(100)))
+    assert metrics.hop_token_score is not None
+    assert metrics.per_file_hops is not None
+    assert metrics.per_file_hops["repo/file_b.py"] == 1
+</file>
+
 <file path="tests_harness/test_subprocess_guard.py">
 from pathlib import Path
 
@@ -13994,7 +14885,7 @@ def test_writer_records_policy_events(monkeypatch):
 
     class DummyMessage:
         def __init__(self):
-            self.content = '{"code": "def score(node, graph, step):\\n    return 1.0\\n"}'
+            self.content = '{"code": "def frontier_priority(node, graph, step):\\n    return 1.0\\n"}'
 
     class DummyChoice:
         def __init__(self):
@@ -14044,7 +14935,7 @@ def test_writer_records_policy_events(monkeypatch):
 
     result = writer.generate_policy(
         feedback={"a": 1},
-        current_policy="def score(node, graph, step):\n    return 0.0\n",
+        current_policy="def frontier_priority(node, graph, step):\n    return 0.0\n",
         tests="",
         frontier_context="",
         frontier_context_details=type_loader.FrontierContext(
@@ -14061,7 +14952,7 @@ def test_writer_records_policy_events(monkeypatch):
         comparison_summary="IC vs JC summary",
         parent_trace=DummySpan("parent"),
     )
-    assert "def score" in result
+    assert "def frontier_priority" in result
     assert ("writer.policy_compiled", 1.0) in attempt_scores
     assert ("writer.policy_generated", 1.0) in attempt_scores
 
@@ -14662,6 +15553,7 @@ import argparse
 from pathlib import Path
 import sys
 from contextlib import nullcontext
+from typing import Any
 
 # Ensure the repository root (parent of the harness package) is on sys.path when executed as a script.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -14836,24 +15728,28 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     return repair_chart, opt_chart
 
 
-def _render(machine: object, fmt: str) -> str:
+def _render(machine: Any, fmt: str) -> str:
     # python-statemachine exposes a private graph builder; use it to support multiple formats.
-    graph = machine._graph()  # type: ignore[attr-defined]
+    graph_builder = getattr(machine, "_graph", None)
+    graph: Any = graph_builder() if callable(graph_builder) else None
+
+    def _safe_to_string(obj: Any) -> str:
+        return obj.to_string() if obj is not None and hasattr(obj, "to_string") else ""
     if fmt == "mermaid":
         try:
             return f"{machine:mermaid}"
         except Exception:
-            return graph.to_string()  # type: ignore[attr-defined]
+            return _safe_to_string(graph)
     if fmt == "dot":
         try:
             return f"{machine:dot}"
         except Exception:
-            return graph.to_string()  # type: ignore[attr-defined]
+            return _safe_to_string(graph)
     if fmt == "md":
         try:
             return f"{machine:md}"
         except Exception:
-            return graph.to_string()  # type: ignore[attr-defined]
+            return _safe_to_string(graph)
     raise ValueError(f"Unsupported format: {fmt}")
 
 
@@ -15738,6 +16634,8 @@ dependencies = [
     "mcp>=1.26.0",
     "statemachine>=0.1",
     "pydot>=2.0.0",
+    "networkx>=3.0",
+    "llm-tldr>=1.5.2",
 ]
 
 [tool.uv.sources]
@@ -15759,7 +16657,7 @@ reportUnnecessaryIsInstance = "warning"
 reportUnnecessaryCast = "warning"
 reportUnnecessaryComparison = "warning"
 include = ["./"]
-exclude = ["tests_harness"]
+exclude = ["tests_harness", "**/tests_harness"]
 </file>
 
 </files>

@@ -185,11 +185,13 @@ class LocalizationPrediction(BaseModel):
     predicted_files: List[str]
 
     @classmethod
-    def from_raw(cls, value: Sequence[str] | Mapping[str, Sequence[str]]) -> "LocalizationPrediction":
+    def from_raw(cls, value: Sequence[str] | Mapping[str, object]) -> "LocalizationPrediction":
         if isinstance(value, Mapping):
             files = value.get("predicted_files", [])
-            return cls(predicted_files=list(files))
-        return cls(predicted_files=list(value))
+            if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
+                return cls(predicted_files=[str(f) for f in files])
+            return cls(predicted_files=[])
+        return cls(predicted_files=[str(v) for v in value])
 
 
 class LocalizationGold(BaseModel):
@@ -198,11 +200,13 @@ class LocalizationGold(BaseModel):
     changed_files: List[str]
 
     @classmethod
-    def from_raw(cls, value: Sequence[str] | Mapping[str, Sequence[str]]) -> "LocalizationGold":
+    def from_raw(cls, value: Sequence[str] | Mapping[str, object]) -> "LocalizationGold":
         if isinstance(value, Mapping):
             files = value.get("changed_files", [])
-            return cls(changed_files=list(files))
-        return cls(changed_files=list(value))
+            if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
+                return cls(changed_files=[str(f) for f in files])
+            return cls(changed_files=[])
+        return cls(changed_files=[str(v) for v in value])
 
 
 class LocalizationEvidenceItem(BaseModel):
@@ -218,11 +222,19 @@ class LocalizationEvidence(BaseModel):
     items: List[LocalizationEvidenceItem] = Field(default_factory=list)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Sequence[str]]) -> "LocalizationEvidence":
+    def from_mapping(cls, value: Mapping[str, object]) -> "LocalizationEvidence":
+        if not isinstance(value, Mapping):
+            return cls()
+        pairs: list[tuple[str, Sequence[str]]] = []
+        for path, hints in value.items():
+            if isinstance(hints, Sequence) and not isinstance(hints, (str, bytes)):
+                pairs.append((str(path), [str(h) for h in hints]))
+        if not pairs:
+            return cls()
         return cls(
             items=[
-                LocalizationEvidenceItem(file=str(path), hints=[str(h) for h in hints])
-                for path, hints in value.items()
+                LocalizationEvidenceItem(file=path, hints=list(hints))
+                for path, hints in pairs
             ]
         )
 
@@ -252,15 +264,34 @@ class LocalizationMetrics(BaseModel):
     f1: float
     hit: float
     score: float
+    hop_token_score: float | None = None
+    distance_term: float | None = None
+    token_term: float | None = None
+    per_file_hops: Mapping[str, float | None] | None = None
 
     @classmethod
-    def from_mapping(cls, metrics: Mapping[str, float]) -> "LocalizationMetrics":
+    def from_mapping(cls, metrics: Mapping[str, object]) -> "LocalizationMetrics":
+        def _f(val: object, default: float = 0.0) -> float:
+            return float(val) if isinstance(val, (int, float)) else default
+
+        def _fo(val: object) -> float | None:
+            return float(val) if isinstance(val, (int, float)) else None
+
+        per_file_hops_val = metrics.get("per_file_hops")
+        per_file_hops: Mapping[str, float | None] | None = None
+        if isinstance(per_file_hops_val, Mapping):
+            per_file_hops = {str(k): _fo(v) for k, v in per_file_hops_val.items()}
+
         return cls(
-            precision=float(metrics.get("precision", 0.0)),
-            recall=float(metrics.get("recall", 0.0)),
-            f1=float(metrics.get("f1", 0.0)),
-            hit=float(metrics.get("hit", 0.0)),
-            score=float(metrics.get("score", metrics.get("f1", 0.0))),
+            precision=_f(metrics.get("precision"), 0.0),
+            recall=_f(metrics.get("recall"), 0.0),
+            f1=_f(metrics.get("f1"), 0.0),
+            hit=_f(metrics.get("hit"), 0.0),
+            score=_f(metrics.get("score", metrics.get("f1", 0.0)), _f(metrics.get("f1"), 0.0)),
+            hop_token_score=_fo(metrics.get("hop_token_score")),
+            distance_term=_fo(metrics.get("distance_term")),
+            token_term=_fo(metrics.get("token_term")),
+            per_file_hops=per_file_hops,
         )
 
 
@@ -345,11 +376,13 @@ def _as_list(value: object) -> List[str]:
     return [str(value)]
 
 
-def normalize_lca_task(data: Mapping[str, object], defaults: tuple[str, str, str] | None = None) -> LCATask:
+def normalize_lca_task(data: Mapping[str, object] | LCATask, defaults: tuple[str, str, str] | None = None) -> LCATask:
     """
     Coerce an arbitrary mapping (e.g., LCA dataset row) into an `LCATask`.
     `defaults` may provide (dataset_name, dataset_config, dataset_split) when absent from the row.
     """
+    if isinstance(data, LCATask):
+        return data
     identity_map = data.get("identity") if isinstance(data.get("identity"), Mapping) else {}
     dataset_name = str(
         data.get("dataset_name")

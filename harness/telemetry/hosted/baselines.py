@@ -248,7 +248,7 @@ def compute_baseline_for_task(
                 materialization_events=materialization.events if materialization else None,
             )
             for name, value in metrics.model_dump().items():
-                if value is None:
+                if value is None or isinstance(value, dict):
                     continue
                 emit_score_for_handle(
                     trace,

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from iterative_context.server import IterativeContextToolRuntime, list_tools
 
-from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
+from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async, serialize_tool_result_for_model
 from harness.utils.openai_schema import ChatCompletionToolParam
 
 
@@ -27,6 +27,7 @@ class ToolCallPayload(BaseModel):
 
     name: str
     arguments: dict[str, Any]
+    source_observations: list[dict[str, Any]] | None = None
 
 
 def _coerce_arguments_for_schema(arguments: dict[str, Any], tool_spec: ChatCompletionToolParam | None) -> dict[str, Any]:
@@ -77,7 +78,12 @@ class IterativeContextBackend:
                 self._tool_spec_by_name[name] = spec
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
-        payload = ToolCallPayload(name=name, arguments=arguments or {})
+        source_obs = arguments.get("source_observations") if isinstance(arguments, dict) else None
+        payload = ToolCallPayload(name=name, arguments=arguments or {}, source_observations=source_obs)
         coerced_args = _coerce_arguments_for_schema(payload.arguments, self._tool_spec_by_name.get(payload.name))
         result_blocks = run_async(self._runtime.call_tool(payload.name, coerced_args))
-        return parse_text_content_payload(result_blocks)
+        parsed = parse_text_content_payload(result_blocks)
+        # Preserve original payload shape for callers/tests; add observations when provided.
+        if payload.source_observations:
+            return {"result": parsed, "observations": payload.source_observations}
+        return parsed

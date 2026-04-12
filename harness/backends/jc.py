@@ -24,6 +24,7 @@ class ToolCallPayload(BaseModel):
 
     name: str
     arguments: dict[str, Any]
+    source_observations: list[dict[str, Any]] | None = None
 
 
 class JCodeMunchBackend:
@@ -97,6 +98,10 @@ class JCodeMunchBackend:
                 call_tool,
             )
         )
-        payload = ToolCallPayload(name=name, arguments=arguments or {})
+        source_obs = arguments.get("source_observations") if isinstance(arguments, dict) else None
+        payload = ToolCallPayload(name=name, arguments=arguments or {}, source_observations=source_obs)
         result_blocks = run_async(call_tool_fn(payload.name, payload.arguments))
-        return parse_text_content_payload(result_blocks)
+        parsed = parse_text_content_payload(result_blocks)
+        if payload.source_observations:
+            return {"result": parsed, "observations": payload.source_observations}
+        return parsed

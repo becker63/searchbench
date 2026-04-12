@@ -75,15 +75,14 @@ def cost_details_for_usage(model: str | None, usage_details: dict[str, object] |
     def _as_num(val: object) -> float:
         if isinstance(val, (int, float)):
             return float(val)
-        try:
-            return float(val)  # type: ignore[arg-type]
-        except Exception:
-            return 0.0
+        return 0.0
 
     inp = _as_num(usage_details.get("input") or usage_details.get("prompt_tokens") or usage_details.get("total"))
     out = _as_num(usage_details.get("output") or usage_details.get("completion_tokens") or 0)
-    input_price = float(price_entry["input_price_per_million"]) / 1_000_000
-    output_price = float(price_entry["output_price_per_million"]) / 1_000_000
+    input_raw = price_entry.get("input_price_per_million")
+    output_raw = price_entry.get("output_price_per_million")
+    input_price = float(input_raw) / 1_000_000 if isinstance(input_raw, (int, float)) else 0.0
+    output_price = float(output_raw) / 1_000_000 if isinstance(output_raw, (int, float)) else 0.0
     costs: dict[str, float] = {}
     if inp > 0:
         costs["input"] = inp * input_price

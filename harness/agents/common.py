@@ -113,12 +113,18 @@ class AgentTaskPayload(BaseModel):
         if isinstance(value, Mapping):
             identity_val = value.get("identity")
             context_val = value.get("context")
-            normalized_identity = (
-                identity_val.model_dump() if identity_val is not None and hasattr(identity_val, "model_dump") else identity_val
-            )
-            normalized_context = (
-                context_val.model_dump() if context_val is not None and hasattr(context_val, "model_dump") else context_val
-            )
+
+            def _maybe_dump(obj: object) -> object:
+                model_dump = getattr(obj, "model_dump", None)
+                if callable(model_dump):
+                    try:
+                        return model_dump()
+                    except Exception:
+                        return obj
+                return obj
+
+            normalized_identity = _maybe_dump(identity_val)
+            normalized_context = _maybe_dump(context_val)
             return {
                 **value,
                 "identity": normalized_identity,
