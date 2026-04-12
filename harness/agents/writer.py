@@ -18,7 +18,7 @@ from harness.utils.model_budgets import compute_prompt_char_budget, get_model_bu
 from harness.prompts import WriterPromptContext
 from harness.utils.template_loader import render_prompt_template
 from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
-from harness.utils.type_loader import ScorerContext, format_scoring_context
+from harness.utils.type_loader import FrontierContext, format_frontier_context
 
 
 class WriterRequest(BaseModel):
@@ -29,8 +29,8 @@ class WriterRequest(BaseModel):
     feedback: Mapping[str, object]
     current_policy: str
     tests: str
-    scoring_context: str
-    scoring_context_details: ScorerContext
+    frontier_context: str
+    frontier_context_details: FrontierContext
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -131,8 +131,8 @@ def _ensure_valid_policy_code(code: str) -> str:
         raise ValueError("Writer returned empty code")
     if "```" in cleaned:
         raise ValueError("Writer returned fenced code")
-    if "def score" not in cleaned:
-        raise ValueError("Writer missing score function")
+    if "def frontier_priority" not in cleaned:
+        raise ValueError("Writer missing frontier_priority function")
     compile(cleaned, "<generated-policy>", "exec")
     return cleaned
 
@@ -148,8 +148,8 @@ def _render_writer_prompt(
     diff_str: str,
     diff_hint: str,
     tests: str,
-    scoring_context: str,
-    scoring_context_details: ScorerContext,
+    frontier_context: str,
+    frontier_context_details: FrontierContext,
 ) -> str:
     feedback_text = feedback_str if feedback_str else str(feedback)
     context = WriterPromptContext.model_validate(
@@ -162,8 +162,8 @@ def _render_writer_prompt(
             "diff_str": diff_str,
             "diff_hint": diff_hint,
             "tests": tests,
-            "scoring_context": scoring_context,
-            "scoring_context_details": scoring_context_details,
+            "frontier_context": frontier_context,
+            "frontier_context_details": frontier_context_details,
         }
     )
     rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
@@ -176,8 +176,8 @@ def generate_policy(
     feedback: dict[str, Any],
     current_policy: str,
     tests: str,
-    scoring_context: str,
-    scoring_context_details: ScorerContext,
+    frontier_context: str,
+    frontier_context_details: FrontierContext,
     feedback_str: str,
     guidance_hint: str,
     diff_str: str,
@@ -190,14 +190,14 @@ def generate_policy(
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
-    scoring_context_rendered = scoring_context or format_scoring_context(scoring_context_details)
+    frontier_context_rendered = frontier_context or format_frontier_context(frontier_context_details)
     try:
         WriterRequest(
             feedback=feedback,
             current_policy=current_policy,
             tests=tests,
-            scoring_context=scoring_context_rendered,
-            scoring_context_details=scoring_context_details,
+            frontier_context=frontier_context_rendered,
+            frontier_context_details=frontier_context_details,
             feedback_str=feedback_str,
             guidance_hint=guidance_hint,
             diff_str=diff_str,
@@ -230,8 +230,8 @@ def generate_policy(
         diff_str=diff_str,
         diff_hint=diff_hint,
         tests=tests,
-        scoring_context=scoring_context_rendered,
-        scoring_context_details=scoring_context_details,
+        frontier_context=frontier_context_rendered,
+        frontier_context_details=frontier_context_details,
     )
     with start_observation(
         name="policy_writer",

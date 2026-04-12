@@ -18,8 +18,9 @@ def _bounded_tokens(node: GraphNode, cap: float = 200.0) -> float:
     return 0.0
 
 
-def score(node: GraphNode, graph: Graph, step: int) -> float:
-    """Deterministic scoring function aligned to SelectionCallable.
+def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:
+    """
+    Deterministic traversal priority aligned to SelectionCallable.
 
     Priorities:
       - anchors first, then pending (unexplored) nodes

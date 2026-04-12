@@ -134,7 +134,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         deps = self.deps
         guidance = (
             "Repair mode: produce the smallest change that makes harness/policy.py pass ruff, basedpyright, and pytest. "
-            "Add missing parameter annotations and return type -> float. Do not optimize score until the policy is valid."
+            "Add missing parameter annotations and return type -> float. Do not optimize frontier_priority until the policy is valid."
             if ctx.attempts_used > 0
             else ctx.feedback.guidance_hint
         )
@@ -145,8 +145,8 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             feedback=ctx.feedback.feedback,
             initial_policy=ctx.evaluation.policy_code,
             tests=ctx.feedback.tests,
-            scoring_context=ctx.feedback.scoring_context,
-            scoring_context_details=ctx.feedback.scoring_context_details,
+            frontier_context=ctx.feedback.frontier_context,
+            frontier_context_details=ctx.feedback.frontier_context_details,
             feedback_str=ctx.feedback.feedback_str,
             guidance_hint=guidance,
             diff_str=ctx.feedback.diff_str,

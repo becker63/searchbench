@@ -1,8 +1,8 @@
 {% set system_instructions -%}
-You are optimizing a scoring function for a graph search system.
+You are optimizing a traversal/frontier priority function for a graph search system.
 Respond ONLY with JSON matching the provided schema.
-The 'code' field must contain pure Python defining a typed score function with signature:
-def score(node: GraphNode, graph: Graph, step: int) -> float.
+The 'code' field must contain pure Python defining a typed frontier priority function with signature:
+def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float.
 - node: GraphNode (Pending/Pruned/Anchor/Resolved) from graph_models.py
 - graph: Graph (networkx DiGraph with GraphNode data)
 - step: int traversal step index
@@ -42,15 +42,15 @@ Diff guidance:
 Tests (source of truth, do not modify):
 {{ tests }}
 
-Scoring interface + examples (STRICT CONTRACT):
-{{ scoring_context }}
+Frontier priority interface + examples (STRICT CONTRACT):
+{{ frontier_context }}
 
 Validation requirements:
-- score MUST have type annotations on all parameters and return float
-- Target signature: def score(node: GraphNode, graph: Graph, step: int) -> float
+- frontier_priority MUST have type annotations on all parameters and return float
+- Target signature: def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float
 - Code MUST be valid under BasedPyright
 - Use GraphNode/Graph model fields directly; do NOT invent alternate signatures
-- scorer is deterministic and local to traversal selection
+- frontier priority is deterministic and local to traversal selection
 
 Instructions:
 - Fix errors in order of priority:
@@ -58,7 +58,7 @@ Instructions:
   2. LINT ERRORS
   3. TEST FAILURES
 - Do NOT attempt to optimize until all tests pass
-- MUST define a typed score function used by the harness that returns a float
+- MUST define a typed frontier_priority function used by the harness that returns a float
 - MUST be deterministic
 - MUST NOT import external libraries
 - MUST operate only on provided node/state data

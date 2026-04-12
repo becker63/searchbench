@@ -86,7 +86,7 @@ def test_writer_records_policy_events(monkeypatch):
 
     class DummyMessage:
         def __init__(self):
-            self.content = '{"code": "def score(node, graph, step):\\n    return 1.0\\n"}'
+            self.content = '{"code": "def frontier_priority(node, graph, step):\\n    return 1.0\\n"}'
 
     class DummyChoice:
         def __init__(self):
@@ -136,10 +136,10 @@ def test_writer_records_policy_events(monkeypatch):
 
     result = writer.generate_policy(
         feedback={"a": 1},
-        current_policy="def score(node, graph, step):\n    return 0.0\n",
+        current_policy="def frontier_priority(node, graph, step):\n    return 0.0\n",
         tests="",
-        scoring_context="",
-        scoring_context_details=type_loader.ScorerContext(
+        frontier_context="",
+        frontier_context_details=type_loader.FrontierContext(
             signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
             graph_models="",
             types="",
@@ -153,7 +153,7 @@ def test_writer_records_policy_events(monkeypatch):
         comparison_summary="IC vs JC summary",
         parent_trace=DummySpan("parent"),
     )
-    assert "def score" in result
+    assert "def frontier_priority" in result
     assert ("writer.policy_compiled", 1.0) in attempt_scores
     assert ("writer.policy_generated", 1.0) in attempt_scores
 

@@ -51,7 +51,7 @@ def test_hf_loader_normalizes_rows(monkeypatch):
     assert task.identity.repo_owner == "square"
     assert task.identity.repo_name == "okhttp"
     assert task.identity.base_sha == "abc123"
-    assert sorted(task.gold.normalized_changed_files()) == ["src/Main.kt"]
+    assert sorted(task.gold.normalized_changed_files()) == ["src/main.kt"]
     assert task.context.repo_language == "kotlin"
     assert task.context.repo_license == "apache"
 

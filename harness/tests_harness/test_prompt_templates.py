@@ -19,7 +19,7 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
     template_path = prompts_dir / "policy_writer.jinja"
     template_path.write_text("Policy: {{ current_policy }} | Tests: {{ tests }} | Feedback: {{ feedback_text }}", encoding="utf-8")
     monkeypatch.setattr(template_loader, "find_repo_root", lambda: tmp_path)
-    dummy_ctx = type_loader.ScorerContext(
+    dummy_ctx = type_loader.FrontierContext(
         signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
         graph_models="",
         types="",
@@ -37,8 +37,8 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
         diff_str="diff",
         diff_hint="hint2",
         tests="tests-content",
-        scoring_context="ctx",
-        scoring_context_details=dummy_ctx,
+        frontier_context="ctx",
+        frontier_context_details=dummy_ctx,
     )
     assert "code_v1" in rendered
     assert "tests-content" in rendered
@@ -47,7 +47,7 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_real_writer_prompt_includes_selection_signature():
     rendered = writer._render_writer_prompt(
-        current_policy="def score(node, graph, step):\n    return 0",
+        current_policy="def frontier_priority(node, graph, step):\n    return 0",
         failure_context="",
         feedback_str="",
         feedback={},
@@ -56,14 +56,14 @@ def test_real_writer_prompt_includes_selection_signature():
         diff_str="",
         diff_hint="",
         tests="",
-        scoring_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
-        scoring_context_details=type_loader.ScorerContext(
+        frontier_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        frontier_context_details=type_loader.FrontierContext(
             signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
             graph_models="class GraphNode:\n    pass\nclass Graph:\n    ...",
             types="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
             examples="from iterative_context.graph_models import Graph, GraphNode\n"
-            "def score(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
-            notes="Traversal calls score(node, graph, step).",
+            "def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
+            notes="Traversal calls frontier_priority(node, graph, step).",
         ),
     )
     assert "SelectionCallable" in rendered
@@ -106,8 +106,8 @@ def test_writer_prompt_validation_rejects_extra_fields():
                 "diff_str": "",
                 "diff_hint": "",
                 "tests": "",
-                "scoring_context": "",
-                "scoring_context_details": type_loader.ScorerContext(
+                "frontier_context": "",
+                "frontier_context_details": type_loader.FrontierContext(
                     signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
                     graph_models="",
                     types="",

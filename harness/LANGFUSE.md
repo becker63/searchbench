@@ -45,4 +45,4 @@ Leaf-operation observability remains with:
 - To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.tracing.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/tracing/cerebras_pricing.py`.
 
 ## Policy Loading
-- `policy_loader.py` now loads `policy.py` and requires the public Iterative Context scorer contract `score(node: GraphNode, graph: Graph, step: int) -> float` (SelectionCallable). No sandbox or restricted execution.
+- `policy_loader.py` now loads `policy.py` and requires the public Iterative Context frontier priority contract `frontier_priority(node: GraphNode, graph: Graph, step: int) -> float` (SelectionCallable). No sandbox or restricted execution.

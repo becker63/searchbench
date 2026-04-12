@@ -1352,7 +1352,7 @@ from harness.utils.model_budgets import compute_prompt_char_budget, get_model_bu
 from harness.prompts import WriterPromptContext
 from harness.utils.template_loader import render_prompt_template
 from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
-from harness.utils.type_loader import ScorerContext, format_scoring_context
+from harness.utils.type_loader import FrontierContext, format_frontier_context
 
 
 class WriterRequest(BaseModel):
@@ -1363,8 +1363,8 @@ class WriterRequest(BaseModel):
     feedback: Mapping[str, object]
     current_policy: str
     tests: str
-    scoring_context: str
-    scoring_context_details: ScorerContext
+    frontier_context: str
+    frontier_context_details: FrontierContext
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -1465,8 +1465,8 @@ def _ensure_valid_policy_code(code: str) -> str:
         raise ValueError("Writer returned empty code")
     if "```" in cleaned:
         raise ValueError("Writer returned fenced code")
-    if "def score" not in cleaned:
-        raise ValueError("Writer missing score function")
+    if "def frontier_priority" not in cleaned:
+        raise ValueError("Writer missing frontier_priority function")
     compile(cleaned, "<generated-policy>", "exec")
     return cleaned
 
@@ -1482,8 +1482,8 @@ def _render_writer_prompt(
     diff_str: str,
     diff_hint: str,
     tests: str,
-    scoring_context: str,
-    scoring_context_details: ScorerContext,
+    frontier_context: str,
+    frontier_context_details: FrontierContext,
 ) -> str:
     feedback_text = feedback_str if feedback_str else str(feedback)
     context = WriterPromptContext.model_validate(
@@ -1496,8 +1496,8 @@ def _render_writer_prompt(
             "diff_str": diff_str,
             "diff_hint": diff_hint,
             "tests": tests,
-            "scoring_context": scoring_context,
-            "scoring_context_details": scoring_context_details,
+            "frontier_context": frontier_context,
+            "frontier_context_details": frontier_context_details,
         }
     )
     rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
@@ -1510,8 +1510,8 @@ def generate_policy(
     feedback: dict[str, Any],
     current_policy: str,
     tests: str,
-    scoring_context: str,
-    scoring_context_details: ScorerContext,
+    frontier_context: str,
+    frontier_context_details: FrontierContext,
     feedback_str: str,
     guidance_hint: str,
     diff_str: str,
@@ -1524,14 +1524,14 @@ def generate_policy(
     """
     Request an updated policy using Cerebras via the OpenAI-compatible client.
     """
-    scoring_context_rendered = scoring_context or format_scoring_context(scoring_context_details)
+    frontier_context_rendered = frontier_context or format_frontier_context(frontier_context_details)
     try:
         WriterRequest(
             feedback=feedback,
             current_policy=current_policy,
             tests=tests,
-            scoring_context=scoring_context_rendered,
-            scoring_context_details=scoring_context_details,
+            frontier_context=frontier_context_rendered,
+            frontier_context_details=frontier_context_details,
             feedback_str=feedback_str,
             guidance_hint=guidance_hint,
             diff_str=diff_str,
@@ -1564,8 +1564,8 @@ def generate_policy(
         diff_str=diff_str,
         diff_hint=diff_hint,
         tests=tests,
-        scoring_context=scoring_context_rendered,
-        scoring_context_details=scoring_context_details,
+        frontier_context=frontier_context_rendered,
+        frontier_context_details=frontier_context_details,
     )
     with start_observation(
         name="policy_writer",
@@ -4482,16 +4482,16 @@ __all__ = ["TokenUsage", "TokenUsageRecord", "extract_token_usage_record"]
 <file path="orchestration/__init__.py">
 """Orchestration: state machines, listeners, and runtime coordination."""
 
-from .runtime import (
-    _clean_policy_code,
-    _hash_tests_dir,
-    _read_policy,
-    _write_policy,
+from .runtime import (  # pyright: ignore[reportPrivateUsage,reportUnusedImport]
+    _clean_policy_code,  # pyright: ignore[reportPrivateUsage]
+    _hash_tests_dir,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]
+    _read_policy,  # pyright: ignore[reportPrivateUsage]
+    _write_policy,  # pyright: ignore[reportPrivateUsage]
     emit_score,
     evaluate_policy_on_item,
     index_folder,
-    load_policy,
-    build_scorer_context,
+    load_frontier_policy,
+    build_frontier_context,
     load_graph_models,
     prepare_iteration_tasks,
     run_loop,
@@ -4527,9 +4527,9 @@ __all__ = [
     "_clean_policy_code",
     "index_folder",
     "emit_score",
-    "load_policy",
+    "load_frontier_policy",
     "load_graph_models",
-    "build_scorer_context",
+    "build_frontier_context",
     "run_policy_pipeline",
     "OptimizationStateMachine",
     "RepairStateMachine",
@@ -4903,7 +4903,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         deps = self.deps
         guidance = (
             "Repair mode: produce the smallest change that makes harness/policy.py pass ruff, basedpyright, and pytest. "
-            "Add missing parameter annotations and return type -> float. Do not optimize score until the policy is valid."
+            "Add missing parameter annotations and return type -> float. Do not optimize frontier_priority until the policy is valid."
             if ctx.attempts_used > 0
             else ctx.feedback.guidance_hint
         )
@@ -4914,8 +4914,8 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             feedback=ctx.feedback.feedback,
             initial_policy=ctx.evaluation.policy_code,
             tests=ctx.feedback.tests,
-            scoring_context=ctx.feedback.scoring_context,
-            scoring_context_details=ctx.feedback.scoring_context_details,
+            frontier_context=ctx.feedback.frontier_context,
+            frontier_context_details=ctx.feedback.frontier_context_details,
             feedback_str=ctx.feedback.feedback_str,
             guidance_hint=guidance,
             diff_str=ctx.feedback.diff_str,
@@ -5333,6 +5333,8 @@ from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol, cast
 from jcodemunch_mcp.tools.index_folder import index_folder
 
 from harness.agents.localizer import run_ic_iteration
+from harness.localization.materialization.materialize import RepoMaterializer
+from harness.localization.runtime.evaluate import LocalizationRunner, MachineScorePolicy
 from harness.telemetry.tracing import (
     flush_langfuse,
     propagate_context,
@@ -5341,12 +5343,19 @@ from harness.telemetry.tracing import (
 from harness.telemetry.tracing.score_emitter import emit_score
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
-from harness.policy.load import load_policy
+from harness.policy.load import load_frontier_policy
 from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
 from harness.utils.repo_root import find_repo_root
 from harness.utils.test_loader import format_tests_for_prompt, load_tests
-from harness.utils.type_loader import ScorerContext, build_scorer_context, format_scoring_context, load_graph_models, load_scoring_examples, load_scoring_types
+from harness.utils.type_loader import (
+    FrontierContext,
+    build_frontier_context,
+    format_frontier_context,
+    load_frontier_examples,
+    load_frontier_types,
+    load_graph_models,
+)
 from harness.agents.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 from harness.orchestration.types import SpanHandle
@@ -5354,8 +5363,6 @@ from harness.orchestration.types import SpanHandle
 if TYPE_CHECKING:
     from harness.telemetry.hosted.baselines import BaselineSnapshot
     from iterative_context.graph_models import Graph, GraphNode
-    from harness.localization.materialization.materialize import RepoMaterializer
-    from harness.localization.runtime.evaluate import LocalizationRunner, MachineScorePolicy
 
 from .machine import OptimizationStateMachine
 from .types import (
@@ -5388,7 +5395,7 @@ _MAX_FAILURE_SUMMARY_CHARS = 400
 # Re-exported helpers so callers can monkeypatch harness.orchestration.runtime.* directly.
 _REEXPORTED = (
     index_folder,
-    load_policy,
+    load_frontier_policy,
     load_graph_models,
     run_ic_iteration,
     compute_diff,
@@ -5398,10 +5405,10 @@ _REEXPORTED = (
     find_repo_root,
     format_tests_for_prompt,
     load_tests,
-    build_scorer_context,
-    format_scoring_context,
-    load_scoring_examples,
-    load_scoring_types,
+    build_frontier_context,
+    format_frontier_context,
+    load_frontier_examples,
+    load_frontier_types,
     generate_policy,
     classify_results,
     default_pipeline,
@@ -5414,10 +5421,10 @@ def evaluate_localization_batch(
     tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
     *,
     dataset_source: str | None = None,
-    materializer: "RepoMaterializer | None" = None,
+    materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
-    runner: "LocalizationRunner | None" = None,
-    machine_score_policy: "MachineScorePolicy" = MachineScorePolicy.AGGREGATE if TYPE_CHECKING else None,  # type: ignore[assignment]
+    runner: LocalizationRunner | None = None,
+    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
 ):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
@@ -5435,13 +5442,13 @@ def evaluate_localization_batch(
     )
 
 
-def score(node: "GraphNode", graph: "Graph", step: int) -> float:
+def frontier_priority(node: "GraphNode", graph: "Graph", step: int) -> float:
     """
-    Delegate to policy.score while keeping a stable monkeypatchable attribute on this module.
+    Delegate to policy.frontier_priority while keeping a stable monkeypatchable attribute on this module.
     """
-    from harness.policy import score as _policy_score
+    from harness.policy import frontier_priority as _frontier_priority
 
-    return _policy_score(node, graph, step)
+    return _frontier_priority(node, graph, step)
 
 
 def _pkg_attr(name: str) -> Any:
@@ -5668,16 +5675,16 @@ def build_iteration_feedback(
     format_tests_for_prompt_fn = cast(
         Callable[[object], str], _pkg_attr("format_tests_for_prompt")
     )
-    build_scorer_context_fn = cast(Callable[[Path], ScorerContext], _pkg_attr("build_scorer_context"))
-    format_scoring_context_fn = cast(Callable[..., str], _pkg_attr("format_scoring_context"))
+    build_frontier_context_fn = cast(Callable[[Path], FrontierContext], _pkg_attr("build_frontier_context"))
+    format_frontier_context_fn = cast(Callable[..., str], _pkg_attr("format_frontier_context"))
     compute_diff_fn = cast(Callable[..., object], _pkg_attr("compute_diff"))
     format_diff_fn = cast(Callable[[object], str], _pkg_attr("format_diff"))
     interpret_diff_fn = cast(Callable[[object], str], _pkg_attr("interpret_diff"))
 
     tests = load_tests_fn(repo_root)
     tests_str = format_tests_for_prompt_fn(tests)
-    scorer_ctx = build_scorer_context_fn(repo_root)
-    scoring_ctx = format_scoring_context_fn(scorer_ctx)
+    frontier_ctx = build_frontier_context_fn(repo_root)
+    frontier_ctx_str = format_frontier_context_fn(frontier_ctx)
 
     diff_str = ""
     diff_hint = ""
@@ -5706,8 +5713,8 @@ def build_iteration_feedback(
 
     return FeedbackPackage(
         tests=tests_str,
-        scoring_context=scoring_ctx,
-        scoring_context_details=scorer_ctx,
+        frontier_context=frontier_ctx_str,
+        frontier_context_details=frontier_ctx,
         comparison_summary=evaluation.comparison_summary,
         feedback=FeedbackEntries.model_validate({"entries": feedback_entries}),
         feedback_str=str(evaluation.metrics.get("error", "")),
@@ -5722,8 +5729,8 @@ def attempt_policy_generation(
     feedback: FeedbackEntries,
     initial_policy: str,
     tests: str,
-    scoring_context: str,
-    scoring_context_details: ScorerContext,
+    frontier_context: str,
+    frontier_context_details: FrontierContext,
     feedback_str: str,
     guidance_hint: str,
     diff_str: str,
@@ -5747,8 +5754,8 @@ def attempt_policy_generation(
             },
             current_policy=initial_policy,
             tests=tests,
-            scoring_context=scoring_context,
-            scoring_context_details=scoring_context_details,
+            frontier_context=frontier_context,
+            frontier_context_details=frontier_context_details,
             feedback_str=str(feedback_str),
             guidance_hint=guidance_hint,
             diff_str=diff_str,
@@ -6000,7 +6007,7 @@ from typing import TYPE_CHECKING, Callable, ContextManager, Mapping, Protocol, S
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
-from harness.utils.type_loader import ScorerContext
+from harness.utils.type_loader import FrontierContext
 from harness.localization.models import LCAContext, LCATaskIdentity
 
 if TYPE_CHECKING:
@@ -6262,8 +6269,8 @@ class FeedbackPackage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tests: str
-    scoring_context: str
-    scoring_context_details: ScorerContext
+    frontier_context: str
+    frontier_context_details: FrontierContext
     comparison_summary: str | None
     feedback: FeedbackEntries
     feedback_str: str
@@ -6837,12 +6844,15 @@ class ExecutionBackend:
 </file>
 
 <file path="policy/__init__.py">
-"""Policy: scoring logic, loader, and examples."""
+"""Policy: frontier-selection priority logic, loader, and examples."""
 
-from .current import score
-from .load import load_policy
+from .current import frontier_priority
+from .load import load_frontier_policy
 
-__all__ = ["score", "load_policy"]
+__all__ = [
+    "frontier_priority",
+    "load_frontier_policy",
+]
 </file>
 
 <file path="policy/current.py">
@@ -6866,8 +6876,9 @@ def _bounded_tokens(node: GraphNode, cap: float = 200.0) -> float:
     return 0.0
 
 
-def score(node: GraphNode, graph: Graph, step: int) -> float:
-    """Deterministic scoring function aligned to SelectionCallable.
+def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:
+    """
+    Deterministic traversal priority aligned to SelectionCallable.
 
     Priorities:
       - anchors first, then pending (unexplored) nodes
@@ -6903,19 +6914,19 @@ def score(node: GraphNode, graph: Graph, step: int) -> float:
 from __future__ import annotations
 
 """
-Example scoring policies aligned to Iterative Context's public scorer contract.
+Example frontier-priority policies aligned to Iterative Context's traversal contract.
 
 This file is meant to teach policy authors and the writer model the expected
-shape of a scoring function:
+shape of a traversal-priority function:
 
-    score(node: GraphNode, graph: Graph, step: int) -> float
+    frontier_priority(node: GraphNode, graph: Graph, step: int) -> float
 
 It intentionally contains multiple examples with different styles:
-- `score_basic`: minimal and readable
-- `score_connectivity_first`: favors graph structure
-- `score_token_aware`: uses state narrowing and token information
-- `score_conservative`: heavily avoids pruned/resolved nodes
-- `score`: default balanced example
+- `frontier_priority_basic`: minimal and readable
+- `frontier_priority_connectivity_first`: favors graph structure
+- `frontier_priority_token_aware`: uses state narrowing and token information
+- `frontier_priority_conservative`: heavily avoids pruned/resolved nodes
+- `frontier_priority`: default balanced example
 
 Guidelines demonstrated here:
 - use direct typed access for stable fields like `node.id` and `node.state`
@@ -6952,7 +6963,7 @@ def _bounded_tokens(node: GraphNode, cap: float = 200.0) -> float:
     return 0.0
 
 
-def score_basic(node: GraphNode, graph: Graph, step: int) -> float:
+def frontier_priority_basic(node: GraphNode, graph: Graph, step: int) -> float:
     """
     Minimal example:
     - prefer pending and anchor nodes
@@ -6977,7 +6988,7 @@ def score_basic(node: GraphNode, graph: Graph, step: int) -> float:
     return float(total)
 
 
-def score_connectivity_first(node: GraphNode, graph: Graph, step: int) -> float:
+def frontier_priority_connectivity_first(node: GraphNode, graph: Graph, step: int) -> float:
     """
     Connectivity-heavy example:
     - still respects state
@@ -7003,7 +7014,7 @@ def score_connectivity_first(node: GraphNode, graph: Graph, step: int) -> float:
     return float(total)
 
 
-def score_token_aware(node: GraphNode, graph: Graph, step: int) -> float:
+def frontier_priority_token_aware(node: GraphNode, graph: Graph, step: int) -> float:
     """
     Token-aware example:
     - prefers anchors
@@ -7021,60 +7032,56 @@ def score_token_aware(node: GraphNode, graph: Graph, step: int) -> float:
     elif node.state == "pruned":
         total -= 100.0
 
-    degree = _degree(node, graph)
-    total += min(float(degree), 20.0) * 0.35
+    tokens = _bounded_tokens(node, cap=150.0)
+    total += tokens * 0.07
 
-    tokens = _bounded_tokens(node, cap=500.0)
-    if tokens > 0.0:
-        # Reward presence of useful evidence/tokens, but taper off.
-        total += min(tokens, 120.0) * 0.06
-        # Slight penalty for very large token footprints.
-        if tokens > 150.0:
-            total -= (tokens - 150.0) * 0.015
+    if tokens > 120.0:
+        total -= (tokens - 120.0) * 0.02
 
+    total += _degree(node, graph) * 0.35
     total += min(float(step), 6.0) * 0.2
 
     return float(total)
 
 
-def score_conservative(node: GraphNode, graph: Graph, step: int) -> float:
+def frontier_priority_conservative(node: GraphNode, graph: Graph, step: int) -> float:
     """
     Conservative example:
-    - strongly prefers pending/anchor
-    - strongly demotes resolved/pruned
-    - uses degree as a secondary signal
+    - heavily penalizes pruned nodes
+    - modest penalty for resolved nodes
+    - moderate encouragement for anchors
     """
     total = 0.0
-
-    if node.state == "pending":
-        total += 8.0
-    elif node.state == "anchor":
-        total += 12.0
-    elif node.state == "resolved":
-        total -= 6.0
-    elif node.state == "pruned":
+    if node.state == "pruned":
         total -= 100.0
+    elif node.state == "resolved":
+        total -= 2.5
+    elif node.state == "pending":
+        total += 5.5
+    elif node.state == "anchor":
+        total += 10.5
 
     degree = _degree(node, graph)
-    total += min(float(degree), 15.0) * 0.3
+    total += min(float(degree), 25.0) * 0.45
 
-    if node.state == "anchor":
-        tokens = _bounded_tokens(node, cap=100.0)
-        total += tokens * 0.04
+    tokens = _bounded_tokens(node, cap=120.0)
+    if tokens > 0.0:
+        total += tokens * 0.08
 
-    # Conservative policies often care less about step.
-    total += min(float(step), 3.0) * 0.1
+    total += min(float(step), 5.0) * 0.2
 
     return float(total)
 
 
-def score_balanced(node: GraphNode, graph: Graph, step: int) -> float:
+def frontier_priority_balanced(node: GraphNode, graph: Graph, step: int) -> float:
     """
-    Balanced example:
-    - combines state priority
-    - moderate structural reward
-    - moderate token reward
-    - mild step awareness
+    Balanced example combining several traversal signals:
+    - anchors/pending favored
+    - resolved slightly positive
+    - pruned heavily negative
+    - degree weighted moderately
+    - tokens on anchor/resolved contribute
+    - iteration step provides light lookahead preference
     """
     total = 0.0
 
@@ -7099,23 +7106,23 @@ def score_balanced(node: GraphNode, graph: Graph, step: int) -> float:
     return float(total)
 
 
-def score(node: GraphNode, graph: Graph, step: int) -> float:
+def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:
     """
-    Default example scoring function aligned to SelectionCallable.
+    Default frontier priority aligned to SelectionCallable.
 
     Searchbench can use this as the primary example while still exposing the
     other examples in this file for the writer to learn from.
     """
-    return score_balanced(node, graph, step)
+    return frontier_priority_balanced(node, graph, step)
 
 
 __all__ = [
-    "score",
-    "score_basic",
-    "score_connectivity_first",
-    "score_token_aware",
-    "score_conservative",
-    "score_balanced",
+    "frontier_priority",
+    "frontier_priority_basic",
+    "frontier_priority_connectivity_first",
+    "frontier_priority_token_aware",
+    "frontier_priority_conservative",
+    "frontier_priority_balanced",
 ]
 </file>
 
@@ -7131,20 +7138,22 @@ from iterative_context.graph_models import Graph, GraphNode  # type: ignore[impo
 from iterative_context.types import SelectionCallable  # type: ignore[import-not-found]
 
 
-def _require_selection_callable(score_fn: Callable[[GraphNode, Graph, int], float]) -> SelectionCallable:
-    sig = inspect.signature(score_fn)
+def _require_frontier_policy_callable(priority_fn: Callable[[GraphNode, Graph, int], float]) -> SelectionCallable:
+    sig = inspect.signature(priority_fn)
     if len(sig.parameters) != 3:
-        raise RuntimeError(f"Unsupported score function arity: expected 3 (node, graph, step), got {len(sig.parameters)}")
+        raise RuntimeError(
+            f"Unsupported frontier policy arity: expected 3 (node, graph, step), got {len(sig.parameters)}"
+        )
 
     def wrapped(node: GraphNode, graph: Graph, step: int) -> float:
-        return float(score_fn(node, graph, step))
+        return float(priority_fn(node, graph, step))
 
     return wrapped
 
 
-def load_policy() -> SelectionCallable:
+def load_frontier_policy() -> SelectionCallable:
     """
-    Load the current policy module and return its score callable aligned to SelectionCallable.
+    Load the current policy module and return its traversal-priority callable aligned to SelectionCallable.
     """
     policy_path = Path(__file__).with_name("current.py")
     if not policy_path.exists():
@@ -7156,12 +7165,14 @@ def load_policy() -> SelectionCallable:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # type: ignore[arg-type]
 
-    score_fn_obj = getattr(module, "score", None)
-    if not callable(score_fn_obj):
-        raise AttributeError("Policy module must define a callable 'score'")
+    priority_obj = getattr(module, "frontier_priority", None)
+    if not callable(priority_obj):
+        raise AttributeError("Policy module must define a callable 'frontier_priority'")
 
-    score_fn_typed: Callable[[GraphNode, Graph, int], float] = cast(Callable[[GraphNode, Graph, int], float], score_fn_obj)
-    adapted: SelectionCallable = _require_selection_callable(score_fn_typed)
+    priority_fn_typed: Callable[[GraphNode, Graph, int], float] = cast(
+        Callable[[GraphNode, Graph, int], float], priority_obj
+    )
+    adapted: SelectionCallable = _require_frontier_policy_callable(priority_fn_typed)
     return adapted
 </file>
 
@@ -7201,10 +7212,10 @@ Guidelines:
 
 <file path="prompts/policy_writer.jinja">
 {% set system_instructions -%}
-You are optimizing a scoring function for a graph search system.
+You are optimizing a traversal/frontier priority function for a graph search system.
 Respond ONLY with JSON matching the provided schema.
-The 'code' field must contain pure Python defining a typed score function with signature:
-def score(node: GraphNode, graph: Graph, step: int) -> float.
+The 'code' field must contain pure Python defining a typed frontier priority function with signature:
+def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float.
 - node: GraphNode (Pending/Pruned/Anchor/Resolved) from graph_models.py
 - graph: Graph (networkx DiGraph with GraphNode data)
 - step: int traversal step index
@@ -7244,15 +7255,15 @@ Diff guidance:
 Tests (source of truth, do not modify):
 {{ tests }}
 
-Scoring interface + examples (STRICT CONTRACT):
-{{ scoring_context }}
+Frontier priority interface + examples (STRICT CONTRACT):
+{{ frontier_context }}
 
 Validation requirements:
-- score MUST have type annotations on all parameters and return float
-- Target signature: def score(node: GraphNode, graph: Graph, step: int) -> float
+- frontier_priority MUST have type annotations on all parameters and return float
+- Target signature: def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float
 - Code MUST be valid under BasedPyright
 - Use GraphNode/Graph model fields directly; do NOT invent alternate signatures
-- scorer is deterministic and local to traversal selection
+- frontier priority is deterministic and local to traversal selection
 
 Instructions:
 - Fix errors in order of priority:
@@ -7260,7 +7271,7 @@ Instructions:
   2. LINT ERRORS
   3. TEST FAILURES
 - Do NOT attempt to optimize until all tests pass
-- MUST define a typed score function used by the harness that returns a float
+- MUST define a typed frontier_priority function used by the harness that returns a float
 - MUST be deterministic
 - MUST NOT import external libraries
 - MUST operate only on provided node/state data
@@ -7272,7 +7283,7 @@ Return ONLY the JSON object specified by the schema.
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, field_validator
-from harness.utils.type_loader import ScorerContext
+from harness.utils.type_loader import FrontierContext
 
 
 class WriterPromptContext(BaseModel):
@@ -7288,8 +7299,8 @@ class WriterPromptContext(BaseModel):
     diff_str: str
     diff_hint: str
     tests: str
-    scoring_context: str
-    scoring_context_details: ScorerContext
+    frontier_context: str
+    frontier_context_details: FrontierContext
 
 
 class SystemPromptContext(BaseModel):
@@ -7329,7 +7340,6 @@ import os
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 from statistics import mean
-from typing import Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -7434,7 +7444,7 @@ def emit_baseline_dataset_aggregates(
             data_type="NUMERIC",
             score_id=f"{getattr(span, 'id', None)}-baseline.avg_{metric_name}" if getattr(span, "id", None) else None,
         )
-    summary_metadata = {
+    summary_metadata: dict[str, object] = {
         "selected_count": len(snapshots),
         "aggregate_metrics": metrics_payload,
     }
@@ -7934,6 +7944,11 @@ def run_hosted_localization_baseline(
         dataset_split=req.dataset_split,
         dataset_version=req.version,
     )
+    selected_tasks: list[LCATask] = []
+    snapshots: list[BaselineSnapshot] = []
+    failure: LocalizationEvaluationFailure | None = None
+    effective_workers = 1
+    selection_info: Mapping[str, object] | None = None
     if cached_bundle is None:
         tasks = tasks or fetch_hf_localization_dataset(
             req.dataset,
@@ -7948,8 +7963,6 @@ def run_hosted_localization_baseline(
             selection_info = req.selection
         else:
             selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
-        snapshots: list[BaselineSnapshot] = []
-        failure: LocalizationEvaluationFailure | None = None
         effective_workers = _effective_workers(req.max_workers or 1, len(selected_tasks))
         selection_meta = selection_info or {
             "selected_count": len(selected_tasks),
@@ -12408,7 +12421,7 @@ from harness.orchestration.types import (
     TaskPayload,
 )
 from harness.pipeline.types import PipelineClassification, StepResult
-from harness.utils.type_loader import ScorerContext
+from harness.utils.type_loader import FrontierContext
 
 
 class RecordingSpan:
@@ -12433,11 +12446,11 @@ class RecordingSpan:
 
 
 def _make_feedback() -> FeedbackPackage:
-    scorer_ctx = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
+    scorer_ctx = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
     return FeedbackPackage(
         tests="",
-        scoring_context="",
-        scoring_context_details=scorer_ctx,
+        frontier_context="",
+        frontier_context_details=scorer_ctx,
         comparison_summary=None,
         feedback=FeedbackEntries(),
         feedback_str="",
@@ -13163,28 +13176,30 @@ import pytest
 from harness.policy import load as policy_loader
 
 
-def test_require_selection_callable_accepts_three_args():
-    def score(node, graph, step):
+def test_require_frontier_policy_callable_accepts_three_args():
+    def priority(node, graph, step):
         return 1.0
 
-    wrapped = policy_loader._require_selection_callable(score)
+    wrapped = policy_loader._require_frontier_policy_callable(priority)
     assert wrapped("n", "g", 1) == 1.0
 
 
-def test_require_selection_callable_rejects_wrong_arity():
+def test_require_frontier_policy_callable_rejects_wrong_arity():
     def score_two(node, graph):
         return 1.0
 
     with pytest.raises(RuntimeError):
-        policy_loader._require_selection_callable(score_two)
+        policy_loader._require_frontier_policy_callable(score_two)
 
 
-def test_load_policy_uses_selection_callable(monkeypatch, tmp_path):
+def test_load_frontier_policy_uses_selection_callable(monkeypatch, tmp_path):
     policy_file = tmp_path / "policy.py"
     policy_file.write_text(
         "from iterative_context.graph_models import Graph, GraphNode\n"
+        "def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:\n"
+        "    return 42.0\n"
         "def score(node: GraphNode, graph: Graph, step: int) -> float:\n"
-        "    return 42.0\n",
+        "    return frontier_priority(node, graph, step)\n",
         encoding="utf-8",
     )
 
@@ -13192,7 +13207,7 @@ def test_load_policy_uses_selection_callable(monkeypatch, tmp_path):
         return policy_file
 
     monkeypatch.setattr(policy_loader.Path, "with_name", fake_with_name)
-    score_fn = policy_loader.load_policy()
+    score_fn = policy_loader.load_frontier_policy()
     assert score_fn("n", "g", 0) == 42.0
 </file>
 
@@ -13342,7 +13357,7 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
     template_path = prompts_dir / "policy_writer.jinja"
     template_path.write_text("Policy: {{ current_policy }} | Tests: {{ tests }} | Feedback: {{ feedback_text }}", encoding="utf-8")
     monkeypatch.setattr(template_loader, "find_repo_root", lambda: tmp_path)
-    dummy_ctx = type_loader.ScorerContext(
+    dummy_ctx = type_loader.FrontierContext(
         signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
         graph_models="",
         types="",
@@ -13360,8 +13375,8 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
         diff_str="diff",
         diff_hint="hint2",
         tests="tests-content",
-        scoring_context="ctx",
-        scoring_context_details=dummy_ctx,
+        frontier_context="ctx",
+        frontier_context_details=dummy_ctx,
     )
     assert "code_v1" in rendered
     assert "tests-content" in rendered
@@ -13379,8 +13394,8 @@ def test_real_writer_prompt_includes_selection_signature():
         diff_str="",
         diff_hint="",
         tests="",
-        scoring_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
-        scoring_context_details=type_loader.ScorerContext(
+        frontier_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        frontier_context_details=type_loader.FrontierContext(
             signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
             graph_models="class GraphNode:\n    pass\nclass Graph:\n    ...",
             types="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
@@ -13429,8 +13444,8 @@ def test_writer_prompt_validation_rejects_extra_fields():
                 "diff_str": "",
                 "diff_hint": "",
                 "tests": "",
-                "scoring_context": "",
-                "scoring_context_details": type_loader.ScorerContext(
+                "frontier_context": "",
+                "frontier_context_details": type_loader.FrontierContext(
                     signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
                     graph_models="",
                     types="",
@@ -13537,25 +13552,25 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     repo_dir.mkdir()
 
     monkeypatch.setattr("harness.orchestration.runtime.index_folder", lambda repo: {"repo": "local/fake-repo-id"})
-    monkeypatch.setattr("harness.orchestration.runtime.load_policy", lambda: lambda *_: 1.0)
+    monkeypatch.setattr("harness.orchestration.runtime.load_frontier_policy", lambda: lambda *_: 1.0)
 
     def fake_run_ic_iteration(task: Mapping[str, object], *args, **kwargs):
         ic_repos.append(task.get("repo"))
         return {"observations": [{"tool": "x"}], "node_count": 1}
 
     monkeypatch.setattr("harness.agents.localizer.run_ic_iteration", fake_run_ic_iteration)
-    monkeypatch.setattr("harness.orchestration.runtime.score", lambda result: {"score": 1.0, "ic_nodes": 1, "jc_nodes": 0})
+    monkeypatch.setattr("harness.orchestration.runtime.frontier_priority", lambda *args, **kwargs: 1.0)
     monkeypatch.setattr("harness.orchestration.runtime.load_tests", lambda repo: [])
     monkeypatch.setattr("harness.orchestration.runtime.format_tests_for_prompt", lambda tests: "")
-    from harness.utils.type_loader import ScorerContext
+    from harness.utils.type_loader import FrontierContext
 
-    dummy_ctx = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
-    monkeypatch.setattr("harness.orchestration.runtime.build_scorer_context", lambda repo: dummy_ctx)
-    monkeypatch.setattr("harness.orchestration.runtime.format_scoring_context", lambda *a, **k: "")
+    dummy_ctx = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
+    monkeypatch.setattr("harness.orchestration.runtime.build_frontier_context", lambda repo: dummy_ctx)
+    monkeypatch.setattr("harness.orchestration.runtime.format_frontier_context", lambda *a, **k: "")
     monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda *a, **k: "def score(node, graph, step):\n    return 0.0\n")
     monkeypatch.setattr("harness.orchestration.runtime._write_policy", lambda *a, **k: None)
     monkeypatch.setattr("harness.orchestration.runtime._hash_tests_dir", lambda *a, **k: "hash")
-    monkeypatch.setattr("harness.orchestration.runtime.generate_policy", lambda **kwargs: "def score(node, graph, step):\n    return 1.0\n")
+    monkeypatch.setattr("harness.orchestration.runtime.generate_policy", lambda **kwargs: "def frontier_priority(node, graph, step):\n    return 1.0\n")
 
     class DummyPipeline:
         def run(self, repo_root, observation=None, allow_no_parent=False):
@@ -14031,8 +14046,8 @@ def test_writer_records_policy_events(monkeypatch):
         feedback={"a": 1},
         current_policy="def score(node, graph, step):\n    return 0.0\n",
         tests="",
-        scoring_context="",
-        scoring_context_details=type_loader.ScorerContext(
+        frontier_context="",
+        frontier_context_details=type_loader.FrontierContext(
             signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
             graph_models="",
             types="",
@@ -14388,30 +14403,30 @@ from __future__ import annotations
 from harness.utils import type_loader
 
 
-def test_format_scoring_context_includes_selection_and_graph_models():
-    ctx = type_loader.ScorerContext(
+def test_format_frontier_context_includes_selection_and_graph_models():
+    ctx = type_loader.FrontierContext(
         signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
         graph_models="class GraphNode:\n    pass\nclass Graph:\n    ...\n",
         types="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
-        examples="def score(node, graph, step): ...",
-        notes="Traversal uses score(node, graph, step).",
+        examples="def frontier_priority(node, graph, step): ...",
+        notes="Traversal uses frontier_priority(node, graph, step).",
     )
-    rendered = type_loader.format_scoring_context(ctx)
+    rendered = type_loader.format_frontier_context(ctx)
     assert "SelectionCallable" in rendered
     assert "GraphNode" in rendered
     assert "Graph" in rendered
 
 
-def test_load_scoring_examples_uses_local_file(tmp_path):
+def test_load_frontier_examples_uses_local_file(tmp_path):
     examples = (
         "from iterative_context.graph_models import Graph, GraphNode\n"
-        "def score(node: GraphNode, graph: Graph, step: int) -> float:\n"
+        "def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:\n"
         "    return 1.0\n"
     )
     (tmp_path / "scoring_examples.py").write_text(examples, encoding="utf-8")
-    loaded = type_loader.load_scoring_examples(tmp_path)
+    loaded = type_loader.load_frontier_examples(tmp_path)
     assert "GraphNode" in loaded
-    assert "score(node: GraphNode, graph: Graph, step: int)" in loaded
+    assert "frontier_priority(node: GraphNode, graph: Graph, step: int)" in loaded
 </file>
 
 <file path="tests_harness/test_writer.py">
@@ -14424,7 +14439,7 @@ import pytest
 from typing import TypedDict
 
 from harness.agents import writer
-from harness.utils.type_loader import ScorerContext
+from harness.utils.type_loader import FrontierContext
 
 
 class DummySpan:
@@ -14496,8 +14511,8 @@ class BaseInputs(TypedDict, total=False):
     feedback: dict[str, object]
     current_policy: str
     tests: str
-    scoring_context: str
-    scoring_context_details: ScorerContext
+    frontier_context: str
+    frontier_context_details: FrontierContext
     feedback_str: str
     guidance_hint: str
     diff_str: str
@@ -14511,10 +14526,10 @@ class BaseInputs(TypedDict, total=False):
 def _base_inputs() -> BaseInputs:
     return {
         "feedback": {"a": 1},
-        "current_policy": "def score(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 0.0\n",
+        "current_policy": "def frontier_priority(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 0.0\n",
         "tests": "",
-        "scoring_context": "",
-        "scoring_context_details": ScorerContext(
+        "frontier_context": "",
+        "frontier_context_details": FrontierContext(
             signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
             graph_models="",
             types="",
@@ -14533,7 +14548,7 @@ def _base_inputs() -> BaseInputs:
 def test_generate_policy_accepts_structured_code(monkeypatch):
     scores: list[tuple[str, float]] = []
     calls: list[dict[str, object]] = []
-    payload = {"code": "def score(node: \"GraphNode\", graph: \"Graph\", step: int) -> float:\n    return 1.0\n"}
+    payload = {"code": "def frontier_priority(node: \"GraphNode\", graph: \"Graph\", step: int) -> float:\n    return 1.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), calls), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(
@@ -14542,7 +14557,7 @@ def test_generate_policy_accepts_structured_code(monkeypatch):
         lambda obs, **kwargs: scores.append((kwargs.get("name"), float(kwargs.get("value", 0.0)))),
     )
     code = writer.generate_policy(**_base_inputs())
-    assert "def score" in code
+    assert "def frontier_priority" in code
     assert ("writer.policy_compiled", 1.0) in scores
     assert ("writer.policy_generated", 1.0) in scores
     assert calls
@@ -14579,7 +14594,7 @@ def test_generate_policy_rejects_missing_or_nonstring_code(monkeypatch, payload)
 
 
 def test_generate_policy_rejects_fenced_code(monkeypatch):
-    payload = {"code": "```python\ndef score():\n    pass\n```"}
+    payload = {"code": "```python\ndef frontier_priority():\n    pass\n```"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
@@ -14588,7 +14603,7 @@ def test_generate_policy_rejects_fenced_code(monkeypatch):
 
 
 def test_generate_policy_rejects_invalid_python(monkeypatch):
-    payload = {"code": "def score(:\n    pass"}
+    payload = {"code": "def frontier_priority(:\n    pass"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
@@ -14606,7 +14621,7 @@ def test_generate_policy_rejects_invalid_json(monkeypatch):
 
 def test_generate_policy_accepts_parsed_fallback(monkeypatch):
     calls: list[dict[str, object]] = []
-    parsed = {"code": "def score(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 2.0\n"}
+    parsed = {"code": "def frontier_priority(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 2.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(None, calls, parsed=parsed), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
@@ -14614,26 +14629,26 @@ def test_generate_policy_accepts_parsed_fallback(monkeypatch):
     assert "return 2.0" in code
 
 
-def test_scoring_context_is_derived_from_structured_context(monkeypatch):
+def test_frontier_context_is_derived_from_structured_context(monkeypatch):
     derived: list[str] = []
 
     def fake_format(ctx):
         derived.append(ctx.signature)
         return "rendered-context"
 
-    payload = {"code": "def score(node: \"GraphNode\", graph: \"Graph\", step: int) -> float:\n    return 1.0\n"}
+    payload = {"code": "def frontier_priority(node: \"GraphNode\", graph: \"Graph\", step: int) -> float:\n    return 1.0\n"}
     monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(json.dumps(payload), []), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
-    monkeypatch.setattr(writer, "format_scoring_context", fake_format)
+    monkeypatch.setattr(writer, "format_frontier_context", fake_format)
     inputs = _base_inputs()
-    inputs["scoring_context"] = ""  # force derivation from structured context
-    inputs["scoring_context_details"] = ScorerContext(
+    inputs["frontier_context"] = ""  # force derivation from structured context
+    inputs["frontier_context_details"] = FrontierContext(
         signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
         graph_models="",
         types="",
         examples="from iterative_context.graph_models import Graph, GraphNode\n"
-        "def score(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
+        "def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
         notes="",
     )
     writer.generate_policy(**inputs)
@@ -14676,7 +14691,7 @@ from harness.orchestration.types import (
 )
 from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.pipeline.types import PipelineClassification, StepResult
-from harness.utils.type_loader import ScorerContext
+from harness.utils.type_loader import FrontierContext
 
 
 class _DummySpan:
@@ -14686,7 +14701,7 @@ class _DummySpan:
     def update(self, **kwargs: object) -> None:
         return None
 
-STUB_SCORER_CTX = ScorerContext(signature="", graph_models="", types="", examples="", notes="")
+STUB_FRONTIER_CTX = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
 
 
 def _stub_deps() -> LoopDependencies:
@@ -14705,8 +14720,8 @@ def _stub_deps() -> LoopDependencies:
     )
     dummy_feedback = FeedbackPackage(
         tests="",
-        scoring_context="",
-        scoring_context_details=STUB_SCORER_CTX,
+        frontier_context="",
+        frontier_context_details=STUB_FRONTIER_CTX,
         comparison_summary=None,
         feedback=FeedbackEntries(),
         feedback_str="",
@@ -14790,8 +14805,8 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
         ),
         feedback=FeedbackPackage(
             tests="",
-            scoring_context="",
-            scoring_context_details=STUB_SCORER_CTX,
+            frontier_context="",
+            frontier_context_details=STUB_FRONTIER_CTX,
             comparison_summary=None,
             feedback=FeedbackEntries(),
             feedback_str="",
@@ -15541,8 +15556,8 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 
-class ScorerContext(BaseModel):
-    """Structured scorer context for writer prompts."""
+class FrontierContext(BaseModel):
+    """Structured frontier-priority context for writer prompts."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -15555,7 +15570,7 @@ class ScorerContext(BaseModel):
 
 def load_graph_models(repo_root: Path) -> str:
     """
-    Load graph model definitions for scorer context.
+    Load graph model definitions for frontier policy context.
     """
     models_path = (
         repo_root
@@ -15572,9 +15587,9 @@ def load_graph_models(repo_root: Path) -> str:
         return ""
 
 
-def load_scoring_types(repo_root: Path) -> str:
+def load_frontier_types(repo_root: Path) -> str:
     """
-    Load canonical scoring type definitions from iterative-context.
+    Load canonical traversal-priority type definitions from iterative-context.
     """
     types_path = (
         repo_root / "iterative-context" / "src" / "iterative_context" / "types.py"
@@ -15587,7 +15602,10 @@ def load_scoring_types(repo_root: Path) -> str:
         return ""
 
 
-def load_scoring_examples(repo_root: Path) -> str:
+def load_frontier_examples(repo_root: Path) -> str:
+    """
+    Load frontier-priority examples (legacy scoring_examples.py path retained for compatibility).
+    """
     scoring_paths = [
         repo_root / "harness" / "scoring_examples.py",
         repo_root / "scoring_examples.py",
@@ -15602,18 +15620,18 @@ def load_scoring_examples(repo_root: Path) -> str:
     return ""
 
 
-def build_scorer_context(repo_root: Path) -> ScorerContext:
+def build_frontier_context(repo_root: Path) -> FrontierContext:
     signature = "SelectionCallable = Callable[[GraphNode, Graph, int], float]"
-    return ScorerContext(
+    return FrontierContext(
         signature=signature,
         graph_models=load_graph_models(repo_root),
-        types=load_scoring_types(repo_root),
-        examples=load_scoring_examples(repo_root),
-        notes="Traversal calls score(node, graph, step) deterministically; use GraphNode/Graph shapes above.",
+        types=load_frontier_types(repo_root),
+        examples=load_frontier_examples(repo_root),
+        notes="Traversal uses frontier_priority(node, graph, step) deterministically.",
     )
 
 
-def format_scoring_context(ctx: ScorerContext, max_chars: int = 8000) -> str:
+def format_frontier_context(ctx: FrontierContext, max_chars: int = 8000) -> str:
     """
     Concatenate type definitions and reference implementations for prompt use.
     """
@@ -15695,7 +15713,7 @@ Leaf-operation observability remains with:
 - To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.tracing.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/tracing/cerebras_pricing.py`.
 
 ## Policy Loading
-- `policy_loader.py` now loads `policy.py` and requires the public Iterative Context scorer contract `score(node: GraphNode, graph: Graph, step: int) -> float` (SelectionCallable). No sandbox or restricted execution.
+- `policy_loader.py` now loads `policy.py` and requires the public Iterative Context frontier priority contract `frontier_priority(node: GraphNode, graph: Graph, step: int) -> float` (SelectionCallable). No sandbox or restricted execution.
 </file>
 
 <file path="pyproject.toml">

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, ContextManager, Mapping, Protocol, S
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
-from harness.utils.type_loader import ScorerContext
+from harness.utils.type_loader import FrontierContext
 from harness.localization.models import LCAContext, LCATaskIdentity
 
 if TYPE_CHECKING:
@@ -268,8 +268,8 @@ class FeedbackPackage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tests: str
-    scoring_context: str
-    scoring_context_details: ScorerContext
+    frontier_context: str
+    frontier_context_details: FrontierContext
     comparison_summary: str | None
     feedback: FeedbackEntries
     feedback_str: str

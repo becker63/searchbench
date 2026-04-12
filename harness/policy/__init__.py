@@ -1,6 +1,9 @@
-"""Policy: scoring logic, loader, and examples."""
+"""Policy: frontier-selection priority logic, loader, and examples."""
 
-from .current import score
-from .load import load_policy
+from .current import frontier_priority
+from .load import load_frontier_policy
 
-__all__ = ["score", "load_policy"]
+__all__ = [
+    "frontier_priority",
+    "load_frontier_policy",
+]

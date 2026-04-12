@@ -5,8 +5,8 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 
-class ScorerContext(BaseModel):
-    """Structured scorer context for writer prompts."""
+class FrontierContext(BaseModel):
+    """Structured frontier-priority context for writer prompts."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -19,7 +19,7 @@ class ScorerContext(BaseModel):
 
 def load_graph_models(repo_root: Path) -> str:
     """
-    Load graph model definitions for scorer context.
+    Load graph model definitions for frontier policy context.
     """
     models_path = (
         repo_root
@@ -36,9 +36,9 @@ def load_graph_models(repo_root: Path) -> str:
         return ""
 
 
-def load_scoring_types(repo_root: Path) -> str:
+def load_frontier_types(repo_root: Path) -> str:
     """
-    Load canonical scoring type definitions from iterative-context.
+    Load canonical traversal-priority type definitions from iterative-context.
     """
     types_path = (
         repo_root / "iterative-context" / "src" / "iterative_context" / "types.py"
@@ -51,7 +51,10 @@ def load_scoring_types(repo_root: Path) -> str:
         return ""
 
 
-def load_scoring_examples(repo_root: Path) -> str:
+def load_frontier_examples(repo_root: Path) -> str:
+    """
+    Load frontier-priority examples (legacy scoring_examples.py path retained for compatibility).
+    """
     scoring_paths = [
         repo_root / "harness" / "scoring_examples.py",
         repo_root / "scoring_examples.py",
@@ -66,18 +69,18 @@ def load_scoring_examples(repo_root: Path) -> str:
     return ""
 
 
-def build_scorer_context(repo_root: Path) -> ScorerContext:
+def build_frontier_context(repo_root: Path) -> FrontierContext:
     signature = "SelectionCallable = Callable[[GraphNode, Graph, int], float]"
-    return ScorerContext(
+    return FrontierContext(
         signature=signature,
         graph_models=load_graph_models(repo_root),
-        types=load_scoring_types(repo_root),
-        examples=load_scoring_examples(repo_root),
-        notes="Traversal calls score(node, graph, step) deterministically; use GraphNode/Graph shapes above.",
+        types=load_frontier_types(repo_root),
+        examples=load_frontier_examples(repo_root),
+        notes="Traversal uses frontier_priority(node, graph, step) deterministically.",
     )
 
 
-def format_scoring_context(ctx: ScorerContext, max_chars: int = 8000) -> str:
+def format_frontier_context(ctx: FrontierContext, max_chars: int = 8000) -> str:
     """
     Concatenate type definitions and reference implementations for prompt use.
     """
