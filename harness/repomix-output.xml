@@ -1268,7 +1268,8 @@ def run_ic_iteration(
                 pass
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
-        node_count_val = _coerce_node_count(normalized.get("node_count"))
+        normalized_node_count = _coerce_node_count(normalized.get("node_count"))
+        node_count_val = normalized_node_count
         # If backend didn't supply node_count, fall back to full_graph nodes length.
         if node_count_val is None:
             full_graph = normalized.get("full_graph")
@@ -1302,14 +1303,14 @@ def run_ic_iteration(
             predicted_files=predicted_files,
             reasoning=reasoning,
             observations=observations,
-            node_count=node_count_val if node_count_val is not None else normalized.get("node_count"),
+            node_count=node_count_val if node_count_val is not None else normalized_node_count,
             raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
             source="fallback",
         )
     if not final.observations:
         final.observations = observations
     if final.node_count is None:
-        final.node_count = node_count_val if node_count_val is not None else normalized.get("node_count")
+        final.node_count = node_count_val if node_count_val is not None else normalized_node_count
     result_dict = final.model_dump()
     full_graph = normalized.get("full_graph")
     if full_graph is not None:
