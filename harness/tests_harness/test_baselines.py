@@ -10,9 +10,10 @@ from harness.localization.models import (
     LCATask,
     LCATaskIdentity,
     LocalizationGold,
-    LocalizationMetrics,
     LocalizationPrediction,
 )
+from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+from harness.localization.scoring_models import ScoreContext, ScoreEngine, summarize_batch_scores, summarize_task_score
 from harness.telemetry.hosted import baselines
 from harness.telemetry.hosted import experiments
 from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest
@@ -54,6 +55,38 @@ def _task(repo: str | None = None) -> LCATask:
     return LCATask(identity=identity, context=context, gold=gold, repo=repo)
 
 
+def _score_bundle(score_hops: int = 0):
+    return ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=("a.py",),
+            gold_files=("a.py",),
+            gold_min_hops=score_hops,
+            issue_min_hops=score_hops,
+            per_prediction_hops={"a.py": score_hops},
+        )
+    )
+
+
+def _eval_result(task: LCATask) -> LocalizationEvaluationResult:
+    bundle = _score_bundle()
+    summary = summarize_batch_scores({task.task_id: bundle})
+    return LocalizationEvaluationResult(
+        score_summary=summary,
+        machine_score=summary.aggregate_composed_score,
+        items=[
+            LocalizationEvaluationTaskResult(
+                task=task,
+                score_bundle=bundle,
+                prediction=["a.py"],
+                evidence=None,
+                materialization=None,
+                trace_id=None,
+            )
+        ],
+        failure=None,
+    )
+
+
 def test_resolve_and_bundle_roundtrip(tmp_path):
     import pytest
     monkeypatch = pytest.MonkeyPatch()
@@ -93,41 +126,21 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
     task = _task(str(repo_dir))
     calls = []
 
-    from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-    from harness.localization.models import LocalizationMetrics, LocalizationPrediction
-
     def fake_backend(**kwargs):
         calls.append(kwargs)
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=["a.py"],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task)
 
     monkeypatch.setattr(baselines, "evaluate_localization_batch", fake_backend)
     snap = baselines.compute_baseline_for_task(task, dataset_version="v1", runner=None)
     assert calls
-    assert snap.metrics.score == 1.0
+    assert snap.score_summary.composed_score == 1.0
     assert snap.prediction.predicted_files == ["a.py"]
 
 
 def test_baseline_dataset_span_gets_aggregates(monkeypatch):
     task = _task()
     snap_one = _snapshot(task, version="v1")
-    snap_two = _snapshot(task, version="v1")
-    snap_two.metrics = LocalizationMetrics(precision=0.0, recall=0.5, f1=0.25, hit=0.0, score=0.25)
+    snap_two = _snapshot(task, version="v1", score_hops=1)
     emitted: list[dict[str, object]] = []
     updates: list[dict[str, object]] = []
 
@@ -144,26 +157,17 @@ def test_baseline_dataset_span_gets_aggregates(monkeypatch):
     monkeypatch.setattr(baselines, "emit_score_for_handle", fake_emit_score)
     baselines.emit_baseline_dataset_aggregates(DummySpan(), [snap_one, snap_two])
     names = {item["name"] for item in emitted}
-    assert len(emitted) == 5
-    assert names == {
-        "baseline.avg_precision",
-        "baseline.avg_recall",
-        "baseline.avg_f1",
-        "baseline.avg_hit",
-        "baseline.avg_score",
-    }
+    assert names == {"baseline.aggregate_composed_score"}
     assert updates
     metadata = updates[-1].get("metadata")
     assert metadata is not None
     assert metadata["selected_count"] == 2
-    assert metadata["aggregate_metrics"]["precision"] == 0.5
-    assert metadata["aggregate_metrics"]["recall"] == 0.75
-    assert metadata["aggregate_metrics"]["f1"] == 0.625
-    assert metadata["aggregate_metrics"]["hit"] == 0.5
-    assert metadata["aggregate_metrics"]["score"] == 0.625
+    assert metadata["score_summary"]["aggregate_composed_score"] == 0.75
 
 
-def _snapshot(task: LCATask, version: str = "v1") -> baselines.BaselineSnapshot:
+def _snapshot(task: LCATask, version: str = "v1", score_hops: int = 0) -> baselines.BaselineSnapshot:
+    bundle = _score_bundle(score_hops)
+    score_summary = summarize_task_score(task.task_id, bundle)
     return baselines.BaselineSnapshot(
         dataset_name=task.identity.dataset_name,
         dataset_config=task.identity.dataset_config,
@@ -172,7 +176,7 @@ def _snapshot(task: LCATask, version: str = "v1") -> baselines.BaselineSnapshot:
         identity=task.task_id,
         prediction=LocalizationPrediction(predicted_files=["a.py"]),
         gold=LocalizationGold(changed_files=["a.py"]),
-        metrics=LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0),
+        score_summary=score_summary,
         repo_owner=task.identity.repo_owner,
         repo_name=task.identity.repo_name,
         base_sha=task.identity.base_sha,
@@ -345,18 +349,12 @@ def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
     result = experiments.run_hosted_localization_baseline(req)
     assert result.items and result.items[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
-    assert names == {
-        "baseline.avg_precision",
-        "baseline.avg_recall",
-        "baseline.avg_f1",
-        "baseline.avg_hit",
-        "baseline.avg_score",
-    }
+    assert names == {"baseline.aggregate_composed_score"}
     assert metadata_updates
     metadata = metadata_updates[-1].get("metadata")
     assert metadata and metadata.get("cache_hit") is True
     assert metadata.get("selected_count") == 1
-    assert metadata["aggregate_metrics"]["score"] == snap.metrics.score
+    assert metadata["score_summary"]["aggregate_composed_score"] == snap.score_summary.composed_score
 
 
 def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
@@ -410,13 +408,7 @@ def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
     result = experiments.run_hosted_localization_baseline(req)
     assert result.items and result.items[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
-    assert names == {
-        "baseline.avg_precision",
-        "baseline.avg_recall",
-        "baseline.avg_f1",
-        "baseline.avg_hit",
-        "baseline.avg_score",
-    }
+    assert names == {"baseline.aggregate_composed_score"}
     metadata = metadata_updates[-1].get("metadata")
     assert metadata and metadata.get("cache_hit") is False
     assert metadata.get("selected_count") == 1

@@ -7,8 +7,8 @@ from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
 )
-from harness.localization.runtime.records import build_file_localization_eval_record
-from harness.localization.scoring import score_with_projection
+from harness.localization.runtime.records import build_localization_score_eval_record
+from harness.localization.scoring import build_score_context
 from harness.localization.materialization.materialize import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
@@ -18,8 +18,8 @@ from harness.localization.models import (
     LCAPrediction,
     LCATask,
     LocalizationEvidence,
-    LocalizationMetrics,
 )
+from harness.localization.scoring_models import ScoreBundle, ScoreEngine, summarize_task_score
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.token_usage import (
     TokenUsageRecord,
@@ -132,25 +132,27 @@ def _default_runner(
 
 def _score_task(
     task: LCATask, prediction: LCAPrediction, repo_path: Path, token_usage: TokenUsageRecord | None = None
-) -> LocalizationMetrics:
+) -> ScoreBundle:
     try:
         anchor_text = "\n".join([task.context.issue_title or "", task.context.issue_body or ""]).strip()
-        metrics = score_with_projection(
+        score_context = build_score_context(
             prediction=prediction,
             gold=task.gold,
             repo_path=repo_path,
             anchor_text=anchor_text,
             token_usage=token_usage,
         )
-        eval_record = build_file_localization_eval_record(
+        score_bundle = ScoreEngine().evaluate(score_context)
+        eval_record = build_localization_score_eval_record(
             task.identity,
             prediction,
             task.gold,
+            score_context=score_context,
+            score_bundle=score_bundle,
             evidence=task.evidence,
             repo_path=repo_path,
-            metrics=metrics,
         )
-        return eval_record.metrics
+        return eval_record.score_bundle
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
@@ -161,7 +163,7 @@ def _score_task(
 
 def _emit_telemetry(
     task: LCATask,
-    metrics: LocalizationMetrics,
+    score_bundle: ScoreBundle,
     evidence: LocalizationEvidence | None,
     materialization: RepoMaterializationResult | None,
     dataset_source: str | None,
@@ -169,9 +171,10 @@ def _emit_telemetry(
     predicted_files: list[str],
     changed_files: list[str],
 ) -> None:
+    task_score_summary = summarize_task_score(task.task_id, score_bundle)
     telemetry = build_localization_telemetry(
         task.identity,
-        metrics=metrics,
+        score_summary=task_score_summary,
         changed_files_count=len(task.gold.normalized_changed_files()),
         dataset_source=dataset_source,
         repo_language=task.context.repo_language,
@@ -179,29 +182,25 @@ def _emit_telemetry(
         evidence=evidence,
         materialization_events=materialization.events if materialization else None,
     )
-    for metric_name, metric_value in metrics.model_dump().items():
-        if metric_value is None or not isinstance(metric_value, (int, float)):
-            continue
+    score_values: dict[str, float] = {}
+    if score_bundle.composed_score is not None:
+        score_values["composed_score"] = score_bundle.composed_score
+    for score_name, result in score_bundle.results.items():
+        if result.value is not None and isinstance(result.value, (int, float)):
+            score_values[score_name] = float(result.value)
+    for score_name, score_value in score_values.items():
         emit_score_for_handle(
             trace,
-            name=f"localization.{metric_name}",
-            value=float(metric_value),
+            name=f"localization.{score_name}",
+            value=float(score_value),
             data_type="NUMERIC",
-            score_id=f"{getattr(trace, 'id', None)}-localization.{metric_name}"
+            score_id=f"{getattr(trace, 'id', None)}-localization.{score_name}"
             if getattr(trace, "id", None)
             else None,
         )
     if trace:
         try:
             telemetry_payload = telemetry.model_dump(exclude_none=True)
-            telemetry_payload.setdefault("metrics", {}).update(
-                {
-                    "hop_token_score": metrics.hop_token_score,
-                    "distance_term": metrics.distance_term,
-                    "token_term": metrics.token_term,
-                    "per_file_hops": metrics.per_file_hops,
-                }
-            )
             metadata_payload = {
                 "telemetry": telemetry_payload,
                 "predicted_files": list(predicted_files),
@@ -223,7 +222,7 @@ def run_localization_task(
     | None = None,
 ) -> Tuple[
     LCAPrediction,
-    LocalizationMetrics,
+    ScoreBundle,
     LocalizationEvidence | None,
     RepoMaterializationResult | None,
     TokenUsageRecord,
@@ -232,9 +231,9 @@ def run_localization_task(
     Execute a single localization task end to end (leaf helper):
     - materialize repo at base_sha (if a materializer is provided)
     - run the localization agent/backend to produce predicted_files
-    - score using file-set localization metrics
+    - score using static-graph score bundles
     - emit task-level telemetry
-    Returns prediction, metrics, optional evidence, and materialization details.
+    Returns prediction, score bundle, optional evidence, materialization details, and token usage.
     """
 
     with start_observation(
@@ -265,10 +264,10 @@ def run_localization_task(
             runner_result if isinstance(runner_result, Mapping) else None,
             source="runner",
         )
-        metrics = _score_task(task, prediction, repo_path, usage)
+        score_bundle = _score_task(task, prediction, repo_path, usage)
         _emit_telemetry(
             task=task,
-            metrics=metrics,
+            score_bundle=score_bundle,
             evidence=task.evidence,
             materialization=materialization_result,
             dataset_source=dataset_source,
@@ -276,4 +275,4 @@ def run_localization_task(
             predicted_files=prediction.normalized_predicted_files(),
             changed_files=task.gold.normalized_changed_files(),
         )
-        return prediction, metrics, task.evidence, materialization_result, usage
+        return prediction, score_bundle, task.evidence, materialization_result, usage

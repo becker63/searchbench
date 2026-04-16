@@ -2,13 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from harness.localization.runtime.evaluate import (
-    DEFAULT_LOCALIZATION_RUNNER,
-    MachineScorePolicy,
-    evaluate_localization_batch,
-)
-from harness.localization.errors import LocalizationFailureCategory, LocalizationEvaluationError
-from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold, LCAPrediction, LocalizationMetrics
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
+from harness.localization.models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
+from harness.localization.runtime.evaluate import evaluate_localization_batch
+from harness.localization.scoring_models import ScoreBundle, ScoreContext, ScoreEngine
 from harness.orchestration.runtime import evaluate_policy_on_item
 from harness.orchestration.types import ICTaskPayload
 
@@ -27,23 +24,35 @@ def _make_task(tmp_path: Path) -> LCATask:
     return LCATask(identity=identity, context=context, gold=gold, repo=str(tmp_path))
 
 
+def _bundle(gold_hops: int = 0, issue_hops: int = 0) -> ScoreBundle:
+    return ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=("a.py",),
+            gold_files=("a.py",),
+            gold_min_hops=gold_hops,
+            issue_min_hops=issue_hops,
+            per_prediction_hops={"a.py": gold_hops},
+        )
+    )
+
+
 def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
     task = _make_task(tmp_path)
-
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
+    bundle = _bundle()
 
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
+        "harness.localization.runtime.evaluate.run_localization_task",
+        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     result = evaluate_localization_batch(
         tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )
     assert result.failure is None
-    assert result.aggregate_score == 1.0
-    assert result.items and result.items[0].metrics.score == 1.0
+    assert result.score_summary is not None
+    assert result.score_summary.aggregate_composed_score == 1.0
+    assert result.machine_score == result.score_summary.aggregate_composed_score
+    assert result.items and result.items[0].score_bundle.composed_score == 1.0
 
 
 def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None:
@@ -65,18 +74,18 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
 
 
 def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
+    bundle = _bundle()
+    task = _make_task(tmp_path)
 
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
+        "harness.localization.runtime.evaluate.run_localization_task",
+        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda: "policy", raising=False)
     ic_task = ICTaskPayload(
-        identity=_make_task(tmp_path).identity,
-        context=_make_task(tmp_path).context,
+        identity=task.identity,
+        context=task.context,
         repo=str(tmp_path),
         changed_files=["a.py"],
     )
@@ -88,48 +97,18 @@ def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
 
 def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
     task = _make_task(tmp_path)
-
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
+    bundle = _bundle()
 
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
+        "harness.localization.runtime.evaluate.run_localization_task",
+        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     result = evaluate_localization_batch(
         tasks=[task], dataset_source="huggingface", materializer=None, parent_trace=None
     )
     assert result.failure is None
-    assert result.aggregate_score == 1.0
-
-
-def test_machine_score_policy(monkeypatch, tmp_path) -> None:
-    task = _make_task(tmp_path)
-
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
-
-    monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (
-            LCAPrediction(predicted_files=["a.py"]),
-            LocalizationMetrics(precision=0.5, recall=0.5, f1=0.5, hit=1.0, score=0.5),
-            None,
-            None,
-        ),
-        raising=False,
-    )
-    result = evaluate_localization_batch(
-        tasks=[task],
-        dataset_source="test",
-        materializer=None,
-        parent_trace=None,
-        machine_score_policy=MachineScorePolicy.HIT,
-    )
-    assert result.failure is None
     assert result.machine_score == 1.0
-    assert result.items[0].metrics.score == 0.5
 
 
 def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
@@ -150,45 +129,20 @@ def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
     assert result.failure.category == LocalizationFailureCategory.SCORING
 
 
-def test_machine_score_policy_failure_is_typed(monkeypatch, tmp_path) -> None:
+def test_score_summary_failure_is_typed(monkeypatch, tmp_path) -> None:
     task = _make_task(tmp_path)
-
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
+    bundle = _bundle()
 
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
+        "harness.localization.runtime.evaluate.run_localization_task",
+        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate._derive_machine_score",
-        lambda **kwargs: (_ for _ in ()).throw(LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "bad policy")),
+        "harness.localization.runtime.evaluate.summarize_batch_scores",
+        lambda *_a, **_k: (_ for _ in ()).throw(LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "bad summary")),
         raising=True,
     )
-    result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
-    )
-    assert result.failure is not None
-    assert result.failure.category == LocalizationFailureCategory.SCORING
-
-
-def test_aggregate_metrics_failure_is_typed(monkeypatch, tmp_path) -> None:
-    task = _make_task(tmp_path)
-
-    class BadMetrics:
-        def __init__(self, *args, **kwargs):
-            raise ValueError("aggregate failed")
-
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
-
-    monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
-        raising=False,
-    )
-    monkeypatch.setattr("harness.localization.runtime.evaluate.LocalizationMetrics", BadMetrics, raising=False)
     result = evaluate_localization_batch(
         tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )

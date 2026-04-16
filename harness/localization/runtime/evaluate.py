@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from enum import Enum
-from statistics import mean
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.localization.runtime.execute import run_localization_task
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
-from harness.localization.models import LCATask, LocalizationEvidence, LocalizationMetrics, normalize_lca_task
+from harness.localization.models import LCATask, LocalizationEvidence, normalize_lca_task
+from harness.localization.runtime.execute import run_localization_task
+from harness.localization.scoring_models import BatchScoreSummary, ScoreBundle, summarize_batch_scores
 from harness.localization.token_usage import TokenUsageRecord
 
 LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]]
@@ -18,21 +17,8 @@ LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Ma
 DEFAULT_LOCALIZATION_RUNNER: LocalizationRunner | None = None
 
 
-def _avg(values: Iterable[float]) -> float | None:
-    collected = [v for v in values if isinstance(v, (float, int))]
-    return mean(collected) if collected else None
-
-
 def _build_failure(category: LocalizationFailureCategory, message: str, task: LCATask | None) -> LocalizationEvaluationFailure:
     return LocalizationEvaluationFailure(category=category, message=message, task_id=task.task_id if task else None)
-
-
-class MachineScorePolicy(str, Enum):
-    AGGREGATE = "aggregate"
-    PRECISION = "precision"
-    RECALL = "recall"
-    F1 = "f1"
-    HIT = "hit"
 
 
 class LocalizationEvaluationFailure(BaseModel):
@@ -47,7 +33,7 @@ class LocalizationEvaluationTaskResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task: LCATask
-    metrics: LocalizationMetrics
+    score_bundle: ScoreBundle
     prediction: list[str] = Field(default_factory=list)
     evidence: LocalizationEvidence | None = None
     materialization: RepoMaterializationResult | None = None
@@ -58,8 +44,7 @@ class LocalizationEvaluationTaskResult(BaseModel):
 class LocalizationEvaluationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    aggregate_score: float | None
-    aggregate_metrics: LocalizationMetrics | None = None
+    score_summary: BatchScoreSummary | None = None
     machine_score: float | None = None
     items: list[LocalizationEvaluationTaskResult] = Field(default_factory=list)
     failure: LocalizationEvaluationFailure | None = None
@@ -72,11 +57,10 @@ def evaluate_localization_batch(
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
-    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
 ) -> LocalizationEvaluationResult:
     """
     Shared localization evaluation backend used by the optimization/repair machine and hosted wrappers.
-    Executes each task via run_localization_task, aggregates scores, and returns typed results/failures.
+    Executes each task via run_localization_task, aggregates score bundles, and returns typed results/failures.
     """
     normalized_tasks = [t if isinstance(t, LCATask) else normalize_lca_task(t) for t in tasks]
     resolved_runner = runner or DEFAULT_LOCALIZATION_RUNNER
@@ -92,12 +76,12 @@ def evaluate_localization_batch(
             )
             if len(run_result) < 4:
                 raise LocalizationEvaluationError(LocalizationFailureCategory.UNKNOWN, "Runner returned insufficient values", task_id=task.task_id)
-            prediction, metrics, evidence, materialization = run_result[:4]
+            prediction, score_bundle, evidence, materialization = run_result[:4]
             usage = run_result[4] if len(run_result) > 4 else None
             task_results.append(
                 LocalizationEvaluationTaskResult(
                     task=task,
-                    metrics=metrics,
+                    score_bundle=score_bundle,
                     prediction=list(prediction.predicted_files),
                     evidence=evidence,
                     materialization=materialization,
@@ -107,59 +91,24 @@ def evaluate_localization_batch(
             )
         except LocalizationEvaluationError as exc:
             failure = _build_failure(exc.category, str(exc), task)
-            return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+            return LocalizationEvaluationResult(failure=failure, items=task_results)
         except Exception as exc:  # noqa: BLE001
             failure = _build_failure(LocalizationFailureCategory.UNKNOWN, str(exc), task)
-            return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+            return LocalizationEvaluationResult(failure=failure, items=task_results)
 
     try:
-        aggregate_score = _avg([res.metrics.score for res in task_results])
-        aggregate_metrics = None
-        if task_results and aggregate_score is not None:
-            aggregate_metrics = LocalizationMetrics(
-                precision=_avg(res.metrics.precision for res in task_results) or 0.0,
-                recall=_avg(res.metrics.recall for res in task_results) or 0.0,
-                f1=_avg(res.metrics.f1 for res in task_results) or aggregate_score,
-                hit=_avg(res.metrics.hit for res in task_results) or 0.0,
-                score=aggregate_score,
-            )
-        resolved_policy = machine_score_policy or MachineScorePolicy.AGGREGATE
-        machine_score = _derive_machine_score(
-            aggregate_score=aggregate_score,
-            aggregate_metrics=aggregate_metrics,
-            policy=resolved_policy,
+        score_summary = summarize_batch_scores(
+            {res.task.task_id: res.score_bundle for res in task_results}
         )
         return LocalizationEvaluationResult(
-            aggregate_score=aggregate_score,
-            aggregate_metrics=aggregate_metrics,
-            machine_score=machine_score,
+            score_summary=score_summary,
+            machine_score=score_summary.aggregate_composed_score,
             items=task_results,
             failure=None,
         )
     except LocalizationEvaluationError as exc:
         failure = _build_failure(exc.category, str(exc), None)
-        return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+        return LocalizationEvaluationResult(failure=failure, items=task_results)
     except Exception as exc:  # noqa: BLE001
         failure = _build_failure(LocalizationFailureCategory.SCORING, str(exc), None)
-        return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
-
-
-def _derive_machine_score(
-    *,
-    aggregate_score: float | None,
-    aggregate_metrics: LocalizationMetrics | None,
-    policy: MachineScorePolicy,
-) -> float | None:
-    if policy == MachineScorePolicy.AGGREGATE:
-        return aggregate_score
-    if aggregate_metrics is None:
-        return aggregate_score
-    if policy == MachineScorePolicy.PRECISION:
-        return aggregate_metrics.precision
-    if policy == MachineScorePolicy.RECALL:
-        return aggregate_metrics.recall
-    if policy == MachineScorePolicy.F1:
-        return aggregate_metrics.f1
-    if policy == MachineScorePolicy.HIT:
-        return aggregate_metrics.hit
-    raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, f"Unknown machine score policy: {policy}")
+        return LocalizationEvaluationResult(failure=failure, items=task_results)

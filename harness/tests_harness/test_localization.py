@@ -11,14 +11,13 @@ from harness.localization.models import (
     LocalizationEvidence,
     LocalizationEvidenceItem,
     LocalizationGold,
-    LocalizationMetrics,
     LocalizationPrediction,
     LocalizationRepoInfo,
     LocalizationTelemetryEnvelope,
     canonicalize_paths,
 )
-from harness.localization.scoring import score_file_localization
-from harness.localization.runtime.records import build_file_localization_eval_record
+from harness.localization.scoring_models import ScoreContext, ScoreEngine, summarize_task_score
+from harness.localization.runtime.records import build_localization_score_eval_record
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.runtime.execute import run_localization_task
 import harness.localization.runtime.execute as executor_module
@@ -41,29 +40,9 @@ def test_identity_is_deterministic():
     )
 
 
-def test_file_set_scoring_paths_only():
-    prediction = LCAPrediction(predicted_files=["a.py", "c.py"])
-    gold = LCAGold(changed_files=["a.py", "b.py"])
-    metrics = score_file_localization(prediction, gold)
-    assert isinstance(metrics, LocalizationMetrics)
-    assert metrics.precision == 0.5
-    assert metrics.recall == 0.5
-    assert metrics.f1 == 0.5
-    assert metrics.score == metrics.f1
-
-
 def test_path_normalization_variants_collapse():
     variants = ["src/foo.py", "./src/foo.py", " SRC\\foo.py "]
     assert canonicalize_paths(variants) == ["src/foo.py"]
-
-
-def test_file_set_scoring_normalizes_paths():
-    prediction = LCAPrediction(predicted_files=["SRC\\foo.py"])
-    gold = LCAGold(changed_files=["./src/foo.py"])
-    metrics = score_file_localization(prediction, gold)
-    assert metrics.precision == 1.0
-    assert metrics.recall == 1.0
-    assert metrics.f1 == 1.0
 
 
 def test_eval_builder_is_model_first():
@@ -79,14 +58,30 @@ def test_eval_builder_is_model_first():
     pred = LCAPrediction(predicted_files=["a.py"])
     gold = LCAGold(changed_files=["a.py"])
     evidence = LocalizationEvidence(items=[LocalizationEvidenceItem(file="a.py", hints=["line 1"])])
-    record = build_file_localization_eval_record(identity, pred, gold, evidence=evidence, repo_path=Path("/tmp/repo"))
+    score_context = ScoreContext(
+        predicted_files=("a.py",),
+        gold_files=("a.py",),
+        gold_min_hops=0,
+        issue_min_hops=0,
+        per_prediction_hops={"a.py": 0},
+    )
+    score_bundle = ScoreEngine().evaluate(score_context)
+    record = build_localization_score_eval_record(
+        identity,
+        pred,
+        gold,
+        score_context=score_context,
+        score_bundle=score_bundle,
+        evidence=evidence,
+        repo_path=Path("/tmp/repo"),
+    )
     assert isinstance(record, LocalizationEvalRecord)
     assert isinstance(record.dataset, LocalizationDatasetInfo)
     assert isinstance(record.repo, LocalizationRepoInfo)
     assert isinstance(record.prediction, LocalizationPrediction)
     assert isinstance(record.gold, LocalizationGold)
     assert isinstance(record.evidence, LocalizationEvidence)
-    assert isinstance(record.metrics, LocalizationMetrics)
+    assert record.score_bundle.composed_score == 1.0
     assert record.repo_path == str(Path("/tmp/repo"))
     dumped = record.model_dump()
     assert dumped["dataset"]["name"] == "d"
@@ -105,11 +100,12 @@ def test_telemetry_builder_is_model_first():
         repo_name="n",
         base_sha="sha",
     )
-    metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+    score_bundle = ScoreEngine().evaluate(ScoreContext(gold_min_hops=0, issue_min_hops=0))
+    score_summary = summarize_task_score("task", score_bundle)
     evidence = LocalizationEvidence(items=[LocalizationEvidenceItem(file="a.py", hints=["hint"])])
     envelope = build_localization_telemetry(
         identity,
-        metrics=metrics,
+        score_summary=score_summary,
         changed_files_count=1,
         dataset_source="langfuse",
         repo_language="py",
@@ -121,10 +117,9 @@ def test_telemetry_builder_is_model_first():
     assert isinstance(envelope.dataset, LocalizationDatasetInfo)
     assert isinstance(envelope.repo, LocalizationRepoInfo)
     assert isinstance(envelope.evidence, LocalizationEvidence)
-    assert isinstance(envelope.metrics, LocalizationMetrics)
     assert envelope.materialization_events is not None
     dumped = envelope.model_dump()
-    assert dumped["metrics"]["score"] == 1.0
+    assert dumped["score_summary"]["composed_score"] == 1.0
     assert dumped["changed_files_count"] == 1
     assert dumped["dataset_source"] == "langfuse"
     assert dumped["evidence"]["items"][0]["file"] == "a.py"
@@ -165,12 +160,12 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
         yield type("S", (), {"id": "span", "metadata": {}, "end": lambda self, **kw: None})()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    prediction, metrics, _evidence, _mat, _usage = run_localization_task(
+    prediction, score_bundle, _evidence, _mat, _usage = run_localization_task(
         lca_task,
         runner=lambda *_args: (["predicted.py"], {"source": "runner"}),
     )
     assert prediction.predicted_files == ["predicted.py"]
-    assert metrics.precision == 0.0
+    assert score_bundle.composed_score is None
 
 
 def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
@@ -209,7 +204,7 @@ def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     monkeypatch.setattr(executor_module, "emit_score_for_handle", lambda *a, **k: None)
-    prediction, metrics, *_ = run_localization_task(
+    prediction, score_bundle, *_ = run_localization_task(
         lca_task,
         runner=lambda *_args: (["SRC\\foo.py"], {"source": "runner"}),
     )
@@ -220,7 +215,7 @@ def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
     assert metadata.get("predicted_files") == ["src/foo.py"]
     assert metadata.get("changed_files") == ["src/foo.py"]
     assert isinstance(metadata.get("telemetry"), dict)
-    assert metrics.f1 == 1.0
+    assert "gold_hop" in score_bundle.results
 
 
 def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):

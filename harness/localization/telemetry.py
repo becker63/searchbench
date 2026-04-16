@@ -6,16 +6,16 @@ from .models import (
     LCATaskIdentity,
     LocalizationDatasetInfo,
     LocalizationEvidence,
-    LocalizationMetrics,
     LocalizationMaterialization,
     LocalizationRepoInfo,
     LocalizationTelemetryEnvelope,
 )
+from .scoring_models import TaskScoreSummary
 
 
 def build_localization_telemetry(
     identity: LCATaskIdentity,
-    metrics: LocalizationMetrics,
+    score_summary: TaskScoreSummary,
     changed_files_count: Optional[int] = None,
     dataset_source: Optional[str] = None,
     repo_language: Optional[str] = None,
@@ -48,7 +48,7 @@ def build_localization_telemetry(
         dataset=dataset_block,
         dataset_source=dataset_source,
         repo=repo_block,
-        metrics=metrics,
+        score_summary=score_summary,
         changed_files_count=changed_files_count,
         evidence=evidence_block,
         materialization_events=materialization_block,

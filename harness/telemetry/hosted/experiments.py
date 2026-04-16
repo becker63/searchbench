@@ -10,7 +10,8 @@ from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
-from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
+from harness.localization.models import LCATask, normalize_lca_task
+from harness.localization.scoring_models import TaskScoreSummary, summarize_task_score
 from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.materialization.materialize import RepoMaterializationResult, RepoMaterializer
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
@@ -38,7 +39,7 @@ from harness.entrypoints.models.requests import HostedLocalizationBaselineReques
 
 class LocalizationRunItemResult(BaseModel):
     task: Mapping[str, object]
-    metrics: LocalizationMetrics
+    score_summary: TaskScoreSummary
     prediction: list[str] = Field(default_factory=list)
     trace_id: str | None = None
     materialization: RepoMaterializationResult | None = None
@@ -353,9 +354,10 @@ def _run_experiment_task(
             )
             raise _TaskFailure(-1, failure.task_id, failure.category, failure.message)
         task_result = eval_result.items[0]
+        score_summary = summarize_task_score(normalized_task.task_id, task_result.score_bundle)
         return LocalizationRunItemResult(
             task=normalized_task.model_dump(),
-            metrics=task_result.metrics,
+            score_summary=score_summary,
             prediction=task_result.prediction,
             trace_id=getattr(parent_trace, "id", None),
             materialization=task_result.materialization,
@@ -510,7 +512,7 @@ def _build_reducer_summary(results: list[LocalizationRunItemResult]) -> PolicyRe
             build_task_input(
                 identity=normalized_task.identity,
                 task_id=normalized_task.task_id,
-                metrics=item.metrics,
+                score_summary=item.score_summary,
                 candidate_usage=item.token_usage,
                 baseline_usage=None,
             )

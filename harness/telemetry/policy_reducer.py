@@ -6,7 +6,8 @@ from typing import Iterable, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.localization.models import LCATaskIdentity, LocalizationMetrics
+from harness.localization.models import LCATaskIdentity
+from harness.localization.scoring_models import TaskScoreSummary
 from harness.localization.token_usage import TokenUsageRecord
 
 
@@ -25,7 +26,7 @@ class PolicyReducerTaskInput(BaseModel):
     dataset_name: str
     dataset_config: str
     dataset_split: str
-    metrics: LocalizationMetrics
+    score_summary: TaskScoreSummary
     baseline_usage: TokenUsageRecord = Field(default_factory=TokenUsageRecord)
     candidate_usage: TokenUsageRecord = Field(default_factory=TokenUsageRecord)
     quality_ok: bool = True
@@ -38,21 +39,18 @@ class PolicyQualityGuard(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    score_floor: float = 0.2
-    hit_floor: float | None = None
-    precision_floor: float | None = None
-    recall_floor: float | None = None
+    score_floors: dict[str, float] = Field(default_factory=lambda: {"composed_score": 0.2})
 
-    def evaluate(self, metrics: LocalizationMetrics) -> tuple[bool, list[str]]:
+    def evaluate(self, score_summary: TaskScoreSummary) -> tuple[bool, list[str]]:
         reasons: list[str] = []
-        if metrics.score is None or metrics.score < self.score_floor:
-            reasons.append("score_below_floor")
-        if self.hit_floor is not None and (metrics.hit is None or metrics.hit < self.hit_floor):
-            reasons.append("hit_below_floor")
-        if self.precision_floor is not None and (metrics.precision is None or metrics.precision < self.precision_floor):
-            reasons.append("precision_below_floor")
-        if self.recall_floor is not None and (metrics.recall is None or metrics.recall < self.recall_floor):
-            reasons.append("recall_below_floor")
+        for score_name, floor in self.score_floors.items():
+            value = (
+                score_summary.composed_score
+                if score_name == "composed_score"
+                else score_summary.component_scores.get(score_name)
+            )
+            if value is None or value < floor:
+                reasons.append(f"{score_name}_below_floor")
         return (len(reasons) == 0, reasons)
 
 
@@ -97,7 +95,7 @@ def build_task_input(
     *,
     identity: LCATaskIdentity,
     task_id: str,
-    metrics: LocalizationMetrics,
+    score_summary: TaskScoreSummary,
     candidate_usage: TokenUsageRecord | None,
     baseline_usage: TokenUsageRecord | None = None,
     quality_guard: PolicyQualityGuard | None = None,
@@ -106,14 +104,14 @@ def build_task_input(
     candidate_record = candidate_usage or TokenUsageRecord(available=False, usage=None, source="candidate")
     token_delta = _compute_token_delta(baseline_record, candidate_record)
     guard = quality_guard or PolicyQualityGuard()
-    quality_ok, reasons = guard.evaluate(metrics)
+    quality_ok, reasons = guard.evaluate(score_summary)
     return PolicyReducerTaskInput(
         task_id=task_id,
         repo_key=repo_key_from_identity(identity),
         dataset_name=identity.dataset_name,
         dataset_config=identity.dataset_config,
         dataset_split=identity.dataset_split,
-        metrics=metrics,
+        score_summary=score_summary,
         baseline_usage=baseline_record,
         candidate_usage=candidate_record,
         quality_ok=quality_ok,

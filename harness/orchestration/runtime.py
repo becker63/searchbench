@@ -15,7 +15,7 @@ from jcodemunch_mcp.tools.index_folder import index_folder
 
 from harness.agents.localizer import run_ic_iteration
 from harness.localization.materialization.materialize import RepoMaterializer
-from harness.localization.runtime.evaluate import LocalizationRunner, MachineScorePolicy
+from harness.localization.runtime.evaluate import LocalizationRunner
 from harness.telemetry.tracing import (
     flush_langfuse,
     propagate_context,
@@ -105,7 +105,6 @@ def evaluate_localization_batch(
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
-    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
 ):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
@@ -119,7 +118,6 @@ def evaluate_localization_batch(
         materializer=materializer,
         parent_trace=parent_trace,
         runner=runner,
-        machine_score_policy=machine_score_policy,
     )
 
 
@@ -322,16 +320,16 @@ def evaluate_policy_on_item(
             error="evaluation_failed: no_results",
     )
     task_result = eval_result.items[0]
-    metrics_obj = task_result.metrics
-    machine_score_val = eval_result.machine_score if eval_result.machine_score is not None else metrics_obj.score
+    score_bundle = task_result.score_bundle
+    machine_score_val = eval_result.machine_score
+    score_value = score_bundle.composed_score if score_bundle.composed_score is not None else -10.0
     additional_metrics = [
-        {"name": "precision", "value": metrics_obj.precision},
-        {"name": "recall", "value": metrics_obj.recall},
-        {"name": "hit", "value": metrics_obj.hit},
-        {"name": "f1", "value": metrics_obj.f1},
+        {"name": name, "value": result.value}
+        for name, result in score_bundle.results.items()
+        if result.value is not None
     ]
     eval_metrics = EvaluationMetrics.model_validate(
-        {"score": metrics_obj.score, "iteration_regression": False, "additional_metrics": additional_metrics}
+        {"score": score_value, "iteration_regression": False, "additional_metrics": additional_metrics}
     )
     ic_result_map = {"predicted_files": task_result.prediction}
     return EvaluationResult(

@@ -75,9 +75,11 @@ localization/
     __init__.py
     anchors.py
     distance.py
+    example.py
     ingest.py
     normalize.py
     raw_tree.py
+    scoring_models.py
     store.py
   __init__.py
   errors.py
@@ -137,6 +139,7 @@ tests_harness/
   test_hf_materializer.py
   test_hf_network_optin.py
   test_localization_evaluation_backend.py
+  test_localization_score_models.py
   test_localization.py
   test_loop_machine_control_score.py
   test_loop_state_machine_min.py
@@ -2099,7 +2102,7 @@ def serialize_tool_result_for_model(result: Any) -> str:
 ## Canonical Contract
 - **Gold**: `changed_files` (excluding tests).
 - **Prediction**: list/set of file paths only.
-- **Scoring**: file-set metrics (precision/recall/F1/hit); `metrics["score"]` maps to F1.
+- **Scoring**: Pydantic score bundles from static-graph distance components plus best-effort token diagnostics. The default composed control score uses graph-distance components; token efficiency is visible/diagnostic unless explicitly composed.
 - **Evidence**: optional diagnostics (spans/snippets), not part of canonical prediction or scoring inputs.
 
 ## Identity
@@ -2112,7 +2115,7 @@ def serialize_tool_result_for_model(result: Any) -> str:
 ## Execution Architecture (Two-Phase)
 - **Phase A (exploration)**: backend MCP tools -> OpenAI tool-calls -> backend `dispatch(...)`; gathers observations grounded in repo/issue/diff.
 - **Phase B (finalization)**: separate no-tools request with strict JSON schema (`predicted_files`, `reasoning`, optional `evidence`); enforces shape via `response_format: json_schema`.
-- **Evaluation**: score structured prediction against gold `changed_files`; telemetry/metrics emitted post-run.
+- **Evaluation**: score structured prediction against gold `changed_files` through static graph resolution; telemetry emits score bundle results post-run.
 
 ## Repo Materialization
 - Inputs: dataset/config/split, repo_owner/name, `base_sha`.
@@ -2144,10 +2147,10 @@ def serialize_tool_result_for_model(result: Any) -> str:
 ## Shared Evaluation Backend (Machine + Hosted)
 - A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.
 - The optimization/repair state machine invokes the backend through the evaluation hook (`evaluate_policy_on_item`) under a machine-owned evaluation span; LCA backend opens child task/materialization spans.
-- Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they continue to emit localization-native metrics and outputs.
-- Machine-facing scores use explicit `machine_score` semantics: by default `machine_score == aggregate_score`; derivation policies may select precision/recall/f1/hit while raw localization metrics remain canonical (`predicted_files` vs `changed_files`, F1/score).
+- Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they emit localization-native score bundle summaries and outputs.
+- Machine-facing scores use explicit `machine_score` semantics: `machine_score == score_summary.aggregate_composed_score`. There is no policy selector over file-set fields.
 - Rollback should be treated as an implementation revert/emergency only, not a co-equal path; the shared backend remains the canonical evaluation route.
-- Post-hoc policy-selection reducers run outside the loop to compare candidate policies; they consume canonical metrics plus token-usage metadata with explicit availability flags. Reducer outputs are parallel to localization metrics/control scores and do not alter loop control. Reducer quality guards default to enforcing a non-zero score/F1 floor (default >=0.2, with optional hit/precision/recall floors) so token savings cannot win when quality regresses.
+- Post-hoc policy-selection reducers run outside the loop to compare candidate policies; they consume `TaskScoreSummary` plus token-usage metadata with explicit availability flags. Reducer outputs are parallel to localization control scores and do not alter loop control. Reducer quality guards enforce configured score-name floors, defaulting to the composed score.
 </file>
 
 <file path="docs/loop_viz.md">
@@ -2328,7 +2331,6 @@ except ImportError:
     termios = None  # type: ignore
 
 from harness.localization.runtime.evaluate import (
-    MachineScorePolicy,
     LocalizationRunner,
     evaluate_localization_batch as _evaluate_localization_batch,
 )
@@ -2446,7 +2448,6 @@ def evaluate_localization_batch(
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
-    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
 ):
     """
     Thin wrapper to keep monkeypatch targets stable for tests while deferring import cycles.
@@ -2457,7 +2458,6 @@ def evaluate_localization_batch(
         materializer=materializer,
         parent_trace=parent_trace,
         runner=runner,
-        machine_score_policy=machine_score_policy,
     )
 
 
@@ -3340,16 +3340,15 @@ def describe_repo_mapping(request: RepoMaterializationRequest) -> str:
 <file path="localization/runtime/evaluate.py">
 from __future__ import annotations
 
-from enum import Enum
-from statistics import mean
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.localization.runtime.execute import run_localization_task
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
-from harness.localization.models import LCATask, LocalizationEvidence, LocalizationMetrics, normalize_lca_task
+from harness.localization.models import LCATask, LocalizationEvidence, normalize_lca_task
+from harness.localization.runtime.execute import run_localization_task
+from harness.localization.scoring_models import BatchScoreSummary, ScoreBundle, summarize_batch_scores
 from harness.localization.token_usage import TokenUsageRecord
 
 LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]]
@@ -3358,21 +3357,8 @@ LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Ma
 DEFAULT_LOCALIZATION_RUNNER: LocalizationRunner | None = None
 
 
-def _avg(values: Iterable[float]) -> float | None:
-    collected = [v for v in values if isinstance(v, (float, int))]
-    return mean(collected) if collected else None
-
-
 def _build_failure(category: LocalizationFailureCategory, message: str, task: LCATask | None) -> LocalizationEvaluationFailure:
     return LocalizationEvaluationFailure(category=category, message=message, task_id=task.task_id if task else None)
-
-
-class MachineScorePolicy(str, Enum):
-    AGGREGATE = "aggregate"
-    PRECISION = "precision"
-    RECALL = "recall"
-    F1 = "f1"
-    HIT = "hit"
 
 
 class LocalizationEvaluationFailure(BaseModel):
@@ -3387,7 +3373,7 @@ class LocalizationEvaluationTaskResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task: LCATask
-    metrics: LocalizationMetrics
+    score_bundle: ScoreBundle
     prediction: list[str] = Field(default_factory=list)
     evidence: LocalizationEvidence | None = None
     materialization: RepoMaterializationResult | None = None
@@ -3398,8 +3384,7 @@ class LocalizationEvaluationTaskResult(BaseModel):
 class LocalizationEvaluationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    aggregate_score: float | None
-    aggregate_metrics: LocalizationMetrics | None = None
+    score_summary: BatchScoreSummary | None = None
     machine_score: float | None = None
     items: list[LocalizationEvaluationTaskResult] = Field(default_factory=list)
     failure: LocalizationEvaluationFailure | None = None
@@ -3412,11 +3397,10 @@ def evaluate_localization_batch(
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
-    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
 ) -> LocalizationEvaluationResult:
     """
     Shared localization evaluation backend used by the optimization/repair machine and hosted wrappers.
-    Executes each task via run_localization_task, aggregates scores, and returns typed results/failures.
+    Executes each task via run_localization_task, aggregates score bundles, and returns typed results/failures.
     """
     normalized_tasks = [t if isinstance(t, LCATask) else normalize_lca_task(t) for t in tasks]
     resolved_runner = runner or DEFAULT_LOCALIZATION_RUNNER
@@ -3432,12 +3416,12 @@ def evaluate_localization_batch(
             )
             if len(run_result) < 4:
                 raise LocalizationEvaluationError(LocalizationFailureCategory.UNKNOWN, "Runner returned insufficient values", task_id=task.task_id)
-            prediction, metrics, evidence, materialization = run_result[:4]
+            prediction, score_bundle, evidence, materialization = run_result[:4]
             usage = run_result[4] if len(run_result) > 4 else None
             task_results.append(
                 LocalizationEvaluationTaskResult(
                     task=task,
-                    metrics=metrics,
+                    score_bundle=score_bundle,
                     prediction=list(prediction.predicted_files),
                     evidence=evidence,
                     materialization=materialization,
@@ -3447,62 +3431,27 @@ def evaluate_localization_batch(
             )
         except LocalizationEvaluationError as exc:
             failure = _build_failure(exc.category, str(exc), task)
-            return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+            return LocalizationEvaluationResult(failure=failure, items=task_results)
         except Exception as exc:  # noqa: BLE001
             failure = _build_failure(LocalizationFailureCategory.UNKNOWN, str(exc), task)
-            return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+            return LocalizationEvaluationResult(failure=failure, items=task_results)
 
     try:
-        aggregate_score = _avg([res.metrics.score for res in task_results])
-        aggregate_metrics = None
-        if task_results and aggregate_score is not None:
-            aggregate_metrics = LocalizationMetrics(
-                precision=_avg(res.metrics.precision for res in task_results) or 0.0,
-                recall=_avg(res.metrics.recall for res in task_results) or 0.0,
-                f1=_avg(res.metrics.f1 for res in task_results) or aggregate_score,
-                hit=_avg(res.metrics.hit for res in task_results) or 0.0,
-                score=aggregate_score,
-            )
-        resolved_policy = machine_score_policy or MachineScorePolicy.AGGREGATE
-        machine_score = _derive_machine_score(
-            aggregate_score=aggregate_score,
-            aggregate_metrics=aggregate_metrics,
-            policy=resolved_policy,
+        score_summary = summarize_batch_scores(
+            {res.task.task_id: res.score_bundle for res in task_results}
         )
         return LocalizationEvaluationResult(
-            aggregate_score=aggregate_score,
-            aggregate_metrics=aggregate_metrics,
-            machine_score=machine_score,
+            score_summary=score_summary,
+            machine_score=score_summary.aggregate_composed_score,
             items=task_results,
             failure=None,
         )
     except LocalizationEvaluationError as exc:
         failure = _build_failure(exc.category, str(exc), None)
-        return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
+        return LocalizationEvaluationResult(failure=failure, items=task_results)
     except Exception as exc:  # noqa: BLE001
         failure = _build_failure(LocalizationFailureCategory.SCORING, str(exc), None)
-        return LocalizationEvaluationResult(aggregate_score=None, failure=failure, items=task_results)
-
-
-def _derive_machine_score(
-    *,
-    aggregate_score: float | None,
-    aggregate_metrics: LocalizationMetrics | None,
-    policy: MachineScorePolicy,
-) -> float | None:
-    if policy == MachineScorePolicy.AGGREGATE:
-        return aggregate_score
-    if aggregate_metrics is None:
-        return aggregate_score
-    if policy == MachineScorePolicy.PRECISION:
-        return aggregate_metrics.precision
-    if policy == MachineScorePolicy.RECALL:
-        return aggregate_metrics.recall
-    if policy == MachineScorePolicy.F1:
-        return aggregate_metrics.f1
-    if policy == MachineScorePolicy.HIT:
-        return aggregate_metrics.hit
-    raise LocalizationEvaluationError(LocalizationFailureCategory.SCORING, f"Unknown machine score policy: {policy}")
+        return LocalizationEvaluationResult(failure=failure, items=task_results)
 </file>
 
 <file path="localization/runtime/execute.py">
@@ -3515,8 +3464,8 @@ from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
 )
-from harness.localization.runtime.records import build_file_localization_eval_record
-from harness.localization.scoring import score_with_projection
+from harness.localization.runtime.records import build_localization_score_eval_record
+from harness.localization.scoring import build_score_context
 from harness.localization.materialization.materialize import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
@@ -3526,8 +3475,8 @@ from harness.localization.models import (
     LCAPrediction,
     LCATask,
     LocalizationEvidence,
-    LocalizationMetrics,
 )
+from harness.localization.scoring_models import ScoreBundle, ScoreEngine, summarize_task_score
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.token_usage import (
     TokenUsageRecord,
@@ -3640,25 +3589,27 @@ def _default_runner(
 
 def _score_task(
     task: LCATask, prediction: LCAPrediction, repo_path: Path, token_usage: TokenUsageRecord | None = None
-) -> LocalizationMetrics:
+) -> ScoreBundle:
     try:
         anchor_text = "\n".join([task.context.issue_title or "", task.context.issue_body or ""]).strip()
-        metrics = score_with_projection(
+        score_context = build_score_context(
             prediction=prediction,
             gold=task.gold,
             repo_path=repo_path,
             anchor_text=anchor_text,
             token_usage=token_usage,
         )
-        eval_record = build_file_localization_eval_record(
+        score_bundle = ScoreEngine().evaluate(score_context)
+        eval_record = build_localization_score_eval_record(
             task.identity,
             prediction,
             task.gold,
+            score_context=score_context,
+            score_bundle=score_bundle,
             evidence=task.evidence,
             repo_path=repo_path,
-            metrics=metrics,
         )
-        return eval_record.metrics
+        return eval_record.score_bundle
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
@@ -3669,7 +3620,7 @@ def _score_task(
 
 def _emit_telemetry(
     task: LCATask,
-    metrics: LocalizationMetrics,
+    score_bundle: ScoreBundle,
     evidence: LocalizationEvidence | None,
     materialization: RepoMaterializationResult | None,
     dataset_source: str | None,
@@ -3677,9 +3628,10 @@ def _emit_telemetry(
     predicted_files: list[str],
     changed_files: list[str],
 ) -> None:
+    task_score_summary = summarize_task_score(task.task_id, score_bundle)
     telemetry = build_localization_telemetry(
         task.identity,
-        metrics=metrics,
+        score_summary=task_score_summary,
         changed_files_count=len(task.gold.normalized_changed_files()),
         dataset_source=dataset_source,
         repo_language=task.context.repo_language,
@@ -3687,29 +3639,25 @@ def _emit_telemetry(
         evidence=evidence,
         materialization_events=materialization.events if materialization else None,
     )
-    for metric_name, metric_value in metrics.model_dump().items():
-        if metric_value is None or not isinstance(metric_value, (int, float)):
-            continue
+    score_values: dict[str, float] = {}
+    if score_bundle.composed_score is not None:
+        score_values["composed_score"] = score_bundle.composed_score
+    for score_name, result in score_bundle.results.items():
+        if result.value is not None and isinstance(result.value, (int, float)):
+            score_values[score_name] = float(result.value)
+    for score_name, score_value in score_values.items():
         emit_score_for_handle(
             trace,
-            name=f"localization.{metric_name}",
-            value=float(metric_value),
+            name=f"localization.{score_name}",
+            value=float(score_value),
             data_type="NUMERIC",
-            score_id=f"{getattr(trace, 'id', None)}-localization.{metric_name}"
+            score_id=f"{getattr(trace, 'id', None)}-localization.{score_name}"
             if getattr(trace, "id", None)
             else None,
         )
     if trace:
         try:
             telemetry_payload = telemetry.model_dump(exclude_none=True)
-            telemetry_payload.setdefault("metrics", {}).update(
-                {
-                    "hop_token_score": metrics.hop_token_score,
-                    "distance_term": metrics.distance_term,
-                    "token_term": metrics.token_term,
-                    "per_file_hops": metrics.per_file_hops,
-                }
-            )
             metadata_payload = {
                 "telemetry": telemetry_payload,
                 "predicted_files": list(predicted_files),
@@ -3731,7 +3679,7 @@ def run_localization_task(
     | None = None,
 ) -> Tuple[
     LCAPrediction,
-    LocalizationMetrics,
+    ScoreBundle,
     LocalizationEvidence | None,
     RepoMaterializationResult | None,
     TokenUsageRecord,
@@ -3740,9 +3688,9 @@ def run_localization_task(
     Execute a single localization task end to end (leaf helper):
     - materialize repo at base_sha (if a materializer is provided)
     - run the localization agent/backend to produce predicted_files
-    - score using file-set localization metrics
+    - score using static-graph score bundles
     - emit task-level telemetry
-    Returns prediction, metrics, optional evidence, and materialization details.
+    Returns prediction, score bundle, optional evidence, materialization details, and token usage.
     """
 
     with start_observation(
@@ -3773,10 +3721,10 @@ def run_localization_task(
             runner_result if isinstance(runner_result, Mapping) else None,
             source="runner",
         )
-        metrics = _score_task(task, prediction, repo_path, usage)
+        score_bundle = _score_task(task, prediction, repo_path, usage)
         _emit_telemetry(
             task=task,
-            metrics=metrics,
+            score_bundle=score_bundle,
             evidence=task.evidence,
             materialization=materialization_result,
             dataset_source=dataset_source,
@@ -3784,7 +3732,7 @@ def run_localization_task(
             predicted_files=prediction.normalized_predicted_files(),
             changed_files=task.gold.normalized_changed_files(),
         )
-        return prediction, metrics, task.evidence, materialization_result, usage
+        return prediction, score_bundle, task.evidence, materialization_result, usage
 </file>
 
 <file path="localization/runtime/records.py">
@@ -3801,12 +3749,11 @@ from harness.localization.models import (
     LocalizationEvalRecord,
     LocalizationEvidence,
     LocalizationGold,
-    LocalizationMetrics,
     LocalizationPrediction,
     LocalizationRepoInfo,
     canonicalize_paths,
 )
-from harness.localization.scoring import score_file_localization
+from harness.localization.scoring_models import ScoreBundle, ScoreContext
 
 
 def localization_eval_identity(identity: LCATaskIdentity) -> str:
@@ -3835,21 +3782,21 @@ def _normalize_gold(gold: LCAGold | Mapping[str, object]) -> List[str]:
     return gold.normalized_changed_files()
 
 
-def build_file_localization_eval_record(
+def build_localization_score_eval_record(
     identity: LCATaskIdentity,
     prediction: LCAPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
+    score_context: ScoreContext,
+    score_bundle: ScoreBundle,
     evidence: Optional[LocalizationEvidence] = None,
     repo_path: Optional[Path] = None,
-    metrics: Optional[LocalizationMetrics] = None,
 ) -> LocalizationEvalRecord:
     """
-    Build a canonical evaluation record for file-path-only predictions against LCA gold.
+    Build a canonical evaluation record for score-bundle localization results.
 
-    Evidence (if provided) is kept separate from the primary metrics/prediction and should
+    Evidence (if provided) is kept separate from the score bundle/prediction and should
     be used only for diagnostics.
     """
-    metrics = metrics or score_file_localization(prediction, gold)
     predicted_files = _normalize_prediction(prediction)
     changed_files = _normalize_gold(gold)
 
@@ -3873,7 +3820,8 @@ def build_file_localization_eval_record(
         repo=repo_block,
         prediction=LocalizationPrediction(predicted_files=predicted_files),
         gold=LocalizationGold(changed_files=changed_files),
-        metrics=metrics if isinstance(metrics, LocalizationMetrics) else LocalizationMetrics.from_mapping(metrics),
+        score_context=score_context,
+        score_bundle=score_bundle,
         evidence=evidence_block,
         repo_path=repo_path_str,
     )
@@ -3893,9 +3841,33 @@ from .distance import HopDistanceResult, compute_hop_distance_summary
 from .ingest import ingest_repo
 from .normalize import raw_tree_to_graph
 from .raw_tree import RawEdge, RawFile, RawFunction, RawTree
+from .scoring_models import (
+    AggregateComponentScore,
+    BatchScoreSummary,
+    ComposeMode,
+    Goal,
+    ScoreBundle,
+    ScoreConfig,
+    ScoreContext,
+    ScoreEngine,
+    ScoreResult,
+    TaskScoreSummary,
+    summarize_batch_scores,
+    summarize_task_score,
+)
 from .store import GraphStore
 
 __all__ = [
+    "AggregateComponentScore",
+    "BatchScoreSummary",
+    "ComposeMode",
+    "Goal",
+    "ScoreBundle",
+    "ScoreConfig",
+    "ScoreContext",
+    "ScoreEngine",
+    "ScoreResult",
+    "TaskScoreSummary",
     "extract_anchors",
     "resolve_anchors",
     "resolve_predictions",
@@ -3908,6 +3880,8 @@ __all__ = [
     "RawFunction",
     "RawTree",
     "GraphStore",
+    "summarize_batch_scores",
+    "summarize_task_score",
 ]
 </file>
 
@@ -4009,6 +3983,53 @@ def compute_hop_distance_summary(
         if hop is not None and (best is None or hop < best):
             best = hop
     return HopDistanceResult(hop_by_prediction=per_pred, min_hop=best)
+</file>
+
+<file path="localization/static_graph/example.py">
+from __future__ import annotations
+
+from .scoring_models import SCORE_REGISTRY, ScoreConfig, ScoreContext, ScoreEngine
+
+
+def build_example_context() -> ScoreContext:
+    return ScoreContext(
+        predicted_files=("src/repair.py", "src/parser.py"),
+        gold_files=("src/repair.py",),
+        gold_min_hops=0,
+        issue_min_hops=2,
+        per_prediction_hops={"src/repair.py": 0, "src/parser.py": 2},
+        previous_total_token_count=8000,
+        resolved_prediction_nodes={
+            "src/repair.py": ("src/repair.py",),
+            "src/parser.py": ("src/parser.py",),
+        },
+        resolved_gold_nodes={"src/repair.py": ("src/repair.py",)},
+        issue_anchor_nodes=("src/repair.py",),
+    )
+
+
+def main() -> None:
+    engine = ScoreEngine(SCORE_REGISTRY, ScoreConfig.default())
+    bundle = engine.evaluate(build_example_context())
+
+    print("COMPOSED MACHINE SCORE")
+    print(f"  mode:    {bundle.compose_mode.value}")
+    print(f"  score:   {bundle.composed_score}")
+    print(f"  weights: {dict(bundle.compose_weights)}")
+
+    print("\nVISIBLE SCORES FOR AGENT")
+    for name, result in bundle.results.items():
+        if result.visible_to_agent:
+            print(
+                f"  {name:16} "
+                f"value={result.value!r:<12} "
+                f"available={result.available!s:<5} "
+                f"metadata={dict(result.metadata)}"
+            )
+
+
+if __name__ == "__main__":
+    main()
 </file>
 
 <file path="localization/static_graph/ingest.py">
@@ -4316,6 +4337,371 @@ class RawTree(BaseModel):
     files: list[RawFile] = Field(default_factory=list)
 </file>
 
+<file path="localization/scoring_models/models.py">
+from __future__ import annotations
+
+from enum import Enum
+from math import log1p
+from typing import Mapping, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class Goal(str, Enum):
+    MAXIMIZE = "maximize"
+    MINIMIZE = "minimize"
+
+
+class ComposeMode(str, Enum):
+    WEIGHTED_SUM = "weighted_sum"
+    GEOMETRIC_MEAN = "geometric_mean"
+
+
+class ScoreContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    predicted_files: tuple[str, ...] = Field(default_factory=tuple)
+    gold_files: tuple[str, ...] = Field(default_factory=tuple)
+    gold_min_hops: int | None = None
+    issue_min_hops: int | None = None
+    per_prediction_hops: Mapping[str, int | None] = Field(default_factory=dict)
+    previous_total_token_count: float | None = None
+    resolved_prediction_nodes: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+    resolved_gold_nodes: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+    issue_anchor_nodes: tuple[str, ...] = Field(default_factory=tuple)
+    unresolved_predictions: tuple[str, ...] = Field(default_factory=tuple)
+    unresolved_gold_files: tuple[str, ...] = Field(default_factory=tuple)
+    repo_path: str | None = None
+    diagnostics: Mapping[str, object] = Field(default_factory=dict)
+
+
+class ScoreResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: float | None
+    goal: Goal
+    available: bool
+    visible_to_agent: bool
+    reason: str | None = None
+    metadata: Mapping[str, object] = Field(default_factory=dict)
+
+
+class ScoreConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: tuple[str, ...]
+    visible_to_agent: tuple[str, ...]
+    compose_weights: Mapping[str, float]
+    compose_mode: ComposeMode = ComposeMode.WEIGHTED_SUM
+    epsilon: float = 1e-6
+
+    @model_validator(mode="after")
+    def _validate_config(self) -> "ScoreConfig":
+        enabled = set(self.enabled)
+        visible = set(self.visible_to_agent)
+        composed = set(self.compose_weights)
+        if not self.enabled:
+            raise ValueError("enabled must not be empty")
+        if not self.compose_weights:
+            raise ValueError("compose_weights must not be empty")
+        if not visible <= enabled:
+            raise ValueError(f"Visible scores must also be enabled: {sorted(visible - enabled)}")
+        if not composed <= enabled:
+            raise ValueError(f"Composed scores must also be enabled: {sorted(composed - enabled)}")
+        total_weight = sum(float(weight) for weight in self.compose_weights.values())
+        if total_weight <= 0.0:
+            raise ValueError("compose_weights must sum to > 0")
+        if self.epsilon <= 0.0:
+            raise ValueError("epsilon must be > 0")
+        return self
+
+    @classmethod
+    def default(cls) -> "ScoreConfig":
+        return cls(
+            enabled=("gold_hop", "issue_hop", "token_efficiency"),
+            visible_to_agent=("gold_hop", "issue_hop", "token_efficiency"),
+            compose_weights={
+                "gold_hop": 0.75,
+                "issue_hop": 0.25,
+            },
+            compose_mode=ComposeMode.WEIGHTED_SUM,
+        )
+
+
+class ScoreBundle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    results: Mapping[str, ScoreResult]
+    composed_score: float | None
+    compose_mode: ComposeMode
+    compose_weights: Mapping[str, float]
+    available: bool
+    diagnostics: Mapping[str, object] = Field(default_factory=dict)
+
+
+class TaskScoreSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    composed_score: float | None
+    available: bool
+    component_scores: Mapping[str, float | None] = Field(default_factory=dict)
+    visible_component_scores: Mapping[str, float | None] = Field(default_factory=dict)
+    component_availability: Mapping[str, bool] = Field(default_factory=dict)
+
+
+class AggregateComponentScore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    average: float | None
+    available_count: int
+    missing_count: int
+    total_count: int
+    visible_to_agent: bool
+
+
+class BatchScoreSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    aggregate_composed_score: float | None
+    composed_available_count: int
+    composed_missing_count: int
+    total_count: int
+    components: Mapping[str, AggregateComponentScore] = Field(default_factory=dict)
+
+
+class ScoreComponent(Protocol):
+    name: str
+    default_enabled: bool
+    default_visible_to_agent: bool
+
+    def compute(self, ctx: ScoreContext) -> ScoreResult: ...
+
+
+def clamp_01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def hop_to_score(hops: int | None) -> float | None:
+    if hops is None:
+        return None
+    if hops < 0:
+        raise ValueError("hops must be >= 0")
+    return 1.0 / (1.0 + float(hops))
+
+
+def tokens_to_score(total_tokens: float | None) -> float | None:
+    if total_tokens is None:
+        return None
+    if total_tokens < 0:
+        raise ValueError("total_tokens must be >= 0")
+    return 1.0 / (1.0 + log1p(float(total_tokens)))
+
+
+class GoldHopScore:
+    name = "gold_hop"
+    default_enabled = True
+    default_visible_to_agent = True
+
+    def compute(self, ctx: ScoreContext) -> ScoreResult:
+        value = hop_to_score(ctx.gold_min_hops)
+        return ScoreResult(
+            name=self.name,
+            value=value,
+            goal=Goal.MAXIMIZE,
+            available=value is not None,
+            visible_to_agent=self.default_visible_to_agent,
+            reason=None if value is not None else "gold_min_hops unavailable",
+            metadata={"gold_min_hops": ctx.gold_min_hops},
+        )
+
+
+class IssueHopScore:
+    name = "issue_hop"
+    default_enabled = True
+    default_visible_to_agent = True
+
+    def compute(self, ctx: ScoreContext) -> ScoreResult:
+        value = hop_to_score(ctx.issue_min_hops)
+        return ScoreResult(
+            name=self.name,
+            value=value,
+            goal=Goal.MAXIMIZE,
+            available=value is not None,
+            visible_to_agent=self.default_visible_to_agent,
+            reason=None if value is not None else "issue_min_hops unavailable",
+            metadata={"issue_min_hops": ctx.issue_min_hops},
+        )
+
+
+class TokenEfficiencyScore:
+    name = "token_efficiency"
+    default_enabled = True
+    default_visible_to_agent = True
+
+    def compute(self, ctx: ScoreContext) -> ScoreResult:
+        value = tokens_to_score(ctx.previous_total_token_count)
+        return ScoreResult(
+            name=self.name,
+            value=value,
+            goal=Goal.MAXIMIZE,
+            available=value is not None,
+            visible_to_agent=self.default_visible_to_agent,
+            reason=None if value is not None else "previous_total_token_count unavailable",
+            metadata={"previous_total_token_count": ctx.previous_total_token_count},
+        )
+
+
+SCORE_REGISTRY: dict[str, ScoreComponent] = {
+    "gold_hop": GoldHopScore(),
+    "issue_hop": IssueHopScore(),
+    "token_efficiency": TokenEfficiencyScore(),
+}
+
+
+class ScoreEngine:
+    def __init__(
+        self,
+        registry: Mapping[str, ScoreComponent] | None = None,
+        config: ScoreConfig | None = None,
+    ) -> None:
+        self._registry = dict(registry or SCORE_REGISTRY)
+        self._config = config or ScoreConfig.default()
+        self._validate_registry()
+
+    def _validate_registry(self) -> None:
+        missing_enabled = [name for name in self._config.enabled if name not in self._registry]
+        if missing_enabled:
+            raise KeyError(f"Unknown enabled scores: {missing_enabled}")
+        missing_composed = [
+            name for name in self._config.compose_weights if name not in self._registry
+        ]
+        if missing_composed:
+            raise KeyError(f"Unknown composed scores: {missing_composed}")
+
+    def evaluate(self, ctx: ScoreContext) -> ScoreBundle:
+        results: dict[str, ScoreResult] = {}
+        visible_names = set(self._config.visible_to_agent)
+        for name in self._config.enabled:
+            raw = self._registry[name].compute(ctx)
+            results[name] = raw.model_copy(
+                update={"visible_to_agent": name in visible_names}
+            )
+        composed_score = self._compose(results)
+        return ScoreBundle(
+            results=results,
+            composed_score=composed_score,
+            compose_mode=self._config.compose_mode,
+            compose_weights=dict(self._config.compose_weights),
+            available=composed_score is not None,
+        )
+
+    def _compose(self, results: Mapping[str, ScoreResult]) -> float | None:
+        selected: list[tuple[float, float]] = []
+        for name, weight in self._config.compose_weights.items():
+            result = results[name]
+            if not result.available or result.value is None:
+                return None
+            selected.append((clamp_01(result.value), float(weight)))
+
+        total_weight = sum(weight for _, weight in selected)
+        normalized = [(value, weight / total_weight) for value, weight in selected]
+        if self._config.compose_mode == ComposeMode.WEIGHTED_SUM:
+            return sum(value * weight for value, weight in normalized)
+        if self._config.compose_mode == ComposeMode.GEOMETRIC_MEAN:
+            product = 1.0
+            for value, weight in normalized:
+                product *= max(self._config.epsilon, value) ** weight
+            return product
+        raise AssertionError(f"Unhandled compose mode: {self._config.compose_mode}")
+
+
+def summarize_task_score(task_id: str, bundle: ScoreBundle) -> TaskScoreSummary:
+    component_scores = {name: result.value for name, result in bundle.results.items()}
+    visible_scores = {
+        name: result.value
+        for name, result in bundle.results.items()
+        if result.visible_to_agent
+    }
+    availability = {name: result.available for name, result in bundle.results.items()}
+    return TaskScoreSummary(
+        task_id=task_id,
+        composed_score=bundle.composed_score,
+        available=bundle.available,
+        component_scores=component_scores,
+        visible_component_scores=visible_scores,
+        component_availability=availability,
+    )
+
+
+def summarize_batch_scores(bundles: Mapping[str, ScoreBundle]) -> BatchScoreSummary:
+    total_count = len(bundles)
+    composed_values = [
+        bundle.composed_score
+        for bundle in bundles.values()
+        if bundle.composed_score is not None
+    ]
+    component_names = sorted(
+        {name for bundle in bundles.values() for name in bundle.results}
+    )
+    components: dict[str, AggregateComponentScore] = {}
+    for name in component_names:
+        values: list[float] = []
+        visible = False
+        for bundle in bundles.values():
+            result = bundle.results.get(name)
+            if result is None:
+                continue
+            visible = visible or result.visible_to_agent
+            if result.available and result.value is not None:
+                values.append(result.value)
+        available_count = len(values)
+        components[name] = AggregateComponentScore(
+            name=name,
+            average=(sum(values) / available_count) if values else None,
+            available_count=available_count,
+            missing_count=total_count - available_count,
+            total_count=total_count,
+            visible_to_agent=visible,
+        )
+    composed_available_count = len(composed_values)
+    return BatchScoreSummary(
+        aggregate_composed_score=(sum(composed_values) / composed_available_count)
+        if composed_values
+        else None,
+        composed_available_count=composed_available_count,
+        composed_missing_count=total_count - composed_available_count,
+        total_count=total_count,
+        components=components,
+    )
+
+
+__all__ = [
+    "AggregateComponentScore",
+    "BatchScoreSummary",
+    "ComposeMode",
+    "Goal",
+    "GoldHopScore",
+    "IssueHopScore",
+    "SCORE_REGISTRY",
+    "ScoreBundle",
+    "ScoreComponent",
+    "ScoreConfig",
+    "ScoreContext",
+    "ScoreEngine",
+    "ScoreResult",
+    "TaskScoreSummary",
+    "TokenEfficiencyScore",
+    "clamp_01",
+    "hop_to_score",
+    "summarize_batch_scores",
+    "summarize_task_score",
+    "tokens_to_score",
+]
+</file>
+
 <file path="localization/static_graph/store.py">
 from __future__ import annotations
 
@@ -4434,8 +4820,8 @@ def debug_summary(store: GraphStore) -> dict[str, int]:
 # pyright: reportUnusedImport=false
 
 from .models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
-from .scoring import file_localization_metrics, score_file_localization, score_with_projection
-from .runtime.records import build_file_localization_eval_record, localization_eval_identity
+from .scoring import build_score_context, score_localization
+from .runtime.records import localization_eval_identity
 from .materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer
 from .telemetry import build_localization_telemetry
 from . import static_graph
@@ -4470,7 +4856,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -4724,45 +5110,6 @@ class LocalizationExtensionCounts(BaseModel):
         return cls(entries=[LocalizationExtensionCount(extension=str(ext), count=int(count)) for ext, count in value.items()])
 
 
-class LocalizationMetrics(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    precision: float
-    recall: float
-    f1: float
-    hit: float
-    score: float
-    hop_token_score: float | None = None
-    distance_term: float | None = None
-    token_term: float | None = None
-    per_file_hops: Mapping[str, float | None] | None = None
-
-    @classmethod
-    def from_mapping(cls, metrics: Mapping[str, object]) -> "LocalizationMetrics":
-        def _f(val: object, default: float = 0.0) -> float:
-            return float(val) if isinstance(val, (int, float)) else default
-
-        def _fo(val: object) -> float | None:
-            return float(val) if isinstance(val, (int, float)) else None
-
-        per_file_hops_val = metrics.get("per_file_hops")
-        per_file_hops: Mapping[str, float | None] | None = None
-        if isinstance(per_file_hops_val, Mapping):
-            per_file_hops = {str(k): _fo(v) for k, v in per_file_hops_val.items()}
-
-        return cls(
-            precision=_f(metrics.get("precision"), 0.0),
-            recall=_f(metrics.get("recall"), 0.0),
-            f1=_f(metrics.get("f1"), 0.0),
-            hit=_f(metrics.get("hit"), 0.0),
-            score=_f(metrics.get("score", metrics.get("f1", 0.0)), _f(metrics.get("f1"), 0.0)),
-            hop_token_score=_fo(metrics.get("hop_token_score")),
-            distance_term=_fo(metrics.get("distance_term")),
-            token_term=_fo(metrics.get("token_term")),
-            per_file_hops=per_file_hops,
-        )
-
-
 class LocalizationMaterialization(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -4781,7 +5128,8 @@ class LocalizationEvalRecord(BaseModel):
     repo: LocalizationRepoInfo
     prediction: LocalizationPrediction
     gold: LocalizationGold
-    metrics: LocalizationMetrics
+    score_context: Any
+    score_bundle: Any
     evidence: Optional[LocalizationEvidence] = None
     repo_path: Optional[str] = None
 
@@ -4790,9 +5138,6 @@ class LocalizationEvalRecord(BaseModel):
     def _coerce_blocks(cls, value: object) -> object:
         if isinstance(value, Mapping):
             raw = dict(value)
-            metrics_val = raw.get("metrics")
-            if isinstance(metrics_val, Mapping):
-                raw["metrics"] = LocalizationMetrics.from_mapping(metrics_val)
             evidence_val = raw.get("evidence")
             if isinstance(evidence_val, Mapping):
                 raw["evidence"] = LocalizationEvidence.from_mapping(evidence_val)
@@ -4811,7 +5156,7 @@ class LocalizationTelemetryEnvelope(BaseModel):
     dataset: LocalizationDatasetInfo
     dataset_source: Optional[str] = None
     repo: LocalizationRepoInfo
-    metrics: LocalizationMetrics
+    score_summary: Any
     changed_files_count: Optional[int] = None
     evidence: Optional[LocalizationEvidence] = None
     materialization_events: Optional[LocalizationMaterialization] = None
@@ -4823,9 +5168,6 @@ class LocalizationTelemetryEnvelope(BaseModel):
     def _coerce_blocks(cls, value: object) -> object:
         if isinstance(value, Mapping):
             raw = dict(value)
-            metrics_val = raw.get("metrics")
-            if isinstance(metrics_val, Mapping):
-                raw["metrics"] = LocalizationMetrics.from_mapping(metrics_val)
             evidence_val = raw.get("evidence")
             if isinstance(evidence_val, Mapping):
                 raw["evidence"] = LocalizationEvidence.from_mapping(evidence_val)
@@ -4943,18 +5285,16 @@ def normalize_lca_task(data: Mapping[str, object] | LCATask, defaults: tuple[str
 <file path="localization/scoring.py">
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Iterable, Mapping, cast
 
-from .models import (
-    LCAGold,
-    LCAPrediction,
-    LocalizationMetrics,
-    canonicalize_paths,
-)
+from .models import LCAGold, LCAPrediction, canonicalize_paths
 from .static_graph import (
     GraphStore,
+    ScoreBundle,
+    ScoreConfig,
+    ScoreContext,
+    ScoreEngine,
     compute_hop_distance_summary,
     extract_anchors,
     ingest_repo,
@@ -4964,85 +5304,18 @@ from .static_graph import (
 from .token_usage import TokenUsageRecord
 
 
-def _as_path_set(paths: Iterable[str]) -> set[str]:
-    return set(canonicalize_paths(paths))
-
-
-def file_localization_metrics(predicted_files: Iterable[str], changed_files: Iterable[str]) -> LocalizationMetrics:
-    """
-    Compute file-set localization metrics from predicted file paths vs. gold changed_files.
-    """
-    pred_set = _as_path_set(predicted_files)
-    gold_set = _as_path_set(changed_files)
-    if not gold_set:
-        return LocalizationMetrics(precision=0.0, recall=0.0, f1=0.0, hit=0.0, score=0.0)
-
-    true_positives = len(pred_set & gold_set)
-    precision = true_positives / len(pred_set) if pred_set else 0.0
-    recall = true_positives / len(gold_set)
-    if precision + recall == 0.0:
-        f1 = 0.0
-    else:
-        f1 = 2 * precision * recall / (precision + recall)
-    hit = 1.0 if true_positives > 0 else 0.0
-    return LocalizationMetrics(
-        precision=precision,
-        recall=recall,
-        f1=f1,
-        hit=hit,
-        score=f1,
-    )
-
-
-def score_file_localization(prediction: LCAPrediction | Mapping[str, object], gold: LCAGold | Mapping[str, object]) -> LocalizationMetrics:
-    """
-    Phase-1 scorer: primary metrics from file-path predictions vs. `changed_files`.
-    `metrics.score` is mapped to F1 for a simple, stable scalar.
-    """
+def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> tuple[str, ...]:
     if isinstance(prediction, Mapping):
         predicted_files_raw = prediction.get("predicted_files", [])
-        predicted_files = canonicalize_paths([str(p) for p in cast(Iterable[object], predicted_files_raw)])
-    else:
-        predicted_files = prediction.normalized_predicted_files()
+        return tuple(canonicalize_paths([str(p) for p in cast(Iterable[object], predicted_files_raw)]))
+    return tuple(prediction.normalized_predicted_files())
 
+
+def _normalize_gold(gold: LCAGold | Mapping[str, object]) -> tuple[str, ...]:
     if isinstance(gold, Mapping):
         changed_files_raw = gold.get("changed_files", [])
-        changed_files = canonicalize_paths([str(p) for p in cast(Iterable[object], changed_files_raw)])
-    else:
-        changed_files = gold.normalized_changed_files()
-
-    return file_localization_metrics(predicted_files, changed_files)
-
-
-def _distance_term(min_hop: int | None) -> float | None:
-    if min_hop is None:
-        return None
-    return 1.0 / (1.0 + float(min_hop))
-
-
-def _token_term(token_usage: TokenUsageRecord | None) -> float | None:
-    if token_usage is None:
-        return None
-    total = token_usage.normalized_total()
-    if total is None:
-        return None
-    return 1.0 / (1.0 + math.log1p(total))
-
-
-def _combine_terms(distance_term: float | None, token_term: float | None, distance_weight: float = 0.5) -> float | None:
-    terms: list[tuple[float, float]] = []
-    if distance_term is not None:
-        terms.append((distance_term, distance_weight))
-    if token_term is not None:
-        # If distance is missing, give token term full weight; otherwise share remaining weight.
-        weight = 1.0 if distance_term is None else max(0.0, 1.0 - distance_weight)
-        terms.append((token_term, weight))
-    if not terms:
-        return None
-    weight_sum = sum(weight for _, weight in terms)
-    if weight_sum == 0:
-        return None
-    return sum(val * weight for val, weight in terms) / weight_sum
+        return tuple(canonicalize_paths([str(p) for p in cast(Iterable[object], changed_files_raw)]))
+    return tuple(gold.normalized_changed_files())
 
 
 def _build_store(repo_path: Path) -> GraphStore | None:
@@ -5054,54 +5327,100 @@ def _build_store(repo_path: Path) -> GraphStore | None:
         return None
 
 
-def score_with_projection(
+def _resolve_file_nodes(store: GraphStore, files: Iterable[str]) -> dict[str, tuple[str, ...]]:
+    resolved: dict[str, tuple[str, ...]] = {}
+    for path in files:
+        nodes = store.find_file(path) or store.find_symbol(path)
+        resolved[path] = tuple(nodes)
+    return resolved
+
+
+def _derive_token_count(token_usage: TokenUsageRecord | None) -> float | None:
+    if token_usage is None:
+        return None
+    return token_usage.normalized_total()
+
+
+def build_score_context(
+    *,
     prediction: LCAPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
     repo_path: Path,
     anchor_text: str,
     token_usage: TokenUsageRecord | None,
-) -> LocalizationMetrics:
-    """
-    Compute legacy localization metrics plus projected hop/token scalar.
-    Does not overwrite legacy metric semantics.
-    """
-    if isinstance(prediction, Mapping):
-        predicted_files_raw = prediction.get("predicted_files", [])
-        predicted_files = canonicalize_paths([str(p) for p in cast(Iterable[object], predicted_files_raw)])
-    else:
-        predicted_files = prediction.normalized_predicted_files()
-
-    if isinstance(gold, Mapping):
-        changed_files_raw = gold.get("changed_files", [])
-        changed_files = canonicalize_paths([str(p) for p in cast(Iterable[object], changed_files_raw)])
-    else:
-        changed_files = gold.normalized_changed_files()
-
-    metrics = file_localization_metrics(predicted_files, changed_files)
-
+) -> ScoreContext:
+    predicted_files = _normalize_prediction(prediction)
+    gold_files = _normalize_gold(gold)
+    previous_total_token_count = _derive_token_count(token_usage)
     store = _build_store(repo_path)
     if store is None:
-        metrics.per_file_hops = {}
-        return metrics
+        return ScoreContext(
+            predicted_files=predicted_files,
+            gold_files=gold_files,
+            previous_total_token_count=previous_total_token_count,
+            repo_path=str(repo_path),
+            diagnostics={"static_graph_available": False},
+        )
+
+    resolved_prediction_nodes = _resolve_file_nodes(store, predicted_files)
+    resolved_gold_nodes = _resolve_file_nodes(store, gold_files)
+    prediction_nodes = {
+        path: list(nodes) for path, nodes in resolved_prediction_nodes.items()
+    }
+    gold_anchor_nodes = [
+        node for nodes in resolved_gold_nodes.values() for node in nodes[:1]
+    ]
+    gold_hops = compute_hop_distance_summary(store, gold_anchor_nodes, prediction_nodes)
 
     anchors = extract_anchors(anchor_text or "")
-    anchor_nodes = resolve_anchors(store, anchors)
+    issue_anchor_nodes = tuple(resolve_anchors(store, anchors))
+    issue_hops = compute_hop_distance_summary(store, issue_anchor_nodes, prediction_nodes)
 
-    prediction_nodes: dict[str, list[str]] = {}
-    for pred in predicted_files:
-        nodes = store.find_file(pred) or store.find_symbol(pred)
-        prediction_nodes[pred] = nodes
+    return ScoreContext(
+        predicted_files=predicted_files,
+        gold_files=gold_files,
+        gold_min_hops=gold_hops.min_hop,
+        issue_min_hops=issue_hops.min_hop,
+        per_prediction_hops=gold_hops.hop_by_prediction,
+        previous_total_token_count=previous_total_token_count,
+        resolved_prediction_nodes=resolved_prediction_nodes,
+        resolved_gold_nodes=resolved_gold_nodes,
+        issue_anchor_nodes=issue_anchor_nodes,
+        unresolved_predictions=tuple(
+            path for path, nodes in resolved_prediction_nodes.items() if not nodes
+        ),
+        unresolved_gold_files=tuple(
+            path for path, nodes in resolved_gold_nodes.items() if not nodes
+        ),
+        repo_path=str(repo_path),
+        diagnostics={
+            "static_graph_available": True,
+            "issue_anchor_count": len(issue_anchor_nodes),
+            "gold_anchor_count": len(gold_anchor_nodes),
+        },
+    )
 
-    hop_result = compute_hop_distance_summary(store, anchor_nodes, prediction_nodes)
-    distance_val = _distance_term(hop_result.min_hop)
-    token_val = _token_term(token_usage)
-    projected = _combine_terms(distance_val, token_val)
 
-    metrics.distance_term = distance_val
-    metrics.token_term = token_val
-    metrics.hop_token_score = projected
-    metrics.per_file_hops = hop_result.hop_by_prediction or {}
-    return metrics
+def score_localization(
+    *,
+    prediction: LCAPrediction | Mapping[str, object],
+    gold: LCAGold | Mapping[str, object],
+    repo_path: Path,
+    anchor_text: str,
+    token_usage: TokenUsageRecord | None,
+    config: ScoreConfig | None = None,
+) -> ScoreBundle:
+    context = build_score_context(
+        prediction=prediction,
+        gold=gold,
+        repo_path=repo_path,
+        anchor_text=anchor_text,
+        token_usage=token_usage,
+    )
+    return ScoreEngine(config=config).evaluate(context)
+
+
+__all__ = ["build_score_context", "score_localization"]
 </file>
 
 <file path="localization/telemetry.py">
@@ -5113,16 +5432,16 @@ from .models import (
     LCATaskIdentity,
     LocalizationDatasetInfo,
     LocalizationEvidence,
-    LocalizationMetrics,
     LocalizationMaterialization,
     LocalizationRepoInfo,
     LocalizationTelemetryEnvelope,
 )
+from .scoring_models import TaskScoreSummary
 
 
 def build_localization_telemetry(
     identity: LCATaskIdentity,
-    metrics: LocalizationMetrics,
+    score_summary: TaskScoreSummary,
     changed_files_count: Optional[int] = None,
     dataset_source: Optional[str] = None,
     repo_language: Optional[str] = None,
@@ -5155,7 +5474,7 @@ def build_localization_telemetry(
         dataset=dataset_block,
         dataset_source=dataset_source,
         repo=repo_block,
-        metrics=metrics,
+        score_summary=score_summary,
         changed_files_count=changed_files_count,
         evidence=evidence_block,
         materialization_events=materialization_block,
@@ -6145,7 +6464,7 @@ from jcodemunch_mcp.tools.index_folder import index_folder
 
 from harness.agents.localizer import run_ic_iteration
 from harness.localization.materialization.materialize import RepoMaterializer
-from harness.localization.runtime.evaluate import LocalizationRunner, MachineScorePolicy
+from harness.localization.runtime.evaluate import LocalizationRunner
 from harness.telemetry.tracing import (
     flush_langfuse,
     propagate_context,
@@ -6235,7 +6554,6 @@ def evaluate_localization_batch(
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
-    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
 ):
     """
     Thin wrapper to keep monkeypatching stable while avoiding import cycles.
@@ -6249,7 +6567,6 @@ def evaluate_localization_batch(
         materializer=materializer,
         parent_trace=parent_trace,
         runner=runner,
-        machine_score_policy=machine_score_policy,
     )
 
 
@@ -6452,16 +6769,16 @@ def evaluate_policy_on_item(
             error="evaluation_failed: no_results",
     )
     task_result = eval_result.items[0]
-    metrics_obj = task_result.metrics
-    machine_score_val = eval_result.machine_score if eval_result.machine_score is not None else metrics_obj.score
+    score_bundle = task_result.score_bundle
+    machine_score_val = eval_result.machine_score
+    score_value = score_bundle.composed_score if score_bundle.composed_score is not None else -10.0
     additional_metrics = [
-        {"name": "precision", "value": metrics_obj.precision},
-        {"name": "recall", "value": metrics_obj.recall},
-        {"name": "hit", "value": metrics_obj.hit},
-        {"name": "f1", "value": metrics_obj.f1},
+        {"name": name, "value": result.value}
+        for name, result in score_bundle.results.items()
+        if result.value is not None
     ]
     eval_metrics = EvaluationMetrics.model_validate(
-        {"score": metrics_obj.score, "iteration_regression": False, "additional_metrics": additional_metrics}
+        {"score": score_value, "iteration_regression": False, "additional_metrics": additional_metrics}
     )
     ic_result_map = {"predicted_files": task_result.prediction}
     return EvaluationResult(
@@ -8164,10 +8481,10 @@ from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
     LocalizationGold,
-    LocalizationMetrics,
     LocalizationPrediction,
     normalize_lca_task,
 )
+from harness.localization.scoring_models import AggregateComponentScore, BatchScoreSummary, TaskScoreSummary, summarize_task_score
 from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.telemetry import build_localization_telemetry
 from harness.telemetry.tracing import propagate_context, start_observation
@@ -8184,7 +8501,7 @@ class BaselineSnapshot(BaseModel):
     identity: str
     prediction: LocalizationPrediction
     gold: LocalizationGold
-    metrics: LocalizationMetrics
+    score_summary: TaskScoreSummary
     repo_owner: str
     repo_name: str
     base_sha: str
@@ -8216,16 +8533,41 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
             pass
 
 
-def _aggregate_metrics(snapshots: Sequence[BaselineSnapshot]) -> LocalizationMetrics | None:
-    metrics = [snap.metrics for snap in snapshots if isinstance(snap.metrics, LocalizationMetrics)]
-    if not metrics:
+def _aggregate_score_summaries(snapshots: Sequence[BaselineSnapshot]) -> BatchScoreSummary | None:
+    if not snapshots:
         return None
-    return LocalizationMetrics(
-        precision=mean(m.precision for m in metrics),
-        recall=mean(m.recall for m in metrics),
-        f1=mean(m.f1 for m in metrics),
-        hit=mean(m.hit for m in metrics),
-        score=mean(m.score for m in metrics),
+    total_count = len(snapshots)
+    composed_values = [
+        snap.score_summary.composed_score
+        for snap in snapshots
+        if snap.score_summary.composed_score is not None
+    ]
+    component_names = sorted(
+        {name for snap in snapshots for name in snap.score_summary.component_scores}
+    )
+    components: dict[str, AggregateComponentScore] = {}
+    for name in component_names:
+        values = [
+            snap.score_summary.component_scores[name]
+            for snap in snapshots
+            if snap.score_summary.component_scores.get(name) is not None
+        ]
+        numeric_values = [float(value) for value in values if isinstance(value, (int, float))]
+        available_count = len(numeric_values)
+        components[name] = AggregateComponentScore(
+            name=name,
+            average=mean(numeric_values) if numeric_values else None,
+            available_count=available_count,
+            missing_count=total_count - available_count,
+            total_count=total_count,
+            visible_to_agent=any(name in snap.score_summary.visible_component_scores for snap in snapshots),
+        )
+    return BatchScoreSummary(
+        aggregate_composed_score=mean(composed_values) if composed_values else None,
+        composed_available_count=len(composed_values),
+        composed_missing_count=total_count - len(composed_values),
+        total_count=total_count,
+        components=components,
     )
 
 
@@ -8237,27 +8579,21 @@ def emit_baseline_dataset_aggregates(
     """
     Emit aggregate baseline metrics to the dataset/root span for observability.
     """
-    aggregates = _aggregate_metrics(snapshots)
-    if span is None or aggregates is None:
+    aggregate_summary = _aggregate_score_summaries(snapshots)
+    if span is None or aggregate_summary is None:
         return
-    metrics_payload = {
-        "precision": aggregates.precision,
-        "recall": aggregates.recall,
-        "f1": aggregates.f1,
-        "hit": aggregates.hit,
-        "score": aggregates.score,
-    }
-    for metric_name, metric_value in metrics_payload.items():
+    score_payload = aggregate_summary.model_dump(mode="json")
+    if aggregate_summary.aggregate_composed_score is not None:
         emit_score_for_handle(
             span,
-            name=f"baseline.avg_{metric_name}",
-            value=float(metric_value),
+            name="baseline.aggregate_composed_score",
+            value=float(aggregate_summary.aggregate_composed_score),
             data_type="NUMERIC",
-            score_id=f"{getattr(span, 'id', None)}-baseline.avg_{metric_name}" if getattr(span, "id", None) else None,
+            score_id=f"{getattr(span, 'id', None)}-baseline.aggregate_composed_score" if getattr(span, "id", None) else None,
         )
     summary_metadata: dict[str, object] = {
         "selected_count": len(snapshots),
-        "aggregate_metrics": metrics_payload,
+        "score_summary": score_payload,
     }
     if extra_metadata:
         summary_metadata.update(dict(extra_metadata))
@@ -8380,27 +8716,25 @@ def compute_baseline_for_task(
                 )
             task_result = eval_result.items[0]
             prediction_model = LocalizationPrediction(predicted_files=task_result.prediction)
-            metrics = task_result.metrics
+            score_summary = summarize_task_score(task.task_id, task_result.score_bundle)
             evidence = task_result.evidence
             materialization = task_result.materialization
             telemetry = build_localization_telemetry(
                 task.identity,
-                metrics=metrics,
+                score_summary=score_summary,
                 changed_files_count=len(task.gold.normalized_changed_files()),
                 repo_language=task.context.repo_language,
                 repo_license=task.context.repo_license,
                 evidence=evidence,
                 materialization_events=materialization.events if materialization else None,
             )
-            for name, value in metrics.model_dump().items():
-                if value is None or isinstance(value, dict):
-                    continue
+            if score_summary.composed_score is not None:
                 emit_score_for_handle(
                     trace,
-                    name=f"baseline.{name}",
-                    value=float(value),
+                    name="baseline.composed_score",
+                    value=float(score_summary.composed_score),
                     data_type="NUMERIC",
-                    score_id=f"{trace.id}-baseline.{name}" if getattr(trace, "id", None) else None,
+                    score_id=f"{trace.id}-baseline.composed_score" if getattr(trace, "id", None) else None,
                 )
             return BaselineSnapshot(
                 dataset_name=task.identity.dataset_name,
@@ -8410,7 +8744,7 @@ def compute_baseline_for_task(
                 identity=task.task_id,
                 prediction=prediction_model,
                 gold=LocalizationGold(changed_files=task.gold.normalized_changed_files()),
-                metrics=metrics,
+                score_summary=score_summary,
                 repo_owner=task.identity.repo_owner,
                 repo_name=task.identity.repo_name,
                 base_sha=task.identity.base_sha,
@@ -8420,6 +8754,7 @@ def compute_baseline_for_task(
                 token_usage=task_result.token_usage,
                 metadata={
                     "telemetry": telemetry.model_dump(exclude_none=True),
+                    "score_summary": score_summary.model_dump(mode="json"),
                     "run_kind": "localization_baseline",
                     "dataset_source": getattr(parent_trace, "metadata", {}).get("dataset_source") if parent_trace else None,
                 },
@@ -8460,7 +8795,7 @@ def make_baseline_bundle(
 
 
 def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
-    serializable = bundle.model_dump(exclude_none=True, mode="json")
+    serializable = bundle.model_dump(mode="json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(serializable, indent=2))
 
@@ -8638,7 +8973,8 @@ from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
-from harness.localization.models import LCATask, LocalizationMetrics, normalize_lca_task
+from harness.localization.models import LCATask, normalize_lca_task
+from harness.localization.scoring_models import TaskScoreSummary, summarize_task_score
 from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.materialization.materialize import RepoMaterializationResult, RepoMaterializer
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
@@ -8666,7 +9002,7 @@ from harness.entrypoints.models.requests import HostedLocalizationBaselineReques
 
 class LocalizationRunItemResult(BaseModel):
     task: Mapping[str, object]
-    metrics: LocalizationMetrics
+    score_summary: TaskScoreSummary
     prediction: list[str] = Field(default_factory=list)
     trace_id: str | None = None
     materialization: RepoMaterializationResult | None = None
@@ -8981,9 +9317,10 @@ def _run_experiment_task(
             )
             raise _TaskFailure(-1, failure.task_id, failure.category, failure.message)
         task_result = eval_result.items[0]
+        score_summary = summarize_task_score(normalized_task.task_id, task_result.score_bundle)
         return LocalizationRunItemResult(
             task=normalized_task.model_dump(),
-            metrics=task_result.metrics,
+            score_summary=score_summary,
             prediction=task_result.prediction,
             trace_id=getattr(parent_trace, "id", None),
             materialization=task_result.materialization,
@@ -9138,7 +9475,7 @@ def _build_reducer_summary(results: list[LocalizationRunItemResult]) -> PolicyRe
             build_task_input(
                 identity=normalized_task.identity,
                 task_id=normalized_task.task_id,
-                metrics=item.metrics,
+                score_summary=item.score_summary,
                 candidate_usage=item.token_usage,
                 baseline_usage=None,
             )
@@ -10106,7 +10443,8 @@ from typing import Iterable, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from harness.localization.models import LCATaskIdentity, LocalizationMetrics
+from harness.localization.models import LCATaskIdentity
+from harness.localization.scoring_models import TaskScoreSummary
 from harness.localization.token_usage import TokenUsageRecord
 
 
@@ -10125,7 +10463,7 @@ class PolicyReducerTaskInput(BaseModel):
     dataset_name: str
     dataset_config: str
     dataset_split: str
-    metrics: LocalizationMetrics
+    score_summary: TaskScoreSummary
     baseline_usage: TokenUsageRecord = Field(default_factory=TokenUsageRecord)
     candidate_usage: TokenUsageRecord = Field(default_factory=TokenUsageRecord)
     quality_ok: bool = True
@@ -10138,21 +10476,18 @@ class PolicyQualityGuard(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    score_floor: float = 0.2
-    hit_floor: float | None = None
-    precision_floor: float | None = None
-    recall_floor: float | None = None
+    score_floors: dict[str, float] = Field(default_factory=lambda: {"composed_score": 0.2})
 
-    def evaluate(self, metrics: LocalizationMetrics) -> tuple[bool, list[str]]:
+    def evaluate(self, score_summary: TaskScoreSummary) -> tuple[bool, list[str]]:
         reasons: list[str] = []
-        if metrics.score is None or metrics.score < self.score_floor:
-            reasons.append("score_below_floor")
-        if self.hit_floor is not None and (metrics.hit is None or metrics.hit < self.hit_floor):
-            reasons.append("hit_below_floor")
-        if self.precision_floor is not None and (metrics.precision is None or metrics.precision < self.precision_floor):
-            reasons.append("precision_below_floor")
-        if self.recall_floor is not None and (metrics.recall is None or metrics.recall < self.recall_floor):
-            reasons.append("recall_below_floor")
+        for score_name, floor in self.score_floors.items():
+            value = (
+                score_summary.composed_score
+                if score_name == "composed_score"
+                else score_summary.component_scores.get(score_name)
+            )
+            if value is None or value < floor:
+                reasons.append(f"{score_name}_below_floor")
         return (len(reasons) == 0, reasons)
 
 
@@ -10197,7 +10532,7 @@ def build_task_input(
     *,
     identity: LCATaskIdentity,
     task_id: str,
-    metrics: LocalizationMetrics,
+    score_summary: TaskScoreSummary,
     candidate_usage: TokenUsageRecord | None,
     baseline_usage: TokenUsageRecord | None = None,
     quality_guard: PolicyQualityGuard | None = None,
@@ -10206,14 +10541,14 @@ def build_task_input(
     candidate_record = candidate_usage or TokenUsageRecord(available=False, usage=None, source="candidate")
     token_delta = _compute_token_delta(baseline_record, candidate_record)
     guard = quality_guard or PolicyQualityGuard()
-    quality_ok, reasons = guard.evaluate(metrics)
+    quality_ok, reasons = guard.evaluate(score_summary)
     return PolicyReducerTaskInput(
         task_id=task_id,
         repo_key=repo_key_from_identity(identity),
         dataset_name=identity.dataset_name,
         dataset_config=identity.dataset_config,
         dataset_split=identity.dataset_split,
-        metrics=metrics,
+        score_summary=score_summary,
         baseline_usage=baseline_record,
         candidate_usage=candidate_record,
         quality_ok=quality_ok,
@@ -10249,6 +10584,10 @@ def reduce_global(tasks: Iterable[PolicyReducerTaskInput]) -> PolicyReducerSumma
         repo_count=len(repo_results),
         valid_repo_count=len(repo_scores),
     )
+</file>
+
+<file path="tests_harness/__init__.py">
+
 </file>
 
 <file path="tests_harness/conftest.py">
@@ -11143,9 +11482,10 @@ from harness.localization.models import (
     LCATask,
     LCATaskIdentity,
     LocalizationGold,
-    LocalizationMetrics,
     LocalizationPrediction,
 )
+from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+from harness.localization.scoring_models import ScoreContext, ScoreEngine, summarize_batch_scores, summarize_task_score
 from harness.telemetry.hosted import baselines
 from harness.telemetry.hosted import experiments
 from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest
@@ -11187,6 +11527,38 @@ def _task(repo: str | None = None) -> LCATask:
     return LCATask(identity=identity, context=context, gold=gold, repo=repo)
 
 
+def _score_bundle(score_hops: int = 0):
+    return ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=("a.py",),
+            gold_files=("a.py",),
+            gold_min_hops=score_hops,
+            issue_min_hops=score_hops,
+            per_prediction_hops={"a.py": score_hops},
+        )
+    )
+
+
+def _eval_result(task: LCATask) -> LocalizationEvaluationResult:
+    bundle = _score_bundle()
+    summary = summarize_batch_scores({task.task_id: bundle})
+    return LocalizationEvaluationResult(
+        score_summary=summary,
+        machine_score=summary.aggregate_composed_score,
+        items=[
+            LocalizationEvaluationTaskResult(
+                task=task,
+                score_bundle=bundle,
+                prediction=["a.py"],
+                evidence=None,
+                materialization=None,
+                trace_id=None,
+            )
+        ],
+        failure=None,
+    )
+
+
 def test_resolve_and_bundle_roundtrip(tmp_path):
     import pytest
     monkeypatch = pytest.MonkeyPatch()
@@ -11226,41 +11598,21 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
     task = _task(str(repo_dir))
     calls = []
 
-    from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-    from harness.localization.models import LocalizationMetrics, LocalizationPrediction
-
     def fake_backend(**kwargs):
         calls.append(kwargs)
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=["a.py"],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task)
 
     monkeypatch.setattr(baselines, "evaluate_localization_batch", fake_backend)
     snap = baselines.compute_baseline_for_task(task, dataset_version="v1", runner=None)
     assert calls
-    assert snap.metrics.score == 1.0
+    assert snap.score_summary.composed_score == 1.0
     assert snap.prediction.predicted_files == ["a.py"]
 
 
 def test_baseline_dataset_span_gets_aggregates(monkeypatch):
     task = _task()
     snap_one = _snapshot(task, version="v1")
-    snap_two = _snapshot(task, version="v1")
-    snap_two.metrics = LocalizationMetrics(precision=0.0, recall=0.5, f1=0.25, hit=0.0, score=0.25)
+    snap_two = _snapshot(task, version="v1", score_hops=1)
     emitted: list[dict[str, object]] = []
     updates: list[dict[str, object]] = []
 
@@ -11277,26 +11629,17 @@ def test_baseline_dataset_span_gets_aggregates(monkeypatch):
     monkeypatch.setattr(baselines, "emit_score_for_handle", fake_emit_score)
     baselines.emit_baseline_dataset_aggregates(DummySpan(), [snap_one, snap_two])
     names = {item["name"] for item in emitted}
-    assert len(emitted) == 5
-    assert names == {
-        "baseline.avg_precision",
-        "baseline.avg_recall",
-        "baseline.avg_f1",
-        "baseline.avg_hit",
-        "baseline.avg_score",
-    }
+    assert names == {"baseline.aggregate_composed_score"}
     assert updates
     metadata = updates[-1].get("metadata")
     assert metadata is not None
     assert metadata["selected_count"] == 2
-    assert metadata["aggregate_metrics"]["precision"] == 0.5
-    assert metadata["aggregate_metrics"]["recall"] == 0.75
-    assert metadata["aggregate_metrics"]["f1"] == 0.625
-    assert metadata["aggregate_metrics"]["hit"] == 0.5
-    assert metadata["aggregate_metrics"]["score"] == 0.625
+    assert metadata["score_summary"]["aggregate_composed_score"] == 0.75
 
 
-def _snapshot(task: LCATask, version: str = "v1") -> baselines.BaselineSnapshot:
+def _snapshot(task: LCATask, version: str = "v1", score_hops: int = 0) -> baselines.BaselineSnapshot:
+    bundle = _score_bundle(score_hops)
+    score_summary = summarize_task_score(task.task_id, bundle)
     return baselines.BaselineSnapshot(
         dataset_name=task.identity.dataset_name,
         dataset_config=task.identity.dataset_config,
@@ -11305,7 +11648,7 @@ def _snapshot(task: LCATask, version: str = "v1") -> baselines.BaselineSnapshot:
         identity=task.task_id,
         prediction=LocalizationPrediction(predicted_files=["a.py"]),
         gold=LocalizationGold(changed_files=["a.py"]),
-        metrics=LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0),
+        score_summary=score_summary,
         repo_owner=task.identity.repo_owner,
         repo_name=task.identity.repo_name,
         base_sha=task.identity.base_sha,
@@ -11478,18 +11821,12 @@ def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
     result = experiments.run_hosted_localization_baseline(req)
     assert result.items and result.items[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
-    assert names == {
-        "baseline.avg_precision",
-        "baseline.avg_recall",
-        "baseline.avg_f1",
-        "baseline.avg_hit",
-        "baseline.avg_score",
-    }
+    assert names == {"baseline.aggregate_composed_score"}
     assert metadata_updates
     metadata = metadata_updates[-1].get("metadata")
     assert metadata and metadata.get("cache_hit") is True
     assert metadata.get("selected_count") == 1
-    assert metadata["aggregate_metrics"]["score"] == snap.metrics.score
+    assert metadata["score_summary"]["aggregate_composed_score"] == snap.score_summary.composed_score
 
 
 def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
@@ -11543,13 +11880,7 @@ def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
     result = experiments.run_hosted_localization_baseline(req)
     assert result.items and result.items[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
-    assert names == {
-        "baseline.avg_precision",
-        "baseline.avg_recall",
-        "baseline.avg_f1",
-        "baseline.avg_hit",
-        "baseline.avg_score",
-    }
+    assert names == {"baseline.aggregate_composed_score"}
     metadata = metadata_updates[-1].get("metadata")
     assert metadata and metadata.get("cache_hit") is False
     assert metadata.get("selected_count") == 1
@@ -12030,7 +12361,7 @@ def test_score_task_failure_is_typed(tmp_path, monkeypatch):
     def bad_eval(*_a, **_k):
         raise ValueError("score fail")
 
-    monkeypatch.setattr("harness.localization.runtime.execute.build_file_localization_eval_record", bad_eval)
+    monkeypatch.setattr("harness.localization.runtime.execute.build_localization_score_eval_record", bad_eval)
     with pytest.raises(LocalizationEvaluationError) as exc:
         _score_task(task, LCAPrediction(predicted_files=["a.py"]), repo)
     assert exc.value.category == LocalizationFailureCategory.SCORING
@@ -12045,7 +12376,8 @@ import pytest
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity, LocalizationMetrics
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.scoring_models import ScoreContext, ScoreEngine, summarize_batch_scores
 from harness.telemetry.hosted import experiments
 
 
@@ -12063,32 +12395,41 @@ def _task(repo: str) -> LCATask:
     return LCATask(identity=identity, context=context, gold=gold, repo=repo)
 
 
+def _eval_result(task: LCATask, prediction: list[str] | None = None) -> LocalizationEvaluationResult:
+    prediction = prediction or ["a.py"]
+    bundle = ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=tuple(prediction),
+            gold_files=("a.py",),
+            gold_min_hops=0,
+            issue_min_hops=0,
+        )
+    )
+    summary = summarize_batch_scores({task.task_id: bundle})
+    return LocalizationEvaluationResult(
+        score_summary=summary,
+        machine_score=summary.aggregate_composed_score,
+        items=[
+            LocalizationEvaluationTaskResult(
+                task=task,
+                score_bundle=bundle,
+                prediction=prediction,
+                evidence=None,
+                materialization=None,
+                trace_id=None,
+            )
+        ],
+        failure=None,
+    )
+
+
 def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     task = _task(str(tmp_path / "repo"))
     calls = []
 
-    from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-    from harness.localization.models import LocalizationMetrics
-
     def fake_backend(**kwargs):
         calls.append(kwargs)
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=["a.py"],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task)
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     monkeypatch.setattr(
@@ -12119,23 +12460,7 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
     def fake_backend(**kwargs):
         task = kwargs["tasks"][0]
         time.sleep(durations[task.task_id])
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=[task.task_id],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task, [task.task_id])
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -12163,23 +12488,7 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
         calls.append(task.task_id)
         if task.task_id == t2.task_id:
             raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, "runner failed", task_id=task.task_id)
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=[task.task_id],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task, [task.task_id])
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -12207,23 +12516,7 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
     def fake_backend(**kwargs):
         task = kwargs["tasks"][0]
         calls.append(task.task_id)
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=[task.task_id],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task, [task.task_id])
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -12617,13 +12910,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from harness.localization.runtime.evaluate import (
-    DEFAULT_LOCALIZATION_RUNNER,
-    MachineScorePolicy,
-    evaluate_localization_batch,
-)
-from harness.localization.errors import LocalizationFailureCategory, LocalizationEvaluationError
-from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold, LCAPrediction, LocalizationMetrics
+from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
+from harness.localization.models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
+from harness.localization.runtime.evaluate import evaluate_localization_batch
+from harness.localization.scoring_models import ScoreBundle, ScoreContext, ScoreEngine
 from harness.orchestration.runtime import evaluate_policy_on_item
 from harness.orchestration.types import ICTaskPayload
 
@@ -12642,23 +12932,35 @@ def _make_task(tmp_path: Path) -> LCATask:
     return LCATask(identity=identity, context=context, gold=gold, repo=str(tmp_path))
 
 
+def _bundle(gold_hops: int = 0, issue_hops: int = 0) -> ScoreBundle:
+    return ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=("a.py",),
+            gold_files=("a.py",),
+            gold_min_hops=gold_hops,
+            issue_min_hops=issue_hops,
+            per_prediction_hops={"a.py": gold_hops},
+        )
+    )
+
+
 def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
     task = _make_task(tmp_path)
-
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
+    bundle = _bundle()
 
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
+        "harness.localization.runtime.evaluate.run_localization_task",
+        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     result = evaluate_localization_batch(
         tasks=[task], dataset_source="test", materializer=None, parent_trace=None
     )
     assert result.failure is None
-    assert result.aggregate_score == 1.0
-    assert result.items and result.items[0].metrics.score == 1.0
+    assert result.score_summary is not None
+    assert result.score_summary.aggregate_composed_score == 1.0
+    assert result.machine_score == result.score_summary.aggregate_composed_score
+    assert result.items and result.items[0].score_bundle.composed_score == 1.0
 
 
 def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None:
@@ -12680,18 +12982,18 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
 
 
 def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
+    bundle = _bundle()
+    task = _make_task(tmp_path)
 
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
+        "harness.localization.runtime.evaluate.run_localization_task",
+        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda: "policy", raising=False)
     ic_task = ICTaskPayload(
-        identity=_make_task(tmp_path).identity,
-        context=_make_task(tmp_path).context,
+        identity=task.identity,
+        context=task.context,
         repo=str(tmp_path),
         changed_files=["a.py"],
     )
@@ -12703,48 +13005,18 @@ def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
 
 def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
     task = _make_task(tmp_path)
-
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
+    bundle = _bundle()
 
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
+        "harness.localization.runtime.evaluate.run_localization_task",
+        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     result = evaluate_localization_batch(
         tasks=[task], dataset_source="huggingface", materializer=None, parent_trace=None
     )
     assert result.failure is None
-    assert result.aggregate_score == 1.0
-
-
-def test_machine_score_policy(monkeypatch, tmp_path) -> None:
-    task = _make_task(tmp_path)
-
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
-
-    monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (
-            LCAPrediction(predicted_files=["a.py"]),
-            LocalizationMetrics(precision=0.5, recall=0.5, f1=0.5, hit=1.0, score=0.5),
-            None,
-            None,
-        ),
-        raising=False,
-    )
-    result = evaluate_localization_batch(
-        tasks=[task],
-        dataset_source="test",
-        materializer=None,
-        parent_trace=None,
-        machine_score_policy=MachineScorePolicy.HIT,
-    )
-    assert result.failure is None
     assert result.machine_score == 1.0
-    assert result.items[0].metrics.score == 0.5
 
 
 def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
@@ -12765,20 +13037,18 @@ def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
     assert result.failure.category == LocalizationFailureCategory.SCORING
 
 
-def test_machine_score_policy_failure_is_typed(monkeypatch, tmp_path) -> None:
+def test_score_summary_failure_is_typed(monkeypatch, tmp_path) -> None:
     task = _make_task(tmp_path)
-
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
+    bundle = _bundle()
 
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
+        "harness.localization.runtime.evaluate.run_localization_task",
+        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     monkeypatch.setattr(
-        "harness.localization.runtime.evaluate._derive_machine_score",
-        lambda **kwargs: (_ for _ in ()).throw(LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "bad policy")),
+        "harness.localization.runtime.evaluate.summarize_batch_scores",
+        lambda *_a, **_k: (_ for _ in ()).throw(LocalizationEvaluationError(LocalizationFailureCategory.SCORING, "bad summary")),
         raising=True,
     )
     result = evaluate_localization_batch(
@@ -12786,29 +13056,120 @@ def test_machine_score_policy_failure_is_typed(monkeypatch, tmp_path) -> None:
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING
+</file>
+
+<file path="tests_harness/test_localization_score_models.py">
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from harness.localization.scoring_models import (
+    ComposeMode,
+    ScoreConfig,
+    ScoreContext,
+    ScoreEngine,
+    summarize_batch_scores,
+    summarize_task_score,
+)
 
 
-def test_aggregate_metrics_failure_is_typed(monkeypatch, tmp_path) -> None:
-    task = _make_task(tmp_path)
+def test_score_context_rejects_extra_fields():
+    with pytest.raises(ValidationError):
+        ScoreContext(gold_min_hops=1, metrics={"score": 1.0})
 
-    class BadMetrics:
-        def __init__(self, *args, **kwargs):
-            raise ValueError("aggregate failed")
 
-    def stub_runner(lca_task: LCATask, repo_path: str, parent: object | None):
-        return ["a.py"], {}
-
-    monkeypatch.setattr(
-        "harness.localization.runtime.evaluate.DEFAULT_LOCALIZATION_RUNNER",
-        stub_runner,
-        raising=False,
+def test_default_composition_keeps_token_efficiency_best_effort():
+    ctx = ScoreContext(
+        predicted_files=("src/b.py",),
+        gold_files=("src/a.py",),
+        gold_min_hops=1,
+        issue_min_hops=2,
+        per_prediction_hops={"src/b.py": 1},
     )
-    monkeypatch.setattr("harness.localization.runtime.evaluate.LocalizationMetrics", BadMetrics, raising=False)
-    result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
+    bundle = ScoreEngine().evaluate(ctx)
+
+    assert tuple(bundle.results) == ("gold_hop", "issue_hop", "token_efficiency")
+    assert bundle.results["token_efficiency"].available is False
+    assert bundle.results["token_efficiency"].value is None
+    assert bundle.composed_score == pytest.approx((0.5 * 0.75) + ((1.0 / 3.0) * 0.25))
+    assert bundle.available is True
+
+
+def test_token_efficiency_can_be_required_by_composition():
+    config = ScoreConfig(
+        enabled=("gold_hop", "issue_hop", "token_efficiency"),
+        visible_to_agent=("gold_hop", "issue_hop", "token_efficiency"),
+        compose_weights={"gold_hop": 0.5, "token_efficiency": 0.5},
     )
-    assert result.failure is not None
-    assert result.failure.category == LocalizationFailureCategory.SCORING
+    ctx = ScoreContext(gold_min_hops=0, issue_min_hops=1)
+    bundle = ScoreEngine(config=config).evaluate(ctx)
+
+    assert bundle.results["token_efficiency"].available is False
+    assert bundle.composed_score is None
+    assert bundle.available is False
+
+
+def test_visibility_override_and_geometric_composition():
+    config = ScoreConfig(
+        enabled=("gold_hop", "issue_hop", "token_efficiency"),
+        visible_to_agent=("gold_hop",),
+        compose_weights={"gold_hop": 0.5, "issue_hop": 0.5},
+        compose_mode=ComposeMode.GEOMETRIC_MEAN,
+    )
+    ctx = ScoreContext(gold_min_hops=0, issue_min_hops=3, previous_total_token_count=10)
+    bundle = ScoreEngine(config=config).evaluate(ctx)
+
+    assert bundle.results["gold_hop"].visible_to_agent is True
+    assert bundle.results["issue_hop"].visible_to_agent is False
+    assert bundle.results["token_efficiency"].visible_to_agent is False
+    assert bundle.composed_score == pytest.approx((1.0**0.5) * (0.25**0.5))
+
+
+def test_invalid_config_rejects_disabled_visible_or_composed_scores():
+    with pytest.raises(ValidationError):
+        ScoreConfig(
+            enabled=("gold_hop",),
+            visible_to_agent=("issue_hop",),
+            compose_weights={"gold_hop": 1.0},
+        )
+
+    with pytest.raises(ValidationError):
+        ScoreConfig(
+            enabled=("gold_hop",),
+            visible_to_agent=("gold_hop",),
+            compose_weights={"issue_hop": 1.0},
+        )
+
+
+def test_unknown_registry_entry_is_rejected():
+    config = ScoreConfig(
+        enabled=("gold_hop", "missing_score"),
+        visible_to_agent=("gold_hop",),
+        compose_weights={"gold_hop": 1.0},
+    )
+    with pytest.raises(KeyError):
+        ScoreEngine(config=config)
+
+
+def test_task_and_batch_summaries_include_counts():
+    first = ScoreEngine().evaluate(
+        ScoreContext(gold_min_hops=0, issue_min_hops=1, previous_total_token_count=10)
+    )
+    second = ScoreEngine().evaluate(
+        ScoreContext(gold_min_hops=2, issue_min_hops=2)
+    )
+
+    task_summary = summarize_task_score("task-1", first)
+    assert task_summary.task_id == "task-1"
+    assert task_summary.component_availability["token_efficiency"] is True
+
+    batch = summarize_batch_scores({"task-1": first, "task-2": second})
+    assert batch.total_count == 2
+    assert batch.composed_available_count == 2
+    assert batch.components["gold_hop"].available_count == 2
+    assert batch.components["token_efficiency"].available_count == 1
+    assert batch.components["token_efficiency"].missing_count == 1
 </file>
 
 <file path="tests_harness/test_localization.py">
@@ -12825,14 +13186,13 @@ from harness.localization.models import (
     LocalizationEvidence,
     LocalizationEvidenceItem,
     LocalizationGold,
-    LocalizationMetrics,
     LocalizationPrediction,
     LocalizationRepoInfo,
     LocalizationTelemetryEnvelope,
     canonicalize_paths,
 )
-from harness.localization.scoring import score_file_localization
-from harness.localization.runtime.records import build_file_localization_eval_record
+from harness.localization.scoring_models import ScoreContext, ScoreEngine, summarize_task_score
+from harness.localization.runtime.records import build_localization_score_eval_record
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.runtime.execute import run_localization_task
 import harness.localization.runtime.execute as executor_module
@@ -12855,29 +13215,9 @@ def test_identity_is_deterministic():
     )
 
 
-def test_file_set_scoring_paths_only():
-    prediction = LCAPrediction(predicted_files=["a.py", "c.py"])
-    gold = LCAGold(changed_files=["a.py", "b.py"])
-    metrics = score_file_localization(prediction, gold)
-    assert isinstance(metrics, LocalizationMetrics)
-    assert metrics.precision == 0.5
-    assert metrics.recall == 0.5
-    assert metrics.f1 == 0.5
-    assert metrics.score == metrics.f1
-
-
 def test_path_normalization_variants_collapse():
     variants = ["src/foo.py", "./src/foo.py", " SRC\\foo.py "]
     assert canonicalize_paths(variants) == ["src/foo.py"]
-
-
-def test_file_set_scoring_normalizes_paths():
-    prediction = LCAPrediction(predicted_files=["SRC\\foo.py"])
-    gold = LCAGold(changed_files=["./src/foo.py"])
-    metrics = score_file_localization(prediction, gold)
-    assert metrics.precision == 1.0
-    assert metrics.recall == 1.0
-    assert metrics.f1 == 1.0
 
 
 def test_eval_builder_is_model_first():
@@ -12893,14 +13233,30 @@ def test_eval_builder_is_model_first():
     pred = LCAPrediction(predicted_files=["a.py"])
     gold = LCAGold(changed_files=["a.py"])
     evidence = LocalizationEvidence(items=[LocalizationEvidenceItem(file="a.py", hints=["line 1"])])
-    record = build_file_localization_eval_record(identity, pred, gold, evidence=evidence, repo_path=Path("/tmp/repo"))
+    score_context = ScoreContext(
+        predicted_files=("a.py",),
+        gold_files=("a.py",),
+        gold_min_hops=0,
+        issue_min_hops=0,
+        per_prediction_hops={"a.py": 0},
+    )
+    score_bundle = ScoreEngine().evaluate(score_context)
+    record = build_localization_score_eval_record(
+        identity,
+        pred,
+        gold,
+        score_context=score_context,
+        score_bundle=score_bundle,
+        evidence=evidence,
+        repo_path=Path("/tmp/repo"),
+    )
     assert isinstance(record, LocalizationEvalRecord)
     assert isinstance(record.dataset, LocalizationDatasetInfo)
     assert isinstance(record.repo, LocalizationRepoInfo)
     assert isinstance(record.prediction, LocalizationPrediction)
     assert isinstance(record.gold, LocalizationGold)
     assert isinstance(record.evidence, LocalizationEvidence)
-    assert isinstance(record.metrics, LocalizationMetrics)
+    assert record.score_bundle.composed_score == 1.0
     assert record.repo_path == str(Path("/tmp/repo"))
     dumped = record.model_dump()
     assert dumped["dataset"]["name"] == "d"
@@ -12919,11 +13275,12 @@ def test_telemetry_builder_is_model_first():
         repo_name="n",
         base_sha="sha",
     )
-    metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+    score_bundle = ScoreEngine().evaluate(ScoreContext(gold_min_hops=0, issue_min_hops=0))
+    score_summary = summarize_task_score("task", score_bundle)
     evidence = LocalizationEvidence(items=[LocalizationEvidenceItem(file="a.py", hints=["hint"])])
     envelope = build_localization_telemetry(
         identity,
-        metrics=metrics,
+        score_summary=score_summary,
         changed_files_count=1,
         dataset_source="langfuse",
         repo_language="py",
@@ -12935,10 +13292,9 @@ def test_telemetry_builder_is_model_first():
     assert isinstance(envelope.dataset, LocalizationDatasetInfo)
     assert isinstance(envelope.repo, LocalizationRepoInfo)
     assert isinstance(envelope.evidence, LocalizationEvidence)
-    assert isinstance(envelope.metrics, LocalizationMetrics)
     assert envelope.materialization_events is not None
     dumped = envelope.model_dump()
-    assert dumped["metrics"]["score"] == 1.0
+    assert dumped["score_summary"]["composed_score"] == 1.0
     assert dumped["changed_files_count"] == 1
     assert dumped["dataset_source"] == "langfuse"
     assert dumped["evidence"]["items"][0]["file"] == "a.py"
@@ -12979,12 +13335,12 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
         yield type("S", (), {"id": "span", "metadata": {}, "end": lambda self, **kw: None})()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    prediction, metrics, _evidence, _mat, _usage = run_localization_task(
+    prediction, score_bundle, _evidence, _mat, _usage = run_localization_task(
         lca_task,
         runner=lambda *_args: (["predicted.py"], {"source": "runner"}),
     )
     assert prediction.predicted_files == ["predicted.py"]
-    assert metrics.precision == 0.0
+    assert score_bundle.composed_score is None
 
 
 def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
@@ -13023,7 +13379,7 @@ def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     monkeypatch.setattr(executor_module, "emit_score_for_handle", lambda *a, **k: None)
-    prediction, metrics, *_ = run_localization_task(
+    prediction, score_bundle, *_ = run_localization_task(
         lca_task,
         runner=lambda *_args: (["SRC\\foo.py"], {"source": "runner"}),
     )
@@ -13034,7 +13390,7 @@ def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
     assert metadata.get("predicted_files") == ["src/foo.py"]
     assert metadata.get("changed_files") == ["src/foo.py"]
     assert isinstance(metadata.get("telemetry"), dict)
-    assert metrics.f1 == 1.0
+    assert "gold_hop" in score_bundle.results
 
 
 def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
@@ -13094,27 +13450,47 @@ from __future__ import annotations
 
 import pytest
 
-from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult, MachineScorePolicy
-from harness.localization.models import LocalizationMetrics, LCAContext, LCATaskIdentity, LCAGold, LCATask
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+from harness.localization.scoring_models import ScoreBundle, ScoreContext, ScoreEngine, summarize_batch_scores
 from harness.orchestration.runtime import evaluate_policy_on_item
 from harness.orchestration.types import ICTaskPayload
 
 
-def test_machine_uses_machine_score(monkeypatch, tmp_path):
-    ic_task = ICTaskPayload(
-        identity=LCATaskIdentity(
-            dataset_name="lca",
-            dataset_config="py",
-            dataset_split="dev",
-            repo_owner="o",
-            repo_name="r",
-            base_sha="abc",
-        ),
+def _identity() -> LCATaskIdentity:
+    return LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+
+
+def _bundle(gold_hops: int, issue_hops: int) -> ScoreBundle:
+    return ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=("a.py",),
+            gold_files=("a.py",),
+            gold_min_hops=gold_hops,
+            issue_min_hops=issue_hops,
+        )
+    )
+
+
+def _ic_task(tmp_path) -> ICTaskPayload:
+    return ICTaskPayload(
+        identity=_identity(),
         context=LCAContext(issue_title="bug", issue_body="body"),
         repo=str(tmp_path),
         changed_files=["a.py"],
     )
-    metrics = LocalizationMetrics(precision=0.1, recall=0.1, f1=0.1, hit=0.0, score=0.1)
+
+
+def test_machine_uses_batch_composed_score(monkeypatch, tmp_path):
+    ic_task = _ic_task(tmp_path)
+    score_bundle = _bundle(gold_hops=1, issue_hops=1)
     task_result = LocalizationEvaluationTaskResult(
         task=LCATask(
             identity=ic_task.identity,
@@ -13122,71 +13498,57 @@ def test_machine_uses_machine_score(monkeypatch, tmp_path):
             gold=LCAGold(changed_files=["a.py"]),
             repo=ic_task.repo,
         ),
-        metrics=metrics,
+        score_bundle=score_bundle,
         prediction=["a.py"],
     )
+    score_summary = summarize_batch_scores({"task": score_bundle})
     eval_result = LocalizationEvaluationResult(
-        aggregate_score=0.1,
-        aggregate_metrics=metrics,
-        machine_score=0.5,
+        score_summary=score_summary,
+        machine_score=score_summary.aggregate_composed_score,
         items=[task_result],
         failure=None,
     )
 
-    def fake_backend(**kwargs):
-        return eval_result
-
-    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend)
+    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", lambda **kwargs: eval_result)
     result = evaluate_policy_on_item(ic_task, None, None, 0)
-    assert result.control_score == 0.5
-    assert result.metrics.get("score") == 0.1
+
+    assert result.control_score == pytest.approx(score_summary.aggregate_composed_score)
+    assert result.metrics.get("score") == pytest.approx(score_bundle.composed_score)
 
 
-def test_machine_score_policy_changes_control(monkeypatch, tmp_path):
-    ic_task = ICTaskPayload(
-        identity=LCATaskIdentity(
-            dataset_name="lca",
-            dataset_config="py",
-            dataset_split="dev",
-            repo_owner="o",
-            repo_name="r",
-            base_sha="abc",
-        ),
-        context=LCAContext(issue_title="bug", issue_body="body"),
-        repo=str(tmp_path),
-        changed_files=["a.py"],
-    )
-    metrics = LocalizationMetrics(precision=0.2, recall=0.8, f1=0.32, hit=1.0, score=0.32)
+def test_control_score_changes_with_composed_bundle(monkeypatch, tmp_path):
+    ic_task = _ic_task(tmp_path)
+    first_bundle = _bundle(gold_hops=2, issue_hops=2)
+    second_bundle = _bundle(gold_hops=0, issue_hops=0)
 
-    def fake_backend(**kwargs):
-        policy = kwargs.get("machine_score_policy", MachineScorePolicy.AGGREGATE)
+    def backend_for(bundle: ScoreBundle) -> LocalizationEvaluationResult:
+        task_result = LocalizationEvaluationTaskResult(
+            task=LCATask(
+                identity=ic_task.identity,
+                context=ic_task.context,
+                gold=LCAGold(changed_files=["a.py"]),
+                repo=ic_task.repo,
+            ),
+            score_bundle=bundle,
+            prediction=["a.py"],
+        )
+        summary = summarize_batch_scores({"task": bundle})
         return LocalizationEvaluationResult(
-            aggregate_score=metrics.score,
-            aggregate_metrics=metrics,
-            machine_score=metrics.hit if policy == MachineScorePolicy.HIT else metrics.score,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=LCATask(identity=ic_task.identity, context=ic_task.context, gold=LCAGold(changed_files=["a.py"]), repo=ic_task.repo),
-                    metrics=metrics,
-                    prediction=["a.py"],
-                )
-            ],
+            score_summary=summary,
+            machine_score=summary.aggregate_composed_score,
+            items=[task_result],
             failure=None,
         )
 
-    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend)
+    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", lambda **kwargs: backend_for(first_bundle))
+    res_first = evaluate_policy_on_item(ic_task, None, None, 0)
 
-    res_default = evaluate_policy_on_item(ic_task, None, None, 0)
-    assert res_default.control_score == pytest.approx(metrics.score)
+    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", lambda **kwargs: backend_for(second_bundle))
+    res_second = evaluate_policy_on_item(ic_task, None, None, 0)
 
-    def fake_backend_hit(**kwargs):
-        kwargs["machine_score_policy"] = MachineScorePolicy.HIT
-        return fake_backend(**kwargs)
-
-    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", fake_backend_hit)
-    res_hit = evaluate_policy_on_item(ic_task, None, None, 0)
-    assert res_hit.control_score == pytest.approx(metrics.hit)
-    assert res_hit.metrics.get("score") == pytest.approx(metrics.score)
+    assert res_first.control_score == pytest.approx(first_bundle.composed_score)
+    assert res_second.control_score == pytest.approx(second_bundle.composed_score)
+    assert res_second.control_score > res_first.control_score
 </file>
 
 <file path="tests_harness/test_loop_state_machine_min.py">
@@ -14013,7 +14375,8 @@ def test_load_frontier_policy_uses_selection_callable(monkeypatch, tmp_path):
 <file path="tests_harness/test_policy_reducer.py">
 from __future__ import annotations
 
-from harness.localization.models import LCATaskIdentity, LocalizationMetrics
+from harness.localization.models import LCATaskIdentity
+from harness.localization.scoring_models import TaskScoreSummary
 from harness.localization.token_usage import TokenUsage, TokenUsageRecord
 from harness.telemetry.policy_reducer import (
     build_task_input,
@@ -14039,27 +14402,38 @@ def _usage(total: float) -> TokenUsageRecord:
     return TokenUsageRecord(available=True, usage=TokenUsage(total_tokens=total))
 
 
+def _score(value: float, **components: float) -> TaskScoreSummary:
+    return TaskScoreSummary(
+        task_id="score-task",
+        composed_score=value,
+        available=True,
+        component_scores=dict(components) or {"gold_hop": value},
+        visible_component_scores=dict(components) or {"gold_hop": value},
+        component_availability={name: True for name in (components or {"gold_hop": value})},
+    )
+
+
 def test_equal_repo_weighting_and_order_independence():
-    metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+    score_summary = _score(1.0)
     tasks = [
         build_task_input(
             identity=_identity("o1/r1"),
             task_id="t1",
-            metrics=metrics,
+            score_summary=score_summary,
             baseline_usage=_usage(100),
             candidate_usage=_usage(50),
         ),
         build_task_input(
             identity=_identity("o1/r1"),
             task_id="t2",
-            metrics=metrics,
+            score_summary=score_summary,
             baseline_usage=_usage(100),
             candidate_usage=_usage(40),
         ),
         build_task_input(
             identity=_identity("o2/r2"),
             task_id="t3",
-            metrics=metrics,
+            score_summary=score_summary,
             baseline_usage=_usage(100),
             candidate_usage=_usage(90),
         ),
@@ -14075,11 +14449,10 @@ def test_equal_repo_weighting_and_order_independence():
 
 
 def test_missing_tokens_handled_explicitly():
-    metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
     task = build_task_input(
         identity=_identity("o3/r3"),
         task_id="t_missing",
-        metrics=metrics,
+        score_summary=_score(1.0),
         baseline_usage=_usage(100),
         candidate_usage=TokenUsageRecord(available=False, usage=None),
     )
@@ -14090,11 +14463,10 @@ def test_missing_tokens_handled_explicitly():
 
 
 def test_quality_floor_drops_zero_score_tasks():
-    zero_metrics = LocalizationMetrics(precision=0.0, recall=0.0, f1=0.0, hit=0.0, score=0.0)
     task = build_task_input(
         identity=_identity("o4/r4"),
         task_id="t_zero",
-        metrics=zero_metrics,
+        score_summary=_score(0.0),
         baseline_usage=_usage(50),
         candidate_usage=_usage(25),
     )
@@ -14104,11 +14476,10 @@ def test_quality_floor_drops_zero_score_tasks():
 
 
 def test_token_savings_not_rewarded_when_quality_fails():
-    low_metrics = LocalizationMetrics(precision=0.1, recall=0.1, f1=0.1, hit=0.0, score=0.1)
     task = build_task_input(
         identity=_identity("o5/r5"),
         task_id="t_low_quality",
-        metrics=low_metrics,
+        score_summary=_score(0.1),
         baseline_usage=_usage(100),
         candidate_usage=_usage(1),
     )
@@ -14118,13 +14489,12 @@ def test_token_savings_not_rewarded_when_quality_fails():
     assert repo_result.dropped_for_quality == 1
 
 
-def test_optional_hit_floor_guard():
-    metrics = LocalizationMetrics(precision=0.9, recall=0.9, f1=0.9, hit=0.0, score=0.9)
-    guard = PolicyQualityGuard(hit_floor=1.0)
+def test_named_component_floor_guard():
+    guard = PolicyQualityGuard(score_floors={"gold_hop": 1.0})
     task = build_task_input(
         identity=_identity("o6/r6"),
-        task_id="t_hit_guard",
-        metrics=metrics,
+        task_id="t_component_guard",
+        score_summary=_score(0.9, gold_hop=0.9),
         baseline_usage=_usage(100),
         candidate_usage=_usage(10),
         quality_guard=guard,
@@ -14604,7 +14974,7 @@ from pathlib import Path
 import pytest
 
 from harness.localization.models import LCAGold, LCAPrediction
-from harness.localization.scoring import score_with_projection
+from harness.localization.scoring import build_score_context, score_localization
 from harness.localization.static_graph import (
     GraphStore,
     compute_hop_distance_summary,
@@ -14650,7 +15020,7 @@ def test_anchor_extraction_order_and_dedup():
     assert len(anchors) == len(set(anchors))
 
 
-def test_score_with_projection_uses_min_hop(monkeypatch, tmp_path: Path):
+def test_score_localization_uses_static_graph_context(monkeypatch, tmp_path: Path):
     # Stub ingest_repo to avoid llm-tldr dependency in test
     from harness import localization as loc_mod
     import harness.localization.scoring as scoring_mod
@@ -14674,18 +15044,60 @@ def test_score_with_projection_uses_min_hop(monkeypatch, tmp_path: Path):
     prediction = LCAPrediction(predicted_files=["repo/file_b.py"])
     gold = LCAGold(changed_files=["repo/file_a.py"])
     usage = TokenUsageRecord(available=True, usage=TokenUsage(total_tokens=100))
-    metrics = score_with_projection(
+    ctx = build_score_context(
         prediction=prediction,
         gold=gold,
         repo_path=tmp_path,
         anchor_text="`repo/file_a.py`",
         token_usage=usage,
     )
-    assert metrics.distance_term == pytest.approx(0.5)
-    assert metrics.token_term == pytest.approx(1.0 / (1.0 + math.log1p(100)))
-    assert metrics.hop_token_score is not None
-    assert metrics.per_file_hops is not None
-    assert metrics.per_file_hops["repo/file_b.py"] == 1
+    assert ctx.gold_min_hops == 1
+    assert ctx.issue_min_hops == 1
+    assert ctx.previous_total_token_count == 100
+    assert ctx.per_prediction_hops["repo/file_b.py"] == 1
+
+    bundle = score_localization(
+        prediction=prediction,
+        gold=gold,
+        repo_path=tmp_path,
+        anchor_text="`repo/file_a.py`",
+        token_usage=usage,
+    )
+    assert bundle.results["gold_hop"].value == pytest.approx(0.5)
+    assert bundle.results["issue_hop"].value == pytest.approx(0.5)
+    assert bundle.results["token_efficiency"].value == pytest.approx(1.0 / (1.0 + math.log1p(100)))
+    assert bundle.composed_score == pytest.approx(0.5)
+
+
+def test_score_localization_missing_token_usage_keeps_default_composed_score(monkeypatch, tmp_path: Path):
+    import harness.localization.scoring as scoring_mod
+
+    tree = RawTree(
+        files=[
+            RawFile(
+                path="repo/file_a.py",
+                edges=[RawEdge(source="repo/file_a.py", target="repo/file_b.py", kind="contains")],
+            ),
+            RawFile(path="repo/file_b.py"),
+        ]
+    )
+
+    def fake_ingest(_repo: Path) -> RawTree:
+        return tree
+
+    monkeypatch.setattr(scoring_mod, "ingest_repo", fake_ingest)
+
+    bundle = score_localization(
+        prediction=LCAPrediction(predicted_files=["repo/file_b.py"]),
+        gold=LCAGold(changed_files=["repo/file_a.py"]),
+        repo_path=tmp_path,
+        anchor_text="`repo/file_a.py`",
+        token_usage=TokenUsageRecord(available=False),
+    )
+
+    assert bundle.results["token_efficiency"].available is False
+    assert bundle.results["token_efficiency"].value is None
+    assert bundle.composed_score == pytest.approx(0.5)
 </file>
 
 <file path="tests_harness/test_subprocess_guard.py">
@@ -16583,7 +16995,7 @@ todo.md
 - Items must include localization identity fields and changed_files; symbol fields are ignored.
 
 ## Baselines & Experiments (Localization-first)
-- Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, metrics, repo metadata, and trace/run ids.
+- Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, score summaries, repo metadata, and trace/run ids.
 - Hosted localization baselines/experiments use the documented SDK via `run_hosted_localization_baseline` / `run_hosted_localization_experiment`.
 - Hosted runs accept dataset_source; Langfuse remains default; Hugging Face path uses HF loader and HF repo materializer, emitting dataset source and materialization events in telemetry and stdout summaries.
 - Local runs use `run_localization_task` to materialize, predict, and score; hosted runs emit dataset run ids and telemetry.
@@ -16593,14 +17005,14 @@ todo.md
 
 Orchestration-scoped tracing is owned by the state machines and their listeners:
 - `orchestration/machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
-- `orchestration/listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, metric recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration metrics now record only `metrics.score` (no legacy metrics).
+- `orchestration/listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, score recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration scoring records the composed score bundle output.
 - `orchestration/runtime.py`: thin bootstrap/wiring layer — constructs context, dependencies, and the optimization machine; converts iteration records to public output shape. Not responsible for tracing or orchestration.
 
 Leaf-operation observability remains with:
 - `runner.py`: model calls and MCP tool invocations traced via Langfuse spans.
 - `writer.py`: policy generations/retries traced; emits `writer.policy_generated` and `writer.policy_compiled`.
 - `pipeline` steps emit exit-code/pass flags per step.
-- `scorer.py` remains the source of metric computation; Langfuse stores the metrics.
+- `localization/scoring.py` remains the source of score-context construction; Langfuse stores composed score and named component results.
 
 ## CLI
 - Localization single run: `python run.py --mode localization-single --repo-owner ... --repo-name ... --base-sha ... --issue-title ... --issue-body ... --changed-file path1 --changed-file path2`
@@ -16653,6 +17065,7 @@ reportUnknownParameterType = "warning"
 reportUnknownArgumentType = "warning"
 reportUnknownVariableType = "warning"
 reportUnknownMemberType = "warning"
+reportMissingParameterType = "none"
 reportMissingTypeStubs = "none"
 reportUnnecessaryIsInstance = "warning"
 reportUnnecessaryCast = "warning"

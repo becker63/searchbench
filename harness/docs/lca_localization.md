@@ -3,7 +3,7 @@
 ## Canonical Contract
 - **Gold**: `changed_files` (excluding tests).
 - **Prediction**: list/set of file paths only.
-- **Scoring**: file-set metrics (precision/recall/F1/hit); `metrics["score"]` maps to F1.
+- **Scoring**: Pydantic score bundles from static-graph distance components plus best-effort token diagnostics. The default composed control score uses graph-distance components; token efficiency is visible/diagnostic unless explicitly composed.
 - **Evidence**: optional diagnostics (spans/snippets), not part of canonical prediction or scoring inputs.
 
 ## Identity
@@ -16,7 +16,7 @@
 ## Execution Architecture (Two-Phase)
 - **Phase A (exploration)**: backend MCP tools -> OpenAI tool-calls -> backend `dispatch(...)`; gathers observations grounded in repo/issue/diff.
 - **Phase B (finalization)**: separate no-tools request with strict JSON schema (`predicted_files`, `reasoning`, optional `evidence`); enforces shape via `response_format: json_schema`.
-- **Evaluation**: score structured prediction against gold `changed_files`; telemetry/metrics emitted post-run.
+- **Evaluation**: score structured prediction against gold `changed_files` through static graph resolution; telemetry emits score bundle results post-run.
 
 ## Repo Materialization
 - Inputs: dataset/config/split, repo_owner/name, `base_sha`.
@@ -48,7 +48,7 @@
 ## Shared Evaluation Backend (Machine + Hosted)
 - A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.
 - The optimization/repair state machine invokes the backend through the evaluation hook (`evaluate_policy_on_item`) under a machine-owned evaluation span; LCA backend opens child task/materialization spans.
-- Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they continue to emit localization-native metrics and outputs.
-- Machine-facing scores use explicit `machine_score` semantics: by default `machine_score == aggregate_score`; derivation policies may select precision/recall/f1/hit while raw localization metrics remain canonical (`predicted_files` vs `changed_files`, F1/score).
+- Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they emit localization-native score bundle summaries and outputs.
+- Machine-facing scores use explicit `machine_score` semantics: `machine_score == score_summary.aggregate_composed_score`. There is no policy selector over file-set fields.
 - Rollback should be treated as an implementation revert/emergency only, not a co-equal path; the shared backend remains the canonical evaluation route.
-- Post-hoc policy-selection reducers run outside the loop to compare candidate policies; they consume canonical metrics plus token-usage metadata with explicit availability flags. Reducer outputs are parallel to localization metrics/control scores and do not alter loop control. Reducer quality guards default to enforcing a non-zero score/F1 floor (default >=0.2, with optional hit/precision/recall floors) so token savings cannot win when quality regresses.
+- Post-hoc policy-selection reducers run outside the loop to compare candidate policies; they consume `TaskScoreSummary` plus token-usage metadata with explicit availability flags. Reducer outputs are parallel to localization control scores and do not alter loop control. Reducer quality guards enforce configured score-name floors, defaulting to the composed score.

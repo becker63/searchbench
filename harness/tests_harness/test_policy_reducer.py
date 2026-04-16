@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from harness.localization.models import LCATaskIdentity, LocalizationMetrics
+from harness.localization.models import LCATaskIdentity
+from harness.localization.scoring_models import TaskScoreSummary
 from harness.localization.token_usage import TokenUsage, TokenUsageRecord
 from harness.telemetry.policy_reducer import (
     build_task_input,
@@ -26,27 +27,38 @@ def _usage(total: float) -> TokenUsageRecord:
     return TokenUsageRecord(available=True, usage=TokenUsage(total_tokens=total))
 
 
+def _score(value: float, **components: float) -> TaskScoreSummary:
+    return TaskScoreSummary(
+        task_id="score-task",
+        composed_score=value,
+        available=True,
+        component_scores=dict(components) or {"gold_hop": value},
+        visible_component_scores=dict(components) or {"gold_hop": value},
+        component_availability={name: True for name in (components or {"gold_hop": value})},
+    )
+
+
 def test_equal_repo_weighting_and_order_independence():
-    metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
+    score_summary = _score(1.0)
     tasks = [
         build_task_input(
             identity=_identity("o1/r1"),
             task_id="t1",
-            metrics=metrics,
+            score_summary=score_summary,
             baseline_usage=_usage(100),
             candidate_usage=_usage(50),
         ),
         build_task_input(
             identity=_identity("o1/r1"),
             task_id="t2",
-            metrics=metrics,
+            score_summary=score_summary,
             baseline_usage=_usage(100),
             candidate_usage=_usage(40),
         ),
         build_task_input(
             identity=_identity("o2/r2"),
             task_id="t3",
-            metrics=metrics,
+            score_summary=score_summary,
             baseline_usage=_usage(100),
             candidate_usage=_usage(90),
         ),
@@ -62,11 +74,10 @@ def test_equal_repo_weighting_and_order_independence():
 
 
 def test_missing_tokens_handled_explicitly():
-    metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
     task = build_task_input(
         identity=_identity("o3/r3"),
         task_id="t_missing",
-        metrics=metrics,
+        score_summary=_score(1.0),
         baseline_usage=_usage(100),
         candidate_usage=TokenUsageRecord(available=False, usage=None),
     )
@@ -77,11 +88,10 @@ def test_missing_tokens_handled_explicitly():
 
 
 def test_quality_floor_drops_zero_score_tasks():
-    zero_metrics = LocalizationMetrics(precision=0.0, recall=0.0, f1=0.0, hit=0.0, score=0.0)
     task = build_task_input(
         identity=_identity("o4/r4"),
         task_id="t_zero",
-        metrics=zero_metrics,
+        score_summary=_score(0.0),
         baseline_usage=_usage(50),
         candidate_usage=_usage(25),
     )
@@ -91,11 +101,10 @@ def test_quality_floor_drops_zero_score_tasks():
 
 
 def test_token_savings_not_rewarded_when_quality_fails():
-    low_metrics = LocalizationMetrics(precision=0.1, recall=0.1, f1=0.1, hit=0.0, score=0.1)
     task = build_task_input(
         identity=_identity("o5/r5"),
         task_id="t_low_quality",
-        metrics=low_metrics,
+        score_summary=_score(0.1),
         baseline_usage=_usage(100),
         candidate_usage=_usage(1),
     )
@@ -105,13 +114,12 @@ def test_token_savings_not_rewarded_when_quality_fails():
     assert repo_result.dropped_for_quality == 1
 
 
-def test_optional_hit_floor_guard():
-    metrics = LocalizationMetrics(precision=0.9, recall=0.9, f1=0.9, hit=0.0, score=0.9)
-    guard = PolicyQualityGuard(hit_floor=1.0)
+def test_named_component_floor_guard():
+    guard = PolicyQualityGuard(score_floors={"gold_hop": 1.0})
     task = build_task_input(
         identity=_identity("o6/r6"),
-        task_id="t_hit_guard",
-        metrics=metrics,
+        task_id="t_component_guard",
+        score_summary=_score(0.9, gold_hop=0.9),
         baseline_usage=_usage(100),
         candidate_usage=_usage(10),
         quality_guard=guard,

@@ -6,7 +6,8 @@ import pytest
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity, LocalizationMetrics
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.scoring_models import ScoreContext, ScoreEngine, summarize_batch_scores
 from harness.telemetry.hosted import experiments
 
 
@@ -24,32 +25,41 @@ def _task(repo: str) -> LCATask:
     return LCATask(identity=identity, context=context, gold=gold, repo=repo)
 
 
+def _eval_result(task: LCATask, prediction: list[str] | None = None) -> LocalizationEvaluationResult:
+    prediction = prediction or ["a.py"]
+    bundle = ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=tuple(prediction),
+            gold_files=("a.py",),
+            gold_min_hops=0,
+            issue_min_hops=0,
+        )
+    )
+    summary = summarize_batch_scores({task.task_id: bundle})
+    return LocalizationEvaluationResult(
+        score_summary=summary,
+        machine_score=summary.aggregate_composed_score,
+        items=[
+            LocalizationEvaluationTaskResult(
+                task=task,
+                score_bundle=bundle,
+                prediction=prediction,
+                evidence=None,
+                materialization=None,
+                trace_id=None,
+            )
+        ],
+        failure=None,
+    )
+
+
 def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     task = _task(str(tmp_path / "repo"))
     calls = []
 
-    from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-    from harness.localization.models import LocalizationMetrics
-
     def fake_backend(**kwargs):
         calls.append(kwargs)
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=["a.py"],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task)
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     monkeypatch.setattr(
@@ -80,23 +90,7 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
     def fake_backend(**kwargs):
         task = kwargs["tasks"][0]
         time.sleep(durations[task.task_id])
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=[task.task_id],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task, [task.task_id])
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -124,23 +118,7 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
         calls.append(task.task_id)
         if task.task_id == t2.task_id:
             raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, "runner failed", task_id=task.task_id)
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=[task.task_id],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task, [task.task_id])
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -168,23 +146,7 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
     def fake_backend(**kwargs):
         task = kwargs["tasks"][0]
         calls.append(task.task_id)
-        metrics = LocalizationMetrics(precision=1.0, recall=1.0, f1=1.0, hit=1.0, score=1.0)
-        return LocalizationEvaluationResult(
-            aggregate_score=1.0,
-            aggregate_metrics=metrics,
-            machine_score=1.0,
-            items=[
-                LocalizationEvaluationTaskResult(
-                    task=task,
-                    metrics=metrics,
-                    prediction=[task.task_id],
-                    evidence=None,
-                    materialization=None,
-                    trace_id=None,
-                )
-            ],
-            failure=None,
-        )
+        return _eval_result(task, [task.task_id])
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(

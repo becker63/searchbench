@@ -19,10 +19,10 @@ from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
     LocalizationGold,
-    LocalizationMetrics,
     LocalizationPrediction,
     normalize_lca_task,
 )
+from harness.localization.scoring_models import AggregateComponentScore, BatchScoreSummary, TaskScoreSummary, summarize_task_score
 from harness.localization.token_usage import TokenUsageRecord
 from harness.localization.telemetry import build_localization_telemetry
 from harness.telemetry.tracing import propagate_context, start_observation
@@ -39,7 +39,7 @@ class BaselineSnapshot(BaseModel):
     identity: str
     prediction: LocalizationPrediction
     gold: LocalizationGold
-    metrics: LocalizationMetrics
+    score_summary: TaskScoreSummary
     repo_owner: str
     repo_name: str
     base_sha: str
@@ -71,16 +71,41 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
             pass
 
 
-def _aggregate_metrics(snapshots: Sequence[BaselineSnapshot]) -> LocalizationMetrics | None:
-    metrics = [snap.metrics for snap in snapshots if isinstance(snap.metrics, LocalizationMetrics)]
-    if not metrics:
+def _aggregate_score_summaries(snapshots: Sequence[BaselineSnapshot]) -> BatchScoreSummary | None:
+    if not snapshots:
         return None
-    return LocalizationMetrics(
-        precision=mean(m.precision for m in metrics),
-        recall=mean(m.recall for m in metrics),
-        f1=mean(m.f1 for m in metrics),
-        hit=mean(m.hit for m in metrics),
-        score=mean(m.score for m in metrics),
+    total_count = len(snapshots)
+    composed_values = [
+        snap.score_summary.composed_score
+        for snap in snapshots
+        if snap.score_summary.composed_score is not None
+    ]
+    component_names = sorted(
+        {name for snap in snapshots for name in snap.score_summary.component_scores}
+    )
+    components: dict[str, AggregateComponentScore] = {}
+    for name in component_names:
+        values = [
+            snap.score_summary.component_scores[name]
+            for snap in snapshots
+            if snap.score_summary.component_scores.get(name) is not None
+        ]
+        numeric_values = [float(value) for value in values if isinstance(value, (int, float))]
+        available_count = len(numeric_values)
+        components[name] = AggregateComponentScore(
+            name=name,
+            average=mean(numeric_values) if numeric_values else None,
+            available_count=available_count,
+            missing_count=total_count - available_count,
+            total_count=total_count,
+            visible_to_agent=any(name in snap.score_summary.visible_component_scores for snap in snapshots),
+        )
+    return BatchScoreSummary(
+        aggregate_composed_score=mean(composed_values) if composed_values else None,
+        composed_available_count=len(composed_values),
+        composed_missing_count=total_count - len(composed_values),
+        total_count=total_count,
+        components=components,
     )
 
 
@@ -92,27 +117,21 @@ def emit_baseline_dataset_aggregates(
     """
     Emit aggregate baseline metrics to the dataset/root span for observability.
     """
-    aggregates = _aggregate_metrics(snapshots)
-    if span is None or aggregates is None:
+    aggregate_summary = _aggregate_score_summaries(snapshots)
+    if span is None or aggregate_summary is None:
         return
-    metrics_payload = {
-        "precision": aggregates.precision,
-        "recall": aggregates.recall,
-        "f1": aggregates.f1,
-        "hit": aggregates.hit,
-        "score": aggregates.score,
-    }
-    for metric_name, metric_value in metrics_payload.items():
+    score_payload = aggregate_summary.model_dump(mode="json")
+    if aggregate_summary.aggregate_composed_score is not None:
         emit_score_for_handle(
             span,
-            name=f"baseline.avg_{metric_name}",
-            value=float(metric_value),
+            name="baseline.aggregate_composed_score",
+            value=float(aggregate_summary.aggregate_composed_score),
             data_type="NUMERIC",
-            score_id=f"{getattr(span, 'id', None)}-baseline.avg_{metric_name}" if getattr(span, "id", None) else None,
+            score_id=f"{getattr(span, 'id', None)}-baseline.aggregate_composed_score" if getattr(span, "id", None) else None,
         )
     summary_metadata: dict[str, object] = {
         "selected_count": len(snapshots),
-        "aggregate_metrics": metrics_payload,
+        "score_summary": score_payload,
     }
     if extra_metadata:
         summary_metadata.update(dict(extra_metadata))
@@ -235,27 +254,25 @@ def compute_baseline_for_task(
                 )
             task_result = eval_result.items[0]
             prediction_model = LocalizationPrediction(predicted_files=task_result.prediction)
-            metrics = task_result.metrics
+            score_summary = summarize_task_score(task.task_id, task_result.score_bundle)
             evidence = task_result.evidence
             materialization = task_result.materialization
             telemetry = build_localization_telemetry(
                 task.identity,
-                metrics=metrics,
+                score_summary=score_summary,
                 changed_files_count=len(task.gold.normalized_changed_files()),
                 repo_language=task.context.repo_language,
                 repo_license=task.context.repo_license,
                 evidence=evidence,
                 materialization_events=materialization.events if materialization else None,
             )
-            for name, value in metrics.model_dump().items():
-                if value is None or isinstance(value, dict):
-                    continue
+            if score_summary.composed_score is not None:
                 emit_score_for_handle(
                     trace,
-                    name=f"baseline.{name}",
-                    value=float(value),
+                    name="baseline.composed_score",
+                    value=float(score_summary.composed_score),
                     data_type="NUMERIC",
-                    score_id=f"{trace.id}-baseline.{name}" if getattr(trace, "id", None) else None,
+                    score_id=f"{trace.id}-baseline.composed_score" if getattr(trace, "id", None) else None,
                 )
             return BaselineSnapshot(
                 dataset_name=task.identity.dataset_name,
@@ -265,7 +282,7 @@ def compute_baseline_for_task(
                 identity=task.task_id,
                 prediction=prediction_model,
                 gold=LocalizationGold(changed_files=task.gold.normalized_changed_files()),
-                metrics=metrics,
+                score_summary=score_summary,
                 repo_owner=task.identity.repo_owner,
                 repo_name=task.identity.repo_name,
                 base_sha=task.identity.base_sha,
@@ -275,6 +292,7 @@ def compute_baseline_for_task(
                 token_usage=task_result.token_usage,
                 metadata={
                     "telemetry": telemetry.model_dump(exclude_none=True),
+                    "score_summary": score_summary.model_dump(mode="json"),
                     "run_kind": "localization_baseline",
                     "dataset_source": getattr(parent_trace, "metadata", {}).get("dataset_source") if parent_trace else None,
                 },
@@ -315,7 +333,7 @@ def make_baseline_bundle(
 
 
 def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
-    serializable = bundle.model_dump(exclude_none=True, mode="json")
+    serializable = bundle.model_dump(mode="json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(serializable, indent=2))
 

@@ -18,7 +18,7 @@
 - Items must include localization identity fields and changed_files; symbol fields are ignored.
 
 ## Baselines & Experiments (Localization-first)
-- Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, metrics, repo metadata, and trace/run ids.
+- Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, score summaries, repo metadata, and trace/run ids.
 - Hosted localization baselines/experiments use the documented SDK via `run_hosted_localization_baseline` / `run_hosted_localization_experiment`.
 - Hosted runs accept dataset_source; Langfuse remains default; Hugging Face path uses HF loader and HF repo materializer, emitting dataset source and materialization events in telemetry and stdout summaries.
 - Local runs use `run_localization_task` to materialize, predict, and score; hosted runs emit dataset run ids and telemetry.
@@ -28,14 +28,14 @@
 
 Orchestration-scoped tracing is owned by the state machines and their listeners:
 - `orchestration/machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
-- `orchestration/listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, metric recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration metrics now record only `metrics.score` (no legacy metrics).
+- `orchestration/listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, score recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration scoring records the composed score bundle output.
 - `orchestration/runtime.py`: thin bootstrap/wiring layer — constructs context, dependencies, and the optimization machine; converts iteration records to public output shape. Not responsible for tracing or orchestration.
 
 Leaf-operation observability remains with:
 - `runner.py`: model calls and MCP tool invocations traced via Langfuse spans.
 - `writer.py`: policy generations/retries traced; emits `writer.policy_generated` and `writer.policy_compiled`.
 - `pipeline` steps emit exit-code/pass flags per step.
-- `scorer.py` remains the source of metric computation; Langfuse stores the metrics.
+- `localization/scoring.py` remains the source of score-context construction; Langfuse stores composed score and named component results.
 
 ## CLI
 - Localization single run: `python run.py --mode localization-single --repo-owner ... --repo-name ... --base-sha ... --issue-title ... --issue-body ... --changed-file path1 --changed-file path2`

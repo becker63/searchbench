@@ -11,12 +11,11 @@ from harness.localization.models import (
     LocalizationEvalRecord,
     LocalizationEvidence,
     LocalizationGold,
-    LocalizationMetrics,
     LocalizationPrediction,
     LocalizationRepoInfo,
     canonicalize_paths,
 )
-from harness.localization.scoring import score_file_localization
+from harness.localization.scoring_models import ScoreBundle, ScoreContext
 
 
 def localization_eval_identity(identity: LCATaskIdentity) -> str:
@@ -45,21 +44,21 @@ def _normalize_gold(gold: LCAGold | Mapping[str, object]) -> List[str]:
     return gold.normalized_changed_files()
 
 
-def build_file_localization_eval_record(
+def build_localization_score_eval_record(
     identity: LCATaskIdentity,
     prediction: LCAPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
+    score_context: ScoreContext,
+    score_bundle: ScoreBundle,
     evidence: Optional[LocalizationEvidence] = None,
     repo_path: Optional[Path] = None,
-    metrics: Optional[LocalizationMetrics] = None,
 ) -> LocalizationEvalRecord:
     """
-    Build a canonical evaluation record for file-path-only predictions against LCA gold.
+    Build a canonical evaluation record for score-bundle localization results.
 
-    Evidence (if provided) is kept separate from the primary metrics/prediction and should
+    Evidence (if provided) is kept separate from the score bundle/prediction and should
     be used only for diagnostics.
     """
-    metrics = metrics or score_file_localization(prediction, gold)
     predicted_files = _normalize_prediction(prediction)
     changed_files = _normalize_gold(gold)
 
@@ -83,7 +82,8 @@ def build_file_localization_eval_record(
         repo=repo_block,
         prediction=LocalizationPrediction(predicted_files=predicted_files),
         gold=LocalizationGold(changed_files=changed_files),
-        metrics=metrics if isinstance(metrics, LocalizationMetrics) else LocalizationMetrics.from_mapping(metrics),
+        score_context=score_context,
+        score_bundle=score_bundle,
         evidence=evidence_block,
         repo_path=repo_path_str,
     )

@@ -55,7 +55,7 @@ def test_score_task_failure_is_typed(tmp_path, monkeypatch):
     def bad_eval(*_a, **_k):
         raise ValueError("score fail")
 
-    monkeypatch.setattr("harness.localization.runtime.execute.build_file_localization_eval_record", bad_eval)
+    monkeypatch.setattr("harness.localization.runtime.execute.build_localization_score_eval_record", bad_eval)
     with pytest.raises(LocalizationEvaluationError) as exc:
         _score_task(task, LCAPrediction(predicted_files=["a.py"]), repo)
     assert exc.value.category == LocalizationFailureCategory.SCORING

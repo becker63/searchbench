@@ -22,7 +22,6 @@ except ImportError:
     termios = None  # type: ignore
 
 from harness.localization.runtime.evaluate import (
-    MachineScorePolicy,
     LocalizationRunner,
     evaluate_localization_batch as _evaluate_localization_batch,
 )
@@ -140,7 +139,6 @@ def evaluate_localization_batch(
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
-    machine_score_policy: MachineScorePolicy = MachineScorePolicy.AGGREGATE,
 ):
     """
     Thin wrapper to keep monkeypatch targets stable for tests while deferring import cycles.
@@ -151,7 +149,6 @@ def evaluate_localization_batch(
         materializer=materializer,
         parent_trace=parent_trace,
         runner=runner,
-        machine_score_policy=machine_score_policy,
     )
 
 

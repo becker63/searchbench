@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -256,45 +256,6 @@ class LocalizationExtensionCounts(BaseModel):
         return cls(entries=[LocalizationExtensionCount(extension=str(ext), count=int(count)) for ext, count in value.items()])
 
 
-class LocalizationMetrics(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    precision: float
-    recall: float
-    f1: float
-    hit: float
-    score: float
-    hop_token_score: float | None = None
-    distance_term: float | None = None
-    token_term: float | None = None
-    per_file_hops: Mapping[str, float | None] | None = None
-
-    @classmethod
-    def from_mapping(cls, metrics: Mapping[str, object]) -> "LocalizationMetrics":
-        def _f(val: object, default: float = 0.0) -> float:
-            return float(val) if isinstance(val, (int, float)) else default
-
-        def _fo(val: object) -> float | None:
-            return float(val) if isinstance(val, (int, float)) else None
-
-        per_file_hops_val = metrics.get("per_file_hops")
-        per_file_hops: Mapping[str, float | None] | None = None
-        if isinstance(per_file_hops_val, Mapping):
-            per_file_hops = {str(k): _fo(v) for k, v in per_file_hops_val.items()}
-
-        return cls(
-            precision=_f(metrics.get("precision"), 0.0),
-            recall=_f(metrics.get("recall"), 0.0),
-            f1=_f(metrics.get("f1"), 0.0),
-            hit=_f(metrics.get("hit"), 0.0),
-            score=_f(metrics.get("score", metrics.get("f1", 0.0)), _f(metrics.get("f1"), 0.0)),
-            hop_token_score=_fo(metrics.get("hop_token_score")),
-            distance_term=_fo(metrics.get("distance_term")),
-            token_term=_fo(metrics.get("token_term")),
-            per_file_hops=per_file_hops,
-        )
-
-
 class LocalizationMaterialization(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -313,7 +274,8 @@ class LocalizationEvalRecord(BaseModel):
     repo: LocalizationRepoInfo
     prediction: LocalizationPrediction
     gold: LocalizationGold
-    metrics: LocalizationMetrics
+    score_context: Any
+    score_bundle: Any
     evidence: Optional[LocalizationEvidence] = None
     repo_path: Optional[str] = None
 
@@ -322,9 +284,6 @@ class LocalizationEvalRecord(BaseModel):
     def _coerce_blocks(cls, value: object) -> object:
         if isinstance(value, Mapping):
             raw = dict(value)
-            metrics_val = raw.get("metrics")
-            if isinstance(metrics_val, Mapping):
-                raw["metrics"] = LocalizationMetrics.from_mapping(metrics_val)
             evidence_val = raw.get("evidence")
             if isinstance(evidence_val, Mapping):
                 raw["evidence"] = LocalizationEvidence.from_mapping(evidence_val)
@@ -343,7 +302,7 @@ class LocalizationTelemetryEnvelope(BaseModel):
     dataset: LocalizationDatasetInfo
     dataset_source: Optional[str] = None
     repo: LocalizationRepoInfo
-    metrics: LocalizationMetrics
+    score_summary: Any
     changed_files_count: Optional[int] = None
     evidence: Optional[LocalizationEvidence] = None
     materialization_events: Optional[LocalizationMaterialization] = None
@@ -355,9 +314,6 @@ class LocalizationTelemetryEnvelope(BaseModel):
     def _coerce_blocks(cls, value: object) -> object:
         if isinstance(value, Mapping):
             raw = dict(value)
-            metrics_val = raw.get("metrics")
-            if isinstance(metrics_val, Mapping):
-                raw["metrics"] = LocalizationMetrics.from_mapping(metrics_val)
             evidence_val = raw.get("evidence")
             if isinstance(evidence_val, Mapping):
                 raw["evidence"] = LocalizationEvidence.from_mapping(evidence_val)
