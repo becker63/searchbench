@@ -148,16 +148,19 @@ def test_baseline_dataset_span_gets_aggregates(monkeypatch):
         def __init__(self):
             self.id = "dataset-span"
 
+        def score_trace(self, **kwargs):
+            emitted.append(kwargs)
+
         def update(self, **kwargs):
             updates.append(kwargs)
 
-    def fake_emit_score(handle, name, value, data_type, score_id=None):
-        emitted.append({"handle": handle, "name": name, "value": value, "score_id": score_id})
-
-    monkeypatch.setattr(baselines, "emit_score_for_handle", fake_emit_score)
     baselines.emit_baseline_dataset_aggregates(DummySpan(), [snap_one, snap_two])
     names = {item["name"] for item in emitted}
-    assert names == {"baseline.aggregate_composed_score"}
+    assert names == {
+        "baseline.aggregate_composed_score",
+        "baseline.aggregate_gold_hop",
+        "baseline.aggregate_issue_hop",
+    }
     assert updates
     metadata = updates[-1].get("metadata")
     assert metadata is not None
@@ -325,6 +328,9 @@ def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
             metadata_updates.append(kwargs)
 
         def score(self, **kwargs):
+            raise AssertionError("dataset aggregates should use trace-level scores")
+
+        def score_trace(self, **kwargs):
             captured_scores.append(kwargs)
 
     @contextmanager
@@ -338,8 +344,6 @@ def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
         "fetch_hf_localization_dataset",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch should not run")),
     )
-    monkeypatch.setattr(baselines, "emit_score_for_handle", lambda handle, **k: captured_scores.append(k))
-
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
         dataset_config=task.identity.dataset_config,
@@ -349,7 +353,11 @@ def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
     result = experiments.run_hosted_localization_baseline(req)
     assert result.items and result.items[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
-    assert names == {"baseline.aggregate_composed_score"}
+    assert names == {
+        "baseline.aggregate_composed_score",
+        "baseline.aggregate_gold_hop",
+        "baseline.aggregate_issue_hop",
+    }
     assert metadata_updates
     metadata = metadata_updates[-1].get("metadata")
     assert metadata and metadata.get("cache_hit") is True
@@ -379,6 +387,9 @@ def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
             metadata_updates.append(kwargs)
 
         def score(self, **kwargs):
+            raise AssertionError("dataset aggregates should use trace-level scores")
+
+        def score_trace(self, **kwargs):
             captured_scores.append(kwargs)
 
     @contextmanager
@@ -397,8 +408,6 @@ def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
         "compute_baseline_for_task",
         lambda *a, **k: snap,
     )
-    monkeypatch.setattr(baselines, "emit_score_for_handle", lambda handle, **k: captured_scores.append(k))
-
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
         dataset_config=task.identity.dataset_config,
@@ -408,7 +417,11 @@ def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
     result = experiments.run_hosted_localization_baseline(req)
     assert result.items and result.items[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
-    assert names == {"baseline.aggregate_composed_score"}
+    assert names == {
+        "baseline.aggregate_composed_score",
+        "baseline.aggregate_gold_hop",
+        "baseline.aggregate_issue_hop",
+    }
     metadata = metadata_updates[-1].get("metadata")
     assert metadata and metadata.get("cache_hit") is False
     assert metadata.get("selected_count") == 1

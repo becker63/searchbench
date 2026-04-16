@@ -40,6 +40,29 @@ def test_default_composition_keeps_token_efficiency_best_effort():
     assert bundle.available is True
 
 
+def test_unavailable_component_reasons_use_score_context_diagnostics():
+    ctx = ScoreContext(
+        predicted_files=("src/app.py",),
+        gold_files=("src/app.py",),
+        diagnostics={
+            "static_graph_available": False,
+            "token_usage_available": False,
+            "previous_total_token_count_available": False,
+        },
+    )
+
+    bundle = ScoreEngine().evaluate(ctx)
+
+    assert bundle.results["gold_hop"].reason == "static_graph unavailable"
+    assert bundle.results["issue_hop"].reason == "static_graph unavailable"
+    assert (
+        bundle.results["token_efficiency"].reason
+        == "previous_total_token_count unavailable"
+    )
+    assert bundle.results["gold_hop"].metadata["static_graph_available"] is False
+    assert bundle.results["token_efficiency"].metadata["token_usage_available"] is False
+
+
 def test_token_efficiency_can_be_required_by_composition():
     config = ScoreConfig(
         enabled=("gold_hop", "issue_hop", "token_efficiency"),

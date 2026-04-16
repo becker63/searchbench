@@ -20,7 +20,13 @@ class TokenEfficiencyScore:
             reason=None
             if value is not None
             else "previous_total_token_count unavailable",
-            metadata={"previous_total_token_count": ctx.previous_total_token_count},
+            metadata={
+                "previous_total_token_count": ctx.previous_total_token_count,
+                "token_usage_available": ctx.diagnostics.get("token_usage_available"),
+                "previous_total_token_count_available": ctx.diagnostics.get(
+                    "previous_total_token_count_available"
+                ),
+            },
         )
 
 

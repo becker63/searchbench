@@ -22,6 +22,7 @@ from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.runtime.execute import run_localization_task
 import harness.localization.runtime.execute as executor_module
 import harness.agents.localizer as runner
+from harness.localization.errors import LocalizationEvaluationError
 
 
 def test_identity_is_deterministic():
@@ -218,6 +219,217 @@ def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
     assert "gold_hop" in score_bundle.results
 
 
+def test_localization_task_emits_backend_prefixed_score_bundle(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    lca_task = executor_module.LCATask.model_validate(
+        {
+            "identity": identity.model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="body").model_dump(),
+            "gold": LCAGold(changed_files=["a.py"]).model_dump(),
+            "repo": str(repo_dir),
+        }
+    )
+    bundle = ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=("a.py",),
+            gold_files=("a.py",),
+            gold_min_hops=0,
+            issue_min_hops=0,
+        )
+    )
+
+    from contextlib import contextmanager
+
+    emitted: list[dict[str, object]] = []
+
+    @contextmanager
+    def span_cm():
+        span = type(
+            "S",
+            (),
+            {
+                "id": "span",
+                "metadata": {},
+                "update": lambda self, **kw: None,
+                "end": lambda self, **kw: None,
+            },
+        )()
+        yield span
+
+    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(executor_module, "_score_task", lambda *a, **k: bundle)
+    monkeypatch.setattr(
+        executor_module,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: emitted.append(kwargs),
+    )
+
+    run_localization_task(
+        lca_task,
+        runner=lambda *_args: (["a.py"], {"backend": "ic"}),
+    )
+
+    names = {item["name"] for item in emitted}
+    assert {"ic.composed_score", "ic.gold_hop", "ic.issue_hop"} <= names
+    assert all("score_id" not in item for item in emitted)
+
+
+def test_localization_task_scores_runner_usage_as_visible_component(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    (repo_dir / "src").mkdir(parents=True)
+    (repo_dir / "src" / "app.py").write_text("def app():\n    return 1\n")
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    lca_task = executor_module.LCATask.model_validate(
+        {
+            "identity": identity.model_dump(),
+            "context": LCAContext(issue_title="app bug", issue_body="src app").model_dump(),
+            "gold": LCAGold(changed_files=["src/app.py"]).model_dump(),
+            "repo": str(repo_dir),
+        }
+    )
+
+    from contextlib import contextmanager
+
+    emitted: list[dict[str, object]] = []
+
+    @contextmanager
+    def span_cm():
+        span = type(
+            "S",
+            (),
+            {
+                "id": "span",
+                "metadata": {},
+                "update": lambda self, **kw: None,
+                "end": lambda self, **kw: None,
+            },
+        )()
+        yield span
+
+    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(
+        executor_module,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: emitted.append(kwargs),
+    )
+
+    _prediction, score_bundle, _evidence, _mat, usage = run_localization_task(
+        lca_task,
+        runner=lambda *_args: (
+            ["src/app.py"],
+            {
+                "backend": "ic",
+                "usage_details": {"input": 10, "output": 5, "total": 15},
+            },
+        ),
+    )
+
+    assert usage.available is True
+    assert score_bundle.results["token_efficiency"].available is True
+    assert score_bundle.results["token_efficiency"].value is not None
+    names = {item["name"] for item in emitted}
+    assert "ic.token_efficiency" in names
+
+
+def test_localization_langfuse_boundary_node_count_visible_without_malformed_bundle_fallback(
+    monkeypatch, tmp_path
+):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    lca_task = executor_module.LCATask.model_validate(
+        {
+            "identity": identity.model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="body").model_dump(),
+            "gold": LCAGold(changed_files=["a.py"]).model_dump(),
+            "repo": str(repo_dir),
+        }
+    )
+    bundle = ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=("a.py",),
+            gold_files=("a.py",),
+            gold_min_hops=0,
+            issue_min_hops=0,
+        )
+    )
+
+    from contextlib import contextmanager
+
+    handle_scores: list[dict[str, object]] = []
+    create_score_calls: list[dict[str, object]] = []
+
+    class TaskSpan:
+        id = "task-observation"
+        metadata: dict[str, object] = {}
+
+        def update(self, **kwargs):
+            pass
+
+        def end(self, **kwargs):
+            pass
+
+    class BackendSpan:
+        id = "backend-observation"
+
+        def score(self, **kwargs):
+            handle_scores.append(kwargs)
+
+    class DummyClient:
+        def auth_check(self):
+            return True
+
+        def create_score(self, **kwargs):
+            create_score_calls.append(kwargs)
+
+    @contextmanager
+    def span_cm():
+        yield TaskSpan()
+
+    def runner_with_visible_node_count(*_args):
+        executor_module.emit_score_for_handle(
+            BackendSpan(),
+            name="ic.node_count",
+            value=2.0,
+            data_type="NUMERIC",
+        )
+        return ["a.py"], {"backend": "ic"}
+
+    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(executor_module, "_score_task", lambda *a, **k: bundle)
+    monkeypatch.setattr(
+        "harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient()
+    )
+
+    run_localization_task(lca_task, runner=runner_with_visible_node_count)
+
+    assert [score["name"] for score in handle_scores] == ["ic.node_count"]
+    assert create_score_calls == []
+
+
 def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
     captured: list[dict[str, object]] = []
 
@@ -268,3 +480,361 @@ def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
     assert captured
     assert "changed_files" not in captured[0]
     assert result.get("predicted_files") == ["src/app.py"]
+
+
+def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        runner,
+        "run_agent",
+        lambda *a, **k: {
+            "observations": [
+                {
+                    "role": "assistant",
+                    "content": {
+                        "predicted_files": ["src/recovered.py"],
+                        "reasoning": "from observations",
+                    },
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_finalize_localization",
+        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
+            predicted_files=[], observations=obs, source="finalize"
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type(
+            "B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}}
+        )(),
+    )
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        yield type(
+            "S",
+            (),
+            {"update": lambda self, **kw: None, "end": lambda self, **kw: None, "id": "span"},
+        )()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    result = runner.run_ic_iteration(
+        {
+            "identity": LCATaskIdentity(
+                dataset_name="lca",
+                dataset_config="py",
+                dataset_split="dev",
+                repo_owner="o",
+                repo_name="r",
+                base_sha="abc",
+            ).model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+            "repo": str(repo_dir),
+        },
+        score_fn=None,
+        steps=1,
+        parent_trace=object(),
+    )
+
+    assert result["predicted_files"] == ["src/recovered.py"]
+    assert result["source"] == "fallback"
+    assert result["reasoning"] == "from observations"
+
+
+def test_run_ic_iteration_recovers_nested_tool_result_candidates(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    nested_path = repo_dir / "SRC" / "Nested.py"
+    monkeypatch.setattr(
+        runner,
+        "run_agent",
+        lambda *a, **k: {
+            "observations": [
+                {
+                    "role": "tool",
+                    "result": {
+                        "matches": [
+                            {"file": str(nested_path)},
+                            {"metadata": {"relative_path": "./pkg/Other.py"}},
+                        ],
+                    },
+                    "content": "{}",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_finalize_localization",
+        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
+            predicted_files=[], observations=obs, source="finalize"
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type(
+            "B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}}
+        )(),
+    )
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        yield type(
+            "S",
+            (),
+            {"update": lambda self, **kw: None, "end": lambda self, **kw: None, "id": "span"},
+        )()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+
+    result = runner.run_ic_iteration(
+        {
+            "identity": LCATaskIdentity(
+                dataset_name="lca",
+                dataset_config="py",
+                dataset_split="dev",
+                repo_owner="o",
+                repo_name="r",
+                base_sha="abc",
+            ).model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+            "repo": str(repo_dir),
+        },
+        score_fn=None,
+        steps=1,
+        parent_trace=object(),
+    )
+
+    assert result["predicted_files"] == ["src/nested.py", "pkg/other.py"]
+    assert result["source"] == "fallback"
+
+
+def test_run_ic_iteration_recovers_when_finalization_request_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        runner,
+        "run_agent",
+        lambda *a, **k: {
+            "observations": [
+                {
+                    "role": "tool",
+                    "result": {"files": ["src/from_tool.py"]},
+                    "content": "{}",
+                }
+            ]
+        },
+    )
+
+    def raise_finalization_error(*_args, **_kwargs):
+        raise RuntimeError("queue_exceeded")
+
+    monkeypatch.setattr(runner, "_finalize_localization", raise_finalization_error)
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type(
+            "B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}}
+        )(),
+    )
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        yield type(
+            "S",
+            (),
+            {"update": lambda self, **kw: None, "end": lambda self, **kw: None, "id": "span"},
+        )()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    result = runner.run_ic_iteration(
+        {
+            "identity": LCATaskIdentity(
+                dataset_name="lca",
+                dataset_config="py",
+                dataset_split="dev",
+                repo_owner="o",
+                repo_name="r",
+                base_sha="abc",
+            ).model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+            "repo": str(repo_dir),
+        },
+        score_fn=None,
+        steps=1,
+        parent_trace=object(),
+    )
+
+    assert result["predicted_files"] == ["src/from_tool.py"]
+    assert result["source"] == "fallback"
+
+
+def test_candidate_file_collection_normalizes_and_dedupes(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    observations = [
+        {
+            "role": "tool",
+            "result": {
+                "files": [
+                    str(repo_dir / "SRC" / "App.py"),
+                    "./src/app.py",
+                    "",
+                    "https://example.com/not-a-file.py",
+                    "/outside/repo.py",
+                    "not_a_file_symbol",
+                ],
+                "nested": {"owner_path": "pkg/Util.py"},
+            },
+        },
+        {
+            "role": "assistant",
+            "content": '{"paths": ["pkg/Util.py", "tests/Test_App.py"]}',
+        },
+    ]
+
+    assert runner._collect_candidate_files_from_observations(  # type: ignore[attr-defined]
+        observations,
+        repo_root=str(repo_dir),
+    ) == ["pkg/util.py", "tests/test_app.py", "src/app.py"]
+
+
+def test_run_localization_task_empty_finalize_and_empty_fallback_is_typed(
+    monkeypatch, tmp_path
+):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    lca_task = executor_module.LCATask.model_validate(
+        {
+            "identity": identity.model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="body").model_dump(),
+            "gold": LCAGold(changed_files=["a.py"]).model_dump(),
+            "repo": str(repo_dir),
+        }
+    )
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        yield type(
+            "S",
+            (),
+            {
+                "id": "span",
+                "metadata": {},
+                "update": lambda self, **kw: None,
+                "end": lambda self, **kw: None,
+            },
+        )()
+
+    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(runner, "run_agent", lambda *a, **k: {"observations": []})
+    monkeypatch.setattr(
+        runner,
+        "_finalize_localization",
+        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
+            predicted_files=[], observations=obs, source="finalize"
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type(
+            "B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}}
+        )(),
+    )
+
+    with pytest.raises(LocalizationEvaluationError) as exc_info:
+        run_localization_task(lca_task)
+
+    assert exc_info.value.category.value == "runner"
+    assert "fallback recovery" in str(exc_info.value)
+
+
+def test_run_localization_task_preserves_exploration_failure_without_observations(
+    monkeypatch, tmp_path
+):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    lca_task = executor_module.LCATask.model_validate(
+        {
+            "identity": identity.model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="body").model_dump(),
+            "gold": LCAGold(changed_files=["a.py"]).model_dump(),
+            "repo": str(repo_dir),
+        }
+    )
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        yield type(
+            "S",
+            (),
+            {
+                "id": "span",
+                "metadata": {},
+                "update": lambda self, **kw: None,
+                "end": lambda self, **kw: None,
+            },
+        )()
+
+    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+
+    def raise_exploration_error(*_args, **_kwargs):
+        raise RuntimeError("queue_exceeded")
+
+    monkeypatch.setattr(runner, "run_agent", raise_exploration_error)
+    monkeypatch.setattr(
+        runner,
+        "_finalize_localization",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("finalization should not run without observations")
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type(
+            "B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}}
+        )(),
+    )
+
+    with pytest.raises(LocalizationEvaluationError) as exc_info:
+        run_localization_task(lca_task)
+
+    assert exc_info.value.category.value == "runner"
+    assert "failed before producing observations" in str(exc_info.value)
+    assert "queue_exceeded" in str(exc_info.value)

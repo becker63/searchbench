@@ -1,14 +1,14 @@
-from __future__ import annotations
-
 """
 Localization-first CLI entrypoint: parse arguments, build typed requests, and run LCA bug localization flows.
 Adds dataset guardrails: deterministic selection, cost projection, confirmation gating, and automation safety.
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
-import sys
 import os
+import sys
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -212,7 +212,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     baseline_parser.add_argument(
         "--invalidate-baseline-cache",
         action="store_true",
-        help="Remove any cached baseline bundle before running",
+        help="Remove cached baseline bundle and selected repo worktree caches before running",
     )
 
     experiment_parser = subparsers.add_parser("experiment")
@@ -280,6 +280,26 @@ def _invalidate_baseline_cache(bundle_path: Path) -> None:
         print(f"[CACHE] Baseline cache invalidated at {cache_path}")
         return
     print(f"[CACHE] Baseline cache not found at {cache_path}; nothing to invalidate.")
+
+
+def _invalidate_materialized_repos_for_tasks(
+    tasks: Sequence[LCATask], materializer: RepoMaterializer
+) -> list[str]:
+    """
+    Best-effort targeted invalidation of repo worktree caches for selected tasks.
+    """
+    invalidator = getattr(materializer, "invalidate_tasks", None)
+    if not callable(invalidator):
+        print("[CACHE] Repo worktree cache invalidation unavailable for materializer.")
+        return []
+    raw_events = invalidator(tasks)
+    events = [str(event) for event in raw_events] if isinstance(raw_events, list) else []
+    print(
+        f"[CACHE] Repo worktree cache invalidated for {len(tasks)} selected task(s)"
+    )
+    for event in events:
+        print(f"[CACHE] {event}")
+    return events
 
 
 def _select_tasks(
@@ -521,9 +541,6 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "baseline"
         else None
     )
-    if baseline_bundle_path and getattr(args, "invalidate_baseline_cache", False):
-        _invalidate_baseline_cache(baseline_bundle_path)
-
     try:
         if args.command == "baseline":
             print(f"[RUN] HF localization baseline for dataset '{HF_DATASET_NAME}'")
@@ -556,6 +573,9 @@ def main(argv: list[str] | None = None) -> None:
             if args.projection_only:
                 print("[RUN] Projection-only mode: exiting before execution.")
                 return
+            if baseline_bundle_path and getattr(args, "invalidate_baseline_cache", False):
+                _invalidate_baseline_cache(baseline_bundle_path)
+                _invalidate_materialized_repos_for_tasks(selected_tasks, materializer)
             req = HostedLocalizationBaselineRequest(
                 dataset=HF_DATASET_NAME,
                 version=args.revision,

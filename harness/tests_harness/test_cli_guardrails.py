@@ -8,6 +8,7 @@ import pytest
 
 import run as run_module
 from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest
+from harness.localization.materialization.materialize import RepoMaterializationRequest, describe_repo_mapping
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.telemetry.hosted.baselines import baseline_cache_path
 from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
@@ -37,9 +38,7 @@ def _stub_cli_baseline(monkeypatch, tmp_path, run_stub, cache_root=None, baselin
     monkeypatch.setattr(
         run_module,
         "fetch_hf_localization_dataset",
-        lambda *args, **kwargs: [
-            SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))
-        ],
+        lambda *args, **kwargs: [_task("o", "r", "b", dataset=run_module.harness_run.HF_DATASET_NAME, config="py", split="dev")],
     )
 
     def fake_select(tasks, max_items, offset):
@@ -60,6 +59,22 @@ def _stub_cli_baseline(monkeypatch, tmp_path, run_stub, cache_root=None, baselin
     monkeypatch.setattr(run_module, "_require_confirmation", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_module, "run_hosted_localization_baseline", run_stub)
     return hf_cache_dir, baseline_cache_dir
+
+
+def _cache_key(request: RepoMaterializationRequest) -> str:
+    return describe_repo_mapping(request).replace(":", "__").replace("/", "__")
+
+
+def _worktree_path(cache_root, *, repo_owner: str = "o", repo_name: str = "r", base_sha: str = "b", config: str = "py"):
+    request = RepoMaterializationRequest(
+        dataset_name=run_module.harness_run.HF_DATASET_NAME,
+        dataset_config=config,
+        dataset_split="dev",
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        base_sha=base_sha,
+    )
+    return cache_root / "worktrees" / _cache_key(request)
 
 
 def test_parse_defaults():
@@ -164,6 +179,55 @@ def test_projection_only_skips_execution(monkeypatch):
     assert calls["baseline"] == 0, "Projection-only should exit before executing baseline run"
 
 
+def test_projection_only_with_invalidation_skips_destructive_cache_removal(monkeypatch, tmp_path):
+    calls = {"baseline": 0}
+
+    def fake_fetch(name, dataset_config=None, dataset_split=None, revision=None):
+        return [_task("o", "r", "b", dataset=name, config=dataset_config or "py", split=dataset_split or "dev")]
+
+    def fake_run(*args, **kwargs):
+        calls["baseline"] += 1
+        return None
+
+    monkeypatch.setenv("HF_LCA_CACHE_DIR", str(tmp_path / "hf_cache"))
+    monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path / "baseline_cache"))
+    monkeypatch.setattr(run_module.harness_run, "ensure_langfuse_auth", lambda: None)
+    monkeypatch.setattr(run_module.harness_run, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", fake_fetch)
+    monkeypatch.setattr(run_module, "_compute_projection", lambda *args, **kwargs: {"total": {"planned": 0, "hard_cap": 0}, "localization": {}, "writer": {}})
+    monkeypatch.setattr(run_module, "_require_confirmation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_module, "run_hosted_localization_baseline", fake_run)
+    bundle_path = baseline_cache_path(
+        run_module.harness_run.HF_DATASET_NAME,
+        dataset_config="py",
+        dataset_split="dev",
+        dataset_version=None,
+    )
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_text("{}")
+    worktree_path = _worktree_path(tmp_path / "hf_cache")
+    worktree_path.mkdir(parents=True)
+    (worktree_path / ".complete").write_text("")
+
+    run_module.main([
+        "baseline",
+        "--config",
+        "py",
+        "--split",
+        "dev",
+        "--projection-only",
+        "--yes",
+        "--max-items",
+        "1",
+        "--invalidate-baseline-cache",
+    ])
+
+    assert calls["baseline"] == 0
+    assert bundle_path.exists()
+    assert worktree_path.exists()
+    assert (worktree_path / ".complete").exists()
+
+
 def test_hf_loader_is_used(monkeypatch):
     calls = {"loader": None, "baseline": None}
 
@@ -260,6 +324,9 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
     hf_cache_root = tmp_path / "hf_cache_existing"
     hf_cache_root.mkdir(parents=True, exist_ok=True)
     (hf_cache_root / "marker.txt").write_text("cached")
+    worktree_path = _worktree_path(hf_cache_root)
+    worktree_path.mkdir(parents=True)
+    (worktree_path / ".complete").write_text("")
     _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
     bundle_path = baseline_cache_path(
         run_module.harness_run.HF_DATASET_NAME,
@@ -286,8 +353,10 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
     out = capsys.readouterr().out
 
     assert "[CACHE] Baseline cache invalidated" in out
+    assert "[CACHE] Repo worktree cache invalidated for 1 selected task(s)" in out
     assert calls == [True]
     assert not bundle_path.exists()
+    assert not worktree_path.exists()
     assert (hf_cache_root / "marker.txt").exists(), "HF cache should remain untouched"
 
 
@@ -301,6 +370,9 @@ def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys
     hf_cache_root = tmp_path / "hf_cache_missing"
     hf_cache_root.mkdir(parents=True, exist_ok=True)
     (hf_cache_root / "marker.txt").write_text("cached")
+    worktree_path = _worktree_path(hf_cache_root)
+    worktree_path.mkdir(parents=True)
+    (worktree_path / ".complete").write_text("")
     _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
     bundle_path = baseline_cache_path(
         run_module.harness_run.HF_DATASET_NAME,
@@ -325,6 +397,83 @@ def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys
     out = capsys.readouterr().out
 
     assert "Baseline cache not found" in out
+    assert "[CACHE] Repo worktree cache invalidated for 1 selected task(s)" in out
     assert calls == [True]
     assert not bundle_path.exists()
+    assert not worktree_path.exists()
     assert (hf_cache_root / "marker.txt").exists(), "HF cache should remain untouched"
+
+
+def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypatch, tmp_path):
+    def fake_run(req, materializer=None, tasks=None):
+        return SimpleNamespace(items=[], failure=None)
+
+    selected_task = _task(
+        "selected",
+        "repo",
+        "a" * 40,
+        dataset=run_module.harness_run.HF_DATASET_NAME,
+        config="py",
+        split="dev",
+    )
+    other_task = _task(
+        "other",
+        "repo",
+        "b" * 40,
+        dataset=run_module.harness_run.HF_DATASET_NAME,
+        config="py",
+        split="dev",
+    )
+    hf_cache_root = tmp_path / "hf_cache_targeted"
+    selected_path = _worktree_path(
+        hf_cache_root,
+        repo_owner="selected",
+        repo_name="repo",
+        base_sha="a" * 40,
+    )
+    other_path = _worktree_path(
+        hf_cache_root,
+        repo_owner="other",
+        repo_name="repo",
+        base_sha="b" * 40,
+    )
+    selected_path.mkdir(parents=True)
+    other_path.mkdir(parents=True)
+    (selected_path / ".complete").write_text("")
+    (other_path / ".complete").write_text("")
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
+    monkeypatch.setattr(
+        run_module,
+        "fetch_hf_localization_dataset",
+        lambda *args, **kwargs: [selected_task, other_task],
+    )
+    monkeypatch.setattr(
+        run_module,
+        "_select_tasks",
+        lambda tasks, max_items, offset: (
+            [selected_task],
+            {
+                "selected_count": 1,
+                "offset": offset,
+                "limit": max_items,
+                "total_available": 2,
+                "preview": [selected_task.task_id],
+            },
+        ),
+    )
+
+    run_module.main([
+        "baseline",
+        "--config",
+        "py",
+        "--split",
+        "dev",
+        "--max-items",
+        "1",
+        "--yes",
+        "--invalidate-baseline-cache",
+    ])
+
+    assert not selected_path.exists()
+    assert other_path.exists()
+    assert (other_path / ".complete").exists()

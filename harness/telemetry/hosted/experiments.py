@@ -24,7 +24,7 @@ from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
-from harness.scoring import summarize_task_score
+from harness.scoring import summarize_score_summaries, summarize_task_score
 from harness.scoring.batch import TaskScoreSummary
 from harness.scoring.token_usage import TokenUsageRecord
 from harness.telemetry.hosted.baselines import (
@@ -46,6 +46,10 @@ from harness.telemetry.tracing import (
     flush_langfuse,
     propagate_context,
     start_observation,
+)
+from harness.telemetry.tracing.score_emitter import (
+    batch_score_summary_metadata,
+    emit_batch_score_summary,
 )
 from harness.telemetry.tracing.session_policy import resolve_session_id
 from harness.utils.env import get_runner_model
@@ -390,6 +394,37 @@ def _normalize_task_payload(
     raise RuntimeError("Localization task must be a mapping or Pydantic model")
 
 
+def _emit_experiment_dataset_aggregates(
+    span: object | None,
+    results: Sequence[LocalizationRunItemResult],
+    extra_metadata: Mapping[str, object] | None = None,
+) -> None:
+    if span is None or not results:
+        return
+    summary = summarize_score_summaries(
+        {
+            str(item.score_summary.item_id or idx): item.score_summary
+            for idx, item in enumerate(results)
+        }
+    )
+    emit_batch_score_summary(
+        span,
+        summary,
+        prefix="experiment",
+        metadata_key="score_summary",
+    )
+    metadata: dict[str, object] = {"selected_count": len(results)}
+    metadata.update(batch_score_summary_metadata(summary, metadata_key="score_summary"))
+    if extra_metadata:
+        metadata.update(dict(extra_metadata))
+    updater = getattr(span, "update", None)
+    if callable(updater):
+        try:
+            updater(metadata=metadata)
+        except Exception:
+            pass
+
+
 def _run_experiment_task(
     task: LCATask | Mapping[str, object],
     parent_trace: object,
@@ -585,6 +620,17 @@ def run_hosted_localization_experiment(
                     materializer,
                     run_session_id,
                 )
+            _emit_experiment_dataset_aggregates(
+                dataset_span,
+                results,
+                extra_metadata={
+                    "dataset": req.dataset,
+                    "dataset_config": req.dataset_config,
+                    "dataset_split": req.dataset_split,
+                    "dataset_version": req.version,
+                    "selection": selection_meta,
+                },
+            )
     flush_langfuse()
     reducer_summary = _build_reducer_summary(results)
     return LocalizationRunResult(

@@ -101,6 +101,58 @@ def test_score_localization_uses_static_graph_context(monkeypatch, tmp_path: Pat
     assert bundle.composed_score == pytest.approx(0.5)
 
 
+def test_score_context_resolves_real_ingest_repo_relative_paths(monkeypatch, tmp_path: Path):
+    import harness.localization.static_graph.ingest as ingest_mod
+
+    repo = tmp_path / "repo"
+    source = repo / "src" / "app.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def run():\n    return 1\n")
+
+    monkeypatch.setattr(ingest_mod, "extract_file", lambda path: {"functions": []})
+    monkeypatch.setattr(ingest_mod, "get_imports", lambda path: [])
+    monkeypatch.setattr(ingest_mod, "ModuleInfo", None)
+    monkeypatch.setattr(ingest_mod, "FunctionInfo", None)
+    monkeypatch.setattr(ingest_mod, "ImportInfo", None)
+
+    ctx = build_localization_score_context(
+        prediction=LCAPrediction(predicted_files=["src/app.py"]),
+        gold=LCAGold(changed_files=["src/app.py"]),
+        repo_path=repo,
+        anchor_text="Failure points at `src/app.py`.",
+        token_usage=TokenUsageRecord(
+            available=True,
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=5),
+        ),
+    )
+
+    assert ctx.resolved_prediction_nodes["src/app.py"] == ("src/app.py",)
+    assert ctx.resolved_gold_nodes["src/app.py"] == ("src/app.py",)
+    assert ctx.gold_min_hops == 0
+    assert ctx.issue_min_hops == 0
+    assert ctx.previous_total_token_count == 15
+    assert ctx.diagnostics["static_graph_available"] is True
+    assert ctx.diagnostics["resolved_prediction_count"] == 1
+    assert ctx.diagnostics["resolved_gold_count"] == 1
+
+    bundle = score_localization(
+        prediction=LCAPrediction(predicted_files=["src/app.py"]),
+        gold=LCAGold(changed_files=["src/app.py"]),
+        repo_path=repo,
+        anchor_text="Failure points at `src/app.py`.",
+        token_usage=TokenUsageRecord(
+            available=True,
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=5),
+        ),
+    )
+    assert bundle.results["gold_hop"].available is True
+    assert bundle.results["issue_hop"].available is True
+    assert bundle.results["token_efficiency"].available is True
+    assert bundle.composed_score == pytest.approx(1.0)
+    assert bundle.diagnostics["resolved_prediction_count"] == 1
+    assert bundle.diagnostics["resolved_gold_count"] == 1
+
+
 def test_score_localization_missing_token_usage_keeps_default_composed_score(monkeypatch, tmp_path: Path):
     import harness.localization.scoring as scoring_mod
 

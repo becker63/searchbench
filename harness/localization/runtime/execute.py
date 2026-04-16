@@ -26,7 +26,11 @@ from harness.scoring.token_usage import (
     extract_token_usage_record,
 )
 from harness.telemetry.tracing import start_observation
-from harness.telemetry.tracing.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing.score_emitter import (
+    emit_score_bundle,
+    emit_score_for_handle,
+    score_bundle_metadata,
+)
 
 
 def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -> None:
@@ -105,6 +109,22 @@ def _run_runner(
     return predicted_files, result_map
 
 
+def _score_prefix_from_runner_result(runner_result: Mapping[str, object] | None) -> str:
+    if runner_result is None:
+        return "localization"
+    backend = runner_result.get("backend")
+    if backend in {"ic", "iterative_context"}:
+        return "ic"
+    if backend in {"jc", "jcodemunch"}:
+        return "jc"
+    source = runner_result.get("source")
+    if source in {"ic", "iterative_context"}:
+        return "ic"
+    if source in {"jc", "jcodemunch"}:
+        return "jc"
+    return "localization"
+
+
 def _default_runner(
     lca_task: LCATask, repo_path: str, parent: object | None
 ) -> tuple[list[str], Mapping[str, object] | None]:
@@ -126,7 +146,22 @@ def _default_runner(
         raise RuntimeError("Localization runner produced no predicted_files")
     predictions = [p for p in predicted if isinstance(p, str) and p.strip()]
     if not predictions:
-        raise RuntimeError("Localization runner produced an empty predicted_files list")
+        source = result.get("source")
+        if source == "runner_error":
+            raw = result.get("raw")
+            error = raw.get("error") if isinstance(raw, Mapping) else None
+            detail = f": {error}" if isinstance(error, str) and error else ""
+            raise RuntimeError(
+                f"Localization runner failed before producing observations{detail}"
+            )
+        detail = (
+            " after finalization and fallback recovery"
+            if source == "fallback_empty"
+            else ""
+        )
+        raise RuntimeError(
+            f"Localization runner produced an empty predicted_files list{detail}"
+        )
     return predictions, result
 
 
@@ -170,6 +205,7 @@ def _emit_telemetry(
     trace: object | None,
     predicted_files: list[str],
     changed_files: list[str],
+    score_prefix: str = "localization",
 ) -> None:
     task_score_summary = summarize_task_score(task.task_id, score_bundle)
     telemetry = build_localization_telemetry(
@@ -182,30 +218,25 @@ def _emit_telemetry(
         evidence=evidence,
         materialization_events=materialization.events if materialization else None,
     )
-    score_values: dict[str, float] = {}
-    if score_bundle.composed_score is not None:
-        score_values["composed_score"] = score_bundle.composed_score
-    for score_name, result in score_bundle.results.items():
-        if result.value is not None and isinstance(result.value, (int, float)):
-            score_values[score_name] = float(result.value)
-    for score_name, score_value in score_values.items():
-        emit_score_for_handle(
-            trace,
-            name=f"localization.{score_name}",
-            value=float(score_value),
-            data_type="NUMERIC",
-            score_id=f"{getattr(trace, 'id', None)}-localization.{score_name}"
-            if getattr(trace, "id", None)
-            else None,
-        )
+    emit_score_bundle(
+        trace,
+        score_bundle,
+        prefix=score_prefix,
+        metadata_key="score_bundle",
+        emit_fn=emit_score_for_handle,
+    )
     if trace:
         try:
             telemetry_payload = telemetry.model_dump(exclude_none=True)
-            metadata_payload = {
+            metadata_payload: dict[str, object] = {
                 "telemetry": telemetry_payload,
+                "score_summary": task_score_summary.model_dump(mode="json"),
                 "predicted_files": list(predicted_files),
                 "changed_files": list(changed_files),
             }
+            metadata_payload.update(
+                score_bundle_metadata(score_bundle, metadata_key="score_bundle")
+            )
             _safe_update_metadata(trace, metadata_payload)
         except Exception:
             pass
@@ -274,5 +305,6 @@ def run_localization_task(
             trace=trace,
             predicted_files=prediction.normalized_predicted_files(),
             changed_files=task.gold.normalized_changed_files(),
+            score_prefix=_score_prefix_from_runner_result(runner_result),
         )
         return prediction, score_bundle, task.evidence, materialization_result, usage

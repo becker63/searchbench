@@ -56,6 +56,33 @@ def test_hf_loader_normalizes_rows(monkeypatch):
     assert task.context.repo_license == "apache"
 
 
+def test_hf_loader_parses_stringified_changed_files(monkeypatch):
+    rows = [
+        {
+            "repo_owner": "square",
+            "repo_name": "okhttp",
+            "base_sha": "abc123",
+            "issue_title": "t",
+            "issue_body": "b",
+            "changed_files": "['src/Main.kt']",
+        }
+    ]
+
+    fake_module = types.SimpleNamespace(utils=types.SimpleNamespace(AuthenticationError=Exception))
+    monkeypatch.setattr(
+        "harness.telemetry.hosted.hf_lca._require_dependency",
+        lambda: types.SimpleNamespace(load_dataset=_FakeDatasets(rows).load_dataset, utils=fake_module.utils),
+    )
+
+    tasks = fetch_hf_localization_dataset(
+        "JetBrains-Research/lca-bug-localization",
+        dataset_config="py",
+        dataset_split="dev",
+    )
+
+    assert tasks[0].gold.normalized_changed_files() == ["src/main.kt"]
+
+
 def test_hf_loader_missing_required_fields_raises(monkeypatch):
     rows = [
         {

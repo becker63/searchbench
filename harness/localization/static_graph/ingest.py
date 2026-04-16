@@ -6,6 +6,7 @@ from typing import cast
 
 from harness.localization.models import canonicalize_path
 
+from .filter import _is_probably_text, _should_skip_path, is_supported_source_file
 from .raw_tree import RawEdge, RawFile, RawFunction, RawTree
 
 try:
@@ -96,26 +97,36 @@ def _iter_calls(fn: object) -> list[str]:
 
 def ingest_repo(root: Path) -> RawTree:
     if extract_file is None or get_imports is None:
-        raise ImportError("llm-tldr is required for static graph ingestion") from _import_error
+        raise ImportError(
+            "llm-tldr is required for static graph ingestion"
+        ) from _import_error
 
+    root = root.resolve()
     files: list[RawFile] = []
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if any(
-            segment in path.parts
-            for segment in (".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "node_modules")
-        ):
+        if _should_skip_path(path):
             continue
-        # Skip oversized files (>512KB) to keep ingestion deterministic and fast.
+        if not is_supported_source_file(path):
+            continue
+
         try:
             if path.stat().st_size > 512 * 1024:
                 continue
         except OSError:
             continue
 
+        if not _is_probably_text(path):
+            continue
+
         try:
-            extracted = extract_file(str(path))  # type: ignore[assignment]
+            relative_path = canonicalize_path(path.relative_to(root).as_posix())
+        except ValueError:
+            relative_path = canonicalize_path(path.name)
+
+        try:
+            extracted = extract_file(str(path))
         except Exception:
             continue
 
@@ -131,12 +142,12 @@ def ingest_repo(root: Path) -> RawTree:
             if not name:
                 continue
 
-            qualified_name = f"{path}:{name}"
+            qualified_name = f"{relative_path}:{name}"
             functions.append(
                 RawFunction(
                     id=canonicalize_path(qualified_name),
                     name=name,
-                    file=canonicalize_path(str(path)),
+                    file=relative_path,
                 )
             )
 
@@ -146,17 +157,17 @@ def ingest_repo(root: Path) -> RawTree:
                         source=canonicalize_path(qualified_name),
                         target=called,
                         kind="call",
-                        file=canonicalize_path(str(path)),
+                        file=relative_path,
                     )
                 )
 
         for src, target in _iter_call_graph_edges(extracted):
             edges.append(
                 RawEdge(
-                    source=canonicalize_path(f"{path}:{src}"),
+                    source=canonicalize_path(f"{relative_path}:{src}"),
                     target=target,
                     kind="call",
-                    file=canonicalize_path(str(path)),
+                    file=relative_path,
                 )
             )
 
@@ -176,16 +187,16 @@ def ingest_repo(root: Path) -> RawTree:
                 imports.append(module)
                 edges.append(
                     RawEdge(
-                        source=canonicalize_path(str(path)),
+                        source=relative_path,
                         target=module,
                         kind="import",
-                        file=canonicalize_path(str(path)),
+                        file=relative_path,
                     )
                 )
 
         files.append(
             RawFile(
-                path=canonicalize_path(str(path)),
+                path=relative_path,
                 functions=functions,
                 imports=imports,
                 edges=edges,

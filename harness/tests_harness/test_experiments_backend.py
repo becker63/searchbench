@@ -79,6 +79,40 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     assert result.items[0].prediction == ["a.py"]
 
 
+def test_experiment_dataset_aggregates_emit_component_scores(monkeypatch, tmp_path):
+    task = _task(str(tmp_path / "repo"))
+    eval_result = _eval_result(task)
+    item = experiments.LocalizationRunItemResult(
+        task=task.model_dump(),
+        score_summary=eval_result.items[0].score_bundle.model_copy(
+            update={"item_id": task.task_id}
+        ),
+        prediction=["a.py"],
+    )
+    emitted: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    class DummySpan:
+        id = "dataset-span"
+
+        def score_trace(self, **kwargs):
+            emitted.append(kwargs)
+
+        def update(self, **kwargs):
+            updates.append(kwargs)
+
+    experiments._emit_experiment_dataset_aggregates(DummySpan(), [item])
+
+    names = {item["name"] for item in emitted}
+    assert {
+        "experiment.aggregate_composed_score",
+        "experiment.aggregate_gold_hop",
+        "experiment.aggregate_issue_hop",
+    } <= names
+    assert updates
+    assert updates[-1]["metadata"]["score_summary"]["aggregate_composed_score"] == 1.0
+
+
 def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

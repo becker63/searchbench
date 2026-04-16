@@ -37,7 +37,12 @@ from harness.scoring.batch import TaskScoreSummary
 from harness.localization.telemetry import build_localization_telemetry
 from harness.scoring.token_usage import TokenUsageRecord
 from harness.telemetry.tracing import propagate_context, start_observation
-from harness.telemetry.tracing.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing.score_emitter import (
+    batch_score_summary_metadata,
+    emit_batch_score_summary,
+    emit_score_for_handle,
+    emit_task_score_summary,
+)
 
 
 class BaselineSnapshot(BaseModel):
@@ -138,21 +143,18 @@ def emit_baseline_dataset_aggregates(
     aggregate_summary = _aggregate_score_summaries(snapshots)
     if span is None or aggregate_summary is None:
         return
-    score_payload = aggregate_summary.model_dump(mode="json")
-    if aggregate_summary.aggregate_composed_score is not None:
-        emit_score_for_handle(
-            span,
-            name="baseline.aggregate_composed_score",
-            value=float(aggregate_summary.aggregate_composed_score),
-            data_type="NUMERIC",
-            score_id=f"{getattr(span, 'id', None)}-baseline.aggregate_composed_score"
-            if getattr(span, "id", None)
-            else None,
-        )
+    emit_batch_score_summary(
+        span,
+        aggregate_summary,
+        prefix="baseline",
+        metadata_key="score_summary",
+    )
     summary_metadata: dict[str, object] = {
         "selected_count": len(snapshots),
-        "score_summary": score_payload,
     }
+    summary_metadata.update(
+        batch_score_summary_metadata(aggregate_summary, metadata_key="score_summary")
+    )
     if extra_metadata:
         summary_metadata.update(dict(extra_metadata))
     _safe_update_metadata(span, summary_metadata)
@@ -299,16 +301,13 @@ def compute_baseline_for_task(
                 if materialization
                 else None,
             )
-            if score_summary.composed_score is not None:
-                emit_score_for_handle(
-                    trace,
-                    name="baseline.composed_score",
-                    value=float(score_summary.composed_score),
-                    data_type="NUMERIC",
-                    score_id=f"{trace.id}-baseline.composed_score"
-                    if getattr(trace, "id", None)
-                    else None,
-                )
+            emit_task_score_summary(
+                trace,
+                score_summary,
+                prefix="baseline",
+                metadata_key="score_summary",
+                emit_fn=emit_score_for_handle,
+            )
             return BaselineSnapshot(
                 dataset_name=task.identity.dataset_name,
                 dataset_config=task.identity.dataset_config,

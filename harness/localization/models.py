@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, List, Optional
@@ -329,6 +330,15 @@ def _as_list(value: object) -> List[str]:
         return [str(v) for v in value]
     if value is None:
         return []
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = ast.literal_eval(text)
+            except (SyntaxError, ValueError):
+                return [value]
+            if isinstance(parsed, Sequence) and not isinstance(parsed, (str, bytes)):
+                return [str(v) for v in parsed]
     return [str(value)]
 
 

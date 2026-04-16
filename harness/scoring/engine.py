@@ -41,6 +41,7 @@ class ScoreEngine:
             compose_mode=self._config.compose_mode,
             compose_weights=dict(self._config.compose_weights),
             available=composed_score is not None,
+            diagnostics=dict(ctx.diagnostics),
         )
 
     def _compose(self, results: Mapping[str, ScoreResult]) -> float | None:

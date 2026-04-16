@@ -344,6 +344,69 @@ def _dummy_client(tool_name: str, args: dict[str, Any]):
     return DummyClient(), "dummy-model"
 
 
+def test_run_agent_returns_usage_details_for_scoring(monkeypatch):
+    updates: list[dict[str, object]] = []
+
+    class DummyMessage:
+        content = '{"predicted_files": ["src/app.py"]}'
+
+    class DummyChoice:
+        message = DummyMessage()
+
+    class DummyResponse:
+        choices = [DummyChoice()]
+        usage = type(
+            "U",
+            (),
+            {
+                "prompt_tokens": 12,
+                "completion_tokens": 4,
+                "total_tokens": 16,
+                "prompt_tokens_details": {},
+                "completion_tokens_details": {},
+            },
+        )()
+        model = "dummy-model"
+
+    class DummyCompletions:
+        def create(self, **kwargs):
+            return DummyResponse()
+
+    class DummyClient:
+        chat = type("Chat", (), {"completions": DummyCompletions()})()
+
+    @contextmanager
+    def span_cm():
+        yield type(
+            "S",
+            (),
+            {
+                "id": "span",
+                "update": lambda self, **kwargs: updates.append(kwargs),
+                "end": lambda self, **kwargs: None,
+            },
+        )()
+
+    monkeypatch.setattr(runner, "_make_client", lambda model_override=None: (DummyClient(), "dummy-model"))
+    monkeypatch.setattr(runner, "get_cerebras_api_key", lambda: "key")
+    monkeypatch.setattr(runner, "start_observation", lambda *args, **kwargs: span_cm())
+
+    result = runner.run_agent(
+        {"identity": {}, "repo": "repo", "context": {}},
+        steps=1,
+        tool_specs=[],
+        dispatch_tool_call=lambda name, args: {},
+        system_prompt="system",
+        parent_trace=object(),
+        backend_name="iterative_context",
+    )
+
+    assert result["usage_details"]["total_tokens"] == 16.0
+    observations = cast(list[dict[str, object]], result["observations"])
+    assert observations[0]["usage_details"]["total_tokens"] == 16.0
+    assert any("usage_details" in update for update in updates)
+
+
 def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp_path):
     dummy_tool = Tool(
         name="resolve_path",
@@ -419,8 +482,12 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
         ),
     )
     assert result["node_count"] == 2
-    first_obs = cast(dict[str, Any], result["observations"][0])
-    payload = cast(dict[str, Any], first_obs["result"])
+    tool_obs = next(
+        cast(dict[str, Any], obs)
+        for obs in result["observations"]
+        if isinstance(obs, dict) and obs.get("role") == "tool"
+    )
+    payload = cast(dict[str, Any], tool_obs["result"])
     assert payload["full_graph"] == {"nodes": [1, 2]}
     assert payload["score_source"] == "injected"
     assert payload["node"] == {"id": "n1"}
@@ -487,8 +554,12 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
         ),
     )
     assert result["node_count"] == 0
-    first_obs = cast(dict[str, Any], result["observations"][0])
-    assert first_obs["result"] == {"called": "search_files", "args": {"query": "foo"}}
+    tool_obs = next(
+        cast(dict[str, Any], obs)
+        for obs in result["observations"]
+        if isinstance(obs, dict) and obs.get("role") == "tool"
+    )
+    assert tool_obs["result"] == {"called": "search_files", "args": {"query": "foo"}}
 
 
 def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
@@ -667,6 +738,157 @@ def test_finalization_uses_json_schema(monkeypatch, tmp_path):
     assert schema.get("type") == "object"
     assert schema.get("additionalProperties") is False
     assert "predicted_files" in schema.get("properties", {})
+
+
+def test_finalization_json_schema_uses_provider_supported_subset(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+
+    unsupported_keywords = {
+        "default",
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+        "pattern",
+    }
+    schema_payloads: list[dict[str, object]] = []
+
+    def find_unsupported(value: object, path: str = "$") -> list[str]:
+        found: list[str] = []
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}"
+                if key in unsupported_keywords:
+                    found.append(child_path)
+                found.extend(find_unsupported(child, child_path))
+        elif isinstance(value, list):
+            for idx, child in enumerate(value):
+                found.extend(find_unsupported(child, f"{path}[{idx}]"))
+        return found
+
+    class DummyCompletions:
+        def create(self, **kwargs):
+            response_format = kwargs.get("response_format")
+            if isinstance(response_format, dict):
+                json_schema = response_format.get("json_schema")
+                if isinstance(json_schema, dict):
+                    schema_payloads.append(json_schema)
+                    unsupported = find_unsupported(json_schema)
+                    if unsupported:
+                        raise AssertionError(
+                            f"provider-incompatible schema keywords: {unsupported}"
+                        )
+            content = '{"predicted_files": ["src/app.py"], "reasoning": "r"}'
+            return type(
+                "DummyResponse",
+                (),
+                {
+                    "choices": [
+                        type("Choice", (), {"message": type("Msg", (), {"content": content})()})()
+                    ],
+                    "usage": type(
+                        "U",
+                        (),
+                        {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2,
+                            "prompt_tokens_details": {},
+                            "completion_tokens_details": {},
+                        },
+                    )(),
+                },
+            )()
+
+    class DummyClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": DummyCompletions()})()
+
+    monkeypatch.setattr(runner, "_make_client", lambda model_override=None: (DummyClient(), "dummy-model"))
+    monkeypatch.setattr(
+        runner,
+        "IterativeContextBackend",
+        lambda repo, score_fn: type(
+            "B",
+            (),
+            {
+                "tool_specs": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "t",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "dispatch": lambda self, name, args: {"file": "src/app.py"},
+            },
+        )(),
+    )
+
+    @contextmanager
+    def span_cm():
+        class Span:
+            id = "span"
+
+            def update(self, **kwargs): ...
+            def end(self, **kwargs): ...
+
+        yield Span()
+
+    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+
+    result = runner.run_ic_iteration(
+        {
+            "identity": LCATaskIdentity(
+                dataset_name="lca",
+                dataset_config="py",
+                dataset_split="dev",
+                repo_owner="o",
+                repo_name="r",
+                base_sha="abc",
+            ).model_dump(),
+            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
+            "repo": str(tmp_path),
+        },
+        score_fn=None,
+        steps=1,
+        parent_trace=object(),
+    )
+
+    assert schema_payloads
+    assert result["predicted_files"] == ["src/app.py"]
+    assert result["source"] == "finalize"
+
+
+def test_apply_tool_results_preserves_assistant_tool_response_order():
+    tool_call = {
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "resolve", "arguments": "{}"},
+    }
+    messages = runner._apply_tool_results(  # type: ignore[attr-defined]
+        {"identity": {}, "repo": "r", "context": {}},
+        [
+            {"role": "assistant", "tool_calls": [tool_call], "content": ""},
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": '{"file": "src/app.py"}',
+                "result": {"file": "src/app.py"},
+            },
+        ],
+        [],
+        "system",
+        [],
+    )
+
+    assistant_idx = next(
+        idx for idx, msg in enumerate(messages) if msg.get("role") == "assistant"
+    )
+    tool_idx = next(idx for idx, msg in enumerate(messages) if msg.get("role") == "tool")
+    assert tool_idx == assistant_idx + 1
+    assert messages[tool_idx]["tool_call_id"] == "call-1"
 
 
 def test_jc_prompt_uses_canonical_tool_names():

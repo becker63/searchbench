@@ -4,7 +4,9 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
+
+from harness.localization.models import LCATask
 
 from .materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer, describe_repo_mapping
 
@@ -28,7 +30,7 @@ class HuggingFaceRepoMaterializer(RepoMaterializer):
         self.stale_lock_timeout_seconds = stale_lock_timeout_seconds
 
     def materialize(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
-        cache_key = describe_repo_mapping(request).replace(":", "__").replace("/", "__")
+        cache_key = _cache_key_for_request(request)
         worktree_root = self.cache_root / "worktrees" / cache_key
         mirror_root = self.cache_root / "mirrors"
         lock_path = self.cache_root / "locks" / f"{cache_key}.lock"
@@ -109,6 +111,48 @@ class HuggingFaceRepoMaterializer(RepoMaterializer):
             logs=logs,
             events=logs,
         )
+
+    def invalidate_request_cache(self, request: RepoMaterializationRequest) -> list[str]:
+        """Remove the cached worktree for one materialization request, if present."""
+
+        cache_key = _cache_key_for_request(request)
+        worktree_root = self.cache_root / "worktrees" / cache_key
+        mirror_path = self.cache_root / "mirrors" / f"{request.repo_owner}__{request.repo_name}.git"
+        lock_path = self.cache_root / "locks" / f"{cache_key}.lock"
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        logs: list[str] = []
+        with _Lock(
+            lock_path,
+            timeout_seconds=self.lock_timeout_seconds,
+            stale_timeout_seconds=self.stale_lock_timeout_seconds,
+            logs=logs,
+        ):
+            removed = _remove_cached_worktree(mirror_path, worktree_root, logs)
+        if not removed:
+            logs.append(f"no cached worktree found at {worktree_root}")
+        return logs
+
+    def invalidate_tasks(self, tasks: Sequence[LCATask]) -> list[str]:
+        """Remove cached worktrees for the unique repos/base SHAs in selected tasks."""
+
+        events: list[str] = []
+        seen: set[str] = set()
+        for task in tasks:
+            request = RepoMaterializationRequest(
+                dataset_name=task.identity.dataset_name,
+                dataset_config=task.identity.dataset_config,
+                dataset_split=task.identity.dataset_split,
+                repo_owner=task.identity.repo_owner,
+                repo_name=task.identity.repo_name,
+                base_sha=task.identity.base_sha,
+            )
+            cache_key = _cache_key_for_request(request)
+            if cache_key in seen:
+                continue
+            seen.add(cache_key)
+            events.extend(self.invalidate_request_cache(request))
+        return events
 
 
 class MaterializationError(RuntimeError):
@@ -248,6 +292,28 @@ def _prune_worktree(mirror_path: Path, worktree_path: Path, logs: List[str]) -> 
             pass
     if worktree_path.exists() and not (worktree_path / ".complete").exists():
         shutil.rmtree(worktree_path, ignore_errors=True)
+
+
+def _remove_cached_worktree(mirror_path: Path, worktree_path: Path, logs: List[str]) -> bool:
+    """
+    Remove a cached worktree and prune git worktree metadata for its mirror.
+    """
+    marker = worktree_path / ".complete"
+    removed = False
+    if marker.exists():
+        marker.unlink(missing_ok=True)
+        logs.append(f"removed completion marker at {marker}")
+        removed = True
+    if worktree_path.exists():
+        shutil.rmtree(worktree_path, ignore_errors=True)
+        logs.append(f"removed cached worktree at {worktree_path}")
+        removed = True
+    _prune_worktree(mirror_path, worktree_path, logs)
+    return removed
+
+
+def _cache_key_for_request(request: RepoMaterializationRequest) -> str:
+    return describe_repo_mapping(request).replace(":", "__").replace("/", "__")
 
 
 def _pid_alive(pid: int) -> bool:

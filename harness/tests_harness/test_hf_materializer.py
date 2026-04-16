@@ -4,6 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
 from harness.localization.materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, describe_repo_mapping
 
@@ -36,6 +37,26 @@ def _make_local_bare_repo(tmp_path: Path) -> tuple[Path, str]:
     origin_bare = origin_repo_dir / f"{repo_name}.git"
     _run_git(["clone", "--bare", str(repo_path), str(origin_bare)])
     return origin_root, base_sha
+
+
+def _task(repo_owner: str, repo_name: str, base_sha: str, config: str = "py") -> LCATask:
+    identity = LCATaskIdentity(
+        dataset_name="hf",
+        dataset_config=config,
+        dataset_split="dev",
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        base_sha=base_sha,
+    )
+    return LCATask(
+        identity=identity,
+        context=LCAContext(issue_title="t", issue_body="b"),
+        gold=LCAGold(changed_files=["README.md"]),
+    )
+
+
+def _cache_key(request: RepoMaterializationRequest) -> str:
+    return describe_repo_mapping(request).replace(":", "__").replace("/", "__")
 
 
 def test_materializer_creates_and_reuses_cache(tmp_path):
@@ -203,3 +224,82 @@ def test_materializer_parallel_calls_share_cache(tmp_path):
     assert len(results) == 2
     assert results[0].local_path == results[1].local_path
     assert (results[0].local_path / ".complete").exists()
+
+
+def test_materializer_targeted_invalidation_only_removes_selected_worktree(tmp_path):
+    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache")
+    selected_request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha="a" * 40,
+    )
+    other_request = selected_request.model_copy(
+        update={"dataset_config": "java", "base_sha": "b" * 40}
+    )
+    selected_path = materializer.cache_root / "worktrees" / _cache_key(selected_request)
+    other_path = materializer.cache_root / "worktrees" / _cache_key(other_request)
+    selected_path.mkdir(parents=True)
+    other_path.mkdir(parents=True)
+    (selected_path / ".complete").write_text("")
+    (other_path / ".complete").write_text("")
+
+    events = materializer.invalidate_tasks([
+        _task("example", "repo", "a" * 40, config="py")
+    ])
+
+    assert any("removed cached worktree" in event for event in events)
+    assert not selected_path.exists()
+    assert other_path.exists()
+    assert (other_path / ".complete").exists()
+
+
+def test_materializer_invalidation_forces_next_materialization_fresh(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+
+    first = materializer.materialize(request)
+    assert first.cache_hit is False
+    assert first.worktree_created is True
+    second = materializer.materialize(request)
+    assert second.cache_hit is True
+    assert second.worktree_created is False
+
+    materializer.invalidate_request_cache(request)
+    fresh = materializer.materialize(request)
+
+    assert fresh.cache_hit is False
+    assert fresh.worktree_created is True
+    assert fresh.local_path == first.local_path
+    assert fresh.local_path and (fresh.local_path / ".complete").exists()
+
+
+def test_materializer_invalidation_is_idempotent_for_missing_or_corrupt_worktree(tmp_path):
+    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache")
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha="a" * 40,
+    )
+    worktree_path = materializer.cache_root / "worktrees" / _cache_key(request)
+    worktree_path.mkdir(parents=True)
+
+    first_events = materializer.invalidate_request_cache(request)
+    second_events = materializer.invalidate_request_cache(request)
+
+    assert not worktree_path.exists()
+    assert any("removed cached worktree" in event for event in first_events)
+    assert any("no cached worktree found" in event for event in second_events)

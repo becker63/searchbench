@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """
 Localizer agent: LLM/tool-execution layer for iterative-context and jcodemunch
 bug-localization flows.  Owns message construction, model calls, tool dispatch,
 context-budget management, finalization, and retry logic.
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -387,23 +387,17 @@ def _apply_tool_results(
     system_prompt: str,
     tool_specs: list[ChatCompletionToolParam],
 ) -> list[dict[str, object]]:
-    new_obs: list[dict[str, object]] = []
-    tool_only: list[dict[str, object]] = []
-    for obs in observations:
-        new_obs.append(obs)
-        if obs.get("role") == "tool":
-            tool_only.append(obs)
-        if obs.get("role") == "assistant" and obs.get("tool_calls"):
-            new_obs.extend(tool_results)
-            tool_only.extend(tool_results)
-    ordered_obs = [obs for obs in new_obs if obs.get("role") != "tool"] + tool_only
+    ordered_obs = list(observations)
+    for result in tool_results:
+        if result not in ordered_obs:
+            ordered_obs.append(result)
     return _enforce_message_budget(
         _build_model_messages(agent_task, tool_specs, system_prompt) + ordered_obs,
         max_total_chars=_AGGRESSIVE_TOTAL_CHARS,
         max_tool_content=_AGGRESSIVE_TOOL_CONTENT_CHARS,
         max_system_chars=_AGGRESSIVE_SYSTEM_CHARS,
         max_user_chars=_AGGRESSIVE_USER_CHARS,
-        keep_last_n_tools=max(1, len(tool_only)),
+        keep_last_n_tools=max(1, len(ordered_obs)),
     )
 
 
@@ -424,6 +418,31 @@ def _collect_usage_details(response: Any) -> dict[str, object] | None:
     return usage_model.to_payload()
 
 
+_USAGE_TOTAL_KEYS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "input",
+    "output",
+    "total",
+)
+
+
+def _accumulate_usage_details(
+    aggregate: dict[str, object],
+    usage_details: Mapping[str, object],
+) -> None:
+    for key in _USAGE_TOTAL_KEYS:
+        value = usage_details.get(key)
+        if isinstance(value, (int, float)):
+            existing = aggregate.get(key, 0.0)
+            existing_total = float(existing) if isinstance(existing, (int, float)) else 0.0
+            aggregate[key] = existing_total + float(value)
+    model = usage_details.get("model")
+    if isinstance(model, str) and model:
+        aggregate["model"] = model
+
+
 def run_agent(
     agent_task: dict[str, object],
     steps: int,
@@ -440,6 +459,7 @@ def run_agent(
     tool_choice = "required" if tool_specs else None
     tools_payload: list[ChatCompletionToolParam] | None = tool_specs or None
     observations: list[dict[str, object]] = []
+    aggregate_usage_details: dict[str, object] = {}
 
     for step in range(steps):
         with start_observation(
@@ -492,6 +512,7 @@ def run_agent(
             choice = completion.choices[0]
             usage_details = _collect_usage_details(completion)
             if usage_details:
+                _accumulate_usage_details(aggregate_usage_details, usage_details)
                 obs.update(usage_details=usage_details)
             else:
                 raise RuntimeError("Agent response missing usage details")
@@ -513,6 +534,13 @@ def run_agent(
             elif tool_calls_raw is not None:
                 tool_calls = [tool_calls_raw]
             if tool_calls:
+                assistant_observation = {
+                    "role": "assistant",
+                    "tool_calls": tool_calls,
+                    "content": response_message.get("content") or "",
+                    "usage_details": usage_details,
+                }
+                observations.append(assistant_observation)
                 tool_results = _collect_tool_results(
                     observations=[{"tool_call": call} for call in tool_calls],
                     dispatch_tool_call=dispatch_tool_call,
@@ -521,14 +549,7 @@ def run_agent(
                 )
                 if tool_results:
                     observations.extend(tool_results)
-                observations.append(
-                    {
-                        "role": "assistant",
-                        "tool_calls": tool_calls,
-                        "content": response_message.get("content") or "",
-                    }
-                )
-                messages = _apply_tool_results(agent_task, observations, tool_results, system_prompt, tool_specs)
+                messages = _apply_tool_results(agent_task, observations, [], system_prompt, tool_specs)
                 continue
             else:
                 raw_content = response_message.get("content")
@@ -538,9 +559,18 @@ def run_agent(
                 except json.JSONDecodeError as exc:  # noqa: BLE001
                     response_json = {"error": f"invalid json: {exc}"}
                 obs.update(output=_truncate_for_metadata(response_json))
-                observations.append({"role": "assistant", "content": response_json})
+                observations.append(
+                    {
+                        "role": "assistant",
+                        "content": response_json,
+                        "usage_details": usage_details,
+                    }
+                )
                 break
-    return {"observations": observations}
+    result: dict[str, object] = {"observations": observations}
+    if aggregate_usage_details:
+        result["usage_details"] = aggregate_usage_details
+    return result
 
 
 def run_agent_with_retry(
@@ -720,35 +750,149 @@ def _clean_observations_for_finalization(
     return cleaned
 
 
-def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tuple[list[str], str | None]:
+_FILE_KEY_NAMES = {
+    "file",
+    "files",
+    "filename",
+    "filenames",
+    "filepath",
+    "filepaths",
+    "path",
+    "paths",
+    "predicted_file",
+    "predicted_files",
+    "relative_path",
+    "relative_paths",
+    "repo_path",
+    "repo_paths",
+}
+_FILE_SUFFIXES = ("_file", "_files", "_path", "_paths", "_filename", "_filenames")
+
+
+def _is_file_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized = key.strip().lower()
+    return normalized in _FILE_KEY_NAMES or normalized.endswith(_FILE_SUFFIXES)
+
+
+def _normalize_candidate_file(value: str, repo_root: str | None) -> str | None:
+    candidate = value.strip().strip("\"'")
+    if not candidate:
+        return None
+    if "\n" in candidate or "\r" in candidate or "://" in candidate:
+        return None
+    if candidate.startswith(("git@", "#")):
+        return None
+    candidate = candidate.replace("\\", "/")
+    candidate = _strip_repo_root(candidate, repo_root).replace("\\", "/")
+    if candidate.startswith("/"):
+        return None
+    if candidate in {".", ".."}:
+        return None
+    while candidate.startswith("./"):
+        candidate = candidate[2:]
+    parts = [part for part in candidate.split("/") if part]
+    if not parts or any(part in {".", ".."} for part in parts):
+        return None
+    candidate = "/".join(parts)
+    if " " in candidate or "\t" in candidate:
+        return None
+    # Avoid treating symbolic graph node ids or free-form labels as files.
+    if "." not in parts[-1]:
+        return None
+    return candidate.lower()
+
+
+def _collect_candidate_files_from_value(
+    value: object,
+    *,
+    repo_root: str | None,
+    trusted_file_context: bool,
+) -> list[str]:
+    candidates: list[str] = []
+    if isinstance(value, str):
+        if trusted_file_context:
+            normalized = _normalize_candidate_file(value, repo_root)
+            if normalized:
+                candidates.append(normalized)
+            return candidates
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return candidates
+        return _collect_candidate_files_from_value(
+            parsed,
+            repo_root=repo_root,
+            trusted_file_context=False,
+        )
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            child_file_context = trusted_file_context or _is_file_key(key)
+            candidates.extend(
+                _collect_candidate_files_from_value(
+                    child,
+                    repo_root=repo_root,
+                    trusted_file_context=child_file_context,
+                )
+            )
+        return candidates
+    if isinstance(value, list):
+        for item in value:
+            candidates.extend(
+                _collect_candidate_files_from_value(
+                    item,
+                    repo_root=repo_root,
+                    trusted_file_context=trusted_file_context,
+                )
+            )
+        return candidates
+    return candidates
+
+
+def _collect_candidate_files_from_observations(
+    observations: list[dict[str, object]],
+    *,
+    repo_root: str | None = None,
+) -> list[str]:
+    """Collect grounded repo-relative file candidates from structured observations."""
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for obs in reversed(observations):
+        if not isinstance(obs, Mapping):
+            continue
+        for key in ("content", "result"):
+            for candidate in _collect_candidate_files_from_value(
+                obs.get(key),
+                repo_root=repo_root,
+                trusted_file_context=False,
+            ):
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                candidates.append(candidate)
+    return candidates
+
+
+def _extract_localization_prediction(
+    agent_result: Mapping[str, object],
+    *,
+    repo_root: str | None = None,
+) -> tuple[list[str], str | None, dict[str, object]]:
     """
     Emergency-only fallback: try to extract predicted_files from assistant content when finalization fails.
     This is a degraded path and should not be considered equivalent to schema-finalized output.
     """
     observations = agent_result.get("observations")
     if not isinstance(observations, list):
-        return [], None
+        return [], None, {"candidate_files": [], "reason": "missing_observations"}
 
     def _as_file_list(value: object) -> list[str]:
-        # Fallback only accepts already-structured array or JSON string.
-        cleaned: list[str] = []
-        if isinstance(value, list):
-            for entry in value:
-                if isinstance(entry, str):
-                    stripped = entry.strip()
-                    if stripped:
-                        cleaned.append(stripped.lower())
-        elif isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-                if isinstance(parsed, list):
-                    for entry in parsed:
-                        if isinstance(entry, str):
-                            stripped = entry.strip()
-                            if stripped:
-                                cleaned.append(stripped.lower())
-            except Exception:
-                return []
+        cleaned = _collect_candidate_files_from_value(
+            value,
+            repo_root=repo_root,
+            trusted_file_context=True,
+        )
         # Preserve order while de-duplicating
         seen: set[str] = set()
         unique: list[str] = []
@@ -771,19 +915,27 @@ def _extract_localization_prediction(agent_result: Mapping[str, object]) -> tupl
             reason_val = content.get("reasoning")
             reasoning = reason_val if isinstance(reason_val, str) else None
             if predicted:
-                return predicted, reasoning
+                return predicted, reasoning, {"candidate_files": predicted, "source": "assistant_content"}
         elif isinstance(content, str):
             try:
                 parsed = json.loads(content)
                 if isinstance(parsed, Mapping):
                     predicted = _as_file_list(parsed.get("predicted_files"))
+                    if not predicted:
+                        predicted = _as_file_list(parsed.get("files") or parsed.get("paths"))
                     reason_val = parsed.get("reasoning")
                     reasoning = reason_val if isinstance(reason_val, str) else None
                     if predicted:
-                        return predicted, reasoning
+                        return predicted, reasoning, {"candidate_files": predicted, "source": "assistant_content_json"}
             except Exception:
-                return [], None
-    return [], None
+                pass
+    candidates = _collect_candidate_files_from_observations(
+        [dict(obs) for obs in observations if isinstance(obs, Mapping)],
+        repo_root=repo_root,
+    )
+    if candidates:
+        return candidates, None, {"candidate_files": candidates, "source": "structured_observations"}
+    return [], None, {"candidate_files": [], "source": "none"}
 
 
 def _localization_result_schema() -> dict[str, object]:
@@ -796,7 +948,6 @@ def _localization_result_schema() -> dict[str, object]:
                 "predicted_files": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "default": [],
                 },
                 "reasoning": {"type": "string"},
                 "evidence": {
@@ -810,7 +961,6 @@ def _localization_result_schema() -> dict[str, object]:
                         },
                         "required": ["file"],
                     },
-                    "default": [],
                 },
             },
             "required": ["predicted_files"],
@@ -863,6 +1013,9 @@ def _finalize_localization(
             response_format={"type": "json_schema", "json_schema": schema},
             extra_headers={"x-cerebras-api-key": get_cerebras_api_key()},
         )
+        usage_details = _collect_usage_details(completion)
+        if usage_details:
+            obs.update(usage_details=usage_details)
         choice = completion.choices[0]
         message_obj = getattr(choice, "message", None)
         content = getattr(message_obj, "content", None) if message_obj is not None else None
@@ -882,11 +1035,95 @@ def _finalize_localization(
                 "predicted_files": parsed.get("predicted_files", []),
                 "reasoning": parsed.get("reasoning"),
                 "observations": prepared_observations or observations,
-                "raw": {"final": parsed},
+                "raw": {
+                    "final": parsed,
+                    "usage_details": usage_details,
+                },
                 "source": "finalize",
             }
         )
         return result
+
+
+def _fallback_localization_result(
+    *,
+    normalized: Mapping[str, object],
+    observations: list[dict[str, object]],
+    node_count: int | None,
+    repo_root: str | None,
+    error: object,
+) -> LocalizationRunnerResult:
+    predicted_files, reasoning, diagnostics = _extract_localization_prediction(
+        normalized,
+        repo_root=repo_root,
+    )
+    return LocalizationRunnerResult(
+        predicted_files=predicted_files,
+        reasoning=reasoning,
+        observations=observations,
+        node_count=node_count,
+        raw={
+            "error": str(error),
+            "fallback_raw": normalized.get("raw"),
+            "fallback_diagnostics": diagnostics,
+        },
+        source="fallback" if predicted_files else "fallback_empty",
+    )
+
+
+def _finalize_or_recover(
+    *,
+    agent_task: dict[str, object],
+    observations: list[dict[str, object]],
+    normalized: Mapping[str, object],
+    node_count: int | None,
+    parent_span: object,
+) -> LocalizationRunnerResult:
+    try:
+        final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
+    except Exception as exc:  # noqa: BLE001
+        repo_value = agent_task.get("repo")
+        return _fallback_localization_result(
+            normalized=normalized,
+            observations=observations,
+            node_count=node_count,
+            repo_root=repo_value if isinstance(repo_value, str) else None,
+            error=exc,
+        )
+    if final.predicted_files:
+        return final
+    repo_value = agent_task.get("repo")
+    return _fallback_localization_result(
+        normalized=normalized,
+        observations=observations,
+        node_count=node_count,
+        repo_root=repo_value if isinstance(repo_value, str) else None,
+        error="finalization returned empty predicted_files",
+    )
+
+
+def _runner_error_result(
+    *,
+    normalized: Mapping[str, object],
+    observations: list[dict[str, object]],
+    node_count: int | None,
+) -> LocalizationRunnerResult | None:
+    error = normalized.get("error")
+    if not error or observations:
+        return None
+    return LocalizationRunnerResult(
+        predicted_files=[],
+        observations=[],
+        node_count=node_count,
+        raw={
+            "error": str(error),
+            "fallback_diagnostics": {
+                "candidate_files": [],
+                "source": "runner_error_no_observations",
+            },
+        },
+        source="runner_error",
+    )
 
 
 def run_ic_iteration(
@@ -963,17 +1200,18 @@ def run_ic_iteration(
         emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count_metric, data_type="NUMERIC")
         backend_obs.update(metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
 
-    try:
-        final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
-    except (json.JSONDecodeError, ValidationError) as exc:
-        predicted_files, reasoning = _extract_localization_prediction(normalized)
-        final = LocalizationRunnerResult(
-            predicted_files=predicted_files,
-            reasoning=reasoning,
+    final = _runner_error_result(
+        normalized=normalized,
+        observations=observations,
+        node_count=node_count_val if node_count_val is not None else normalized_node_count,
+    )
+    if final is None:
+        final = _finalize_or_recover(
+            agent_task=agent_task,
             observations=observations,
+            normalized=normalized,
             node_count=node_count_val if node_count_val is not None else normalized_node_count,
-            raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
-            source="fallback",
+            parent_span=parent_span,
         )
     if not final.observations:
         final.observations = observations
@@ -987,6 +1225,7 @@ def run_ic_iteration(
             nodes = full_graph.get("nodes")
             if isinstance(nodes, list):
                 result_dict["node_count"] = len(nodes)
+    result_dict["backend"] = "ic"
     return result_dict
 
 
@@ -1047,23 +1286,26 @@ def run_jc_iteration(
         emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count_metric, data_type="NUMERIC")
         backend_obs.update(metadata={"node_count": node_count_val or 0})
 
-    try:
-        final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
-    except (json.JSONDecodeError, ValidationError) as exc:
-        predicted_files, reasoning = _extract_localization_prediction(normalized)
-        final = LocalizationRunnerResult(
-            predicted_files=predicted_files,
-            reasoning=reasoning,
+    final = _runner_error_result(
+        normalized=normalized,
+        observations=observations,
+        node_count=node_count_val,
+    )
+    if final is None:
+        final = _finalize_or_recover(
+            agent_task=agent_task,
             observations=observations,
+            normalized=normalized,
             node_count=node_count_val,
-            raw={"error": str(exc), "fallback_raw": normalized.get("raw")},
-            source="fallback",
+            parent_span=parent_span,
         )
     if not final.observations:
         final.observations = observations
     if final.node_count is None:
         final.node_count = node_count_val
-    return final.model_dump()
+    result_dict = final.model_dump()
+    result_dict["backend"] = "jc"
+    return result_dict
 
 
 __all__ = [

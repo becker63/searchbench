@@ -17,6 +17,7 @@ from .static_graph import (
     raw_tree_to_graph,
     resolve_anchors,
 )
+from .static_graph.store import debug_summary
 
 
 def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> tuple[str, ...]:
@@ -33,13 +34,23 @@ def _normalize_gold(gold: LCAGold | Mapping[str, object]) -> tuple[str, ...]:
     return tuple(gold.normalized_changed_files())
 
 
-def _build_store(repo_path: Path) -> GraphStore | None:
+def _build_store(repo_path: Path) -> tuple[GraphStore | None, dict[str, object]]:
     try:
         tree = ingest_repo(repo_path)
         graph = raw_tree_to_graph(tree)
-        return GraphStore(graph)
-    except Exception:
-        return None
+        store = GraphStore(graph)
+        return store, {
+            "static_graph_available": True,
+            "static_graph_file_count": len(tree.files),
+            "static_graph_node_count": debug_summary(store)["nodes"],
+            "static_graph_edge_count": debug_summary(store)["edges"],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return None, {
+            "static_graph_available": False,
+            "static_graph_error": type(exc).__name__,
+            "static_graph_error_message": str(exc),
+        }
 
 
 def _resolve_file_nodes(store: GraphStore, files: Iterable[str]) -> dict[str, tuple[str, ...]]:
@@ -67,14 +78,21 @@ def build_localization_score_context(
     predicted_files = _normalize_prediction(prediction)
     gold_files = _normalize_gold(gold)
     previous_total_token_count = _derive_token_count(token_usage)
-    store = _build_store(repo_path)
+    store, graph_diagnostics = _build_store(repo_path)
+    base_diagnostics: dict[str, object] = {
+        **graph_diagnostics,
+        "predicted_files_count": len(predicted_files),
+        "gold_files_count": len(gold_files),
+        "token_usage_available": bool(token_usage and token_usage.available),
+        "previous_total_token_count_available": previous_total_token_count is not None,
+    }
     if store is None:
         return ScoreContext(
             predicted_files=predicted_files,
             gold_files=gold_files,
             previous_total_token_count=previous_total_token_count,
             repo_path=str(repo_path),
-            diagnostics={"static_graph_available": False},
+            diagnostics=base_diagnostics,
         )
 
     resolved_prediction_nodes = _resolve_file_nodes(store, predicted_files)
@@ -90,6 +108,12 @@ def build_localization_score_context(
     anchors = extract_anchors(anchor_text or "")
     issue_anchor_nodes = tuple(resolve_anchors(store, anchors))
     issue_hops = compute_hop_distance_summary(store, issue_anchor_nodes, prediction_nodes)
+    unresolved_predictions = tuple(
+        path for path, nodes in resolved_prediction_nodes.items() if not nodes
+    )
+    unresolved_gold_files = tuple(
+        path for path, nodes in resolved_gold_nodes.items() if not nodes
+    )
 
     return ScoreContext(
         predicted_files=predicted_files,
@@ -101,17 +125,23 @@ def build_localization_score_context(
         resolved_prediction_nodes=resolved_prediction_nodes,
         resolved_gold_nodes=resolved_gold_nodes,
         issue_anchor_nodes=issue_anchor_nodes,
-        unresolved_predictions=tuple(
-            path for path, nodes in resolved_prediction_nodes.items() if not nodes
-        ),
-        unresolved_gold_files=tuple(
-            path for path, nodes in resolved_gold_nodes.items() if not nodes
-        ),
+        unresolved_predictions=unresolved_predictions,
+        unresolved_gold_files=unresolved_gold_files,
         repo_path=str(repo_path),
         diagnostics={
-            "static_graph_available": True,
+            **base_diagnostics,
             "issue_anchor_count": len(issue_anchor_nodes),
             "gold_anchor_count": len(gold_anchor_nodes),
+            "resolved_prediction_count": sum(
+                1 for nodes in resolved_prediction_nodes.values() if nodes
+            ),
+            "resolved_gold_count": sum(
+                1 for nodes in resolved_gold_nodes.values() if nodes
+            ),
+            "unresolved_predictions": list(unresolved_predictions),
+            "unresolved_gold_files": list(unresolved_gold_files),
+            "gold_min_hops_available": gold_hops.min_hop is not None,
+            "issue_min_hops_available": issue_hops.min_hop is not None,
         },
     )
 
