@@ -13,7 +13,7 @@ from harness.localization.models import (
     LocalizationPrediction,
 )
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-from harness.localization.scoring_models import ScoreContext, ScoreEngine, summarize_batch_scores, summarize_task_score
+from harness.scoring import ScoreContext, ScoreEngine, summarize_batch_scores, summarize_task_score
 from harness.telemetry.hosted import baselines
 from harness.telemetry.hosted import experiments
 from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest

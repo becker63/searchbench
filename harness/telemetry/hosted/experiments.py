@@ -7,6 +7,10 @@ from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
+from harness.entrypoints.models.requests import (
+    HostedLocalizationBaselineRequest,
+    HostedLocalizationRunRequest,
+)
 from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
@@ -20,9 +24,9 @@ from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
-from harness.localization.scoring_models import summarize_task_score
-from harness.localization.scoring_models.batch import TaskScoreSummary
-from harness.localization.token_usage import TokenUsageRecord
+from harness.scoring import summarize_task_score
+from harness.scoring.batch import TaskScoreSummary
+from harness.scoring.token_usage import TokenUsageRecord
 from harness.telemetry.hosted.baselines import (
     BaselineBundle,
     BaselineSnapshot,
@@ -33,7 +37,7 @@ from harness.telemetry.hosted.baselines import (
     persist_baseline_bundle,
 )
 from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
-from harness.telemetry.policy_reducer import (
+from harness.scoring.reducers import (
     PolicyReducerSummary,
     build_task_input,
     reduce_global,
@@ -47,11 +51,6 @@ from harness.telemetry.tracing.session_policy import resolve_session_id
 from harness.utils.env import get_runner_model
 
 _LOGGER = logging.getLogger(__name__)
-
-from harness.entrypoints.models.requests import (
-    HostedLocalizationBaselineRequest,
-    HostedLocalizationRunRequest,
-)
 
 
 class LocalizationRunItemResult(BaseModel):

@@ -5,6 +5,7 @@ from .batch import (
     BatchScoreSummary,
     BatchSummary,
     ComponentAggregate,
+    TaskScoreSummary,
 )
 from .bundle import ScoreBundle
 from .engine import ScoreEngine
@@ -27,6 +28,7 @@ from .summaries import (
     summarize_score_summaries,
     summarize_task_score,
 )
+from .token_usage import TokenUsage, TokenUsageRecord, extract_token_usage_record
 
 __all__ = [
     "AggregateComponentScore",
@@ -44,8 +46,12 @@ __all__ = [
     "ScoreContext",
     "ScoreEngine",
     "ScoreResult",
+    "TaskScoreSummary",
     "TokenEfficiencyScore",
+    "TokenUsage",
+    "TokenUsageRecord",
     "clamp_01",
+    "extract_token_usage_record",
     "hop_to_score",
     "summarize_batch_scores",
     "summarize_score_summaries",

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from harness.localization.models import LCATaskIdentity
-from harness.localization.scoring_models import ComposeMode, Goal, ScoreResult, TaskScoreSummary
-from harness.localization.token_usage import TokenUsage, TokenUsageRecord
-from harness.telemetry.policy_reducer import (
+from harness.scoring import ComposeMode, Goal, ScoreResult, TaskScoreSummary
+from harness.scoring.token_usage import TokenUsage, TokenUsageRecord
+from harness.scoring.reducers import (
     build_task_input,
     PolicyQualityGuard,
     reduce_global,

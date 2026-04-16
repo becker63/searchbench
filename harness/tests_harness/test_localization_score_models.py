@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from harness.localization.scoring_models import (
+from harness.scoring import (
     BatchSummary,
     ComponentAggregate,
     ComposeMode,

@@ -16,7 +16,7 @@ from harness.localization.models import (
     LocalizationTelemetryEnvelope,
     canonicalize_paths,
 )
-from harness.localization.scoring_models import ScoreContext, ScoreEngine, summarize_task_score
+from harness.scoring import ScoreContext, ScoreEngine, summarize_task_score
 from harness.localization.runtime.records import build_localization_score_eval_record
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.runtime.execute import run_localization_task

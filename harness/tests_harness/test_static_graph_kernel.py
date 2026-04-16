@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from harness.localization.models import LCAGold, LCAPrediction
-from harness.localization.scoring import build_score_context, score_localization
+from harness.localization.scoring import build_localization_score_context, score_localization
 from harness.localization.static_graph import (
     GraphStore,
     compute_hop_distance_summary,
@@ -15,7 +15,7 @@ from harness.localization.static_graph import (
     resolve_anchors,
 )
 from harness.localization.static_graph.raw_tree import RawEdge, RawFile, RawFunction, RawTree
-from harness.localization.token_usage import TokenUsage, TokenUsageRecord
+from harness.scoring.token_usage import TokenUsage, TokenUsageRecord
 
 
 def test_raw_tree_normalization_and_hops():
@@ -76,7 +76,7 @@ def test_score_localization_uses_static_graph_context(monkeypatch, tmp_path: Pat
     prediction = LCAPrediction(predicted_files=["repo/file_b.py"])
     gold = LCAGold(changed_files=["repo/file_a.py"])
     usage = TokenUsageRecord(available=True, usage=TokenUsage(total_tokens=100))
-    ctx = build_score_context(
+    ctx = build_localization_score_context(
         prediction=prediction,
         gold=gold,
         repo_path=tmp_path,

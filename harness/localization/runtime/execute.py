@@ -8,7 +8,7 @@ from harness.localization.errors import (
     LocalizationFailureCategory,
 )
 from harness.localization.runtime.records import build_localization_score_eval_record
-from harness.localization.scoring import build_score_context
+from harness.localization.scoring import build_localization_score_context
 from harness.localization.materialization.materialize import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
@@ -19,9 +19,9 @@ from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
 )
-from harness.localization.scoring_models import ScoreBundle, ScoreEngine, summarize_task_score
+from harness.scoring import ScoreBundle, ScoreEngine, summarize_task_score
 from harness.localization.telemetry import build_localization_telemetry
-from harness.localization.token_usage import (
+from harness.scoring.token_usage import (
     TokenUsageRecord,
     extract_token_usage_record,
 )
@@ -135,7 +135,7 @@ def _score_task(
 ) -> ScoreBundle:
     try:
         anchor_text = "\n".join([task.context.issue_title or "", task.context.issue_body or ""]).strip()
-        score_context = build_score_context(
+        score_context = build_localization_score_context(
             prediction=prediction,
             gold=task.gold,
             repo_path=repo_path,

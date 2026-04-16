@@ -5,7 +5,7 @@ from pathlib import Path
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
 from harness.localization.runtime.evaluate import evaluate_localization_batch
-from harness.localization.scoring_models import ScoreBundle, ScoreContext, ScoreEngine
+from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine
 from harness.orchestration.runtime import evaluate_policy_on_item
 from harness.orchestration.types import ICTaskPayload
 

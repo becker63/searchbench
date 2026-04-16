@@ -28,14 +28,14 @@ from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
-from harness.localization.scoring_models import (
+from harness.scoring import (
     AggregateComponentScore,
     BatchScoreSummary,
     summarize_task_score,
 )
-from harness.localization.scoring_models.batch import TaskScoreSummary
+from harness.scoring.batch import TaskScoreSummary
 from harness.localization.telemetry import build_localization_telemetry
-from harness.localization.token_usage import TokenUsageRecord
+from harness.scoring.token_usage import TokenUsageRecord
 from harness.telemetry.tracing import propagate_context, start_observation
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 

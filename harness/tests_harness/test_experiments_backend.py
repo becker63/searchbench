@@ -7,7 +7,7 @@ import pytest
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
-from harness.localization.scoring_models import ScoreContext, ScoreEngine, summarize_batch_scores
+from harness.scoring import ScoreContext, ScoreEngine, summarize_batch_scores
 from harness.telemetry.hosted import experiments
 
 

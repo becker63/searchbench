@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..scoring_models import SCORE_REGISTRY, ScoreConfig, ScoreContext, ScoreEngine
+from harness.scoring import SCORE_REGISTRY, ScoreConfig, ScoreContext, ScoreEngine
 
 
 def build_example_context() -> ScoreContext:

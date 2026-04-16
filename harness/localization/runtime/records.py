@@ -15,7 +15,7 @@ from harness.localization.models import (
     LocalizationRepoInfo,
     canonicalize_paths,
 )
-from harness.localization.scoring_models import ScoreBundle, ScoreContext
+from harness.scoring import ScoreBundle, ScoreContext
 
 
 def localization_eval_identity(identity: LCATaskIdentity) -> str:

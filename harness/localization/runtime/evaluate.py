@@ -8,8 +8,8 @@ from harness.localization.errors import LocalizationEvaluationError, Localizatio
 from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
 from harness.localization.models import LCATask, LocalizationEvidence, normalize_lca_task
 from harness.localization.runtime.execute import run_localization_task
-from harness.localization.scoring_models import BatchScoreSummary, ScoreBundle, summarize_batch_scores
-from harness.localization.token_usage import TokenUsageRecord
+from harness.scoring import BatchScoreSummary, ScoreBundle, summarize_batch_scores
+from harness.scoring.token_usage import TokenUsageRecord
 
 LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]]
 

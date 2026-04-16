@@ -4,7 +4,7 @@ import pytest
 
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-from harness.localization.scoring_models import ScoreBundle, ScoreContext, ScoreEngine, summarize_batch_scores
+from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine, summarize_batch_scores
 from harness.orchestration.runtime import evaluate_policy_on_item
 from harness.orchestration.types import ICTaskPayload
 

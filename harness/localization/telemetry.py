@@ -10,7 +10,7 @@ from .models import (
     LocalizationRepoInfo,
     LocalizationTelemetryEnvelope,
 )
-from .scoring_models.batch import TaskScoreSummary
+from harness.scoring.batch import TaskScoreSummary
 
 
 def build_localization_telemetry(

@@ -1,10 +1,14 @@
+"""Localization adapter that derives score context and delegates to scoring."""
+
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable, Mapping, cast
 
+from harness.scoring import ScoreBundle, ScoreConfig, ScoreContext, ScoreEngine
+from harness.scoring.token_usage import TokenUsageRecord
+
 from .models import LCAGold, LCAPrediction, canonicalize_paths
-from .scoring_models import ScoreBundle, ScoreConfig, ScoreContext, ScoreEngine
 from .static_graph import (
     GraphStore,
     compute_hop_distance_summary,
@@ -13,7 +17,6 @@ from .static_graph import (
     raw_tree_to_graph,
     resolve_anchors,
 )
-from .token_usage import TokenUsageRecord
 
 
 def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> tuple[str, ...]:
@@ -53,7 +56,7 @@ def _derive_token_count(token_usage: TokenUsageRecord | None) -> float | None:
     return token_usage.normalized_total()
 
 
-def build_score_context(
+def build_localization_score_context(
     *,
     prediction: LCAPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
@@ -122,7 +125,7 @@ def score_localization(
     token_usage: TokenUsageRecord | None,
     config: ScoreConfig | None = None,
 ) -> ScoreBundle:
-    context = build_score_context(
+    context = build_localization_score_context(
         prediction=prediction,
         gold=gold,
         repo_path=repo_path,
@@ -132,4 +135,4 @@ def score_localization(
     return ScoreEngine(config=config).evaluate(context)
 
 
-__all__ = ["build_score_context", "score_localization"]
+__all__ = ["build_localization_score_context", "score_localization"]

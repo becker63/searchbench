@@ -7,8 +7,8 @@ from typing import Iterable, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.localization.models import LCATaskIdentity
-from harness.localization.scoring_models.batch import TaskScoreSummary
-from harness.localization.token_usage import TokenUsageRecord
+from harness.scoring.batch import TaskScoreSummary
+from harness.scoring.token_usage import TokenUsageRecord
 
 
 def repo_key_from_identity(identity: LCATaskIdentity) -> str:

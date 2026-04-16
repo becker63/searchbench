@@ -1,12 +1,9 @@
-from __future__ import annotations
-
 """
-Canonical localization scoring models.
+Canonical scoring models.
 
-This module defines the typed boundary for the localization scoring system.
-It is intentionally broader than the static-graph implementation details:
-the types here are meant to be shared by scoring, runtime evaluation,
-reducers, telemetry, hosted baselines, and orchestration.
+This module defines the typed boundary for the scoring system. The types here
+are shared by scoring, runtime evaluation, reducers, telemetry, hosted
+baselines, and orchestration.
 
 Design intent
 -------------
@@ -45,6 +42,8 @@ A few important invariants:
   Static-graph code may *produce* these models, but the models define a more
   general API boundary than any one scorer implementation.
 """
+
+from __future__ import annotations
 
 from enum import Enum
 from typing import Mapping, Protocol

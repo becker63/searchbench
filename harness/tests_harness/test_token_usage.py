@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from harness.localization.token_usage import extract_token_usage_record
+from harness.scoring.token_usage import extract_token_usage_record
 
 
 def test_extracts_from_top_level_usage_details():
