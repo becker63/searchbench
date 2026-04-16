@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
 from statistics import mean
+from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.localization.runtime.evaluate import (
-    LocalizationEvaluationFailure,
-    evaluate_localization_batch,
+from harness.localization.errors import (
+    LocalizationEvaluationError,
+    LocalizationFailureCategory,
 )
-from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
-from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
+from harness.localization.materialization.materialize import (
+    RepoMaterializationResult,
+    RepoMaterializer,
+)
 from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
@@ -22,9 +24,18 @@ from harness.localization.models import (
     LocalizationPrediction,
     normalize_lca_task,
 )
-from harness.localization.scoring_models import AggregateComponentScore, BatchScoreSummary, TaskScoreSummary, summarize_task_score
-from harness.localization.token_usage import TokenUsageRecord
+from harness.localization.runtime.evaluate import (
+    LocalizationEvaluationFailure,
+    evaluate_localization_batch,
+)
+from harness.localization.scoring_models import (
+    AggregateComponentScore,
+    BatchScoreSummary,
+    summarize_task_score,
+)
+from harness.localization.scoring_models.batch import TaskScoreSummary
 from harness.localization.telemetry import build_localization_telemetry
+from harness.localization.token_usage import TokenUsageRecord
 from harness.telemetry.tracing import propagate_context, start_observation
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 
@@ -71,7 +82,9 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
             pass
 
 
-def _aggregate_score_summaries(snapshots: Sequence[BaselineSnapshot]) -> BatchScoreSummary | None:
+def _aggregate_score_summaries(
+    snapshots: Sequence[BaselineSnapshot],
+) -> BatchScoreSummary | None:
     if not snapshots:
         return None
     total_count = len(snapshots)
@@ -90,7 +103,9 @@ def _aggregate_score_summaries(snapshots: Sequence[BaselineSnapshot]) -> BatchSc
             for snap in snapshots
             if snap.score_summary.component_scores.get(name) is not None
         ]
-        numeric_values = [float(value) for value in values if isinstance(value, (int, float))]
+        numeric_values = [
+            float(value) for value in values if isinstance(value, (int, float))
+        ]
         available_count = len(numeric_values)
         components[name] = AggregateComponentScore(
             name=name,
@@ -98,7 +113,10 @@ def _aggregate_score_summaries(snapshots: Sequence[BaselineSnapshot]) -> BatchSc
             available_count=available_count,
             missing_count=total_count - available_count,
             total_count=total_count,
-            visible_to_agent=any(name in snap.score_summary.visible_component_scores for snap in snapshots),
+            visible_to_agent=any(
+                name in snap.score_summary.visible_component_scores
+                for snap in snapshots
+            ),
         )
     return BatchScoreSummary(
         aggregate_composed_score=mean(composed_values) if composed_values else None,
@@ -127,7 +145,9 @@ def emit_baseline_dataset_aggregates(
             name="baseline.aggregate_composed_score",
             value=float(aggregate_summary.aggregate_composed_score),
             data_type="NUMERIC",
-            score_id=f"{getattr(span, 'id', None)}-baseline.aggregate_composed_score" if getattr(span, "id", None) else None,
+            score_id=f"{getattr(span, 'id', None)}-baseline.aggregate_composed_score"
+            if getattr(span, "id", None)
+            else None,
         )
     summary_metadata: dict[str, object] = {
         "selected_count": len(snapshots),
@@ -138,7 +158,9 @@ def emit_baseline_dataset_aggregates(
     _safe_update_metadata(span, summary_metadata)
 
 
-def index_baselines(bundle: BaselineBundle | Sequence[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
+def index_baselines(
+    bundle: BaselineBundle | Sequence[BaselineSnapshot],
+) -> dict[str, BaselineSnapshot]:
     items = bundle.items if isinstance(bundle, BaselineBundle) else list(bundle)
     return {snap.identity: snap for snap in items}
 
@@ -222,7 +244,10 @@ def compute_baseline_for_task(
     session_id: str | None = None,
     dataset_version: str | None = None,
     parent_trace: object | None = None,
-    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
+    runner: Callable[
+        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+    ]
+    | None = None,
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
 ) -> BaselineSnapshot:
@@ -247,13 +272,19 @@ def compute_baseline_for_task(
             )
             if eval_result.failure or not eval_result.items:
                 failure = eval_result.failure or LocalizationEvaluationFailure(
-                    category=LocalizationFailureCategory.UNKNOWN, message="baseline_evaluation_failed", task_id=task.task_id
+                    category=LocalizationFailureCategory.UNKNOWN,
+                    message="baseline_evaluation_failed",
+                    task_id=task.task_id,
                 )
                 raise LocalizationEvaluationError(
-                    failure.category, failure.message, task_id=failure.task_id or task.task_id  # type: ignore[arg-type]
+                    failure.category,
+                    failure.message,
+                    task_id=failure.task_id or task.task_id,  # type: ignore[arg-type]
                 )
             task_result = eval_result.items[0]
-            prediction_model = LocalizationPrediction(predicted_files=task_result.prediction)
+            prediction_model = LocalizationPrediction(
+                predicted_files=task_result.prediction
+            )
             score_summary = summarize_task_score(task.task_id, task_result.score_bundle)
             evidence = task_result.evidence
             materialization = task_result.materialization
@@ -264,7 +295,9 @@ def compute_baseline_for_task(
                 repo_language=task.context.repo_language,
                 repo_license=task.context.repo_license,
                 evidence=evidence,
-                materialization_events=materialization.events if materialization else None,
+                materialization_events=materialization.events
+                if materialization
+                else None,
             )
             if score_summary.composed_score is not None:
                 emit_score_for_handle(
@@ -272,7 +305,9 @@ def compute_baseline_for_task(
                     name="baseline.composed_score",
                     value=float(score_summary.composed_score),
                     data_type="NUMERIC",
-                    score_id=f"{trace.id}-baseline.composed_score" if getattr(trace, "id", None) else None,
+                    score_id=f"{trace.id}-baseline.composed_score"
+                    if getattr(trace, "id", None)
+                    else None,
                 )
             return BaselineSnapshot(
                 dataset_name=task.identity.dataset_name,
@@ -281,7 +316,9 @@ def compute_baseline_for_task(
                 dataset_version=dataset_version,
                 identity=task.task_id,
                 prediction=prediction_model,
-                gold=LocalizationGold(changed_files=task.gold.normalized_changed_files()),
+                gold=LocalizationGold(
+                    changed_files=task.gold.normalized_changed_files()
+                ),
                 score_summary=score_summary,
                 repo_owner=task.identity.repo_owner,
                 repo_name=task.identity.repo_name,
@@ -294,21 +331,31 @@ def compute_baseline_for_task(
                     "telemetry": telemetry.model_dump(exclude_none=True),
                     "score_summary": score_summary.model_dump(mode="json"),
                     "run_kind": "localization_baseline",
-                    "dataset_source": getattr(parent_trace, "metadata", {}).get("dataset_source") if parent_trace else None,
+                    "dataset_source": getattr(parent_trace, "metadata", {}).get(
+                        "dataset_source"
+                    )
+                    if parent_trace
+                    else None,
                 },
                 materialization=materialization,
             )
 
 
-def resolve_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask) -> BaselineSnapshot | None:
+def resolve_baseline(
+    baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask
+) -> BaselineSnapshot | None:
     indexed = index_baselines(baselines)
     return indexed.get(task.task_id)
 
 
-def require_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask) -> BaselineSnapshot:
+def require_baseline(
+    baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask
+) -> BaselineSnapshot:
     resolved = resolve_baseline(baselines, task)
     if resolved is None:
-        raise ValueError(f"No baseline snapshot found for localization task_id={task.task_id}")
+        raise ValueError(
+            f"No baseline snapshot found for localization task_id={task.task_id}"
+        )
     return resolved
 
 
@@ -320,7 +367,10 @@ def make_baseline_bundle(
     failure: LocalizationEvaluationFailure | None = None,
 ) -> BaselineBundle:
     snapshot_models = [
-        snap if isinstance(snap, BaselineSnapshot) else BaselineSnapshot.model_validate(snap) for snap in snapshots
+        snap
+        if isinstance(snap, BaselineSnapshot)
+        else BaselineSnapshot.model_validate(snap)
+        for snap in snapshots
     ]
     return BaselineBundle(
         dataset_name=dataset_name,

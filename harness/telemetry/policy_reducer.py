@@ -7,7 +7,7 @@ from typing import Iterable, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.localization.models import LCATaskIdentity
-from harness.localization.scoring_models import TaskScoreSummary
+from harness.localization.scoring_models.batch import TaskScoreSummary
 from harness.localization.token_usage import TokenUsageRecord
 
 
@@ -39,7 +39,9 @@ class PolicyQualityGuard(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    score_floors: dict[str, float] = Field(default_factory=lambda: {"composed_score": 0.2})
+    score_floors: dict[str, float] = Field(
+        default_factory=lambda: {"composed_score": 0.2}
+    )
 
     def evaluate(self, score_summary: TaskScoreSummary) -> tuple[bool, list[str]]:
         reasons: list[str] = []
@@ -79,7 +81,9 @@ class PolicyReducerSummary(BaseModel):
     valid_repo_count: int = 0
 
 
-def _compute_token_delta(baseline: TokenUsageRecord, candidate: TokenUsageRecord) -> float | None:
+def _compute_token_delta(
+    baseline: TokenUsageRecord, candidate: TokenUsageRecord
+) -> float | None:
     base_total = baseline.normalized_total() if baseline else None
     cand_total = candidate.normalized_total() if candidate else None
     if not baseline or not baseline.available:
@@ -100,8 +104,12 @@ def build_task_input(
     baseline_usage: TokenUsageRecord | None = None,
     quality_guard: PolicyQualityGuard | None = None,
 ) -> PolicyReducerTaskInput:
-    baseline_record = baseline_usage or TokenUsageRecord(available=False, usage=None, source="baseline")
-    candidate_record = candidate_usage or TokenUsageRecord(available=False, usage=None, source="candidate")
+    baseline_record = baseline_usage or TokenUsageRecord(
+        available=False, usage=None, source="baseline"
+    )
+    candidate_record = candidate_usage or TokenUsageRecord(
+        available=False, usage=None, source="candidate"
+    )
     token_delta = _compute_token_delta(baseline_record, candidate_record)
     guard = quality_guard or PolicyQualityGuard()
     quality_ok, reasons = guard.evaluate(score_summary)
@@ -121,7 +129,9 @@ def build_task_input(
 
 
 def reduce_repo(tasks: Sequence[PolicyReducerTaskInput]) -> RepoReducerResult:
-    valid_deltas = [t.token_delta for t in tasks if t.quality_ok and t.token_delta is not None]
+    valid_deltas = [
+        t.token_delta for t in tasks if t.quality_ok and t.token_delta is not None
+    ]
     score = median(valid_deltas) if valid_deltas else None
     return RepoReducerResult(
         repo_key=tasks[0].repo_key if tasks else "unknown",
@@ -129,7 +139,9 @@ def reduce_repo(tasks: Sequence[PolicyReducerTaskInput]) -> RepoReducerResult:
         task_count=len(tasks),
         valid_count=len(valid_deltas),
         missing_baseline_tokens=sum(1 for t in tasks if not t.baseline_usage.available),
-        missing_candidate_tokens=sum(1 for t in tasks if not t.candidate_usage.available),
+        missing_candidate_tokens=sum(
+            1 for t in tasks if not t.candidate_usage.available
+        ),
         dropped_for_quality=sum(1 for t in tasks if not t.quality_ok),
     )
 

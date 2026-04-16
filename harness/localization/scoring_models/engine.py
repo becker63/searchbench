@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from .bundle import ScoreBundle
 from .helpers import clamp_01
-from .models import ComposeMode, ScoreBundle, ScoreComponent, ScoreConfig, ScoreContext, ScoreResult
+from .models import ComposeMode, ScoreComponent, ScoreConfig, ScoreContext, ScoreResult
 from .scorers import SCORE_REGISTRY
 
 

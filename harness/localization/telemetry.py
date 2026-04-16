@@ -10,7 +10,7 @@ from .models import (
     LocalizationRepoInfo,
     LocalizationTelemetryEnvelope,
 )
-from .scoring_models import TaskScoreSummary
+from .scoring_models.batch import TaskScoreSummary
 
 
 def build_localization_telemetry(
@@ -42,7 +42,11 @@ def build_localization_telemetry(
         license=repo_license,
     )
     evidence_block = evidence
-    materialization_block = LocalizationMaterialization(events=list(materialization_events)) if materialization_events else None
+    materialization_block = (
+        LocalizationMaterialization(events=list(materialization_events))
+        if materialization_events
+        else None
+    )
     return LocalizationTelemetryEnvelope(
         identity=identity.task_id(),
         dataset=dataset_block,

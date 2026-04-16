@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from harness.localization.models import LCATaskIdentity
-from harness.localization.scoring_models import TaskScoreSummary
+from harness.localization.scoring_models import ComposeMode, Goal, ScoreResult, TaskScoreSummary
 from harness.localization.token_usage import TokenUsage, TokenUsageRecord
 from harness.telemetry.policy_reducer import (
     build_task_input,
@@ -28,13 +28,23 @@ def _usage(total: float) -> TokenUsageRecord:
 
 
 def _score(value: float, **components: float) -> TaskScoreSummary:
+    component_values = dict(components) or {"gold_hop": value}
     return TaskScoreSummary(
-        task_id="score-task",
+        item_id="score-task",
+        results={
+            name: ScoreResult(
+                name=name,
+                value=component_value,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            )
+            for name, component_value in component_values.items()
+        },
         composed_score=value,
+        compose_mode=ComposeMode.WEIGHTED_SUM,
+        compose_weights={name: 1.0 for name in component_values},
         available=True,
-        component_scores=dict(components) or {"gold_hop": value},
-        visible_component_scores=dict(components) or {"gold_hop": value},
-        component_availability={name: True for name in (components or {"gold_hop": value})},
     )
 
 

@@ -71,6 +71,19 @@ localization/
     evaluate.py
     execute.py
     records.py
+  scoring_models/
+    scorers/
+      __init__.py
+      gold_hop.py
+      issue_hop.py
+      token_efficiency.py
+    __init__.py
+    batch.py
+    bundle.py
+    engine.py
+    helpers.py
+    models.py
+    summaries.py
   static_graph/
     __init__.py
     anchors.py
@@ -79,7 +92,6 @@ localization/
     ingest.py
     normalize.py
     raw_tree.py
-    scoring_models.py
     store.py
   __init__.py
   errors.py
@@ -2150,7 +2162,7 @@ def serialize_tool_result_for_model(result: Any) -> str:
 - Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they emit localization-native score bundle summaries and outputs.
 - Machine-facing scores use explicit `machine_score` semantics: `machine_score == score_summary.aggregate_composed_score`. There is no policy selector over file-set fields.
 - Rollback should be treated as an implementation revert/emergency only, not a co-equal path; the shared backend remains the canonical evaluation route.
-- Post-hoc policy-selection reducers run outside the loop to compare candidate policies; they consume `TaskScoreSummary` plus token-usage metadata with explicit availability flags. Reducer outputs are parallel to localization control scores and do not alter loop control. Reducer quality guards enforce configured score-name floors, defaulting to the composed score.
+- Post-hoc policy-selection reducers run outside the loop to compare candidate policies; they consume the localization `TaskScoreSummary` alias over the single-item `ScoreBundle` plus token-usage metadata with explicit availability flags. Reducer outputs are parallel to localization control scores and do not alter loop control. Reducer quality guards enforce configured score-name floors, defaulting to the composed score.
 </file>
 
 <file path="docs/loop_viz.md">
@@ -3827,6 +3839,858 @@ def build_localization_score_eval_record(
     )
 </file>
 
+<file path="localization/scoring_models/scorers/__init__.py">
+from __future__ import annotations
+
+from ..models import ScoreComponent
+from .gold_hop import GoldHopScore
+from .issue_hop import IssueHopScore
+from .token_efficiency import TokenEfficiencyScore
+
+SCORE_REGISTRY: dict[str, ScoreComponent] = {
+    "gold_hop": GoldHopScore(),
+    "issue_hop": IssueHopScore(),
+    "token_efficiency": TokenEfficiencyScore(),
+}
+
+__all__ = [
+    "GoldHopScore",
+    "IssueHopScore",
+    "SCORE_REGISTRY",
+    "TokenEfficiencyScore",
+]
+</file>
+
+<file path="localization/scoring_models/scorers/gold_hop.py">
+from __future__ import annotations
+
+from ..helpers import hop_to_score
+from ..models import Goal, ScoreContext, ScoreResult
+
+
+class GoldHopScore:
+    name = "gold_hop"
+    default_enabled = True
+    default_visible_to_agent = True
+
+    def compute(self, ctx: ScoreContext) -> ScoreResult:
+        value = hop_to_score(ctx.gold_min_hops)
+        return ScoreResult(
+            name=self.name,
+            value=value,
+            goal=Goal.MAXIMIZE,
+            available=value is not None,
+            visible_to_agent=self.default_visible_to_agent,
+            reason=None if value is not None else "gold_min_hops unavailable",
+            metadata={"gold_min_hops": ctx.gold_min_hops},
+        )
+
+
+__all__ = ["GoldHopScore"]
+</file>
+
+<file path="localization/scoring_models/scorers/issue_hop.py">
+from __future__ import annotations
+
+from ..helpers import hop_to_score
+from ..models import Goal, ScoreContext, ScoreResult
+
+
+class IssueHopScore:
+    name = "issue_hop"
+    default_enabled = True
+    default_visible_to_agent = True
+
+    def compute(self, ctx: ScoreContext) -> ScoreResult:
+        value = hop_to_score(ctx.issue_min_hops)
+        return ScoreResult(
+            name=self.name,
+            value=value,
+            goal=Goal.MAXIMIZE,
+            available=value is not None,
+            visible_to_agent=self.default_visible_to_agent,
+            reason=None if value is not None else "issue_min_hops unavailable",
+            metadata={"issue_min_hops": ctx.issue_min_hops},
+        )
+
+
+__all__ = ["IssueHopScore"]
+</file>
+
+<file path="localization/scoring_models/scorers/token_efficiency.py">
+from __future__ import annotations
+
+from ..helpers import tokens_to_score
+from ..models import Goal, ScoreContext, ScoreResult
+
+
+class TokenEfficiencyScore:
+    name = "token_efficiency"
+    default_enabled = True
+    default_visible_to_agent = True
+
+    def compute(self, ctx: ScoreContext) -> ScoreResult:
+        value = tokens_to_score(ctx.previous_total_token_count)
+        return ScoreResult(
+            name=self.name,
+            value=value,
+            goal=Goal.MAXIMIZE,
+            available=value is not None,
+            visible_to_agent=self.default_visible_to_agent,
+            reason=None
+            if value is not None
+            else "previous_total_token_count unavailable",
+            metadata={"previous_total_token_count": ctx.previous_total_token_count},
+        )
+
+
+__all__ = ["TokenEfficiencyScore"]
+</file>
+
+<file path="localization/scoring_models/__init__.py">
+from __future__ import annotations
+
+from .batch import (
+    AggregateComponentScore,
+    BatchScoreSummary,
+    BatchSummary,
+    ComponentAggregate,
+)
+from .bundle import ScoreBundle
+from .engine import ScoreEngine
+from .helpers import (
+    clamp_01,
+    hop_to_score,
+    tokens_to_score,
+)
+from .models import (
+    ComposeMode,
+    Goal,
+    ScoreComponent,
+    ScoreConfig,
+    ScoreContext,
+    ScoreResult,
+)
+from .scorers import SCORE_REGISTRY, GoldHopScore, IssueHopScore, TokenEfficiencyScore
+from .summaries import (
+    summarize_batch_scores,
+    summarize_score_summaries,
+    summarize_task_score,
+)
+
+__all__ = [
+    "AggregateComponentScore",
+    "BatchScoreSummary",
+    "BatchSummary",
+    "ComponentAggregate",
+    "ComposeMode",
+    "Goal",
+    "GoldHopScore",
+    "IssueHopScore",
+    "SCORE_REGISTRY",
+    "ScoreBundle",
+    "ScoreComponent",
+    "ScoreConfig",
+    "ScoreContext",
+    "ScoreEngine",
+    "ScoreResult",
+    "TokenEfficiencyScore",
+    "clamp_01",
+    "hop_to_score",
+    "summarize_batch_scores",
+    "summarize_score_summaries",
+    "summarize_task_score",
+    "tokens_to_score",
+]
+</file>
+
+<file path="localization/scoring_models/batch.py">
+from __future__ import annotations
+
+from typing import Generic, Mapping, TypeAlias, TypeVar
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from .bundle import ScoreBundle
+
+TItemBundle = TypeVar("TItemBundle", bound=ScoreBundle)
+
+
+class ComponentAggregate(BaseModel):
+    """Aggregate batch-level summary for one named score component."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    average: float | None
+    available_count: int
+    missing_count: int
+    total_count: int
+    visible_to_agent: bool
+
+
+class BatchSummary(BaseModel, Generic[TItemBundle]):
+    """Generic aggregate summary of score outcomes across a batch of items."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    aggregate_composed_score: float | None
+    composed_available_count: int
+    composed_missing_count: int
+    total_count: int
+    items: Mapping[str, TItemBundle] = Field(default_factory=dict)
+    components: Mapping[str, ComponentAggregate] = Field(default_factory=dict)
+
+
+TaskScoreSummary: TypeAlias = ScoreBundle
+AggregateComponentScore: TypeAlias = ComponentAggregate
+BatchScoreSummary: TypeAlias = BatchSummary[TaskScoreSummary]
+
+
+__all__ = [
+    "AggregateComponentScore",
+    "BatchScoreSummary",
+    "BatchSummary",
+    "ComponentAggregate",
+    "TaskScoreSummary",
+]
+</file>
+
+<file path="localization/scoring_models/bundle.py">
+from __future__ import annotations
+
+from typing import Mapping
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from .models import ComposeMode, ScoreResult
+
+
+class ScoreBundle(BaseModel):
+    """
+    Complete output produced by `ScoreEngine` for one scored item.
+
+    The bundle is deliberately separate from reusable batch summaries: it is
+    part of the concrete scoring core and carries component results plus the
+    composed machine/control score for one item.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str | None = None
+    results: Mapping[str, ScoreResult]
+    composed_score: float | None
+    compose_mode: ComposeMode
+    compose_weights: Mapping[str, float]
+    available: bool
+    diagnostics: Mapping[str, object] = Field(default_factory=dict)
+
+    @property
+    def component_scores(self) -> Mapping[str, float | None]:
+        return {name: result.value for name, result in self.results.items()}
+
+    @property
+    def visible_component_scores(self) -> Mapping[str, float | None]:
+        return {
+            name: result.value
+            for name, result in self.results.items()
+            if result.visible_to_agent
+        }
+
+    @property
+    def component_availability(self) -> Mapping[str, bool]:
+        return {name: result.available for name, result in self.results.items()}
+
+
+__all__ = ["ScoreBundle"]
+</file>
+
+<file path="localization/scoring_models/engine.py">
+from __future__ import annotations
+
+from typing import Mapping
+
+from .bundle import ScoreBundle
+from .helpers import clamp_01
+from .models import ComposeMode, ScoreComponent, ScoreConfig, ScoreContext, ScoreResult
+from .scorers import SCORE_REGISTRY
+
+
+class ScoreEngine:
+    def __init__(
+        self,
+        registry: Mapping[str, ScoreComponent] | None = None,
+        config: ScoreConfig | None = None,
+    ) -> None:
+        self._registry = dict(registry or SCORE_REGISTRY)
+        self._config = config or ScoreConfig.default()
+        self._validate_registry()
+
+    def _validate_registry(self) -> None:
+        missing_enabled = [name for name in self._config.enabled if name not in self._registry]
+        if missing_enabled:
+            raise KeyError(f"Unknown enabled scores: {missing_enabled}")
+        missing_composed = [
+            name for name in self._config.compose_weights if name not in self._registry
+        ]
+        if missing_composed:
+            raise KeyError(f"Unknown composed scores: {missing_composed}")
+
+    def evaluate(self, ctx: ScoreContext) -> ScoreBundle:
+        results: dict[str, ScoreResult] = {}
+        visible_names = set(self._config.visible_to_agent)
+        for name in self._config.enabled:
+            raw = self._registry[name].compute(ctx)
+            results[name] = raw.model_copy(update={"visible_to_agent": name in visible_names})
+        composed_score = self._compose(results)
+        return ScoreBundle(
+            results=results,
+            composed_score=composed_score,
+            compose_mode=self._config.compose_mode,
+            compose_weights=dict(self._config.compose_weights),
+            available=composed_score is not None,
+        )
+
+    def _compose(self, results: Mapping[str, ScoreResult]) -> float | None:
+        selected: list[tuple[float, float]] = []
+        for name, weight in self._config.compose_weights.items():
+            result = results[name]
+            if not result.available or result.value is None:
+                return None
+            selected.append((clamp_01(result.value), float(weight)))
+
+        total_weight = sum(weight for _, weight in selected)
+        normalized = [(value, weight / total_weight) for value, weight in selected]
+        if self._config.compose_mode == ComposeMode.WEIGHTED_SUM:
+            return sum(value * weight for value, weight in normalized)
+        if self._config.compose_mode == ComposeMode.GEOMETRIC_MEAN:
+            product = 1.0
+            for value, weight in normalized:
+                product *= max(self._config.epsilon, value) ** weight
+            return product
+        raise AssertionError(f"Unhandled compose mode: {self._config.compose_mode}")
+
+
+__all__ = ["ScoreEngine"]
+</file>
+
+<file path="localization/scoring_models/helpers.py">
+from math import log1p
+
+
+def clamp_01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def hop_to_score(hops: int | None) -> float | None:
+    if hops is None:
+        return None
+    if hops < 0:
+        raise ValueError("hops must be >= 0")
+    return 1.0 / (1.0 + float(hops))
+
+
+def tokens_to_score(total_tokens: float | None) -> float | None:
+    if total_tokens is None:
+        return None
+    if total_tokens < 0:
+        raise ValueError("total_tokens must be >= 0")
+    return 1.0 / (1.0 + log1p(float(total_tokens)))
+
+
+__all__ = [
+    "clamp_01",
+    "hop_to_score",
+    "tokens_to_score",
+]
+</file>
+
+<file path="localization/scoring_models/models.py">
+from __future__ import annotations
+
+"""
+Canonical localization scoring models.
+
+This module defines the typed boundary for the localization scoring system.
+It is intentionally broader than the static-graph implementation details:
+the types here are meant to be shared by scoring, runtime evaluation,
+reducers, telemetry, hosted baselines, and orchestration.
+
+Design intent
+-------------
+The scoring pipeline is split into a few conceptual stages:
+
+1. A caller constructs a `ScoreContext`.
+   This is the raw, structured input to scoring. It contains the normalized
+   predicted files, gold files, hop-distance summaries, token-usage summaries,
+   and any diagnostic metadata that concrete scorers may need.
+
+2. One or more score components compute `ScoreResult` values from that context.
+   Each component is a small, deterministic unit of scoring logic such as
+   "gold hop distance", "issue hop distance", or "token efficiency".
+
+3. A scoring engine combines component results into a `ScoreBundle`.
+   The bundle contains all individual score results, the composed machine score,
+   the composition settings used, and high-level availability metadata.
+
+4. Runtime and downstream systems summarize bundles into item-level and
+   batch-level views.
+   `ScoreBundle` is the single-item score representation used by reducers,
+   telemetry, and reporting. Localization code uses the `TaskScoreSummary`
+   alias for readability where a task id has been attached to the bundle.
+   `BatchSummary[TItemBundle]` is the generic aggregate view over item bundles
+   used for dataset-wide evaluation, orchestration control, and hosted
+   summaries. Localization code uses `BatchScoreSummary`.
+
+A few important invariants:
+---------------------------
+- These models are strict. Unknown top-level fields are rejected.
+- The canonical control scalar is the composed score on `ScoreBundle`,
+  and its batch aggregate on `BatchSummary` / `BatchScoreSummary`.
+- A score can be unavailable without necessarily making the whole bundle unusable.
+  Availability is represented explicitly rather than smuggled through sentinel values.
+- These models should not depend on the static-graph implementation itself.
+  Static-graph code may *produce* these models, but the models define a more
+  general API boundary than any one scorer implementation.
+"""
+
+from enum import Enum
+from typing import Mapping, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class Goal(str, Enum):
+    """
+    Optimization direction for a single score.
+
+    A score is not meaningful unless downstream consumers know whether
+    "larger is better" or "smaller is better". This enum makes that explicit.
+
+    Members
+    -------
+    MAXIMIZE
+        Higher values are better. Typical examples include quality, relevance,
+        or normalized goodness scores.
+
+    MINIMIZE
+        Lower values are better. Typical examples include distances, error
+        terms, or costs when they are represented directly rather than inverted
+        into a reward-like score.
+    """
+
+    MAXIMIZE = "maximize"
+    MINIMIZE = "minimize"
+
+
+class ComposeMode(str, Enum):
+    """
+    Strategy used to combine multiple component scores into one composed score.
+
+    The scoring engine may support multiple composition modes so that the
+    machine/control scalar can reflect different optimization semantics.
+
+    Members
+    -------
+    WEIGHTED_SUM
+        Computes a weighted linear combination of component scores.
+        This is typically the easiest mode to reason about and is a good
+        default when score magnitudes are already normalized.
+
+    GEOMETRIC_MEAN
+        Computes a multiplicative-style aggregate that penalizes weak
+        components more strongly than a weighted sum. This can be useful
+        when a single poor component should significantly reduce the final
+        score, but it requires positive inputs and careful normalization.
+    """
+
+    WEIGHTED_SUM = "weighted_sum"
+    GEOMETRIC_MEAN = "geometric_mean"
+
+
+class ScoreContext(BaseModel):
+    """
+    Raw structured input passed to score components.
+
+    `ScoreContext` is intentionally the "facts" layer of scoring rather than the
+    "judgment" layer. It contains normalized task inputs and derived static-graph
+    facts, but it does not itself decide what the final score should be.
+
+    This separation is important because different components may interpret the
+    same context differently. For example:
+    - one scorer may reward small prediction-to-gold hop distance,
+    - another may reward closeness to issue anchors,
+    - another may reward lower token usage.
+
+    Fields
+    ------
+    predicted_files
+        The normalized predicted repo-relative files emitted by the localizer.
+
+    gold_files
+        The normalized gold repo-relative files for the task.
+
+    gold_min_hops
+        The minimum static-graph hop distance observed between predicted files
+        and gold files, if such a distance could be computed.
+
+    issue_min_hops
+        The minimum static-graph hop distance observed between predicted files
+        and issue-anchor nodes, if such a distance could be computed.
+
+    per_prediction_hops
+        Per-prediction hop diagnostics keyed by predicted file path.
+        A value of `None` means the hop distance was not computable for that
+        prediction rather than "infinite" or "bad".
+
+    previous_total_token_count
+        A derived scalar representing total token usage associated with the
+        prior run or attempt. This is intended as the canonical token-usage
+        input for token-based score components.
+
+    resolved_prediction_nodes
+        Mapping from predicted file path to the graph node ids that the scorer
+        resolved for that prediction.
+
+    resolved_gold_nodes
+        Mapping from gold file path to the graph node ids that the scorer
+        resolved for that gold file.
+
+    issue_anchor_nodes
+        The anchor node ids derived from issue title/body or other task context.
+
+    unresolved_predictions
+        Predicted files that could not be resolved into graph nodes.
+
+    unresolved_gold_files
+        Gold files that could not be resolved into graph nodes.
+
+    repo_path
+        Optional repository root path used while building the context.
+        This is mostly diagnostic and should not typically affect score logic.
+
+    diagnostics
+        Arbitrary structured diagnostic payload. This is intentionally generic
+        so the context can carry debugging or trace information without forcing
+        every scorer to know about it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    predicted_files: tuple[str, ...] = Field(default_factory=tuple)
+    gold_files: tuple[str, ...] = Field(default_factory=tuple)
+    gold_min_hops: int | None = None
+    issue_min_hops: int | None = None
+    per_prediction_hops: Mapping[str, int | None] = Field(default_factory=dict)
+    previous_total_token_count: float | None = None
+    resolved_prediction_nodes: Mapping[str, tuple[str, ...]] = Field(
+        default_factory=dict
+    )
+    resolved_gold_nodes: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+    issue_anchor_nodes: tuple[str, ...] = Field(default_factory=tuple)
+    unresolved_predictions: tuple[str, ...] = Field(default_factory=tuple)
+    unresolved_gold_files: tuple[str, ...] = Field(default_factory=tuple)
+    repo_path: str | None = None
+    diagnostics: Mapping[str, object] = Field(default_factory=dict)
+
+
+class ScoreResult(BaseModel):
+    """
+    Result produced by a single score component.
+
+    This model is the atomic unit of scoring output. A `ScoreResult` answers:
+    - what score was computed,
+    - whether it was actually available,
+    - whether it should be shown to the agent,
+    - and any explanation or metadata attached to it.
+
+    Not every score must be available for every task. For example, token-based
+    scoring may be unavailable if no token record exists, or a hop-based score
+    may be unavailable if graph resolution fails. Instead of overloading `0.0`
+    or some arbitrary sentinel, availability is represented explicitly.
+
+    Fields
+    ------
+    name
+        Stable component name, such as `"gold_hop"` or `"token_efficiency"`.
+
+    value
+        Numeric score value if the component produced one. `None` indicates the
+        component did not produce a usable numeric value.
+
+    goal
+        Whether downstream systems should maximize or minimize this score.
+
+    available
+        Whether the score was meaningfully computed for this task.
+
+    visible_to_agent
+        Whether this score should be surfaced to the policy-writing / agent
+        feedback layer. Hidden scores may still be used for machine scoring,
+        telemetry, or diagnostics.
+
+    reason
+        Optional human-readable explanation for unavailability or other notable
+        scorer behavior.
+
+    metadata
+        Arbitrary structured diagnostics attached by the component.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: float | None
+    goal: Goal
+    available: bool
+    visible_to_agent: bool
+    reason: str | None = None
+    metadata: Mapping[str, object] = Field(default_factory=dict)
+
+
+class ScoreConfig(BaseModel):
+    """
+    Configuration for score computation and composition.
+
+    `ScoreConfig` answers three main questions:
+
+    1. Which score components are enabled?
+    2. Which enabled components are visible to the agent?
+    3. How are enabled components combined into a composed machine score?
+
+    This config is deliberately strict because loose scoring configuration can
+    create subtle evaluation bugs. A component should never be visible unless
+    it is enabled, and a component should never participate in composition
+    unless it is enabled.
+
+    Fields
+    ------
+    enabled
+        Ordered component names that should be executed.
+
+    visible_to_agent
+        Subset of enabled component names that should be surfaced to the agent.
+
+    compose_weights
+        Mapping from component name to composition weight. Only components named
+        here participate in the composed score.
+
+    compose_mode
+        The mathematical strategy used to combine composed component scores.
+
+    epsilon
+        Small positive constant used to stabilize computations in composition
+        modes that need it, such as geometric mean.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: tuple[str, ...]
+    visible_to_agent: tuple[str, ...]
+    compose_weights: Mapping[str, float]
+    compose_mode: ComposeMode = ComposeMode.WEIGHTED_SUM
+    epsilon: float = 1e-6
+
+    @model_validator(mode="after")
+    def _validate_config(self) -> "ScoreConfig":
+        """
+        Enforce internal consistency of the scoring configuration.
+
+        Validation rules:
+        - at least one component must be enabled,
+        - at least one component must participate in composition,
+        - visible component names must be a subset of enabled component names,
+        - composed component names must be a subset of enabled component names,
+        - total composition weight must be positive,
+        - epsilon must be strictly positive.
+
+        These checks make configuration errors fail fast at construction time
+        rather than producing confusing runtime behavior later.
+        """
+        enabled = set(self.enabled)
+        visible = set(self.visible_to_agent)
+        composed = set(self.compose_weights)
+        if not self.enabled:
+            raise ValueError("enabled must not be empty")
+        if not self.compose_weights:
+            raise ValueError("compose_weights must not be empty")
+        if not visible <= enabled:
+            raise ValueError(
+                f"Visible scores must also be enabled: {sorted(visible - enabled)}"
+            )
+        if not composed <= enabled:
+            raise ValueError(
+                f"Composed scores must also be enabled: {sorted(composed - enabled)}"
+            )
+        total_weight = sum(float(weight) for weight in self.compose_weights.values())
+        if total_weight <= 0.0:
+            raise ValueError("compose_weights must sum to > 0")
+        if self.epsilon <= 0.0:
+            raise ValueError("epsilon must be > 0")
+        return self
+
+    @classmethod
+    def default(cls) -> "ScoreConfig":
+        """
+        Return the default scoring configuration.
+
+        Current default behavior:
+        - all three canonical components are enabled,
+        - all three are visible to the agent,
+        - only `gold_hop` and `issue_hop` participate in composition,
+        - composition uses weighted sum,
+        - `gold_hop` has the dominant weight.
+
+        This default expresses an important policy choice:
+        token efficiency is tracked and surfaced, but does not control the main
+        machine score unless a caller explicitly opts into that behavior.
+        """
+        return cls(
+            enabled=("gold_hop", "issue_hop", "token_efficiency"),
+            visible_to_agent=("gold_hop", "issue_hop", "token_efficiency"),
+            compose_weights={
+                "gold_hop": 0.75,
+                "issue_hop": 0.25,
+            },
+            compose_mode=ComposeMode.WEIGHTED_SUM,
+        )
+
+
+class ScoreComponent(Protocol):
+    """
+    Structural protocol implemented by concrete score components.
+
+    Concrete scorers do not need to inherit from a base class as long as they
+    satisfy this protocol. This keeps component implementations lightweight
+    while still giving the engine and type checker a consistent interface.
+
+    Required attributes
+    -------------------
+    name
+        Stable identifier for the component.
+
+    default_enabled
+        Whether this component should normally be enabled in default configs.
+
+    default_visible_to_agent
+        Whether this component should normally be shown to the agent.
+
+    Required method
+    ---------------
+    compute(ctx: ScoreContext) -> ScoreResult
+        Compute the component result deterministically from the given context.
+    """
+
+    name: str
+    default_enabled: bool
+    default_visible_to_agent: bool
+
+    def compute(self, ctx: ScoreContext) -> ScoreResult:
+        """
+        Compute this component's score from a `ScoreContext`.
+
+        Implementations should:
+        - be deterministic,
+        - return a `ScoreResult` with a stable `name`,
+        - mark uncomputable situations via `available=False`,
+        - avoid raising for ordinary "not enough data" cases when a structured
+          unavailable result is sufficient.
+        """
+        ...
+
+
+__all__ = [
+    "ComposeMode",
+    "Goal",
+    "ScoreComponent",
+    "ScoreConfig",
+    "ScoreContext",
+    "ScoreResult",
+]
+</file>
+
+<file path="localization/scoring_models/summaries.py">
+from __future__ import annotations
+
+from typing import Mapping
+
+from .batch import (
+    AggregateComponentScore,
+    BatchScoreSummary,
+)
+from .bundle import ScoreBundle
+
+
+def summarize_task_score(task_id: str, bundle: ScoreBundle) -> ScoreBundle:
+    """Attach a localization task id to a concrete `ScoreBundle`."""
+
+    return bundle.model_copy(update={"item_id": task_id})
+
+
+def summarize_score_summaries(
+    summaries: Mapping[str, ScoreBundle],
+) -> BatchScoreSummary:
+    """Aggregate task score bundles into the localization batch score summary."""
+
+    total_count = len(summaries)
+    composed_values = [
+        summary.composed_score
+        for summary in summaries.values()
+        if summary.composed_score is not None
+    ]
+    component_names = sorted(
+        {name for summary in summaries.values() for name in summary.component_scores}
+    )
+    components: dict[str, AggregateComponentScore] = {}
+    for name in component_names:
+        values: list[float] = []
+        visible = False
+        for summary in summaries.values():
+            visible = visible or name in summary.visible_component_scores
+            value = summary.component_scores.get(name)
+            if value is not None:
+                values.append(value)
+        available_count = len(values)
+        components[name] = AggregateComponentScore(
+            name=name,
+            average=(sum(values) / available_count) if values else None,
+            available_count=available_count,
+            missing_count=total_count - available_count,
+            total_count=total_count,
+            visible_to_agent=visible,
+        )
+    composed_available_count = len(composed_values)
+    return BatchScoreSummary(
+        aggregate_composed_score=(sum(composed_values) / composed_available_count)
+        if composed_values
+        else None,
+        composed_available_count=composed_available_count,
+        composed_missing_count=total_count - composed_available_count,
+        total_count=total_count,
+        items=dict(summaries),
+        components=components,
+    )
+
+
+def summarize_batch_scores(bundles: Mapping[str, ScoreBundle]) -> BatchScoreSummary:
+    """
+    Project concrete bundles into item summaries, then aggregate those summaries.
+    """
+
+    summaries = {
+        task_id: summarize_task_score(task_id, bundle)
+        for task_id, bundle in bundles.items()
+    }
+    return summarize_score_summaries(summaries)
+
+
+__all__ = [
+    "summarize_batch_scores",
+    "summarize_score_summaries",
+    "summarize_task_score",
+]
+</file>
+
 <file path="localization/static_graph/__init__.py">
 """
 Static evaluator graph kernel for localization:
@@ -3841,33 +4705,9 @@ from .distance import HopDistanceResult, compute_hop_distance_summary
 from .ingest import ingest_repo
 from .normalize import raw_tree_to_graph
 from .raw_tree import RawEdge, RawFile, RawFunction, RawTree
-from .scoring_models import (
-    AggregateComponentScore,
-    BatchScoreSummary,
-    ComposeMode,
-    Goal,
-    ScoreBundle,
-    ScoreConfig,
-    ScoreContext,
-    ScoreEngine,
-    ScoreResult,
-    TaskScoreSummary,
-    summarize_batch_scores,
-    summarize_task_score,
-)
 from .store import GraphStore
 
 __all__ = [
-    "AggregateComponentScore",
-    "BatchScoreSummary",
-    "ComposeMode",
-    "Goal",
-    "ScoreBundle",
-    "ScoreConfig",
-    "ScoreContext",
-    "ScoreEngine",
-    "ScoreResult",
-    "TaskScoreSummary",
     "extract_anchors",
     "resolve_anchors",
     "resolve_predictions",
@@ -3880,8 +4720,6 @@ __all__ = [
     "RawFunction",
     "RawTree",
     "GraphStore",
-    "summarize_batch_scores",
-    "summarize_task_score",
 ]
 </file>
 
@@ -3988,7 +4826,7 @@ def compute_hop_distance_summary(
 <file path="localization/static_graph/example.py">
 from __future__ import annotations
 
-from .scoring_models import SCORE_REGISTRY, ScoreConfig, ScoreContext, ScoreEngine
+from ..scoring_models import SCORE_REGISTRY, ScoreConfig, ScoreContext, ScoreEngine
 
 
 def build_example_context() -> ScoreContext:
@@ -4335,371 +5173,6 @@ class RawFile(BaseModel):
 
 class RawTree(BaseModel):
     files: list[RawFile] = Field(default_factory=list)
-</file>
-
-<file path="localization/scoring_models/models.py">
-from __future__ import annotations
-
-from enum import Enum
-from math import log1p
-from typing import Mapping, Protocol
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-
-class Goal(str, Enum):
-    MAXIMIZE = "maximize"
-    MINIMIZE = "minimize"
-
-
-class ComposeMode(str, Enum):
-    WEIGHTED_SUM = "weighted_sum"
-    GEOMETRIC_MEAN = "geometric_mean"
-
-
-class ScoreContext(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    predicted_files: tuple[str, ...] = Field(default_factory=tuple)
-    gold_files: tuple[str, ...] = Field(default_factory=tuple)
-    gold_min_hops: int | None = None
-    issue_min_hops: int | None = None
-    per_prediction_hops: Mapping[str, int | None] = Field(default_factory=dict)
-    previous_total_token_count: float | None = None
-    resolved_prediction_nodes: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
-    resolved_gold_nodes: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
-    issue_anchor_nodes: tuple[str, ...] = Field(default_factory=tuple)
-    unresolved_predictions: tuple[str, ...] = Field(default_factory=tuple)
-    unresolved_gold_files: tuple[str, ...] = Field(default_factory=tuple)
-    repo_path: str | None = None
-    diagnostics: Mapping[str, object] = Field(default_factory=dict)
-
-
-class ScoreResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    value: float | None
-    goal: Goal
-    available: bool
-    visible_to_agent: bool
-    reason: str | None = None
-    metadata: Mapping[str, object] = Field(default_factory=dict)
-
-
-class ScoreConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: tuple[str, ...]
-    visible_to_agent: tuple[str, ...]
-    compose_weights: Mapping[str, float]
-    compose_mode: ComposeMode = ComposeMode.WEIGHTED_SUM
-    epsilon: float = 1e-6
-
-    @model_validator(mode="after")
-    def _validate_config(self) -> "ScoreConfig":
-        enabled = set(self.enabled)
-        visible = set(self.visible_to_agent)
-        composed = set(self.compose_weights)
-        if not self.enabled:
-            raise ValueError("enabled must not be empty")
-        if not self.compose_weights:
-            raise ValueError("compose_weights must not be empty")
-        if not visible <= enabled:
-            raise ValueError(f"Visible scores must also be enabled: {sorted(visible - enabled)}")
-        if not composed <= enabled:
-            raise ValueError(f"Composed scores must also be enabled: {sorted(composed - enabled)}")
-        total_weight = sum(float(weight) for weight in self.compose_weights.values())
-        if total_weight <= 0.0:
-            raise ValueError("compose_weights must sum to > 0")
-        if self.epsilon <= 0.0:
-            raise ValueError("epsilon must be > 0")
-        return self
-
-    @classmethod
-    def default(cls) -> "ScoreConfig":
-        return cls(
-            enabled=("gold_hop", "issue_hop", "token_efficiency"),
-            visible_to_agent=("gold_hop", "issue_hop", "token_efficiency"),
-            compose_weights={
-                "gold_hop": 0.75,
-                "issue_hop": 0.25,
-            },
-            compose_mode=ComposeMode.WEIGHTED_SUM,
-        )
-
-
-class ScoreBundle(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    results: Mapping[str, ScoreResult]
-    composed_score: float | None
-    compose_mode: ComposeMode
-    compose_weights: Mapping[str, float]
-    available: bool
-    diagnostics: Mapping[str, object] = Field(default_factory=dict)
-
-
-class TaskScoreSummary(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    task_id: str
-    composed_score: float | None
-    available: bool
-    component_scores: Mapping[str, float | None] = Field(default_factory=dict)
-    visible_component_scores: Mapping[str, float | None] = Field(default_factory=dict)
-    component_availability: Mapping[str, bool] = Field(default_factory=dict)
-
-
-class AggregateComponentScore(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    average: float | None
-    available_count: int
-    missing_count: int
-    total_count: int
-    visible_to_agent: bool
-
-
-class BatchScoreSummary(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    aggregate_composed_score: float | None
-    composed_available_count: int
-    composed_missing_count: int
-    total_count: int
-    components: Mapping[str, AggregateComponentScore] = Field(default_factory=dict)
-
-
-class ScoreComponent(Protocol):
-    name: str
-    default_enabled: bool
-    default_visible_to_agent: bool
-
-    def compute(self, ctx: ScoreContext) -> ScoreResult: ...
-
-
-def clamp_01(value: float) -> float:
-    return max(0.0, min(1.0, value))
-
-
-def hop_to_score(hops: int | None) -> float | None:
-    if hops is None:
-        return None
-    if hops < 0:
-        raise ValueError("hops must be >= 0")
-    return 1.0 / (1.0 + float(hops))
-
-
-def tokens_to_score(total_tokens: float | None) -> float | None:
-    if total_tokens is None:
-        return None
-    if total_tokens < 0:
-        raise ValueError("total_tokens must be >= 0")
-    return 1.0 / (1.0 + log1p(float(total_tokens)))
-
-
-class GoldHopScore:
-    name = "gold_hop"
-    default_enabled = True
-    default_visible_to_agent = True
-
-    def compute(self, ctx: ScoreContext) -> ScoreResult:
-        value = hop_to_score(ctx.gold_min_hops)
-        return ScoreResult(
-            name=self.name,
-            value=value,
-            goal=Goal.MAXIMIZE,
-            available=value is not None,
-            visible_to_agent=self.default_visible_to_agent,
-            reason=None if value is not None else "gold_min_hops unavailable",
-            metadata={"gold_min_hops": ctx.gold_min_hops},
-        )
-
-
-class IssueHopScore:
-    name = "issue_hop"
-    default_enabled = True
-    default_visible_to_agent = True
-
-    def compute(self, ctx: ScoreContext) -> ScoreResult:
-        value = hop_to_score(ctx.issue_min_hops)
-        return ScoreResult(
-            name=self.name,
-            value=value,
-            goal=Goal.MAXIMIZE,
-            available=value is not None,
-            visible_to_agent=self.default_visible_to_agent,
-            reason=None if value is not None else "issue_min_hops unavailable",
-            metadata={"issue_min_hops": ctx.issue_min_hops},
-        )
-
-
-class TokenEfficiencyScore:
-    name = "token_efficiency"
-    default_enabled = True
-    default_visible_to_agent = True
-
-    def compute(self, ctx: ScoreContext) -> ScoreResult:
-        value = tokens_to_score(ctx.previous_total_token_count)
-        return ScoreResult(
-            name=self.name,
-            value=value,
-            goal=Goal.MAXIMIZE,
-            available=value is not None,
-            visible_to_agent=self.default_visible_to_agent,
-            reason=None if value is not None else "previous_total_token_count unavailable",
-            metadata={"previous_total_token_count": ctx.previous_total_token_count},
-        )
-
-
-SCORE_REGISTRY: dict[str, ScoreComponent] = {
-    "gold_hop": GoldHopScore(),
-    "issue_hop": IssueHopScore(),
-    "token_efficiency": TokenEfficiencyScore(),
-}
-
-
-class ScoreEngine:
-    def __init__(
-        self,
-        registry: Mapping[str, ScoreComponent] | None = None,
-        config: ScoreConfig | None = None,
-    ) -> None:
-        self._registry = dict(registry or SCORE_REGISTRY)
-        self._config = config or ScoreConfig.default()
-        self._validate_registry()
-
-    def _validate_registry(self) -> None:
-        missing_enabled = [name for name in self._config.enabled if name not in self._registry]
-        if missing_enabled:
-            raise KeyError(f"Unknown enabled scores: {missing_enabled}")
-        missing_composed = [
-            name for name in self._config.compose_weights if name not in self._registry
-        ]
-        if missing_composed:
-            raise KeyError(f"Unknown composed scores: {missing_composed}")
-
-    def evaluate(self, ctx: ScoreContext) -> ScoreBundle:
-        results: dict[str, ScoreResult] = {}
-        visible_names = set(self._config.visible_to_agent)
-        for name in self._config.enabled:
-            raw = self._registry[name].compute(ctx)
-            results[name] = raw.model_copy(
-                update={"visible_to_agent": name in visible_names}
-            )
-        composed_score = self._compose(results)
-        return ScoreBundle(
-            results=results,
-            composed_score=composed_score,
-            compose_mode=self._config.compose_mode,
-            compose_weights=dict(self._config.compose_weights),
-            available=composed_score is not None,
-        )
-
-    def _compose(self, results: Mapping[str, ScoreResult]) -> float | None:
-        selected: list[tuple[float, float]] = []
-        for name, weight in self._config.compose_weights.items():
-            result = results[name]
-            if not result.available or result.value is None:
-                return None
-            selected.append((clamp_01(result.value), float(weight)))
-
-        total_weight = sum(weight for _, weight in selected)
-        normalized = [(value, weight / total_weight) for value, weight in selected]
-        if self._config.compose_mode == ComposeMode.WEIGHTED_SUM:
-            return sum(value * weight for value, weight in normalized)
-        if self._config.compose_mode == ComposeMode.GEOMETRIC_MEAN:
-            product = 1.0
-            for value, weight in normalized:
-                product *= max(self._config.epsilon, value) ** weight
-            return product
-        raise AssertionError(f"Unhandled compose mode: {self._config.compose_mode}")
-
-
-def summarize_task_score(task_id: str, bundle: ScoreBundle) -> TaskScoreSummary:
-    component_scores = {name: result.value for name, result in bundle.results.items()}
-    visible_scores = {
-        name: result.value
-        for name, result in bundle.results.items()
-        if result.visible_to_agent
-    }
-    availability = {name: result.available for name, result in bundle.results.items()}
-    return TaskScoreSummary(
-        task_id=task_id,
-        composed_score=bundle.composed_score,
-        available=bundle.available,
-        component_scores=component_scores,
-        visible_component_scores=visible_scores,
-        component_availability=availability,
-    )
-
-
-def summarize_batch_scores(bundles: Mapping[str, ScoreBundle]) -> BatchScoreSummary:
-    total_count = len(bundles)
-    composed_values = [
-        bundle.composed_score
-        for bundle in bundles.values()
-        if bundle.composed_score is not None
-    ]
-    component_names = sorted(
-        {name for bundle in bundles.values() for name in bundle.results}
-    )
-    components: dict[str, AggregateComponentScore] = {}
-    for name in component_names:
-        values: list[float] = []
-        visible = False
-        for bundle in bundles.values():
-            result = bundle.results.get(name)
-            if result is None:
-                continue
-            visible = visible or result.visible_to_agent
-            if result.available and result.value is not None:
-                values.append(result.value)
-        available_count = len(values)
-        components[name] = AggregateComponentScore(
-            name=name,
-            average=(sum(values) / available_count) if values else None,
-            available_count=available_count,
-            missing_count=total_count - available_count,
-            total_count=total_count,
-            visible_to_agent=visible,
-        )
-    composed_available_count = len(composed_values)
-    return BatchScoreSummary(
-        aggregate_composed_score=(sum(composed_values) / composed_available_count)
-        if composed_values
-        else None,
-        composed_available_count=composed_available_count,
-        composed_missing_count=total_count - composed_available_count,
-        total_count=total_count,
-        components=components,
-    )
-
-
-__all__ = [
-    "AggregateComponentScore",
-    "BatchScoreSummary",
-    "ComposeMode",
-    "Goal",
-    "GoldHopScore",
-    "IssueHopScore",
-    "SCORE_REGISTRY",
-    "ScoreBundle",
-    "ScoreComponent",
-    "ScoreConfig",
-    "ScoreContext",
-    "ScoreEngine",
-    "ScoreResult",
-    "TaskScoreSummary",
-    "TokenEfficiencyScore",
-    "clamp_01",
-    "hop_to_score",
-    "summarize_batch_scores",
-    "summarize_task_score",
-    "tokens_to_score",
-]
 </file>
 
 <file path="localization/static_graph/store.py">
@@ -5289,12 +5762,9 @@ from pathlib import Path
 from typing import Iterable, Mapping, cast
 
 from .models import LCAGold, LCAPrediction, canonicalize_paths
+from .scoring_models import ScoreBundle, ScoreConfig, ScoreContext, ScoreEngine
 from .static_graph import (
     GraphStore,
-    ScoreBundle,
-    ScoreConfig,
-    ScoreContext,
-    ScoreEngine,
     compute_hop_distance_summary,
     extract_anchors,
     ingest_repo,
@@ -5436,7 +5906,7 @@ from .models import (
     LocalizationRepoInfo,
     LocalizationTelemetryEnvelope,
 )
-from .scoring_models import TaskScoreSummary
+from .scoring_models.batch import TaskScoreSummary
 
 
 def build_localization_telemetry(
@@ -5468,7 +5938,11 @@ def build_localization_telemetry(
         license=repo_license,
     )
     evidence_block = evidence
-    materialization_block = LocalizationMaterialization(events=list(materialization_events)) if materialization_events else None
+    materialization_block = (
+        LocalizationMaterialization(events=list(materialization_events))
+        if materialization_events
+        else None
+    )
     return LocalizationTelemetryEnvelope(
         identity=identity.task_id(),
         dataset=dataset_block,
@@ -8463,20 +8937,22 @@ class BackendPromptContext(BaseModel):
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
 from statistics import mean
+from typing import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from harness.localization.runtime.evaluate import (
-    LocalizationEvaluationFailure,
-    evaluate_localization_batch,
+from harness.localization.errors import (
+    LocalizationEvaluationError,
+    LocalizationFailureCategory,
 )
-from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
-from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
+from harness.localization.materialization.materialize import (
+    RepoMaterializationResult,
+    RepoMaterializer,
+)
 from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
@@ -8484,9 +8960,18 @@ from harness.localization.models import (
     LocalizationPrediction,
     normalize_lca_task,
 )
-from harness.localization.scoring_models import AggregateComponentScore, BatchScoreSummary, TaskScoreSummary, summarize_task_score
-from harness.localization.token_usage import TokenUsageRecord
+from harness.localization.runtime.evaluate import (
+    LocalizationEvaluationFailure,
+    evaluate_localization_batch,
+)
+from harness.localization.scoring_models import (
+    AggregateComponentScore,
+    BatchScoreSummary,
+    summarize_task_score,
+)
+from harness.localization.scoring_models.batch import TaskScoreSummary
 from harness.localization.telemetry import build_localization_telemetry
+from harness.localization.token_usage import TokenUsageRecord
 from harness.telemetry.tracing import propagate_context, start_observation
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 
@@ -8533,7 +9018,9 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
             pass
 
 
-def _aggregate_score_summaries(snapshots: Sequence[BaselineSnapshot]) -> BatchScoreSummary | None:
+def _aggregate_score_summaries(
+    snapshots: Sequence[BaselineSnapshot],
+) -> BatchScoreSummary | None:
     if not snapshots:
         return None
     total_count = len(snapshots)
@@ -8552,7 +9039,9 @@ def _aggregate_score_summaries(snapshots: Sequence[BaselineSnapshot]) -> BatchSc
             for snap in snapshots
             if snap.score_summary.component_scores.get(name) is not None
         ]
-        numeric_values = [float(value) for value in values if isinstance(value, (int, float))]
+        numeric_values = [
+            float(value) for value in values if isinstance(value, (int, float))
+        ]
         available_count = len(numeric_values)
         components[name] = AggregateComponentScore(
             name=name,
@@ -8560,7 +9049,10 @@ def _aggregate_score_summaries(snapshots: Sequence[BaselineSnapshot]) -> BatchSc
             available_count=available_count,
             missing_count=total_count - available_count,
             total_count=total_count,
-            visible_to_agent=any(name in snap.score_summary.visible_component_scores for snap in snapshots),
+            visible_to_agent=any(
+                name in snap.score_summary.visible_component_scores
+                for snap in snapshots
+            ),
         )
     return BatchScoreSummary(
         aggregate_composed_score=mean(composed_values) if composed_values else None,
@@ -8589,7 +9081,9 @@ def emit_baseline_dataset_aggregates(
             name="baseline.aggregate_composed_score",
             value=float(aggregate_summary.aggregate_composed_score),
             data_type="NUMERIC",
-            score_id=f"{getattr(span, 'id', None)}-baseline.aggregate_composed_score" if getattr(span, "id", None) else None,
+            score_id=f"{getattr(span, 'id', None)}-baseline.aggregate_composed_score"
+            if getattr(span, "id", None)
+            else None,
         )
     summary_metadata: dict[str, object] = {
         "selected_count": len(snapshots),
@@ -8600,7 +9094,9 @@ def emit_baseline_dataset_aggregates(
     _safe_update_metadata(span, summary_metadata)
 
 
-def index_baselines(bundle: BaselineBundle | Sequence[BaselineSnapshot]) -> dict[str, BaselineSnapshot]:
+def index_baselines(
+    bundle: BaselineBundle | Sequence[BaselineSnapshot],
+) -> dict[str, BaselineSnapshot]:
     items = bundle.items if isinstance(bundle, BaselineBundle) else list(bundle)
     return {snap.identity: snap for snap in items}
 
@@ -8684,7 +9180,10 @@ def compute_baseline_for_task(
     session_id: str | None = None,
     dataset_version: str | None = None,
     parent_trace: object | None = None,
-    runner: Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]] | None = None,
+    runner: Callable[
+        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+    ]
+    | None = None,
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
 ) -> BaselineSnapshot:
@@ -8709,13 +9208,19 @@ def compute_baseline_for_task(
             )
             if eval_result.failure or not eval_result.items:
                 failure = eval_result.failure or LocalizationEvaluationFailure(
-                    category=LocalizationFailureCategory.UNKNOWN, message="baseline_evaluation_failed", task_id=task.task_id
+                    category=LocalizationFailureCategory.UNKNOWN,
+                    message="baseline_evaluation_failed",
+                    task_id=task.task_id,
                 )
                 raise LocalizationEvaluationError(
-                    failure.category, failure.message, task_id=failure.task_id or task.task_id  # type: ignore[arg-type]
+                    failure.category,
+                    failure.message,
+                    task_id=failure.task_id or task.task_id,  # type: ignore[arg-type]
                 )
             task_result = eval_result.items[0]
-            prediction_model = LocalizationPrediction(predicted_files=task_result.prediction)
+            prediction_model = LocalizationPrediction(
+                predicted_files=task_result.prediction
+            )
             score_summary = summarize_task_score(task.task_id, task_result.score_bundle)
             evidence = task_result.evidence
             materialization = task_result.materialization
@@ -8726,7 +9231,9 @@ def compute_baseline_for_task(
                 repo_language=task.context.repo_language,
                 repo_license=task.context.repo_license,
                 evidence=evidence,
-                materialization_events=materialization.events if materialization else None,
+                materialization_events=materialization.events
+                if materialization
+                else None,
             )
             if score_summary.composed_score is not None:
                 emit_score_for_handle(
@@ -8734,7 +9241,9 @@ def compute_baseline_for_task(
                     name="baseline.composed_score",
                     value=float(score_summary.composed_score),
                     data_type="NUMERIC",
-                    score_id=f"{trace.id}-baseline.composed_score" if getattr(trace, "id", None) else None,
+                    score_id=f"{trace.id}-baseline.composed_score"
+                    if getattr(trace, "id", None)
+                    else None,
                 )
             return BaselineSnapshot(
                 dataset_name=task.identity.dataset_name,
@@ -8743,7 +9252,9 @@ def compute_baseline_for_task(
                 dataset_version=dataset_version,
                 identity=task.task_id,
                 prediction=prediction_model,
-                gold=LocalizationGold(changed_files=task.gold.normalized_changed_files()),
+                gold=LocalizationGold(
+                    changed_files=task.gold.normalized_changed_files()
+                ),
                 score_summary=score_summary,
                 repo_owner=task.identity.repo_owner,
                 repo_name=task.identity.repo_name,
@@ -8756,21 +9267,31 @@ def compute_baseline_for_task(
                     "telemetry": telemetry.model_dump(exclude_none=True),
                     "score_summary": score_summary.model_dump(mode="json"),
                     "run_kind": "localization_baseline",
-                    "dataset_source": getattr(parent_trace, "metadata", {}).get("dataset_source") if parent_trace else None,
+                    "dataset_source": getattr(parent_trace, "metadata", {}).get(
+                        "dataset_source"
+                    )
+                    if parent_trace
+                    else None,
                 },
                 materialization=materialization,
             )
 
 
-def resolve_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask) -> BaselineSnapshot | None:
+def resolve_baseline(
+    baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask
+) -> BaselineSnapshot | None:
     indexed = index_baselines(baselines)
     return indexed.get(task.task_id)
 
 
-def require_baseline(baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask) -> BaselineSnapshot:
+def require_baseline(
+    baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask
+) -> BaselineSnapshot:
     resolved = resolve_baseline(baselines, task)
     if resolved is None:
-        raise ValueError(f"No baseline snapshot found for localization task_id={task.task_id}")
+        raise ValueError(
+            f"No baseline snapshot found for localization task_id={task.task_id}"
+        )
     return resolved
 
 
@@ -8782,7 +9303,10 @@ def make_baseline_bundle(
     failure: LocalizationEvaluationFailure | None = None,
 ) -> BaselineBundle:
     snapshot_models = [
-        snap if isinstance(snap, BaselineSnapshot) else BaselineSnapshot.model_validate(snap) for snap in snapshots
+        snap
+        if isinstance(snap, BaselineSnapshot)
+        else BaselineSnapshot.model_validate(snap)
+        for snap in snapshots
     ]
     return BaselineBundle(
         dataset_name=dataset_name,
@@ -8964,20 +9488,28 @@ def local_dataset(
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 from concurrent.futures import FIRST_COMPLETED
 from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
+from harness.localization.errors import (
+    LocalizationEvaluationError,
+    LocalizationFailureCategory,
+)
+from harness.localization.materialization.materialize import (
+    RepoMaterializationResult,
+    RepoMaterializer,
+)
+from harness.localization.models import LCATask, normalize_lca_task
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
-from harness.localization.models import LCATask, normalize_lca_task
-from harness.localization.scoring_models import TaskScoreSummary, summarize_task_score
+from harness.localization.scoring_models import summarize_task_score
+from harness.localization.scoring_models.batch import TaskScoreSummary
 from harness.localization.token_usage import TokenUsageRecord
-from harness.localization.materialization.materialize import RepoMaterializationResult, RepoMaterializer
-from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.telemetry.hosted.baselines import (
     BaselineBundle,
     BaselineSnapshot,
@@ -8988,16 +9520,25 @@ from harness.telemetry.hosted.baselines import (
     persist_baseline_bundle,
 )
 from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
-from harness.telemetry.tracing import flush_langfuse, propagate_context, start_observation
+from harness.telemetry.policy_reducer import (
+    PolicyReducerSummary,
+    build_task_input,
+    reduce_global,
+)
+from harness.telemetry.tracing import (
+    flush_langfuse,
+    propagate_context,
+    start_observation,
+)
 from harness.telemetry.tracing.session_policy import resolve_session_id
-from harness.telemetry.policy_reducer import PolicyReducerSummary, build_task_input, reduce_global
 from harness.utils.env import get_runner_model
-
-import logging
 
 _LOGGER = logging.getLogger(__name__)
 
-from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
+from harness.entrypoints.models.requests import (
+    HostedLocalizationBaselineRequest,
+    HostedLocalizationRunRequest,
+)
 
 
 class LocalizationRunItemResult(BaseModel):
@@ -9035,12 +9576,20 @@ def select_localization_tasks(
         raise ValueError("offset must be >= 0")
     if max_items is not None and max_items <= 0:
         raise ValueError("max_items must be > 0 when provided")
-    sorted_tasks = sorted(list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id())
+    sorted_tasks = sorted(
+        list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id()
+    )
     total_available = len(sorted_tasks)
     start = min(offset, total_available)
-    end = total_available if max_items is None else min(start + max_items, total_available)
+    end = (
+        total_available
+        if max_items is None
+        else min(start + max_items, total_available)
+    )
     selected = sorted_tasks[start:end]
-    preview = [getattr(t, "task_id", None) or t.identity.task_id() for t in selected[:5]]
+    preview = [
+        getattr(t, "task_id", None) or t.identity.task_id() for t in selected[:5]
+    ]
     selection_info: dict[str, object] = {
         "total_available": total_available,
         "offset": offset,
@@ -9052,7 +9601,13 @@ def select_localization_tasks(
 
 
 class _TaskFailure(Exception):
-    def __init__(self, index: int, task_id: str | None, category: LocalizationFailureCategory | str, message: str):
+    def __init__(
+        self,
+        index: int,
+        task_id: str | None,
+        category: LocalizationFailureCategory | str,
+        message: str,
+    ):
         super().__init__(message)
         self.index = index
         self.task_id = task_id
@@ -9068,7 +9623,9 @@ def _effective_workers(requested: int, selected_count: int) -> int:
     return max(1, min(requested, selected_count))
 
 
-def _normalize_failure_category(category: LocalizationFailureCategory | str) -> LocalizationFailureCategory:
+def _normalize_failure_category(
+    category: LocalizationFailureCategory | str,
+) -> LocalizationFailureCategory:
     if isinstance(category, LocalizationFailureCategory):
         return category
     try:
@@ -9109,8 +9666,12 @@ def run_hosted_localization_baseline(
             selected_tasks = list(tasks)
             selection_info = req.selection
         else:
-            selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
-        effective_workers = _effective_workers(req.max_workers or 1, len(selected_tasks))
+            selected_tasks, selection_info = select_localization_tasks(
+                tasks, max_items=req.max_items, offset=req.offset
+            )
+        effective_workers = _effective_workers(
+            req.max_workers or 1, len(selected_tasks)
+        )
         selection_meta = selection_info or {
             "selected_count": len(selected_tasks),
             "offset": req.offset,
@@ -9210,7 +9771,12 @@ def _baseline_worker(
     session_id: str | None,
 ) -> BaselineSnapshot:
     if parent_trace is None:
-        raise _TaskFailure(index, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, "missing parent trace")
+        raise _TaskFailure(
+            index,
+            getattr(task, "task_id", None),
+            LocalizationFailureCategory.UNKNOWN,
+            "missing parent trace",
+        )
     try:
         return compute_baseline_for_task(
             task,
@@ -9222,9 +9788,16 @@ def _baseline_worker(
         )
     except LocalizationEvaluationError as exc:
         category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
-        raise _TaskFailure(index, getattr(task, "task_id", None), category, str(exc)) from exc
+        raise _TaskFailure(
+            index, getattr(task, "task_id", None), category, str(exc)
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise _TaskFailure(index, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc)) from exc
+        raise _TaskFailure(
+            index,
+            getattr(task, "task_id", None),
+            LocalizationFailureCategory.UNKNOWN,
+            str(exc),
+        ) from exc
 
 
 def _run_baseline_parallel(
@@ -9240,7 +9813,10 @@ def _run_baseline_parallel(
     next_index = 0
     inflight: dict[concurrent.futures.Future[BaselineSnapshot], int] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=effective_workers
+    ) as executor:
+
         def _submit(idx: int) -> None:
             future = executor.submit(
                 _baseline_worker,
@@ -9258,7 +9834,9 @@ def _run_baseline_parallel(
             next_index += 1
 
         while inflight:
-            done, _ = concurrent.futures.wait(inflight.keys(), return_when=FIRST_COMPLETED)
+            done, _ = concurrent.futures.wait(
+                inflight.keys(), return_when=FIRST_COMPLETED
+            )
             for future in done:
                 idx = inflight.pop(future)
                 try:
@@ -9267,7 +9845,12 @@ def _run_baseline_parallel(
                     if failure is None or exc.index < failure.index:
                         failure = exc
                 except Exception as exc:  # noqa: BLE001
-                    fallback = _TaskFailure(idx, getattr(tasks[idx], "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc))
+                    fallback = _TaskFailure(
+                        idx,
+                        getattr(tasks[idx], "task_id", None),
+                        LocalizationFailureCategory.UNKNOWN,
+                        str(exc),
+                    )
                     if failure is None or idx < failure.index:
                         failure = fallback
                 if failure is None and next_index < len(tasks):
@@ -9285,7 +9868,9 @@ def _run_baseline_parallel(
     return ordered_results, failure_payload
 
 
-def _normalize_task_payload(task: LCATask | Mapping[str, object]) -> Mapping[str, object]:
+def _normalize_task_payload(
+    task: LCATask | Mapping[str, object],
+) -> Mapping[str, object]:
     if isinstance(task, Mapping):
         return task
     if hasattr(task, "model_dump"):
@@ -9300,7 +9885,12 @@ def _run_experiment_task(
     session_id: str | None,
 ) -> LocalizationRunItemResult:
     if parent_trace is None:
-        raise _TaskFailure(-1, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, "missing parent trace")
+        raise _TaskFailure(
+            -1,
+            getattr(task, "task_id", None),
+            LocalizationFailureCategory.UNKNOWN,
+            "missing parent trace",
+        )
     task_payload = _normalize_task_payload(task)
     normalized_task = normalize_lca_task(task_payload)
     try:
@@ -9313,11 +9903,15 @@ def _run_experiment_task(
             )
         if eval_result.failure or not eval_result.items:
             failure = eval_result.failure or LocalizationEvaluationFailure(
-                category=LocalizationFailureCategory.UNKNOWN, message="experiment_evaluation_failed", task_id=normalized_task.task_id
+                category=LocalizationFailureCategory.UNKNOWN,
+                message="experiment_evaluation_failed",
+                task_id=normalized_task.task_id,
             )
             raise _TaskFailure(-1, failure.task_id, failure.category, failure.message)
         task_result = eval_result.items[0]
-        score_summary = summarize_task_score(normalized_task.task_id, task_result.score_bundle)
+        score_summary = summarize_task_score(
+            normalized_task.task_id, task_result.score_bundle
+        )
         return LocalizationRunItemResult(
             task=normalized_task.model_dump(),
             score_summary=score_summary,
@@ -9330,9 +9924,16 @@ def _run_experiment_task(
         raise
     except LocalizationEvaluationError as exc:
         category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
-        raise _TaskFailure(-1, getattr(normalized_task, "task_id", None), category, str(exc)) from exc
+        raise _TaskFailure(
+            -1, getattr(normalized_task, "task_id", None), category, str(exc)
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise _TaskFailure(-1, getattr(normalized_task, "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc)) from exc
+        raise _TaskFailure(
+            -1,
+            getattr(normalized_task, "task_id", None),
+            LocalizationFailureCategory.UNKNOWN,
+            str(exc),
+        ) from exc
 
 
 def _run_experiment_parallel(
@@ -9347,7 +9948,10 @@ def _run_experiment_parallel(
     next_index = 0
     inflight: dict[concurrent.futures.Future[LocalizationRunItemResult], int] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=effective_workers
+    ) as executor:
+
         def _submit(idx: int) -> None:
             future = executor.submit(
                 _run_experiment_task,
@@ -9363,17 +9967,26 @@ def _run_experiment_parallel(
             next_index += 1
 
         while inflight:
-            done, _ = concurrent.futures.wait(inflight.keys(), return_when=FIRST_COMPLETED)
+            done, _ = concurrent.futures.wait(
+                inflight.keys(), return_when=FIRST_COMPLETED
+            )
             for future in done:
                 idx = inflight.pop(future)
                 try:
                     results[idx] = future.result()
                 except _TaskFailure as exc:
-                    indexed_failure = _TaskFailure(idx, exc.task_id, exc.category, exc.message)
+                    indexed_failure = _TaskFailure(
+                        idx, exc.task_id, exc.category, exc.message
+                    )
                     if failure is None or indexed_failure.index < failure.index:
                         failure = indexed_failure
                 except Exception as exc:  # noqa: BLE001
-                    fallback = _TaskFailure(idx, getattr(tasks[idx], "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc))
+                    fallback = _TaskFailure(
+                        idx,
+                        getattr(tasks[idx], "task_id", None),
+                        LocalizationFailureCategory.UNKNOWN,
+                        str(exc),
+                    )
                     if failure is None or idx < failure.index:
                         failure = fallback
                 if failure is None and next_index < len(tasks):
@@ -9390,6 +10003,7 @@ def _run_experiment_parallel(
     ordered_results = [r for r in results if r is not None]
     return ordered_results, failure_payload
 
+
 def run_hosted_localization_experiment(
     req: HostedLocalizationRunRequest,
     materializer: RepoMaterializer | None = None,
@@ -9402,7 +10016,9 @@ def run_hosted_localization_experiment(
         selected_tasks = list(tasks)
         selection_info = req.selection
     else:
-        selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
+        selected_tasks, selection_info = select_localization_tasks(
+            tasks, max_items=req.max_items, offset=req.offset
+        )
     results: list[LocalizationRunItemResult] = []
     failure: LocalizationEvaluationFailure | None = None
     effective_workers = _effective_workers(req.max_workers or 1, len(selected_tasks))
@@ -9459,10 +10075,18 @@ def run_hosted_localization_experiment(
                 )
     flush_langfuse()
     reducer_summary = _build_reducer_summary(results)
-    return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results, failure=failure, reducer_summary=reducer_summary)
+    return LocalizationRunResult(
+        dataset_name=req.dataset,
+        dataset_version=req.version,
+        items=results,
+        failure=failure,
+        reducer_summary=reducer_summary,
+    )
 
 
-def _build_reducer_summary(results: list[LocalizationRunItemResult]) -> PolicyReducerSummary | None:
+def _build_reducer_summary(
+    results: list[LocalizationRunItemResult],
+) -> PolicyReducerSummary | None:
     if not results:
         return None
     task_inputs = []
@@ -10444,7 +11068,7 @@ from typing import Iterable, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.localization.models import LCATaskIdentity
-from harness.localization.scoring_models import TaskScoreSummary
+from harness.localization.scoring_models.batch import TaskScoreSummary
 from harness.localization.token_usage import TokenUsageRecord
 
 
@@ -10476,7 +11100,9 @@ class PolicyQualityGuard(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    score_floors: dict[str, float] = Field(default_factory=lambda: {"composed_score": 0.2})
+    score_floors: dict[str, float] = Field(
+        default_factory=lambda: {"composed_score": 0.2}
+    )
 
     def evaluate(self, score_summary: TaskScoreSummary) -> tuple[bool, list[str]]:
         reasons: list[str] = []
@@ -10516,7 +11142,9 @@ class PolicyReducerSummary(BaseModel):
     valid_repo_count: int = 0
 
 
-def _compute_token_delta(baseline: TokenUsageRecord, candidate: TokenUsageRecord) -> float | None:
+def _compute_token_delta(
+    baseline: TokenUsageRecord, candidate: TokenUsageRecord
+) -> float | None:
     base_total = baseline.normalized_total() if baseline else None
     cand_total = candidate.normalized_total() if candidate else None
     if not baseline or not baseline.available:
@@ -10537,8 +11165,12 @@ def build_task_input(
     baseline_usage: TokenUsageRecord | None = None,
     quality_guard: PolicyQualityGuard | None = None,
 ) -> PolicyReducerTaskInput:
-    baseline_record = baseline_usage or TokenUsageRecord(available=False, usage=None, source="baseline")
-    candidate_record = candidate_usage or TokenUsageRecord(available=False, usage=None, source="candidate")
+    baseline_record = baseline_usage or TokenUsageRecord(
+        available=False, usage=None, source="baseline"
+    )
+    candidate_record = candidate_usage or TokenUsageRecord(
+        available=False, usage=None, source="candidate"
+    )
     token_delta = _compute_token_delta(baseline_record, candidate_record)
     guard = quality_guard or PolicyQualityGuard()
     quality_ok, reasons = guard.evaluate(score_summary)
@@ -10558,7 +11190,9 @@ def build_task_input(
 
 
 def reduce_repo(tasks: Sequence[PolicyReducerTaskInput]) -> RepoReducerResult:
-    valid_deltas = [t.token_delta for t in tasks if t.quality_ok and t.token_delta is not None]
+    valid_deltas = [
+        t.token_delta for t in tasks if t.quality_ok and t.token_delta is not None
+    ]
     score = median(valid_deltas) if valid_deltas else None
     return RepoReducerResult(
         repo_key=tasks[0].repo_key if tasks else "unknown",
@@ -10566,7 +11200,9 @@ def reduce_repo(tasks: Sequence[PolicyReducerTaskInput]) -> RepoReducerResult:
         task_count=len(tasks),
         valid_count=len(valid_deltas),
         missing_baseline_tokens=sum(1 for t in tasks if not t.baseline_usage.available),
-        missing_candidate_tokens=sum(1 for t in tasks if not t.candidate_usage.available),
+        missing_candidate_tokens=sum(
+            1 for t in tasks if not t.candidate_usage.available
+        ),
         dropped_for_quality=sum(1 for t in tasks if not t.quality_ok),
     )
 
@@ -13065,10 +13701,15 @@ import pytest
 from pydantic import ValidationError
 
 from harness.localization.scoring_models import (
+    BatchSummary,
+    ComponentAggregate,
     ComposeMode,
+    Goal,
     ScoreConfig,
     ScoreContext,
     ScoreEngine,
+    ScoreResult,
+    TaskScoreSummary,
     summarize_batch_scores,
     summarize_task_score,
 )
@@ -13161,15 +13802,63 @@ def test_task_and_batch_summaries_include_counts():
     )
 
     task_summary = summarize_task_score("task-1", first)
-    assert task_summary.task_id == "task-1"
+    assert task_summary.item_id == "task-1"
     assert task_summary.component_availability["token_efficiency"] is True
 
     batch = summarize_batch_scores({"task-1": first, "task-2": second})
     assert batch.total_count == 2
     assert batch.composed_available_count == 2
+    assert batch.items["task-1"].item_id == "task-1"
     assert batch.components["gold_hop"].available_count == 2
     assert batch.components["token_efficiency"].available_count == 1
     assert batch.components["token_efficiency"].missing_count == 1
+
+
+def test_generic_summary_models_and_localization_aliases():
+    with pytest.raises(ValidationError):
+        TaskScoreSummary(
+            task_id="task-1",
+            composed_score=0.5,
+            available=True,
+        )
+
+    task_summary = TaskScoreSummary(
+        item_id="task-1",
+        results={
+            "gold_hop": ScoreResult(
+                name="gold_hop",
+                value=0.5,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            )
+        },
+        composed_score=0.5,
+        compose_mode=ComposeMode.WEIGHTED_SUM,
+        compose_weights={"gold_hop": 1.0},
+        available=True,
+    )
+    assert task_summary.item_id == "task-1"
+    assert task_summary.component_scores["gold_hop"] == 0.5
+
+    component = ComponentAggregate(
+        name="gold_hop",
+        average=0.5,
+        available_count=1,
+        missing_count=0,
+        total_count=1,
+        visible_to_agent=True,
+    )
+    batch = BatchSummary[TaskScoreSummary](
+        aggregate_composed_score=0.5,
+        composed_available_count=1,
+        composed_missing_count=0,
+        total_count=1,
+        items={"task-1": task_summary},
+        components={"gold_hop": component},
+    )
+    assert batch.items["task-1"].composed_score == 0.5
+    assert batch.components["gold_hop"].average == 0.5
 </file>
 
 <file path="tests_harness/test_localization.py">
@@ -14376,7 +15065,7 @@ def test_load_frontier_policy_uses_selection_callable(monkeypatch, tmp_path):
 from __future__ import annotations
 
 from harness.localization.models import LCATaskIdentity
-from harness.localization.scoring_models import TaskScoreSummary
+from harness.localization.scoring_models import ComposeMode, Goal, ScoreResult, TaskScoreSummary
 from harness.localization.token_usage import TokenUsage, TokenUsageRecord
 from harness.telemetry.policy_reducer import (
     build_task_input,
@@ -14403,13 +15092,23 @@ def _usage(total: float) -> TokenUsageRecord:
 
 
 def _score(value: float, **components: float) -> TaskScoreSummary:
+    component_values = dict(components) or {"gold_hop": value}
     return TaskScoreSummary(
-        task_id="score-task",
+        item_id="score-task",
+        results={
+            name: ScoreResult(
+                name=name,
+                value=component_value,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            )
+            for name, component_value in component_values.items()
+        },
         composed_score=value,
+        compose_mode=ComposeMode.WEIGHTED_SUM,
+        compose_weights={name: 1.0 for name in component_values},
         available=True,
-        component_scores=dict(components) or {"gold_hop": value},
-        visible_component_scores=dict(components) or {"gold_hop": value},
-        component_availability={name: True for name in (components or {"gold_hop": value})},
     )
 
 

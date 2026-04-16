@@ -4,10 +4,15 @@ import pytest
 from pydantic import ValidationError
 
 from harness.localization.scoring_models import (
+    BatchSummary,
+    ComponentAggregate,
     ComposeMode,
+    Goal,
     ScoreConfig,
     ScoreContext,
     ScoreEngine,
+    ScoreResult,
+    TaskScoreSummary,
     summarize_batch_scores,
     summarize_task_score,
 )
@@ -100,12 +105,60 @@ def test_task_and_batch_summaries_include_counts():
     )
 
     task_summary = summarize_task_score("task-1", first)
-    assert task_summary.task_id == "task-1"
+    assert task_summary.item_id == "task-1"
     assert task_summary.component_availability["token_efficiency"] is True
 
     batch = summarize_batch_scores({"task-1": first, "task-2": second})
     assert batch.total_count == 2
     assert batch.composed_available_count == 2
+    assert batch.items["task-1"].item_id == "task-1"
     assert batch.components["gold_hop"].available_count == 2
     assert batch.components["token_efficiency"].available_count == 1
     assert batch.components["token_efficiency"].missing_count == 1
+
+
+def test_generic_summary_models_and_localization_aliases():
+    with pytest.raises(ValidationError):
+        TaskScoreSummary(
+            task_id="task-1",
+            composed_score=0.5,
+            available=True,
+        )
+
+    task_summary = TaskScoreSummary(
+        item_id="task-1",
+        results={
+            "gold_hop": ScoreResult(
+                name="gold_hop",
+                value=0.5,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            )
+        },
+        composed_score=0.5,
+        compose_mode=ComposeMode.WEIGHTED_SUM,
+        compose_weights={"gold_hop": 1.0},
+        available=True,
+    )
+    assert task_summary.item_id == "task-1"
+    assert task_summary.component_scores["gold_hop"] == 0.5
+
+    component = ComponentAggregate(
+        name="gold_hop",
+        average=0.5,
+        available_count=1,
+        missing_count=0,
+        total_count=1,
+        visible_to_agent=True,
+    )
+    batch = BatchSummary[TaskScoreSummary](
+        aggregate_composed_score=0.5,
+        composed_available_count=1,
+        composed_missing_count=0,
+        total_count=1,
+        items={"task-1": task_summary},
+        components={"gold_hop": component},
+    )
+    assert batch.items["task-1"].composed_score == 0.5
+    assert batch.components["gold_hop"].average == 0.5

@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 from concurrent.futures import FIRST_COMPLETED
 from typing import Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
+from harness.localization.errors import (
+    LocalizationEvaluationError,
+    LocalizationFailureCategory,
+)
+from harness.localization.materialization.materialize import (
+    RepoMaterializationResult,
+    RepoMaterializer,
+)
+from harness.localization.models import LCATask, normalize_lca_task
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
-from harness.localization.models import LCATask, normalize_lca_task
-from harness.localization.scoring_models import TaskScoreSummary, summarize_task_score
+from harness.localization.scoring_models import summarize_task_score
+from harness.localization.scoring_models.batch import TaskScoreSummary
 from harness.localization.token_usage import TokenUsageRecord
-from harness.localization.materialization.materialize import RepoMaterializationResult, RepoMaterializer
-from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.telemetry.hosted.baselines import (
     BaselineBundle,
     BaselineSnapshot,
@@ -25,16 +33,25 @@ from harness.telemetry.hosted.baselines import (
     persist_baseline_bundle,
 )
 from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
-from harness.telemetry.tracing import flush_langfuse, propagate_context, start_observation
+from harness.telemetry.policy_reducer import (
+    PolicyReducerSummary,
+    build_task_input,
+    reduce_global,
+)
+from harness.telemetry.tracing import (
+    flush_langfuse,
+    propagate_context,
+    start_observation,
+)
 from harness.telemetry.tracing.session_policy import resolve_session_id
-from harness.telemetry.policy_reducer import PolicyReducerSummary, build_task_input, reduce_global
 from harness.utils.env import get_runner_model
-
-import logging
 
 _LOGGER = logging.getLogger(__name__)
 
-from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest, HostedLocalizationRunRequest
+from harness.entrypoints.models.requests import (
+    HostedLocalizationBaselineRequest,
+    HostedLocalizationRunRequest,
+)
 
 
 class LocalizationRunItemResult(BaseModel):
@@ -72,12 +89,20 @@ def select_localization_tasks(
         raise ValueError("offset must be >= 0")
     if max_items is not None and max_items <= 0:
         raise ValueError("max_items must be > 0 when provided")
-    sorted_tasks = sorted(list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id())
+    sorted_tasks = sorted(
+        list(tasks), key=lambda t: getattr(t, "task_id", None) or t.identity.task_id()
+    )
     total_available = len(sorted_tasks)
     start = min(offset, total_available)
-    end = total_available if max_items is None else min(start + max_items, total_available)
+    end = (
+        total_available
+        if max_items is None
+        else min(start + max_items, total_available)
+    )
     selected = sorted_tasks[start:end]
-    preview = [getattr(t, "task_id", None) or t.identity.task_id() for t in selected[:5]]
+    preview = [
+        getattr(t, "task_id", None) or t.identity.task_id() for t in selected[:5]
+    ]
     selection_info: dict[str, object] = {
         "total_available": total_available,
         "offset": offset,
@@ -89,7 +114,13 @@ def select_localization_tasks(
 
 
 class _TaskFailure(Exception):
-    def __init__(self, index: int, task_id: str | None, category: LocalizationFailureCategory | str, message: str):
+    def __init__(
+        self,
+        index: int,
+        task_id: str | None,
+        category: LocalizationFailureCategory | str,
+        message: str,
+    ):
         super().__init__(message)
         self.index = index
         self.task_id = task_id
@@ -105,7 +136,9 @@ def _effective_workers(requested: int, selected_count: int) -> int:
     return max(1, min(requested, selected_count))
 
 
-def _normalize_failure_category(category: LocalizationFailureCategory | str) -> LocalizationFailureCategory:
+def _normalize_failure_category(
+    category: LocalizationFailureCategory | str,
+) -> LocalizationFailureCategory:
     if isinstance(category, LocalizationFailureCategory):
         return category
     try:
@@ -146,8 +179,12 @@ def run_hosted_localization_baseline(
             selected_tasks = list(tasks)
             selection_info = req.selection
         else:
-            selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
-        effective_workers = _effective_workers(req.max_workers or 1, len(selected_tasks))
+            selected_tasks, selection_info = select_localization_tasks(
+                tasks, max_items=req.max_items, offset=req.offset
+            )
+        effective_workers = _effective_workers(
+            req.max_workers or 1, len(selected_tasks)
+        )
         selection_meta = selection_info or {
             "selected_count": len(selected_tasks),
             "offset": req.offset,
@@ -247,7 +284,12 @@ def _baseline_worker(
     session_id: str | None,
 ) -> BaselineSnapshot:
     if parent_trace is None:
-        raise _TaskFailure(index, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, "missing parent trace")
+        raise _TaskFailure(
+            index,
+            getattr(task, "task_id", None),
+            LocalizationFailureCategory.UNKNOWN,
+            "missing parent trace",
+        )
     try:
         return compute_baseline_for_task(
             task,
@@ -259,9 +301,16 @@ def _baseline_worker(
         )
     except LocalizationEvaluationError as exc:
         category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
-        raise _TaskFailure(index, getattr(task, "task_id", None), category, str(exc)) from exc
+        raise _TaskFailure(
+            index, getattr(task, "task_id", None), category, str(exc)
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise _TaskFailure(index, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc)) from exc
+        raise _TaskFailure(
+            index,
+            getattr(task, "task_id", None),
+            LocalizationFailureCategory.UNKNOWN,
+            str(exc),
+        ) from exc
 
 
 def _run_baseline_parallel(
@@ -277,7 +326,10 @@ def _run_baseline_parallel(
     next_index = 0
     inflight: dict[concurrent.futures.Future[BaselineSnapshot], int] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=effective_workers
+    ) as executor:
+
         def _submit(idx: int) -> None:
             future = executor.submit(
                 _baseline_worker,
@@ -295,7 +347,9 @@ def _run_baseline_parallel(
             next_index += 1
 
         while inflight:
-            done, _ = concurrent.futures.wait(inflight.keys(), return_when=FIRST_COMPLETED)
+            done, _ = concurrent.futures.wait(
+                inflight.keys(), return_when=FIRST_COMPLETED
+            )
             for future in done:
                 idx = inflight.pop(future)
                 try:
@@ -304,7 +358,12 @@ def _run_baseline_parallel(
                     if failure is None or exc.index < failure.index:
                         failure = exc
                 except Exception as exc:  # noqa: BLE001
-                    fallback = _TaskFailure(idx, getattr(tasks[idx], "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc))
+                    fallback = _TaskFailure(
+                        idx,
+                        getattr(tasks[idx], "task_id", None),
+                        LocalizationFailureCategory.UNKNOWN,
+                        str(exc),
+                    )
                     if failure is None or idx < failure.index:
                         failure = fallback
                 if failure is None and next_index < len(tasks):
@@ -322,7 +381,9 @@ def _run_baseline_parallel(
     return ordered_results, failure_payload
 
 
-def _normalize_task_payload(task: LCATask | Mapping[str, object]) -> Mapping[str, object]:
+def _normalize_task_payload(
+    task: LCATask | Mapping[str, object],
+) -> Mapping[str, object]:
     if isinstance(task, Mapping):
         return task
     if hasattr(task, "model_dump"):
@@ -337,7 +398,12 @@ def _run_experiment_task(
     session_id: str | None,
 ) -> LocalizationRunItemResult:
     if parent_trace is None:
-        raise _TaskFailure(-1, getattr(task, "task_id", None), LocalizationFailureCategory.UNKNOWN, "missing parent trace")
+        raise _TaskFailure(
+            -1,
+            getattr(task, "task_id", None),
+            LocalizationFailureCategory.UNKNOWN,
+            "missing parent trace",
+        )
     task_payload = _normalize_task_payload(task)
     normalized_task = normalize_lca_task(task_payload)
     try:
@@ -350,11 +416,15 @@ def _run_experiment_task(
             )
         if eval_result.failure or not eval_result.items:
             failure = eval_result.failure or LocalizationEvaluationFailure(
-                category=LocalizationFailureCategory.UNKNOWN, message="experiment_evaluation_failed", task_id=normalized_task.task_id
+                category=LocalizationFailureCategory.UNKNOWN,
+                message="experiment_evaluation_failed",
+                task_id=normalized_task.task_id,
             )
             raise _TaskFailure(-1, failure.task_id, failure.category, failure.message)
         task_result = eval_result.items[0]
-        score_summary = summarize_task_score(normalized_task.task_id, task_result.score_bundle)
+        score_summary = summarize_task_score(
+            normalized_task.task_id, task_result.score_bundle
+        )
         return LocalizationRunItemResult(
             task=normalized_task.model_dump(),
             score_summary=score_summary,
@@ -367,9 +437,16 @@ def _run_experiment_task(
         raise
     except LocalizationEvaluationError as exc:
         category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
-        raise _TaskFailure(-1, getattr(normalized_task, "task_id", None), category, str(exc)) from exc
+        raise _TaskFailure(
+            -1, getattr(normalized_task, "task_id", None), category, str(exc)
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise _TaskFailure(-1, getattr(normalized_task, "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc)) from exc
+        raise _TaskFailure(
+            -1,
+            getattr(normalized_task, "task_id", None),
+            LocalizationFailureCategory.UNKNOWN,
+            str(exc),
+        ) from exc
 
 
 def _run_experiment_parallel(
@@ -384,7 +461,10 @@ def _run_experiment_parallel(
     next_index = 0
     inflight: dict[concurrent.futures.Future[LocalizationRunItemResult], int] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=effective_workers
+    ) as executor:
+
         def _submit(idx: int) -> None:
             future = executor.submit(
                 _run_experiment_task,
@@ -400,17 +480,26 @@ def _run_experiment_parallel(
             next_index += 1
 
         while inflight:
-            done, _ = concurrent.futures.wait(inflight.keys(), return_when=FIRST_COMPLETED)
+            done, _ = concurrent.futures.wait(
+                inflight.keys(), return_when=FIRST_COMPLETED
+            )
             for future in done:
                 idx = inflight.pop(future)
                 try:
                     results[idx] = future.result()
                 except _TaskFailure as exc:
-                    indexed_failure = _TaskFailure(idx, exc.task_id, exc.category, exc.message)
+                    indexed_failure = _TaskFailure(
+                        idx, exc.task_id, exc.category, exc.message
+                    )
                     if failure is None or indexed_failure.index < failure.index:
                         failure = indexed_failure
                 except Exception as exc:  # noqa: BLE001
-                    fallback = _TaskFailure(idx, getattr(tasks[idx], "task_id", None), LocalizationFailureCategory.UNKNOWN, str(exc))
+                    fallback = _TaskFailure(
+                        idx,
+                        getattr(tasks[idx], "task_id", None),
+                        LocalizationFailureCategory.UNKNOWN,
+                        str(exc),
+                    )
                     if failure is None or idx < failure.index:
                         failure = fallback
                 if failure is None and next_index < len(tasks):
@@ -427,6 +516,7 @@ def _run_experiment_parallel(
     ordered_results = [r for r in results if r is not None]
     return ordered_results, failure_payload
 
+
 def run_hosted_localization_experiment(
     req: HostedLocalizationRunRequest,
     materializer: RepoMaterializer | None = None,
@@ -439,7 +529,9 @@ def run_hosted_localization_experiment(
         selected_tasks = list(tasks)
         selection_info = req.selection
     else:
-        selected_tasks, selection_info = select_localization_tasks(tasks, max_items=req.max_items, offset=req.offset)
+        selected_tasks, selection_info = select_localization_tasks(
+            tasks, max_items=req.max_items, offset=req.offset
+        )
     results: list[LocalizationRunItemResult] = []
     failure: LocalizationEvaluationFailure | None = None
     effective_workers = _effective_workers(req.max_workers or 1, len(selected_tasks))
@@ -496,10 +588,18 @@ def run_hosted_localization_experiment(
                 )
     flush_langfuse()
     reducer_summary = _build_reducer_summary(results)
-    return LocalizationRunResult(dataset_name=req.dataset, dataset_version=req.version, items=results, failure=failure, reducer_summary=reducer_summary)
+    return LocalizationRunResult(
+        dataset_name=req.dataset,
+        dataset_version=req.version,
+        items=results,
+        failure=failure,
+        reducer_summary=reducer_summary,
+    )
 
 
-def _build_reducer_summary(results: list[LocalizationRunItemResult]) -> PolicyReducerSummary | None:
+def _build_reducer_summary(
+    results: list[LocalizationRunItemResult],
+) -> PolicyReducerSummary | None:
     if not results:
         return None
     task_inputs = []
