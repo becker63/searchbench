@@ -1,9 +1,9 @@
-from __future__ import annotations
-
 """
 Single-run optimizer coordinator: build loop context/deps and invoke the optimization machine.
 Does not parse CLI or dataset concerns; expects normalized inputs and resolved session_id.
 """
+
+from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
@@ -40,6 +40,14 @@ from harness.utils.type_loader import (
 from harness.agents.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 from harness.orchestration.types import SpanHandle
+from harness.prompts import (
+    WriterFeedbackFinding,
+    WriterGuidance,
+    WriterOptimizationBrief,
+    WriterScoreSummary,
+    build_writer_optimization_brief,
+    build_writer_score_summary_from_bundle,
+)
 
 if TYPE_CHECKING:
     from harness.telemetry.hosted.baselines import BaselineSnapshot
@@ -51,8 +59,6 @@ from .types import (
     EvaluationMetrics,
     EvaluationResult,
     FailedRepairDetails,
-    FeedbackEntries,
-    FeedbackEntry,
     FeedbackPackage,
     ICResult,
     ICTaskPayload,
@@ -303,6 +309,12 @@ def evaluate_policy_on_item(
             policy_code="",
             success=False,
             error=f"{getattr(eval_result.failure.category, 'value', eval_result.failure.category)}: {eval_result.failure.message}",
+            score_summary=WriterScoreSummary(
+                primary_name="composed_score",
+                primary_score=-10.0,
+                composed_score=-10.0,
+                optimization_goal="maximize",
+            ),
         )
     if not eval_result.items:
         empty_metrics: dict[str, float | int | bool | None] = {
@@ -318,6 +330,12 @@ def evaluate_policy_on_item(
             policy_code="",
             success=False,
             error="evaluation_failed: no_results",
+            score_summary=WriterScoreSummary(
+                primary_name="composed_score",
+                primary_score=-10.0,
+                composed_score=-10.0,
+                optimization_goal="maximize",
+            ),
     )
     task_result = eval_result.items[0]
     score_bundle = task_result.score_bundle
@@ -340,6 +358,7 @@ def evaluate_policy_on_item(
         comparison_summary=None,
         policy_code=_read_policy(),
         control_score=machine_score_val,
+        score_summary=build_writer_score_summary_from_bundle(score_bundle),
     )
 
 
@@ -365,8 +384,8 @@ def build_iteration_feedback(
     frontier_ctx = build_frontier_context_fn(repo_root)
     frontier_ctx_str = format_frontier_context_fn(frontier_ctx)
 
-    diff_str = ""
-    diff_hint = ""
+    diff_summary = ""
+    diff_guidance = ""
     if prev_score is not None and prev_classified is not None:
         try:
             diff = compute_diff_fn(
@@ -375,46 +394,65 @@ def build_iteration_feedback(
                 prev_classified.model_dump(),
                 prev_classified.model_dump(),
             )
-            diff_str = format_diff_fn(diff)
-            diff_hint = interpret_diff_fn(diff)
+            diff_summary = format_diff_fn(diff)
+            diff_guidance = interpret_diff_fn(diff)
         except Exception:
-            diff_str = ""
-            diff_hint = ""
+            diff_summary = ""
+            diff_guidance = ""
 
-    feedback_entries: list[FeedbackEntry] = []
+    findings: list[WriterFeedbackFinding] = []
+    if evaluation.error:
+        findings.append(
+            WriterFeedbackFinding(
+                kind="evaluation_error",
+                message=evaluation.error,
+                severity="error",
+                source="evaluation",
+            )
+        )
     for key, value in evaluation.metrics.items():
         normalized_val: str | float | int | bool | None
         if isinstance(value, (str, float, int, bool)) or value is None:
             normalized_val = value
         else:
             normalized_val = str(value)
-        feedback_entries.append(FeedbackEntry(name=key, value=normalized_val))
+        severity = "warning" if key == "iteration_regression" and value is True else "info"
+        findings.append(
+            WriterFeedbackFinding(
+                kind="metric",
+                message=f"{key} = {normalized_val}",
+                value=normalized_val,
+                severity=severity,
+                source="evaluation.metrics",
+            )
+        )
+
+    guidance = _writer_guidance_from_evaluation(evaluation)
+    optimization_brief = build_writer_optimization_brief(
+        score_summary=evaluation.score_summary,
+        findings=findings,
+        comparison_summary=evaluation.comparison_summary,
+        diff_summary=diff_summary or None,
+        diff_guidance=diff_guidance or None,
+        guidance=guidance.instructions,
+        mode=guidance.mode,
+    )
 
     return FeedbackPackage(
         tests=tests_str,
         frontier_context=frontier_ctx_str,
         frontier_context_details=frontier_ctx,
-        comparison_summary=evaluation.comparison_summary,
-        feedback=FeedbackEntries.model_validate({"entries": feedback_entries}),
-        feedback_str=str(evaluation.metrics.get("error", "")),
-        guidance_hint="Fix errors before improving score",
-        diff_str=diff_str,
-        diff_hint=diff_hint,
+        optimization_brief=optimization_brief,
     )
 
 
 def attempt_policy_generation(
     *,
-    feedback: FeedbackEntries,
     initial_policy: str,
     tests: str,
     frontier_context: str,
     frontier_context_details: FrontierContext,
-    feedback_str: str,
-    guidance_hint: str,
-    diff_str: str,
-    diff_hint: str,
-    comparison_summary: str | None,
+    optimization_brief: WriterOptimizationBrief,
     failure_context_str: str | None,
     repair_attempt: int,
     parent_trace: object | None = None,
@@ -422,24 +460,14 @@ def attempt_policy_generation(
 ) -> tuple[str | None, str | None]:
     try:
         generator = cast(Callable[..., str], _pkg_attr("generate_policy"))
+        brief = optimization_brief
         new_code = generator(
-            feedback={
-                **feedback.as_map(),
-                **(
-                    {"pipeline_feedback": pipeline_feedback.model_dump()}
-                    if pipeline_feedback
-                    else {}
-                ),
-            },
             current_policy=initial_policy,
             tests=tests,
             frontier_context=frontier_context,
             frontier_context_details=frontier_context_details,
-            feedback_str=str(feedback_str),
-            guidance_hint=guidance_hint,
-            diff_str=diff_str,
-            diff_hint=diff_hint,
-            comparison_summary=comparison_summary,
+            optimization_brief=brief,
+            feedback={"pipeline_feedback": pipeline_feedback.model_dump()} if pipeline_feedback else {},
             parent_trace=parent_trace,
             failure_context=failure_context_str,
             repair_attempt=repair_attempt,
@@ -448,6 +476,41 @@ def attempt_policy_generation(
         return new_code, None
     except Exception as e:  # noqa: BLE001
         return None, str(e)
+
+
+def _writer_guidance_from_evaluation(evaluation: EvaluationResult) -> WriterGuidance:
+    if evaluation.error or not evaluation.success:
+        return WriterGuidance(
+            mode="repair",
+            instructions=[
+                "Resolve the evaluation failure before attempting score optimization.",
+                "Preserve the exact frontier_priority signature and return a float.",
+            ],
+        )
+    regression = evaluation.metrics.get("iteration_regression")
+    if regression is True:
+        return WriterGuidance(
+            mode="repair_regression",
+            instructions=[
+                "Undo the regression while preserving any validation fixes.",
+                "Do not optimize a component by lowering the composed objective.",
+            ],
+        )
+    if evaluation.score_summary and evaluation.score_summary.composed_score is not None:
+        return WriterGuidance(
+            mode="optimize",
+            instructions=[
+                "The policy is evaluable; improve the composed score without breaking validation.",
+                "Prefer changes that improve weighted visible score components in their stated direction.",
+            ],
+        )
+    return WriterGuidance(
+        mode="repair_then_optimize",
+        instructions=[
+            "First make the policy valid under tests and type checks.",
+            "When valid, improve the composed objective while preserving correctness.",
+        ],
+    )
 
 
 def run_policy_pipeline(

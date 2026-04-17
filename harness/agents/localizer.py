@@ -17,13 +17,12 @@ from harness.telemetry.tracing import (
     start_observation,
 )
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
-from harness.prompts import SystemPromptContext
+from harness.prompts import build_ic_system_prompt, build_jc_system_prompt
 from harness.backends.ic import IterativeContextBackend
 from harness.backends.jc import JCodeMunchBackend
 from harness.backends.mcp import serialize_tool_result_for_model
 from harness.utils.env import get_cerebras_api_key, get_runner_model, getenv
 from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
-from harness.utils.template_loader import render_prompt_template
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from harness.localization.models import LCAContext, LCATaskIdentity
@@ -120,16 +119,6 @@ def _safe_update(span: object | None, **kwargs: object) -> None:
             pass
 
 
-def _tool_names_from_specs(tool_specs: list[ChatCompletionToolParam]) -> list[str]:
-    names: list[str] = []
-    for spec in tool_specs:
-        func = spec.get("function") if isinstance(spec, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
-        name = func.get("name") if isinstance(func, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
-        if isinstance(name, str):
-            names.append(name)
-    return names
-
-
 def _sanitize_agent_task(agent_task: Mapping[str, object]) -> dict[str, object]:
     """Drop gold/irrelevant fields before showing the payload to the model."""
     cleaned: dict[str, object] = {}
@@ -146,12 +135,6 @@ def _format_user_prompt(agent_task: dict[str, object]) -> str:
         "Task payload:\n"
         f"{payload_json}"
     )
-
-
-def _format_available_tools(tool_names: list[str]) -> str:
-    if not tool_names:
-        return "- none"
-    return "\n".join(f"- {name}" for name in tool_names)
 
 
 def _truncate_text(text: str, max_length: int, keep_tail: int = 400) -> str:
@@ -290,18 +273,6 @@ def _make_client(model_override: str | None = None) -> tuple[Any, str]:
         raise RuntimeError("CEREBRAS_API_KEY is required for runner agent client")
     model_name = resolve_runner_model(model_override)
     return get_tracing_openai_client(base_url="https://api.cerebras.ai/v1", api_key=api_key), model_name
-
-
-def _build_ic_system_prompt(tool_specs: list[ChatCompletionToolParam], aggressive: bool = False) -> str:
-    tool_names = _tool_names_from_specs(tool_specs)
-    ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
-    return render_prompt_template("ic_system.jinja", ctx.model_dump())
-
-
-def _build_jc_system_prompt(tool_specs: list[ChatCompletionToolParam]) -> str:
-    tool_names = _tool_names_from_specs(tool_specs)
-    ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
-    return render_prompt_template("jc_system.jinja", ctx.model_dump())
 
 
 def _build_model_messages(agent_task: dict[str, object], tool_specs: list[ChatCompletionToolParam], system_prompt: str) -> list[dict[str, object]]:
@@ -1149,7 +1120,7 @@ def run_ic_iteration(
 
     backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
     tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
-    system_prompt = _build_ic_system_prompt(tool_specs)
+    system_prompt = build_ic_system_prompt(tool_specs)
     with start_observation(
         name="iterative_context",
         parent=parent_span,
@@ -1251,7 +1222,7 @@ def run_jc_iteration(
 
     backend = JCodeMunchBackend(repo=repo)
     tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
-    system_prompt = _build_jc_system_prompt(tool_specs)
+    system_prompt = build_jc_system_prompt(tool_specs)
     with start_observation(
         name="jcodemunch",
         parent=parent_span,
@@ -1313,6 +1284,4 @@ __all__ = [
     "run_jc_iteration",
     "run_agent",
     "run_agent_with_retry",
-    "_build_ic_system_prompt",
-    "_build_jc_system_prompt",
 ]

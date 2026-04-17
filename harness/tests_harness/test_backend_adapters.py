@@ -9,7 +9,6 @@ from typing import Any, cast
 import pytest
 from mcp.types import TextContent, Tool
 
-from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.agents import localizer as runner
 from harness.backends.ic import IterativeContextBackend
 from harness.backends.jc import JCodeMunchBackend
@@ -19,6 +18,8 @@ from harness.backends.mcp import (
     run_async,
     serialize_tool_result_for_model,
 )
+from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.prompts import build_jc_system_prompt
 from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
 
 
@@ -902,7 +903,7 @@ def test_jc_prompt_uses_canonical_tool_names():
             "function": {"name": "beta", "description": "", "parameters": {"type": "object", "properties": {}}},
         },
     ]
-    prompt = runner._build_jc_system_prompt(specs)  # type: ignore[attr-defined]
+    prompt = build_jc_system_prompt(specs)
     assert "- alpha" in prompt
     assert "- beta" in prompt
 

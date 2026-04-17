@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, ContextManager, Mapping, Protocol, S
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.prompts import WriterOptimizationBrief, WriterScoreSummary
 from harness.utils.type_loader import FrontierContext
 from harness.localization.models import LCAContext, LCATaskIdentity
 
@@ -113,35 +114,6 @@ class JCResult(ICResult):
     """JC result container."""
 
     model_config = ConfigDict(extra="forbid")
-
-
-class FeedbackEntry(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    value: str | float | int | bool | None
-
-
-class FeedbackEntries(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    entries: list[FeedbackEntry] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_mapping(cls, value: object) -> object:
-        if isinstance(value, Mapping):
-            return {"entries": [{"name": k, "value": v} for k, v in value.items()]}
-        return value
-
-    def as_map(self) -> dict[str, str | float | int | bool | None]:
-        return {entry.name: entry.value for entry in self.entries}
-
-    def get(self, key: str, default: object | None = None) -> object | None:
-        return self.as_map().get(key, default)
-
-    def items(self):
-        return self.as_map().items()
 
 
 class TaskPayload(BaseModel):
@@ -260,6 +232,7 @@ class EvaluationResult(BaseModel):
     success: bool = True
     error: str | None = None
     control_score: float | None = None
+    score_summary: WriterScoreSummary | None = None
 
 
 class FeedbackPackage(BaseModel):
@@ -270,12 +243,7 @@ class FeedbackPackage(BaseModel):
     tests: str
     frontier_context: str
     frontier_context_details: FrontierContext
-    comparison_summary: str | None
-    feedback: FeedbackEntries
-    feedback_str: str
-    guidance_hint: str
-    diff_str: str
-    diff_hint: str
+    optimization_brief: WriterOptimizationBrief
 
 
 class RepairOutcome(BaseModel):

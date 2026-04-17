@@ -104,10 +104,13 @@ policy/
   load.py
 prompts/
   __init__.py
+  builders.py
   ic_system.jinja
   jc_system.jinja
+  policy_writer_system.jinja
   policy_writer.jinja
   prompt_models.py
+  template_loader.py
 scoring/
   scorers/
     __init__.py
@@ -194,7 +197,6 @@ utils/
   openai_schema.py
   repo_root.py
   repo_targets.py
-  template_loader.py
   test_loader.py
   type_loader.py
 __init__.py
@@ -366,13 +368,12 @@ from harness.telemetry.tracing import (
     start_observation,
 )
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
-from harness.prompts import SystemPromptContext
+from harness.prompts import build_ic_system_prompt, build_jc_system_prompt
 from harness.backends.ic import IterativeContextBackend
 from harness.backends.jc import JCodeMunchBackend
 from harness.backends.mcp import serialize_tool_result_for_model
 from harness.utils.env import get_cerebras_api_key, get_runner_model, getenv
 from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
-from harness.utils.template_loader import render_prompt_template
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from harness.localization.models import LCAContext, LCATaskIdentity
@@ -469,16 +470,6 @@ def _safe_update(span: object | None, **kwargs: object) -> None:
             pass
 
 
-def _tool_names_from_specs(tool_specs: list[ChatCompletionToolParam]) -> list[str]:
-    names: list[str] = []
-    for spec in tool_specs:
-        func = spec.get("function") if isinstance(spec, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
-        name = func.get("name") if isinstance(func, Mapping) else None  # pyright: ignore[reportUnnecessaryIsInstance]
-        if isinstance(name, str):
-            names.append(name)
-    return names
-
-
 def _sanitize_agent_task(agent_task: Mapping[str, object]) -> dict[str, object]:
     """Drop gold/irrelevant fields before showing the payload to the model."""
     cleaned: dict[str, object] = {}
@@ -495,12 +486,6 @@ def _format_user_prompt(agent_task: dict[str, object]) -> str:
         "Task payload:\n"
         f"{payload_json}"
     )
-
-
-def _format_available_tools(tool_names: list[str]) -> str:
-    if not tool_names:
-        return "- none"
-    return "\n".join(f"- {name}" for name in tool_names)
 
 
 def _truncate_text(text: str, max_length: int, keep_tail: int = 400) -> str:
@@ -639,18 +624,6 @@ def _make_client(model_override: str | None = None) -> tuple[Any, str]:
         raise RuntimeError("CEREBRAS_API_KEY is required for runner agent client")
     model_name = resolve_runner_model(model_override)
     return get_tracing_openai_client(base_url="https://api.cerebras.ai/v1", api_key=api_key), model_name
-
-
-def _build_ic_system_prompt(tool_specs: list[ChatCompletionToolParam], aggressive: bool = False) -> str:
-    tool_names = _tool_names_from_specs(tool_specs)
-    ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
-    return render_prompt_template("ic_system.jinja", ctx.model_dump())
-
-
-def _build_jc_system_prompt(tool_specs: list[ChatCompletionToolParam]) -> str:
-    tool_names = _tool_names_from_specs(tool_specs)
-    ctx = SystemPromptContext(available_tools=_format_available_tools(tool_names))
-    return render_prompt_template("jc_system.jinja", ctx.model_dump())
 
 
 def _build_model_messages(agent_task: dict[str, object], tool_specs: list[ChatCompletionToolParam], system_prompt: str) -> list[dict[str, object]]:
@@ -1498,7 +1471,7 @@ def run_ic_iteration(
 
     backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
     tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
-    system_prompt = _build_ic_system_prompt(tool_specs)
+    system_prompt = build_ic_system_prompt(tool_specs)
     with start_observation(
         name="iterative_context",
         parent=parent_span,
@@ -1600,7 +1573,7 @@ def run_jc_iteration(
 
     backend = JCodeMunchBackend(repo=repo)
     tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
-    system_prompt = _build_jc_system_prompt(tool_specs)
+    system_prompt = build_jc_system_prompt(tool_specs)
     with start_observation(
         name="jcodemunch",
         parent=parent_span,
@@ -1662,18 +1635,16 @@ __all__ = [
     "run_jc_iteration",
     "run_agent",
     "run_agent_with_retry",
-    "_build_ic_system_prompt",
-    "_build_jc_system_prompt",
 ]
 </file>
 
 <file path="agents/writer.py">
-from __future__ import annotations
-
 """
 Leaf operation: policy writer/generator.
 No CLI or orchestration logic; only generation and validation.
 """
+
+from __future__ import annotations
 
 import json
 import time
@@ -1681,13 +1652,15 @@ from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
+from harness.prompts import (
+    WriterOptimizationBrief,
+    build_writer_prompt,
+)
 from harness.telemetry.tracing import get_tracing_openai_client, start_observation
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 from harness.utils.env import get_cerebras_api_key, get_writer_model
 from harness.utils.model_budgets import compute_prompt_char_budget, get_model_budget
-from harness.prompts import WriterPromptContext
-from harness.utils.template_loader import render_prompt_template
-from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
 from harness.utils.type_loader import FrontierContext, format_frontier_context
 
 
@@ -1701,17 +1674,12 @@ class WriterRequest(BaseModel):
     tests: str
     frontier_context: str
     frontier_context_details: FrontierContext
-    feedback_str: str
-    guidance_hint: str
-    diff_str: str
-    diff_hint: str
-    comparison_summary: str | None = None
+    optimization_brief: WriterOptimizationBrief
     parent_trace: object | None = None
     failure_context: str | None = None
     repair_attempt: int = 0
 
 _client: Any | None = None
-_WRITER_TEMPLATE = "policy_writer.jinja"
 
 
 def _get_client():
@@ -1807,52 +1775,13 @@ def _ensure_valid_policy_code(code: str) -> str:
     return cleaned
 
 
-def _render_writer_prompt(
-    *,
-    current_policy: str,
-    failure_context: str,
-    feedback_str: str,
-    feedback: Mapping[str, object],
-    comparison_summary: str | None,
-    guidance_hint: str,
-    diff_str: str,
-    diff_hint: str,
-    tests: str,
-    frontier_context: str,
-    frontier_context_details: FrontierContext,
-) -> str:
-    feedback_text = feedback_str if feedback_str else str(feedback)
-    context = WriterPromptContext.model_validate(
-        {
-            "current_policy": current_policy,
-            "failure_context": failure_context,
-            "feedback_text": feedback_text,
-            "comparison_summary": comparison_summary or "N/A",
-            "guidance_hint": guidance_hint,
-            "diff_str": diff_str,
-            "diff_hint": diff_hint,
-            "tests": tests,
-            "frontier_context": frontier_context,
-            "frontier_context_details": frontier_context_details,
-        }
-    )
-    rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
-    if "===USER===" not in rendered:
-        rendered = f"===USER===\n{rendered}"
-    return rendered
-
-
 def generate_policy(
-    feedback: dict[str, Any],
     current_policy: str,
     tests: str,
     frontier_context: str,
     frontier_context_details: FrontierContext,
-    feedback_str: str,
-    guidance_hint: str,
-    diff_str: str,
-    diff_hint: str,
-    comparison_summary: str | None = None,
+    optimization_brief: WriterOptimizationBrief,
+    feedback: dict[str, Any] | None = None,
     parent_trace: object | None = None,
     failure_context: str | None = None,
     repair_attempt: int = 0,
@@ -1863,16 +1792,12 @@ def generate_policy(
     frontier_context_rendered = frontier_context or format_frontier_context(frontier_context_details)
     try:
         WriterRequest(
-            feedback=feedback,
+            feedback=feedback or {},
             current_policy=current_policy,
             tests=tests,
             frontier_context=frontier_context_rendered,
             frontier_context_details=frontier_context_details,
-            feedback_str=feedback_str,
-            guidance_hint=guidance_hint,
-            diff_str=diff_str,
-            diff_hint=diff_hint,
-            comparison_summary=comparison_summary,
+            optimization_brief=optimization_brief,
             parent_trace=parent_trace,
             failure_context=failure_context,
             repair_attempt=repair_attempt,
@@ -1890,18 +1815,13 @@ def generate_policy(
     if failure_context:
         failure_context = failure_context[:failure_context_budget]
     completion_tokens = model_budget.completion_reserve
-    prompt_content = _render_writer_prompt(
+    rendered_prompt = build_writer_prompt(
         current_policy=current_policy,
         failure_context=failure_context,
-        feedback_str=str(feedback_str),
-        feedback=feedback,
-        comparison_summary=comparison_summary,
-        guidance_hint=guidance_hint,
-        diff_str=diff_str,
-        diff_hint=diff_hint,
         tests=tests,
         frontier_context=frontier_context_rendered,
         frontier_context_details=frontier_context_details,
+        optimization_brief=optimization_brief,
     )
     with start_observation(
         name="policy_writer",
@@ -1921,15 +1841,14 @@ def generate_policy(
                 metadata={"attempt": attempt, "model": model},
             ) as attempt_obs:
                 try:
-                    system_content, user_content = prompt_content.split("===USER===", 1)
                     messages = [
                         {
                             "role": "system",
-                            "content": system_content.strip(),
+                            "content": rendered_prompt.system,
                         },
                         {
                             "role": "user",
-                            "content": user_content.strip(),
+                            "content": rendered_prompt.user,
                         },
                     ]
                     _ensure_non_empty_messages(messages, caller="writer")
@@ -2004,7 +1923,7 @@ def generate_policy(
             data_type="BOOLEAN",
             comment=json.dumps({"model": model}),
         )
-        _safe_update(writer_obs, metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
+        _safe_update(writer_obs, metadata={"model": model, "length": len(code), "feedback_keys": list((feedback or {}).keys())})
         return code
 </file>
 
@@ -5979,12 +5898,12 @@ class OptimizationTracingListener:
 </file>
 
 <file path="orchestration/machine.py">
-from __future__ import annotations
-
 """
 State machines and lifecycle for optimization/repair loops.
 Holds state transitions and callbacks; no CLI or entrypoint concerns.
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Sequence, cast
@@ -5992,15 +5911,6 @@ from typing import Any, Sequence, cast
 from statemachine import State, StateChart
 from statemachine.event import BoundEvent
 
-_BOUND_EVENT = cast(Any, BoundEvent)
-
-# python-statemachine 3.x uses ``name`` on events while older callback dispatchers
-# expect ``key``. Patch in a lightweight compatibility property so callbacks work
-# uniformly without scattering conditionals.
-if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
-    setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
-
-from harness.pipeline.types import PipelineClassification, StepResult
 from .listeners import OptimizationTracingListener, RepairTracingListener
 from .types import (
     AcceptedPolicy,
@@ -6018,6 +5928,16 @@ from .types import (
     SpanHandle,
     TaskPayload,
 )
+from harness.pipeline.types import PipelineClassification, StepResult
+from harness.prompts import WriterGuidance
+
+_BOUND_EVENT = cast(Any, BoundEvent)
+
+# python-statemachine 3.x uses ``name`` on events while older callback dispatchers
+# expect ``key``. Patch in a lightweight compatibility property so callbacks work
+# uniformly without scattering conditionals.
+if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
+    setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
 
 class RepairStateMachine(StateChart[RepairMachineModel]):
@@ -6113,26 +6033,26 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
     def _run_writer(self) -> None:
         ctx = self.context
         deps = self.deps
-        guidance = (
-            "Repair mode: produce the smallest change that makes harness/policy.py pass ruff, basedpyright, and pytest. "
-            "Add missing parameter annotations and return type -> float. Do not optimize frontier_priority until the policy is valid."
-            if ctx.attempts_used > 0
-            else ctx.feedback.guidance_hint
-        )
+        guidance = list(ctx.feedback.optimization_brief.guidance.instructions)
+        mode = ctx.feedback.optimization_brief.guidance.mode
+        if ctx.attempts_used > 0:
+            mode = "repair"
+            guidance.append(
+                "Repair mode: produce the smallest change that makes harness/policy.py pass ruff, basedpyright, and pytest."
+            )
+            guidance.append("Add missing parameter annotations and return type -> float before optimizing frontier_priority.")
         if ctx.last_classified and ctx.last_classified.type_errors:
-            guidance += " Fix all type errors and ensure parameters are annotated; avoid unknown types."
+            guidance.append("Fix all type errors and ensure parameters are annotated; avoid unknown types.")
+        optimization_brief = ctx.feedback.optimization_brief.model_copy(
+            update={"guidance": WriterGuidance(mode=mode, instructions=guidance)}
+        )
 
         new_code, writer_error = deps.attempt_policy_generation(
-            feedback=ctx.feedback.feedback,
             initial_policy=ctx.evaluation.policy_code,
             tests=ctx.feedback.tests,
             frontier_context=ctx.feedback.frontier_context,
             frontier_context_details=ctx.feedback.frontier_context_details,
-            feedback_str=ctx.feedback.feedback_str,
-            guidance_hint=guidance,
-            diff_str=ctx.feedback.diff_str,
-            diff_hint=ctx.feedback.diff_hint,
-            comparison_summary=ctx.feedback.comparison_summary,
+            optimization_brief=optimization_brief,
             failure_context_str=ctx.failure_context,
             repair_attempt=ctx.attempts_used,
             parent_trace=ctx.repair_observation,
@@ -6529,12 +6449,12 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
 </file>
 
 <file path="orchestration/runtime.py">
-from __future__ import annotations
-
 """
 Single-run optimizer coordinator: build loop context/deps and invoke the optimization machine.
 Does not parse CLI or dataset concerns; expects normalized inputs and resolved session_id.
 """
+
+from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
@@ -6571,6 +6491,14 @@ from harness.utils.type_loader import (
 from harness.agents.writer import generate_policy
 from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
 from harness.orchestration.types import SpanHandle
+from harness.prompts import (
+    WriterFeedbackFinding,
+    WriterGuidance,
+    WriterOptimizationBrief,
+    WriterScoreSummary,
+    build_writer_optimization_brief,
+    build_writer_score_summary_from_bundle,
+)
 
 if TYPE_CHECKING:
     from harness.telemetry.hosted.baselines import BaselineSnapshot
@@ -6582,8 +6510,6 @@ from .types import (
     EvaluationMetrics,
     EvaluationResult,
     FailedRepairDetails,
-    FeedbackEntries,
-    FeedbackEntry,
     FeedbackPackage,
     ICResult,
     ICTaskPayload,
@@ -6834,6 +6760,12 @@ def evaluate_policy_on_item(
             policy_code="",
             success=False,
             error=f"{getattr(eval_result.failure.category, 'value', eval_result.failure.category)}: {eval_result.failure.message}",
+            score_summary=WriterScoreSummary(
+                primary_name="composed_score",
+                primary_score=-10.0,
+                composed_score=-10.0,
+                optimization_goal="maximize",
+            ),
         )
     if not eval_result.items:
         empty_metrics: dict[str, float | int | bool | None] = {
@@ -6849,6 +6781,12 @@ def evaluate_policy_on_item(
             policy_code="",
             success=False,
             error="evaluation_failed: no_results",
+            score_summary=WriterScoreSummary(
+                primary_name="composed_score",
+                primary_score=-10.0,
+                composed_score=-10.0,
+                optimization_goal="maximize",
+            ),
     )
     task_result = eval_result.items[0]
     score_bundle = task_result.score_bundle
@@ -6871,6 +6809,7 @@ def evaluate_policy_on_item(
         comparison_summary=None,
         policy_code=_read_policy(),
         control_score=machine_score_val,
+        score_summary=build_writer_score_summary_from_bundle(score_bundle),
     )
 
 
@@ -6896,8 +6835,8 @@ def build_iteration_feedback(
     frontier_ctx = build_frontier_context_fn(repo_root)
     frontier_ctx_str = format_frontier_context_fn(frontier_ctx)
 
-    diff_str = ""
-    diff_hint = ""
+    diff_summary = ""
+    diff_guidance = ""
     if prev_score is not None and prev_classified is not None:
         try:
             diff = compute_diff_fn(
@@ -6906,46 +6845,65 @@ def build_iteration_feedback(
                 prev_classified.model_dump(),
                 prev_classified.model_dump(),
             )
-            diff_str = format_diff_fn(diff)
-            diff_hint = interpret_diff_fn(diff)
+            diff_summary = format_diff_fn(diff)
+            diff_guidance = interpret_diff_fn(diff)
         except Exception:
-            diff_str = ""
-            diff_hint = ""
+            diff_summary = ""
+            diff_guidance = ""
 
-    feedback_entries: list[FeedbackEntry] = []
+    findings: list[WriterFeedbackFinding] = []
+    if evaluation.error:
+        findings.append(
+            WriterFeedbackFinding(
+                kind="evaluation_error",
+                message=evaluation.error,
+                severity="error",
+                source="evaluation",
+            )
+        )
     for key, value in evaluation.metrics.items():
         normalized_val: str | float | int | bool | None
         if isinstance(value, (str, float, int, bool)) or value is None:
             normalized_val = value
         else:
             normalized_val = str(value)
-        feedback_entries.append(FeedbackEntry(name=key, value=normalized_val))
+        severity = "warning" if key == "iteration_regression" and value is True else "info"
+        findings.append(
+            WriterFeedbackFinding(
+                kind="metric",
+                message=f"{key} = {normalized_val}",
+                value=normalized_val,
+                severity=severity,
+                source="evaluation.metrics",
+            )
+        )
+
+    guidance = _writer_guidance_from_evaluation(evaluation)
+    optimization_brief = build_writer_optimization_brief(
+        score_summary=evaluation.score_summary,
+        findings=findings,
+        comparison_summary=evaluation.comparison_summary,
+        diff_summary=diff_summary or None,
+        diff_guidance=diff_guidance or None,
+        guidance=guidance.instructions,
+        mode=guidance.mode,
+    )
 
     return FeedbackPackage(
         tests=tests_str,
         frontier_context=frontier_ctx_str,
         frontier_context_details=frontier_ctx,
-        comparison_summary=evaluation.comparison_summary,
-        feedback=FeedbackEntries.model_validate({"entries": feedback_entries}),
-        feedback_str=str(evaluation.metrics.get("error", "")),
-        guidance_hint="Fix errors before improving score",
-        diff_str=diff_str,
-        diff_hint=diff_hint,
+        optimization_brief=optimization_brief,
     )
 
 
 def attempt_policy_generation(
     *,
-    feedback: FeedbackEntries,
     initial_policy: str,
     tests: str,
     frontier_context: str,
     frontier_context_details: FrontierContext,
-    feedback_str: str,
-    guidance_hint: str,
-    diff_str: str,
-    diff_hint: str,
-    comparison_summary: str | None,
+    optimization_brief: WriterOptimizationBrief,
     failure_context_str: str | None,
     repair_attempt: int,
     parent_trace: object | None = None,
@@ -6953,24 +6911,14 @@ def attempt_policy_generation(
 ) -> tuple[str | None, str | None]:
     try:
         generator = cast(Callable[..., str], _pkg_attr("generate_policy"))
+        brief = optimization_brief
         new_code = generator(
-            feedback={
-                **feedback.as_map(),
-                **(
-                    {"pipeline_feedback": pipeline_feedback.model_dump()}
-                    if pipeline_feedback
-                    else {}
-                ),
-            },
             current_policy=initial_policy,
             tests=tests,
             frontier_context=frontier_context,
             frontier_context_details=frontier_context_details,
-            feedback_str=str(feedback_str),
-            guidance_hint=guidance_hint,
-            diff_str=diff_str,
-            diff_hint=diff_hint,
-            comparison_summary=comparison_summary,
+            optimization_brief=brief,
+            feedback={"pipeline_feedback": pipeline_feedback.model_dump()} if pipeline_feedback else {},
             parent_trace=parent_trace,
             failure_context=failure_context_str,
             repair_attempt=repair_attempt,
@@ -6979,6 +6927,41 @@ def attempt_policy_generation(
         return new_code, None
     except Exception as e:  # noqa: BLE001
         return None, str(e)
+
+
+def _writer_guidance_from_evaluation(evaluation: EvaluationResult) -> WriterGuidance:
+    if evaluation.error or not evaluation.success:
+        return WriterGuidance(
+            mode="repair",
+            instructions=[
+                "Resolve the evaluation failure before attempting score optimization.",
+                "Preserve the exact frontier_priority signature and return a float.",
+            ],
+        )
+    regression = evaluation.metrics.get("iteration_regression")
+    if regression is True:
+        return WriterGuidance(
+            mode="repair_regression",
+            instructions=[
+                "Undo the regression while preserving any validation fixes.",
+                "Do not optimize a component by lowering the composed objective.",
+            ],
+        )
+    if evaluation.score_summary and evaluation.score_summary.composed_score is not None:
+        return WriterGuidance(
+            mode="optimize",
+            instructions=[
+                "The policy is evaluable; improve the composed score without breaking validation.",
+                "Prefer changes that improve weighted visible score components in their stated direction.",
+            ],
+        )
+    return WriterGuidance(
+        mode="repair_then_optimize",
+        instructions=[
+            "First make the policy valid under tests and type checks.",
+            "When valid, improve the composed objective while preserving correctness.",
+        ],
+    )
 
 
 def run_policy_pipeline(
@@ -7217,6 +7200,7 @@ from typing import TYPE_CHECKING, Callable, ContextManager, Mapping, Protocol, S
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
+from harness.prompts import WriterOptimizationBrief, WriterScoreSummary
 from harness.utils.type_loader import FrontierContext
 from harness.localization.models import LCAContext, LCATaskIdentity
 
@@ -7324,35 +7308,6 @@ class JCResult(ICResult):
     """JC result container."""
 
     model_config = ConfigDict(extra="forbid")
-
-
-class FeedbackEntry(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    value: str | float | int | bool | None
-
-
-class FeedbackEntries(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    entries: list[FeedbackEntry] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_mapping(cls, value: object) -> object:
-        if isinstance(value, Mapping):
-            return {"entries": [{"name": k, "value": v} for k, v in value.items()]}
-        return value
-
-    def as_map(self) -> dict[str, str | float | int | bool | None]:
-        return {entry.name: entry.value for entry in self.entries}
-
-    def get(self, key: str, default: object | None = None) -> object | None:
-        return self.as_map().get(key, default)
-
-    def items(self):
-        return self.as_map().items()
 
 
 class TaskPayload(BaseModel):
@@ -7471,6 +7426,7 @@ class EvaluationResult(BaseModel):
     success: bool = True
     error: str | None = None
     control_score: float | None = None
+    score_summary: WriterScoreSummary | None = None
 
 
 class FeedbackPackage(BaseModel):
@@ -7481,12 +7437,7 @@ class FeedbackPackage(BaseModel):
     tests: str
     frontier_context: str
     frontier_context_details: FrontierContext
-    comparison_summary: str | None
-    feedback: FeedbackEntries
-    feedback_str: str
-    guidance_hint: str
-    diff_str: str
-    diff_hint: str
+    optimization_brief: WriterOptimizationBrief
 
 
 class RepairOutcome(BaseModel):
@@ -8387,11 +8338,190 @@ def load_frontier_policy() -> SelectionCallable:
 </file>
 
 <file path="prompts/__init__.py">
-"""Prompt templates and supporting models."""
+"""Public prompt construction API."""
 
-from .prompt_models import SystemPromptContext, WriterPromptContext
+from .builders import (
+    build_ic_system_prompt,
+    build_jc_system_prompt,
+    build_writer_optimization_brief,
+    build_writer_prompt,
+    build_writer_score_summary_from_bundle,
+)
+from .prompt_models import (
+    RenderedPrompt,
+    SystemPromptContext,
+    WriterComparisonSummary,
+    WriterDiffSummary,
+    WriterFeedbackFinding,
+    WriterGuidance,
+    WriterOptimizationBrief,
+    WriterPromptContext,
+    WriterScoreComponent,
+    WriterScoreSummary,
+)
+from .template_loader import render_prompt_template
 
-__all__ = ["SystemPromptContext", "WriterPromptContext"]
+__all__ = [
+    "RenderedPrompt",
+    "SystemPromptContext",
+    "WriterComparisonSummary",
+    "WriterDiffSummary",
+    "WriterFeedbackFinding",
+    "WriterGuidance",
+    "WriterOptimizationBrief",
+    "WriterPromptContext",
+    "WriterScoreComponent",
+    "WriterScoreSummary",
+    "build_ic_system_prompt",
+    "build_jc_system_prompt",
+    "build_writer_optimization_brief",
+    "build_writer_prompt",
+    "build_writer_score_summary_from_bundle",
+    "render_prompt_template",
+]
+</file>
+
+<file path="prompts/builders.py">
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any
+
+from harness.utils.openai_schema import ChatCompletionToolParam
+
+from .prompt_models import (
+    RenderedPrompt,
+    SystemPromptContext,
+    WriterComparisonSummary,
+    WriterDiffSummary,
+    WriterFeedbackFinding,
+    WriterGuidance,
+    WriterOptimizationBrief,
+    WriterPromptContext,
+    WriterScoreComponent,
+    WriterScoreSummary,
+)
+from .template_loader import render_prompt_template
+
+if TYPE_CHECKING:
+    from harness.scoring import ScoreBundle
+    from harness.utils.type_loader import FrontierContext
+
+_WRITER_SYSTEM_TEMPLATE = "policy_writer_system.jinja"
+_WRITER_USER_TEMPLATE = "policy_writer.jinja"
+
+
+def _format_available_tools(tool_specs: list[ChatCompletionToolParam]) -> str:
+    names: list[str] = []
+    for spec in tool_specs:
+        func = spec.get("function")
+        name = func.get("name") if isinstance(func, Mapping) else None
+        if isinstance(name, str) and name:
+            names.append(name)
+    if not names:
+        return "- none"
+    return "\n".join(f"- {name}" for name in names)
+
+
+def build_ic_system_prompt(tool_specs: list[ChatCompletionToolParam]) -> str:
+    context = SystemPromptContext(available_tools=_format_available_tools(tool_specs))
+    return render_prompt_template("ic_system.jinja", context.model_dump())
+
+
+def build_jc_system_prompt(tool_specs: list[ChatCompletionToolParam]) -> str:
+    context = SystemPromptContext(available_tools=_format_available_tools(tool_specs))
+    return render_prompt_template("jc_system.jinja", context.model_dump())
+
+
+def build_writer_prompt(
+    *,
+    current_policy: str,
+    failure_context: str,
+    tests: str,
+    frontier_context: str,
+    frontier_context_details: "FrontierContext",
+    optimization_brief: WriterOptimizationBrief,
+) -> RenderedPrompt:
+    context = WriterPromptContext.model_validate(
+        {
+            "current_policy": current_policy,
+            "failure_context": failure_context,
+            "tests": tests,
+            "frontier_context": frontier_context,
+            "frontier_context_details": frontier_context_details,
+            "optimization_brief": optimization_brief,
+        }
+    )
+    payload = context.model_dump(mode="json")
+    return RenderedPrompt(
+        system=render_prompt_template(_WRITER_SYSTEM_TEMPLATE, payload).strip(),
+        user=render_prompt_template(_WRITER_USER_TEMPLATE, payload).strip(),
+    )
+
+
+def build_writer_optimization_brief(
+    *,
+    score_summary: WriterScoreSummary | None = None,
+    findings: Sequence[WriterFeedbackFinding] = (),
+    comparison_summary: str | None = None,
+    diff_summary: str | None = None,
+    diff_guidance: str | None = None,
+    guidance: Sequence[str] = (),
+    mode: str = "repair_then_optimize",
+) -> WriterOptimizationBrief:
+    return WriterOptimizationBrief(
+        score_summary=score_summary,
+        findings=list(findings),
+        comparison=WriterComparisonSummary(summary=comparison_summary),
+        diff=WriterDiffSummary(summary=diff_summary, guidance=diff_guidance),
+        guidance=WriterGuidance(mode=mode, instructions=list(guidance)),
+    )
+
+
+def build_writer_score_summary_from_bundle(bundle: "ScoreBundle") -> WriterScoreSummary:
+    """Translate score internals into a concise writer-facing contract."""
+
+    components: list[WriterScoreComponent] = []
+    for name, result in bundle.results.items():
+        if not result.visible_to_agent:
+            continue
+        metadata = result.metadata or {}
+        guard = _metadata_text(metadata, ("guard", "floor", "minimum", "maximum"))
+        components.append(
+            WriterScoreComponent(
+                name=name,
+                value=result.value,
+                goal=getattr(result.goal, "value", str(result.goal)),
+                weight=float(bundle.compose_weights[name]) if name in bundle.compose_weights else None,
+                rationale=result.reason,
+                guard=guard,
+            )
+        )
+    return WriterScoreSummary(
+        primary_name="composed_score",
+        primary_score=bundle.composed_score,
+        composed_score=bundle.composed_score,
+        optimization_goal="maximize",
+        components=components,
+    )
+
+
+def _metadata_text(metadata: Mapping[str, Any], keys: Sequence[str]) -> str | None:
+    parts: list[str] = []
+    for key in keys:
+        value = metadata.get(key)
+        if value is not None:
+            parts.append(f"{key}: {value}")
+    return "; ".join(parts) if parts else None
+
+
+__all__ = [
+    "build_ic_system_prompt",
+    "build_jc_system_prompt",
+    "build_writer_optimization_brief",
+    "build_writer_prompt",
+    "build_writer_score_summary_from_bundle",
+]
 </file>
 
 <file path="prompts/ic_system.jinja">
@@ -8420,8 +8550,7 @@ Guidelines:
 - Exploration phase only: respond with tool calls and minimal/no prose unless a tool truly cannot be used (then give a brief rationale and follow with a tool call).
 </file>
 
-<file path="prompts/policy_writer.jinja">
-{% set system_instructions -%}
+<file path="prompts/policy_writer_system.jinja">
 You are optimizing a traversal/frontier priority function for a graph search system.
 Respond ONLY with JSON matching the provided schema.
 The 'code' field must contain pure Python defining a typed frontier priority function with signature:
@@ -8438,30 +8567,69 @@ STRICT RULES:
 - Do NOT wrap the code in Markdown
 - Use the provided GraphNode/Graph shapes; annotate parameters with GraphNode, Graph, step (int). Quoted annotations are allowed to avoid imports.
 Any violation will cause immediate failure.
-{%- endset %}
+</file>
 
-{{ system_instructions | trim }}
-===USER===
-Current policy:
+<file path="prompts/policy_writer.jinja">
+## Role and constraints
+Replace the frontier priority policy with valid Python that preserves the required interface and improves the search objective when validation already passes.
+
+## Current policy
 {{ current_policy }}
 
-Validation context:
-{{ failure_context }}
+## Scoring objective
+{% if optimization_brief.score_summary %}
+Primary scalar: {{ optimization_brief.score_summary.primary_name or "composed_score" }}
+Current primary score: {{ optimization_brief.score_summary.primary_score if optimization_brief.score_summary.primary_score is not none else "unavailable" }}
+Current composed score: {{ optimization_brief.score_summary.composed_score if optimization_brief.score_summary.composed_score is not none else "unavailable" }}
+Optimization goal: {{ optimization_brief.score_summary.optimization_goal }}
 
-Structured feedback:
-{{ feedback_text }}
+Component scores:
+{% if optimization_brief.score_summary.components %}
+{% for component in optimization_brief.score_summary.components %}
+- {{ component.name }}: value={{ component.value if component.value is not none else "unavailable" }}, goal={{ component.goal or optimization_brief.score_summary.optimization_goal }}{% if component.weight is not none %}, weight={{ component.weight }}{% endif %}{% if component.guard %}, guard={{ component.guard }}{% endif %}{% if component.rationale %}, rationale={{ component.rationale }}{% endif %}
+{% endfor %}
+{% else %}
+- none available
+{% endif %}
+
+Improve the composed objective while preserving correctness, determinism, and the exact frontier_priority contract. Raise weighted components in their stated direction without sacrificing required tests or type checks.
+{% else %}
+No structured score summary is available. First make the policy valid, then improve the feedback score when possible.
+{% endif %}
+
+## Evaluation and comparison summary
+Findings:
+{% if optimization_brief.findings %}
+{% for finding in optimization_brief.findings %}
+- {{ finding.kind }}{% if finding.severity %} ({{ finding.severity }}){% endif %}: {{ finding.message }}{% if finding.value is not none %} [value={{ finding.value }}]{% endif %}{% if finding.source %} [source={{ finding.source }}]{% endif %}
+{% endfor %}
+{% else %}
+- No explicit findings.
+{% endif %}
 
 Baseline comparison:
-{{ comparison_summary }}
+{{ optimization_brief.comparison.summary or "N/A" }}
 
 Guidance:
-{{ guidance_hint }}
+{% if optimization_brief.guidance.instructions %}
+{% for instruction in optimization_brief.guidance.instructions %}
+- {{ instruction }}
+{% endfor %}
+{% else %}
+- Fix validation failures before optimizing score.
+- When validation passes, improve the composed objective without breaking correctness.
+{% endif %}
 
-{{ diff_str }}
+## Failure context
+{{ failure_context }}
+
+## Diff context
+{{ optimization_brief.diff.summary or "N/A" }}
 
 Diff guidance:
-{{ diff_hint }}
+{{ optimization_brief.diff.guidance or "N/A" }}
 
+## Tests and type signature constraints
 Tests (source of truth, do not modify):
 {{ tests }}
 
@@ -8492,8 +8660,92 @@ Return ONLY the JSON object specified by the schema.
 <file path="prompts/prompt_models.py">
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from harness.utils.type_loader import FrontierContext
+
+
+class RenderedPrompt(BaseModel):
+    """Rendered multi-message prompt content."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    system: str
+    user: str
+
+
+class WriterScoreComponent(BaseModel):
+    """Writer-facing description of one score component."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: float | None = None
+    goal: str | None = None
+    weight: float | None = None
+    rationale: str | None = None
+    guard: str | None = None
+
+
+class WriterScoreSummary(BaseModel):
+    """Concise optimization contract for policy writing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    primary_name: str | None = None
+    primary_score: float | None = None
+    composed_score: float | None = None
+    optimization_goal: str = "maximize"
+    components: list[WriterScoreComponent] = Field(default_factory=list)
+
+
+class WriterFeedbackFinding(BaseModel):
+    """One explicit writer-facing evaluation finding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    message: str
+    value: str | float | int | bool | None = None
+    severity: str | None = None
+    source: str | None = None
+
+
+class WriterComparisonSummary(BaseModel):
+    """Writer-facing baseline/comparison context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str | None = None
+
+
+class WriterDiffSummary(BaseModel):
+    """Writer-facing score/pipeline delta context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str | None = None
+    guidance: str | None = None
+
+
+class WriterGuidance(BaseModel):
+    """Explicit next-step steering for the writer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str = "repair_then_optimize"
+    instructions: list[str] = Field(default_factory=list)
+
+
+class WriterOptimizationBrief(BaseModel):
+    """Coherent typed contract for writer prompt optimization."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score_summary: WriterScoreSummary | None = None
+    findings: list[WriterFeedbackFinding] = Field(default_factory=list)
+    comparison: WriterComparisonSummary = Field(default_factory=WriterComparisonSummary)
+    diff: WriterDiffSummary = Field(default_factory=WriterDiffSummary)
+    guidance: WriterGuidance = Field(default_factory=WriterGuidance)
 
 
 class WriterPromptContext(BaseModel):
@@ -8503,14 +8755,10 @@ class WriterPromptContext(BaseModel):
 
     current_policy: str
     failure_context: str
-    feedback_text: str
-    comparison_summary: str
-    guidance_hint: str
-    diff_str: str
-    diff_hint: str
     tests: str
     frontier_context: str
     frontier_context_details: FrontierContext
+    optimization_brief: WriterOptimizationBrief
 
 
 class SystemPromptContext(BaseModel):
@@ -8535,6 +8783,53 @@ class BackendPromptContext(BaseModel):
 
     backend: str
     available_tools: str
+</file>
+
+<file path="prompts/template_loader.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Mapping
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from harness.utils.repo_root import find_repo_root
+
+
+def _resolve_prompts_dir() -> Path:
+    root = find_repo_root()
+    candidates = [
+        root / "prompts",
+        root / "harness" / "prompts",
+        Path(__file__).resolve().parent,
+    ]
+    prompts_dir = next((p for p in candidates if p.exists()), None)
+    if prompts_dir is None:
+        checked = ", ".join(str(candidate) for candidate in candidates)
+        raise RuntimeError(f"Prompts directory missing (checked: {checked})")
+    return prompts_dir
+
+
+def render_prompt_template(template_name: str, context: Mapping[str, Any]) -> str:
+    """Render a Jinja2 template from the harness.prompts package."""
+
+    env = Environment(
+        loader=FileSystemLoader(_resolve_prompts_dir()),
+        autoescape=select_autoescape(enabled_extensions=(), default=False),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    try:
+        template = env.get_template(template_name)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Prompt template '{template_name}' not found") from exc
+    try:
+        return template.render(**context)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to render template '{template_name}'") from exc
+
+
+__all__ = ["render_prompt_template"]
 </file>
 
 <file path="scoring/scorers/__init__.py">
@@ -12300,7 +12595,6 @@ from typing import Any, cast
 import pytest
 from mcp.types import TextContent, Tool
 
-from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.agents import localizer as runner
 from harness.backends.ic import IterativeContextBackend
 from harness.backends.jc import JCodeMunchBackend
@@ -12310,6 +12604,8 @@ from harness.backends.mcp import (
     run_async,
     serialize_tool_result_for_model,
 )
+from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.prompts import build_jc_system_prompt
 from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
 
 
@@ -13193,7 +13489,7 @@ def test_jc_prompt_uses_canonical_tool_names():
             "function": {"name": "beta", "description": "", "parameters": {"type": "object", "properties": {}}},
         },
     ]
-    prompt = runner._build_jc_system_prompt(specs)  # type: ignore[attr-defined]
+    prompt = build_jc_system_prompt(specs)
     assert "- alpha" in prompt
     assert "- beta" in prompt
 
@@ -16337,13 +16633,13 @@ from typing import Any, Iterator, List
 import pytest
 
 from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.orchestration import runtime as runtime_module
 from harness.orchestration.machine import OptimizationStateMachine, RepairStateMachine
 from harness.orchestration.types import (
     AcceptedPolicyMeta,
     EvaluationMetrics,
     EvaluationResult,
     FailedRepairDetails,
-    FeedbackEntries,
     FeedbackPackage,
     IterationTasks,
     ICResult,
@@ -16359,6 +16655,7 @@ from harness.orchestration.types import (
     RepairMachineModel,
     TaskPayload,
 )
+from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import FrontierContext
 
@@ -16390,12 +16687,7 @@ def _make_feedback() -> FeedbackPackage:
         tests="",
         frontier_context="",
         frontier_context_details=scorer_ctx,
-        comparison_summary=None,
-        feedback=FeedbackEntries(),
-        feedback_str="",
-        guidance_hint="hint",
-        diff_str="",
-        diff_hint="",
+        optimization_brief=build_writer_optimization_brief(guidance=["hint"]),
     )
 
 
@@ -16432,6 +16724,35 @@ def test_prepared_tasks_emit_models() -> None:
     assert isinstance(iteration_tasks.jc_task, JCTaskPayload)
     assert iteration_tasks.ic_task.repo == "resolved"
     assert iteration_tasks.jc_task.repo == "jc-id"
+
+
+def test_build_iteration_feedback_produces_typed_writer_brief(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    frontier = FrontierContext(signature="sig", graph_models="", types="", examples="", notes="")
+    monkeypatch.setattr(runtime_module, "load_tests", lambda repo_root: object())
+    monkeypatch.setattr(runtime_module, "format_tests_for_prompt", lambda tests: "tests")
+    monkeypatch.setattr(runtime_module, "build_frontier_context", lambda repo_root: frontier)
+    monkeypatch.setattr(runtime_module, "format_frontier_context", lambda ctx: "frontier")
+    evaluation = EvaluationResult(
+        metrics=EvaluationMetrics.model_validate(
+            {"score": 0.25, "iteration_regression": True, "additional_metrics": [{"name": "gold_hop", "value": 0.5}]}
+        ),
+        ic_result=ICResult(),
+        jc_result=JCResult(),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary="baseline comparison",
+        policy_code="policy",
+        error="runner failed",
+        success=False,
+    )
+
+    feedback = runtime_module.build_iteration_feedback(evaluation, None, None, tmp_path)
+
+    assert feedback.tests == "tests"
+    assert feedback.frontier_context == "frontier"
+    assert feedback.optimization_brief.comparison.summary == "baseline comparison"
+    assert feedback.optimization_brief.guidance.mode == "repair"
+    assert any(finding.kind == "evaluation_error" and finding.message == "runner failed" for finding in feedback.optimization_brief.findings)
+    assert any(finding.kind == "metric" and finding.value == 0.25 for finding in feedback.optimization_brief.findings)
 
 
 def _repair_deps(
@@ -16768,7 +17089,8 @@ from __future__ import annotations
 import pytest
 
 from harness.agents.common import UsageEnvelope
-from harness.orchestration.types import EvaluationMetrics, FeedbackEntries
+from harness.orchestration.types import EvaluationMetrics
+from harness.prompts import WriterOptimizationBrief
 
 
 def test_evaluation_metrics_rejects_unknown_fields():
@@ -16776,9 +17098,9 @@ def test_evaluation_metrics_rejects_unknown_fields():
         EvaluationMetrics.model_validate({"score": 1.0, "unexpected": 2})  # type: ignore[arg-type]
 
 
-def test_feedback_entries_rejects_unknown_fields():
+def test_writer_optimization_brief_rejects_unknown_fields():
     with pytest.raises(Exception):
-        FeedbackEntries.model_validate({"entries": [{"name": "a", "value": 1}], "extra": "nope"})  # type: ignore[arg-type]
+        WriterOptimizationBrief.model_validate({"findings": [], "extra": "nope"})  # type: ignore[arg-type]
 
 
 def test_usage_envelope_flattening_and_rejection():
@@ -17297,12 +17619,20 @@ from pathlib import Path
 
 import pytest
 
-import harness.agents.localizer as runner
-import harness.agents.writer as writer
 from harness.utils import type_loader
 from harness.pipeline.types import StepResult
-from harness.prompts import SystemPromptContext, WriterPromptContext
-from harness.utils import template_loader
+from harness.prompts import (
+    SystemPromptContext,
+    WriterFeedbackFinding,
+    WriterPromptContext,
+    WriterScoreComponent,
+    WriterScoreSummary,
+    build_ic_system_prompt,
+    build_jc_system_prompt,
+    build_writer_optimization_brief,
+    build_writer_prompt,
+)
+from harness.prompts import template_loader
 from harness.utils.openai_schema import ChatCompletionToolParam
 
 
@@ -17310,7 +17640,11 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()
     template_path = prompts_dir / "policy_writer.jinja"
-    template_path.write_text("Policy: {{ current_policy }} | Tests: {{ tests }} | Feedback: {{ feedback_text }}", encoding="utf-8")
+    (prompts_dir / "policy_writer_system.jinja").write_text("system", encoding="utf-8")
+    template_path.write_text(
+        "Policy: {{ current_policy }} | Tests: {{ tests }} | Findings: {{ optimization_brief.findings[0].message }}",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(template_loader, "find_repo_root", lambda: tmp_path)
     dummy_ctx = type_loader.FrontierContext(
         signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
@@ -17320,34 +17654,30 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
         notes="",
     )
 
-    rendered = writer._render_writer_prompt(
+    rendered = build_writer_prompt(
         current_policy="code_v1",
         failure_context="ctx",
-        feedback_str="fb",
-        feedback={},
-        comparison_summary="N/A",
-        guidance_hint="hint",
-        diff_str="diff",
-        diff_hint="hint2",
         tests="tests-content",
         frontier_context="ctx",
         frontier_context_details=dummy_ctx,
+        optimization_brief=build_writer_optimization_brief(
+            findings=[WriterFeedbackFinding(kind="feedback", message="fb")],
+            comparison_summary="N/A",
+            diff_summary="diff",
+            diff_guidance="hint2",
+            guidance=["hint"],
+        ),
     )
-    assert "code_v1" in rendered
-    assert "tests-content" in rendered
-    assert "fb" in rendered
+    assert rendered.system == "system"
+    assert "code_v1" in rendered.user
+    assert "tests-content" in rendered.user
+    assert "fb" in rendered.user
 
 
 def test_real_writer_prompt_includes_selection_signature():
-    rendered = writer._render_writer_prompt(
+    rendered = build_writer_prompt(
         current_policy="def frontier_priority(node, graph, step):\n    return 0",
         failure_context="",
-        feedback_str="",
-        feedback={},
-        comparison_summary="N/A",
-        guidance_hint="",
-        diff_str="",
-        diff_hint="",
         tests="",
         frontier_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
         frontier_context_details=type_loader.FrontierContext(
@@ -17358,10 +17688,12 @@ def test_real_writer_prompt_includes_selection_signature():
             "def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
             notes="Traversal calls frontier_priority(node, graph, step).",
         ),
+        optimization_brief=build_writer_optimization_brief(comparison_summary="N/A"),
     )
-    assert "SelectionCallable" in rendered
-    assert "GraphNode" in rendered
-    assert "graph" in rendered
+    assert "frontier priority function" in rendered.system
+    assert "SelectionCallable" in rendered.user
+    assert "GraphNode" in rendered.user
+    assert "graph" in rendered.user
 
 
 def test_runner_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -17381,10 +17713,51 @@ def test_runner_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
             },
         }
     ]
-    ic_prompt = runner._build_ic_system_prompt(tools)
-    jc_prompt = runner._build_jc_system_prompt(tools)
+    ic_prompt = build_ic_system_prompt(tools)
+    jc_prompt = build_jc_system_prompt(tools)
     assert "inspect_file" in ic_prompt
     assert "inspect_file" in jc_prompt
+
+
+def test_writer_prompt_renders_score_summary_as_optimization_contract():
+    rendered = build_writer_prompt(
+        current_policy="def frontier_priority(node, graph, step):\n    return 0",
+        failure_context="",
+        tests="",
+        frontier_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        frontier_context_details=type_loader.FrontierContext(
+            signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            graph_models="class GraphNode:\n    pass\nclass Graph:\n    ...",
+            types="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            examples="",
+            notes="",
+        ),
+        optimization_brief=build_writer_optimization_brief(
+            score_summary=WriterScoreSummary(
+                primary_name="composed_score",
+                primary_score=0.42,
+                composed_score=0.42,
+                optimization_goal="maximize",
+                components=[
+                    WriterScoreComponent(
+                        name="gold_hop",
+                        value=0.5,
+                        goal="maximize",
+                        weight=0.75,
+                        rationale="closer to changed files is better",
+                        guard="floor: 0.2",
+                    )
+                ],
+            ),
+            comparison_summary="N/A",
+        ),
+    )
+    assert "## Scoring objective" in rendered.user
+    assert "Primary scalar: composed_score" in rendered.user
+    assert "Current composed score: 0.42" in rendered.user
+    assert "gold_hop" in rendered.user
+    assert "weight=0.75" in rendered.user
+    assert "Improve the composed objective" in rendered.user
 
 
 def test_writer_prompt_validation_rejects_extra_fields():
@@ -17393,11 +17766,6 @@ def test_writer_prompt_validation_rejects_extra_fields():
             {
                 "current_policy": "code",
                 "failure_context": "",
-                "feedback_text": "fb",
-                "comparison_summary": "N/A",
-                "guidance_hint": "hint",
-                "diff_str": "",
-                "diff_hint": "",
                 "tests": "",
                 "frontier_context": "",
                 "frontier_context_details": type_loader.FrontierContext(
@@ -17407,9 +17775,29 @@ def test_writer_prompt_validation_rejects_extra_fields():
                     examples="",
                     notes="",
                 ),
+                "optimization_brief": build_writer_optimization_brief(),
                 "extra_field": "nope",
             }
         )
+
+
+def test_writer_prompt_does_not_use_user_delimiter():
+    rendered = build_writer_prompt(
+        current_policy="def frontier_priority(node, graph, step):\n    return 0",
+        failure_context="",
+        tests="",
+        frontier_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        frontier_context_details=type_loader.FrontierContext(
+            signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            graph_models="",
+            types="",
+            examples="",
+            notes="",
+        ),
+        optimization_brief=build_writer_optimization_brief(),
+    )
+    assert "===USER===" not in rendered.system
+    assert "===USER===" not in rendered.user
 
 
 def test_step_result_rejects_extra_fields():
@@ -18421,6 +18809,7 @@ from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.agents import localizer as runner
 from harness.agents import common as agent_common
 from harness.agents import writer
+from harness.prompts import build_writer_optimization_brief
 from harness.utils import type_loader
 
 
@@ -18560,11 +18949,7 @@ def test_writer_records_policy_events(monkeypatch):
             examples="",
             notes="",
         ),
-        feedback_str="",
-        guidance_hint="",
-        diff_str="",
-        diff_hint="",
-        comparison_summary="IC vs JC summary",
+        optimization_brief=build_writer_optimization_brief(comparison_summary="IC vs JC summary"),
         parent_trace=DummySpan("parent"),
     )
     assert "def frontier_priority" in result
@@ -18584,105 +18969,6 @@ def test_run_agent_truncates_tool_content(monkeypatch):
             message = Msg()
 
         choices = [Choice()]
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-
-        def __init__(self):
-            self.usage = self.__class__.usage
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-
-        def __init__(self):
-            self.usage = self.__class__.usage
-
-
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-
-        def __init__(self):
-            self.usage = self.__class__.usage
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
         usage = type(
             "U",
             (),
@@ -18792,7 +19078,10 @@ def test_run_agent_retries_on_context_error(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
-    patched_usage = lambda resp: agent_common.UsageEnvelope.model_validate({"input": 1, "output": 1, "total": 2})
+
+    def patched_usage(resp):
+        return agent_common.UsageEnvelope.model_validate({"input": 1, "output": 1, "total": 2})
+
     monkeypatch.setattr(agent_common, "usage_from_response", patched_usage)
     monkeypatch.setitem(runner.run_agent.__globals__, "usage_from_response", patched_usage)
     @contextmanager
@@ -18945,6 +19234,7 @@ import pytest
 from typing import TypedDict
 
 from harness.agents import writer
+from harness.prompts import WriterOptimizationBrief, build_writer_optimization_brief
 from harness.utils.type_loader import FrontierContext
 
 
@@ -19019,11 +19309,7 @@ class BaseInputs(TypedDict, total=False):
     tests: str
     frontier_context: str
     frontier_context_details: FrontierContext
-    feedback_str: str
-    guidance_hint: str
-    diff_str: str
-    diff_hint: str
-    comparison_summary: str | None
+    optimization_brief: WriterOptimizationBrief
     parent_trace: object | None
     failure_context: str | None
     repair_attempt: int
@@ -19042,11 +19328,7 @@ def _base_inputs() -> BaseInputs:
             examples="",
             notes="",
         ),
-        "feedback_str": "",
-        "guidance_hint": "",
-        "diff_str": "",
-        "diff_hint": "",
-        "comparison_summary": "IC vs JC summary",
+        "optimization_brief": build_writer_optimization_brief(comparison_summary="IC vs JC summary"),
         "parent_trace": DummySpan(),
     }
 
@@ -19164,6 +19446,8 @@ def test_frontier_context_is_derived_from_structured_context(monkeypatch):
 <file path="tools/loop_viz.py">
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import argparse
 from pathlib import Path
 import sys
@@ -19191,12 +19475,12 @@ from harness.orchestration import (
 from harness.orchestration.types import (
     EvaluationMetrics,
     EvaluationResult,
-    FeedbackEntries,
     ICResult,
     JCResult,
     TaskPayload,
 )
 from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import FrontierContext
 
@@ -19229,12 +19513,7 @@ def _stub_deps() -> LoopDependencies:
         tests="",
         frontier_context="",
         frontier_context_details=STUB_FRONTIER_CTX,
-        comparison_summary=None,
-        feedback=FeedbackEntries(),
-        feedback_str="",
-        guidance_hint="",
-        diff_str="",
-        diff_hint="",
+        optimization_brief=build_writer_optimization_brief(),
     )
 
     def _evaluate_policy_on_item(*args: object, **kwargs: object) -> EvaluationResult:
@@ -19314,12 +19593,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
             tests="",
             frontier_context="",
             frontier_context_details=STUB_FRONTIER_CTX,
-            comparison_summary=None,
-            feedback=FeedbackEntries(),
-            feedback_str="",
-            guidance_hint="",
-            diff_str="",
-            diff_hint="",
+            optimization_brief=build_writer_optimization_brief(),
         ),
         max_repair_attempts=1,
         parent_trace=None,
@@ -19978,46 +20252,6 @@ def resolve_repo_target(repo_ref: str) -> str:
 
 
 __all__ = ["resolve_repo_target", "list_repo_targets", "is_known_repo_target"]
-</file>
-
-<file path="utils/template_loader.py">
-from __future__ import annotations
-
-from typing import Mapping, Any
-
-from pathlib import Path
-from jinja2 import Environment, FileSystemLoader, select_autoescape
-
-from .repo_root import find_repo_root
-
-
-def render_prompt_template(template_name: str, context: Mapping[str, Any]) -> str:
-    """
-    Render a Jinja2 template from the prompts/ directory.
-    """
-    root = find_repo_root()
-    candidates = [
-        root / "prompts",
-        root / "harness" / "prompts",
-        Path(__file__).resolve().parent.parent / "prompts",
-    ]
-    prompts_dir = next((p for p in candidates if p.exists()), None)
-    if prompts_dir is None:
-        raise RuntimeError(f"Prompts directory missing (checked: {', '.join(str(c) for c in candidates)})")
-    env = Environment(
-        loader=FileSystemLoader(prompts_dir),
-        autoescape=select_autoescape(enabled_extensions=(), default=False),
-        trim_blocks=True,
-        lstrip_blocks=True,
-    )
-    try:
-        template = env.get_template(template_name)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Prompt template '{template_name}' not found") from exc
-    try:
-        return template.render(**context)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Failed to render template '{template_name}'") from exc
 </file>
 
 <file path="utils/test_loader.py">

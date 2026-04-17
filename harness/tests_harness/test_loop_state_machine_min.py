@@ -7,13 +7,13 @@ from typing import Any, Iterator, List
 import pytest
 
 from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.orchestration import runtime as runtime_module
 from harness.orchestration.machine import OptimizationStateMachine, RepairStateMachine
 from harness.orchestration.types import (
     AcceptedPolicyMeta,
     EvaluationMetrics,
     EvaluationResult,
     FailedRepairDetails,
-    FeedbackEntries,
     FeedbackPackage,
     IterationTasks,
     ICResult,
@@ -29,6 +29,7 @@ from harness.orchestration.types import (
     RepairMachineModel,
     TaskPayload,
 )
+from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import FrontierContext
 
@@ -60,12 +61,7 @@ def _make_feedback() -> FeedbackPackage:
         tests="",
         frontier_context="",
         frontier_context_details=scorer_ctx,
-        comparison_summary=None,
-        feedback=FeedbackEntries(),
-        feedback_str="",
-        guidance_hint="hint",
-        diff_str="",
-        diff_hint="",
+        optimization_brief=build_writer_optimization_brief(guidance=["hint"]),
     )
 
 
@@ -102,6 +98,35 @@ def test_prepared_tasks_emit_models() -> None:
     assert isinstance(iteration_tasks.jc_task, JCTaskPayload)
     assert iteration_tasks.ic_task.repo == "resolved"
     assert iteration_tasks.jc_task.repo == "jc-id"
+
+
+def test_build_iteration_feedback_produces_typed_writer_brief(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    frontier = FrontierContext(signature="sig", graph_models="", types="", examples="", notes="")
+    monkeypatch.setattr(runtime_module, "load_tests", lambda repo_root: object())
+    monkeypatch.setattr(runtime_module, "format_tests_for_prompt", lambda tests: "tests")
+    monkeypatch.setattr(runtime_module, "build_frontier_context", lambda repo_root: frontier)
+    monkeypatch.setattr(runtime_module, "format_frontier_context", lambda ctx: "frontier")
+    evaluation = EvaluationResult(
+        metrics=EvaluationMetrics.model_validate(
+            {"score": 0.25, "iteration_regression": True, "additional_metrics": [{"name": "gold_hop", "value": 0.5}]}
+        ),
+        ic_result=ICResult(),
+        jc_result=JCResult(),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary="baseline comparison",
+        policy_code="policy",
+        error="runner failed",
+        success=False,
+    )
+
+    feedback = runtime_module.build_iteration_feedback(evaluation, None, None, tmp_path)
+
+    assert feedback.tests == "tests"
+    assert feedback.frontier_context == "frontier"
+    assert feedback.optimization_brief.comparison.summary == "baseline comparison"
+    assert feedback.optimization_brief.guidance.mode == "repair"
+    assert any(finding.kind == "evaluation_error" and finding.message == "runner failed" for finding in feedback.optimization_brief.findings)
+    assert any(finding.kind == "metric" and finding.value == 0.25 for finding in feedback.optimization_brief.findings)
 
 
 def _repair_deps(

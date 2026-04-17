@@ -4,12 +4,20 @@ from pathlib import Path
 
 import pytest
 
-import harness.agents.localizer as runner
-import harness.agents.writer as writer
 from harness.utils import type_loader
 from harness.pipeline.types import StepResult
-from harness.prompts import SystemPromptContext, WriterPromptContext
-from harness.utils import template_loader
+from harness.prompts import (
+    SystemPromptContext,
+    WriterFeedbackFinding,
+    WriterPromptContext,
+    WriterScoreComponent,
+    WriterScoreSummary,
+    build_ic_system_prompt,
+    build_jc_system_prompt,
+    build_writer_optimization_brief,
+    build_writer_prompt,
+)
+from harness.prompts import template_loader
 from harness.utils.openai_schema import ChatCompletionToolParam
 
 
@@ -17,7 +25,11 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()
     template_path = prompts_dir / "policy_writer.jinja"
-    template_path.write_text("Policy: {{ current_policy }} | Tests: {{ tests }} | Feedback: {{ feedback_text }}", encoding="utf-8")
+    (prompts_dir / "policy_writer_system.jinja").write_text("system", encoding="utf-8")
+    template_path.write_text(
+        "Policy: {{ current_policy }} | Tests: {{ tests }} | Findings: {{ optimization_brief.findings[0].message }}",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(template_loader, "find_repo_root", lambda: tmp_path)
     dummy_ctx = type_loader.FrontierContext(
         signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
@@ -27,34 +39,30 @@ def test_writer_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
         notes="",
     )
 
-    rendered = writer._render_writer_prompt(
+    rendered = build_writer_prompt(
         current_policy="code_v1",
         failure_context="ctx",
-        feedback_str="fb",
-        feedback={},
-        comparison_summary="N/A",
-        guidance_hint="hint",
-        diff_str="diff",
-        diff_hint="hint2",
         tests="tests-content",
         frontier_context="ctx",
         frontier_context_details=dummy_ctx,
+        optimization_brief=build_writer_optimization_brief(
+            findings=[WriterFeedbackFinding(kind="feedback", message="fb")],
+            comparison_summary="N/A",
+            diff_summary="diff",
+            diff_guidance="hint2",
+            guidance=["hint"],
+        ),
     )
-    assert "code_v1" in rendered
-    assert "tests-content" in rendered
-    assert "fb" in rendered
+    assert rendered.system == "system"
+    assert "code_v1" in rendered.user
+    assert "tests-content" in rendered.user
+    assert "fb" in rendered.user
 
 
 def test_real_writer_prompt_includes_selection_signature():
-    rendered = writer._render_writer_prompt(
+    rendered = build_writer_prompt(
         current_policy="def frontier_priority(node, graph, step):\n    return 0",
         failure_context="",
-        feedback_str="",
-        feedback={},
-        comparison_summary="N/A",
-        guidance_hint="",
-        diff_str="",
-        diff_hint="",
         tests="",
         frontier_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
         frontier_context_details=type_loader.FrontierContext(
@@ -65,10 +73,12 @@ def test_real_writer_prompt_includes_selection_signature():
             "def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:\n    return 1.0\n",
             notes="Traversal calls frontier_priority(node, graph, step).",
         ),
+        optimization_brief=build_writer_optimization_brief(comparison_summary="N/A"),
     )
-    assert "SelectionCallable" in rendered
-    assert "GraphNode" in rendered
-    assert "graph" in rendered
+    assert "frontier priority function" in rendered.system
+    assert "SelectionCallable" in rendered.user
+    assert "GraphNode" in rendered.user
+    assert "graph" in rendered.user
 
 
 def test_runner_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -88,10 +98,51 @@ def test_runner_prompt_renders_jinja(tmp_path: Path, monkeypatch: pytest.MonkeyP
             },
         }
     ]
-    ic_prompt = runner._build_ic_system_prompt(tools)
-    jc_prompt = runner._build_jc_system_prompt(tools)
+    ic_prompt = build_ic_system_prompt(tools)
+    jc_prompt = build_jc_system_prompt(tools)
     assert "inspect_file" in ic_prompt
     assert "inspect_file" in jc_prompt
+
+
+def test_writer_prompt_renders_score_summary_as_optimization_contract():
+    rendered = build_writer_prompt(
+        current_policy="def frontier_priority(node, graph, step):\n    return 0",
+        failure_context="",
+        tests="",
+        frontier_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        frontier_context_details=type_loader.FrontierContext(
+            signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            graph_models="class GraphNode:\n    pass\nclass Graph:\n    ...",
+            types="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            examples="",
+            notes="",
+        ),
+        optimization_brief=build_writer_optimization_brief(
+            score_summary=WriterScoreSummary(
+                primary_name="composed_score",
+                primary_score=0.42,
+                composed_score=0.42,
+                optimization_goal="maximize",
+                components=[
+                    WriterScoreComponent(
+                        name="gold_hop",
+                        value=0.5,
+                        goal="maximize",
+                        weight=0.75,
+                        rationale="closer to changed files is better",
+                        guard="floor: 0.2",
+                    )
+                ],
+            ),
+            comparison_summary="N/A",
+        ),
+    )
+    assert "## Scoring objective" in rendered.user
+    assert "Primary scalar: composed_score" in rendered.user
+    assert "Current composed score: 0.42" in rendered.user
+    assert "gold_hop" in rendered.user
+    assert "weight=0.75" in rendered.user
+    assert "Improve the composed objective" in rendered.user
 
 
 def test_writer_prompt_validation_rejects_extra_fields():
@@ -100,11 +151,6 @@ def test_writer_prompt_validation_rejects_extra_fields():
             {
                 "current_policy": "code",
                 "failure_context": "",
-                "feedback_text": "fb",
-                "comparison_summary": "N/A",
-                "guidance_hint": "hint",
-                "diff_str": "",
-                "diff_hint": "",
                 "tests": "",
                 "frontier_context": "",
                 "frontier_context_details": type_loader.FrontierContext(
@@ -114,9 +160,29 @@ def test_writer_prompt_validation_rejects_extra_fields():
                     examples="",
                     notes="",
                 ),
+                "optimization_brief": build_writer_optimization_brief(),
                 "extra_field": "nope",
             }
         )
+
+
+def test_writer_prompt_does_not_use_user_delimiter():
+    rendered = build_writer_prompt(
+        current_policy="def frontier_priority(node, graph, step):\n    return 0",
+        failure_context="",
+        tests="",
+        frontier_context="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+        frontier_context_details=type_loader.FrontierContext(
+            signature="SelectionCallable = Callable[[GraphNode, Graph, int], float]",
+            graph_models="",
+            types="",
+            examples="",
+            notes="",
+        ),
+        optimization_brief=build_writer_optimization_brief(),
+    )
+    assert "===USER===" not in rendered.system
+    assert "===USER===" not in rendered.user
 
 
 def test_step_result_rejects_extra_fields():

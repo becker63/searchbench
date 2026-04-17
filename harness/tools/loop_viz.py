@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import argparse
 from pathlib import Path
 import sys
@@ -27,12 +29,12 @@ from harness.orchestration import (
 from harness.orchestration.types import (
     EvaluationMetrics,
     EvaluationResult,
-    FeedbackEntries,
     ICResult,
     JCResult,
     TaskPayload,
 )
 from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import FrontierContext
 
@@ -65,12 +67,7 @@ def _stub_deps() -> LoopDependencies:
         tests="",
         frontier_context="",
         frontier_context_details=STUB_FRONTIER_CTX,
-        comparison_summary=None,
-        feedback=FeedbackEntries(),
-        feedback_str="",
-        guidance_hint="",
-        diff_str="",
-        diff_hint="",
+        optimization_brief=build_writer_optimization_brief(),
     )
 
     def _evaluate_policy_on_item(*args: object, **kwargs: object) -> EvaluationResult:
@@ -150,12 +147,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
             tests="",
             frontier_context="",
             frontier_context_details=STUB_FRONTIER_CTX,
-            comparison_summary=None,
-            feedback=FeedbackEntries(),
-            feedback_str="",
-            guidance_hint="",
-            diff_str="",
-            diff_hint="",
+            optimization_brief=build_writer_optimization_brief(),
         ),
         max_repair_attempts=1,
         parent_trace=None,

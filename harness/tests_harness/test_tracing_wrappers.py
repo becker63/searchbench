@@ -7,6 +7,7 @@ from harness.localization.models import LCAContext, LCATaskIdentity
 from harness.agents import localizer as runner
 from harness.agents import common as agent_common
 from harness.agents import writer
+from harness.prompts import build_writer_optimization_brief
 from harness.utils import type_loader
 
 
@@ -146,11 +147,7 @@ def test_writer_records_policy_events(monkeypatch):
             examples="",
             notes="",
         ),
-        feedback_str="",
-        guidance_hint="",
-        diff_str="",
-        diff_hint="",
-        comparison_summary="IC vs JC summary",
+        optimization_brief=build_writer_optimization_brief(comparison_summary="IC vs JC summary"),
         parent_trace=DummySpan("parent"),
     )
     assert "def frontier_priority" in result
@@ -170,105 +167,6 @@ def test_run_agent_truncates_tool_content(monkeypatch):
             message = Msg()
 
         choices = [Choice()]
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-
-        def __init__(self):
-            self.usage = self.__class__.usage
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-
-        def __init__(self):
-            self.usage = self.__class__.usage
-
-
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-
-        def __init__(self):
-            self.usage = self.__class__.usage
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
-        usage = type(
-            "U",
-            (),
-            {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "prompt_tokens_details": {},
-                "completion_tokens_details": {},
-            },
-        )()
         usage = type(
             "U",
             (),
@@ -378,7 +276,10 @@ def test_run_agent_retries_on_context_error(monkeypatch):
             self.chat = type("Chat", (), {"completions": completions})()
 
     monkeypatch.setattr(runner, "_make_client", lambda: (DummyClient(), "model"))
-    patched_usage = lambda resp: agent_common.UsageEnvelope.model_validate({"input": 1, "output": 1, "total": 2})
+
+    def patched_usage(resp):
+        return agent_common.UsageEnvelope.model_validate({"input": 1, "output": 1, "total": 2})
+
     monkeypatch.setattr(agent_common, "usage_from_response", patched_usage)
     monkeypatch.setitem(runner.run_agent.__globals__, "usage_from_response", patched_usage)
     @contextmanager

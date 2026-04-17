@@ -7,6 +7,7 @@ import pytest
 from typing import TypedDict
 
 from harness.agents import writer
+from harness.prompts import WriterOptimizationBrief, build_writer_optimization_brief
 from harness.utils.type_loader import FrontierContext
 
 
@@ -81,11 +82,7 @@ class BaseInputs(TypedDict, total=False):
     tests: str
     frontier_context: str
     frontier_context_details: FrontierContext
-    feedback_str: str
-    guidance_hint: str
-    diff_str: str
-    diff_hint: str
-    comparison_summary: str | None
+    optimization_brief: WriterOptimizationBrief
     parent_trace: object | None
     failure_context: str | None
     repair_attempt: int
@@ -104,11 +101,7 @@ def _base_inputs() -> BaseInputs:
             examples="",
             notes="",
         ),
-        "feedback_str": "",
-        "guidance_hint": "",
-        "diff_str": "",
-        "diff_hint": "",
-        "comparison_summary": "IC vs JC summary",
+        "optimization_brief": build_writer_optimization_brief(comparison_summary="IC vs JC summary"),
         "parent_trace": DummySpan(),
     }
 

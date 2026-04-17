@@ -1,9 +1,9 @@
-from __future__ import annotations
-
 """
 Leaf operation: policy writer/generator.
 No CLI or orchestration logic; only generation and validation.
 """
+
+from __future__ import annotations
 
 import json
 import time
@@ -11,13 +11,15 @@ from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
+from harness.prompts import (
+    WriterOptimizationBrief,
+    build_writer_prompt,
+)
 from harness.telemetry.tracing import get_tracing_openai_client, start_observation
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 from harness.utils.env import get_cerebras_api_key, get_writer_model
 from harness.utils.model_budgets import compute_prompt_char_budget, get_model_budget
-from harness.prompts import WriterPromptContext
-from harness.utils.template_loader import render_prompt_template
-from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
 from harness.utils.type_loader import FrontierContext, format_frontier_context
 
 
@@ -31,17 +33,12 @@ class WriterRequest(BaseModel):
     tests: str
     frontier_context: str
     frontier_context_details: FrontierContext
-    feedback_str: str
-    guidance_hint: str
-    diff_str: str
-    diff_hint: str
-    comparison_summary: str | None = None
+    optimization_brief: WriterOptimizationBrief
     parent_trace: object | None = None
     failure_context: str | None = None
     repair_attempt: int = 0
 
 _client: Any | None = None
-_WRITER_TEMPLATE = "policy_writer.jinja"
 
 
 def _get_client():
@@ -137,52 +134,13 @@ def _ensure_valid_policy_code(code: str) -> str:
     return cleaned
 
 
-def _render_writer_prompt(
-    *,
-    current_policy: str,
-    failure_context: str,
-    feedback_str: str,
-    feedback: Mapping[str, object],
-    comparison_summary: str | None,
-    guidance_hint: str,
-    diff_str: str,
-    diff_hint: str,
-    tests: str,
-    frontier_context: str,
-    frontier_context_details: FrontierContext,
-) -> str:
-    feedback_text = feedback_str if feedback_str else str(feedback)
-    context = WriterPromptContext.model_validate(
-        {
-            "current_policy": current_policy,
-            "failure_context": failure_context,
-            "feedback_text": feedback_text,
-            "comparison_summary": comparison_summary or "N/A",
-            "guidance_hint": guidance_hint,
-            "diff_str": diff_str,
-            "diff_hint": diff_hint,
-            "tests": tests,
-            "frontier_context": frontier_context,
-            "frontier_context_details": frontier_context_details,
-        }
-    )
-    rendered = render_prompt_template(_WRITER_TEMPLATE, context.model_dump())
-    if "===USER===" not in rendered:
-        rendered = f"===USER===\n{rendered}"
-    return rendered
-
-
 def generate_policy(
-    feedback: dict[str, Any],
     current_policy: str,
     tests: str,
     frontier_context: str,
     frontier_context_details: FrontierContext,
-    feedback_str: str,
-    guidance_hint: str,
-    diff_str: str,
-    diff_hint: str,
-    comparison_summary: str | None = None,
+    optimization_brief: WriterOptimizationBrief,
+    feedback: dict[str, Any] | None = None,
     parent_trace: object | None = None,
     failure_context: str | None = None,
     repair_attempt: int = 0,
@@ -193,16 +151,12 @@ def generate_policy(
     frontier_context_rendered = frontier_context or format_frontier_context(frontier_context_details)
     try:
         WriterRequest(
-            feedback=feedback,
+            feedback=feedback or {},
             current_policy=current_policy,
             tests=tests,
             frontier_context=frontier_context_rendered,
             frontier_context_details=frontier_context_details,
-            feedback_str=feedback_str,
-            guidance_hint=guidance_hint,
-            diff_str=diff_str,
-            diff_hint=diff_hint,
-            comparison_summary=comparison_summary,
+            optimization_brief=optimization_brief,
             parent_trace=parent_trace,
             failure_context=failure_context,
             repair_attempt=repair_attempt,
@@ -220,18 +174,13 @@ def generate_policy(
     if failure_context:
         failure_context = failure_context[:failure_context_budget]
     completion_tokens = model_budget.completion_reserve
-    prompt_content = _render_writer_prompt(
+    rendered_prompt = build_writer_prompt(
         current_policy=current_policy,
         failure_context=failure_context,
-        feedback_str=str(feedback_str),
-        feedback=feedback,
-        comparison_summary=comparison_summary,
-        guidance_hint=guidance_hint,
-        diff_str=diff_str,
-        diff_hint=diff_hint,
         tests=tests,
         frontier_context=frontier_context_rendered,
         frontier_context_details=frontier_context_details,
+        optimization_brief=optimization_brief,
     )
     with start_observation(
         name="policy_writer",
@@ -251,15 +200,14 @@ def generate_policy(
                 metadata={"attempt": attempt, "model": model},
             ) as attempt_obs:
                 try:
-                    system_content, user_content = prompt_content.split("===USER===", 1)
                     messages = [
                         {
                             "role": "system",
-                            "content": system_content.strip(),
+                            "content": rendered_prompt.system,
                         },
                         {
                             "role": "user",
-                            "content": user_content.strip(),
+                            "content": rendered_prompt.user,
                         },
                     ]
                     _ensure_non_empty_messages(messages, caller="writer")
@@ -334,5 +282,5 @@ def generate_policy(
             data_type="BOOLEAN",
             comment=json.dumps({"model": model}),
         )
-        _safe_update(writer_obs, metadata={"model": model, "length": len(code), "feedback_keys": list(feedback.keys())})
+        _safe_update(writer_obs, metadata={"model": model, "length": len(code), "feedback_keys": list((feedback or {}).keys())})
         return code

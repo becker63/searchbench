@@ -1,9 +1,9 @@
-from __future__ import annotations
-
 """
 State machines and lifecycle for optimization/repair loops.
 Holds state transitions and callbacks; no CLI or entrypoint concerns.
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Sequence, cast
@@ -11,15 +11,6 @@ from typing import Any, Sequence, cast
 from statemachine import State, StateChart
 from statemachine.event import BoundEvent
 
-_BOUND_EVENT = cast(Any, BoundEvent)
-
-# python-statemachine 3.x uses ``name`` on events while older callback dispatchers
-# expect ``key``. Patch in a lightweight compatibility property so callbacks work
-# uniformly without scattering conditionals.
-if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
-    setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
-
-from harness.pipeline.types import PipelineClassification, StepResult
 from .listeners import OptimizationTracingListener, RepairTracingListener
 from .types import (
     AcceptedPolicy,
@@ -37,6 +28,16 @@ from .types import (
     SpanHandle,
     TaskPayload,
 )
+from harness.pipeline.types import PipelineClassification, StepResult
+from harness.prompts import WriterGuidance
+
+_BOUND_EVENT = cast(Any, BoundEvent)
+
+# python-statemachine 3.x uses ``name`` on events while older callback dispatchers
+# expect ``key``. Patch in a lightweight compatibility property so callbacks work
+# uniformly without scattering conditionals.
+if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
+    setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
 
 class RepairStateMachine(StateChart[RepairMachineModel]):
@@ -132,26 +133,26 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
     def _run_writer(self) -> None:
         ctx = self.context
         deps = self.deps
-        guidance = (
-            "Repair mode: produce the smallest change that makes harness/policy.py pass ruff, basedpyright, and pytest. "
-            "Add missing parameter annotations and return type -> float. Do not optimize frontier_priority until the policy is valid."
-            if ctx.attempts_used > 0
-            else ctx.feedback.guidance_hint
-        )
+        guidance = list(ctx.feedback.optimization_brief.guidance.instructions)
+        mode = ctx.feedback.optimization_brief.guidance.mode
+        if ctx.attempts_used > 0:
+            mode = "repair"
+            guidance.append(
+                "Repair mode: produce the smallest change that makes harness/policy.py pass ruff, basedpyright, and pytest."
+            )
+            guidance.append("Add missing parameter annotations and return type -> float before optimizing frontier_priority.")
         if ctx.last_classified and ctx.last_classified.type_errors:
-            guidance += " Fix all type errors and ensure parameters are annotated; avoid unknown types."
+            guidance.append("Fix all type errors and ensure parameters are annotated; avoid unknown types.")
+        optimization_brief = ctx.feedback.optimization_brief.model_copy(
+            update={"guidance": WriterGuidance(mode=mode, instructions=guidance)}
+        )
 
         new_code, writer_error = deps.attempt_policy_generation(
-            feedback=ctx.feedback.feedback,
             initial_policy=ctx.evaluation.policy_code,
             tests=ctx.feedback.tests,
             frontier_context=ctx.feedback.frontier_context,
             frontier_context_details=ctx.feedback.frontier_context_details,
-            feedback_str=ctx.feedback.feedback_str,
-            guidance_hint=guidance,
-            diff_str=ctx.feedback.diff_str,
-            diff_hint=ctx.feedback.diff_hint,
-            comparison_summary=ctx.feedback.comparison_summary,
+            optimization_brief=optimization_brief,
             failure_context_str=ctx.failure_context,
             repair_attempt=ctx.attempts_used,
             parent_trace=ctx.repair_observation,
