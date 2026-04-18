@@ -8,9 +8,8 @@ from harness.localization.runtime.execute import (
     _resolve_repo_path,
     _run_runner,
     _score_task,
-    run_localization_task,
 )
-from harness.localization.models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
+from harness.localization.models import LCAContext, LCAGold, LocalizationPrediction, LCATask, LCATaskIdentity
 
 
 def _task(repo: Path) -> LCATask:
@@ -57,5 +56,5 @@ def test_score_task_failure_is_typed(tmp_path, monkeypatch):
 
     monkeypatch.setattr("harness.localization.runtime.execute.build_localization_score_eval_record", bad_eval)
     with pytest.raises(LocalizationEvaluationError) as exc:
-        _score_task(task, LCAPrediction(predicted_files=["a.py"]), repo)
+        _score_task(task, LocalizationPrediction(predicted_files=["a.py"]), repo)
     assert exc.value.category == LocalizationFailureCategory.SCORING

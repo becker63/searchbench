@@ -31,9 +31,8 @@ from harness.orchestration.types import (
     EvaluationResult,
     ICResult,
     JCResult,
-    TaskPayload,
 )
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import FrontierContext
@@ -46,14 +45,27 @@ class _DummySpan:
     def update(self, **kwargs: object) -> None:
         return None
 
+
+class _DummyPipeline:
+    def run(
+        self,
+        repo_root: Path,
+        observation: object | None = None,
+        allow_no_parent: bool = False,
+    ) -> list[StepResult]:
+        return [
+            StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")
+        ]
+
+
 STUB_FRONTIER_CTX = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
 
 
 def _stub_deps() -> LoopDependencies:
     """Minimal dependency set for chart rendering (no side effects)."""
 
-    def _prepare(task: TaskPayload, trace: object | None = None) -> PreparedTasks:
-        return PreparedTasks(base_task=task, resolved_repo_path=task.repo, jc_repo_id=None)
+    def _prepare(task: LCATask, trace: object | None = None) -> PreparedTasks:
+        return PreparedTasks(task=task, resolved_repo_path=task.repo, jc_repo_id=None)
 
     dummy_eval = EvaluationResult(
         metrics=EvaluationMetrics(),
@@ -127,7 +139,7 @@ def _stub_deps() -> LoopDependencies:
         get_writer_model=lambda: "model",
         start_observation=lambda *a, **k: nullcontext(_DummySpan()),
         find_repo_root=lambda: Path("."),
-        default_pipeline=lambda: object(),
+        default_pipeline=lambda: _DummyPipeline(),
     )
 
 
@@ -165,7 +177,18 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
         base_sha="base",
     )
     context = LCAContext(issue_title="demo", issue_body="details")
-    loop_ctx = LoopContext(task=TaskPayload(identity=identity, context=context, repo="repo", changed_files=[]), iterations=1, baseline_snapshot=None, run_trace=_DummySpan())
+    task = LCATask(
+        identity=identity,
+        context=context,
+        gold=LCAGold(changed_files=[]),
+        repo="repo",
+    )
+    loop_ctx = LoopContext(
+        task=task,
+        iterations=1,
+        baseline_snapshot=None,
+        run_trace=_DummySpan(),
+    )
     opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
     opt_chart = OptimizationStateMachine(opt_model)
     return repair_chart, opt_chart

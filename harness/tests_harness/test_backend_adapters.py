@@ -18,9 +18,50 @@ from harness.backends.mcp import (
     run_async,
     serialize_tool_result_for_model,
 )
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+    LocalizationRunResult,
+)
 from harness.prompts import build_jc_system_prompt
 from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
+
+
+def _runner_task(repo: str) -> LCATask:
+    return LCATask(
+        identity=LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ),
+        context=LCAContext(issue_title="bug", issue_body="details"),
+        gold=LCAGold(changed_files=["a.py"]),
+        repo=repo,
+    )
+
+
+def _runner_result(
+    task: LCATask,
+    predicted_files: list[str] | None = None,
+    reasoning: str | None = None,
+    observations: list[dict[str, object]] | None = None,
+    source: str | None = None,
+) -> LocalizationRunResult:
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(
+            predicted_files=predicted_files or [],
+            reasoning=reasoning,
+        ),
+        observations=observations or [],
+        source=source,
+    )
 
 
 async def _sample_coroutine(loop_ids: list[int] | None = None) -> str:
@@ -454,38 +495,23 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     def fake_finalize(task, obs, parent_trace=None):
         # Expect a separate no-tools finalize call; simulate schema result.
-        assert isinstance(task, dict)
+        assert isinstance(task, LCATask)
         assert isinstance(obs, list)
         # Ensure the schema path is used (response_format=json_schema would have been required upstream).
-        return runner.LocalizationRunnerResult(predicted_files=["a.py"], observations=obs, source="finalize")
+        return _runner_result(task, ["a.py"], observations=obs, source="finalize")
 
     monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
 
-    task_payload = {
-        "identity": LCATaskIdentity(
-            dataset_name="lca",
-            dataset_config="py",
-            dataset_split="dev",
-            repo_owner="o",
-            repo_name="r",
-            base_sha="abc",
-        ).model_dump(),
-        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-        "repo": str(tmp_path),
-    }
-    result = cast(
-        dict[str, Any],
-        runner.run_ic_iteration(
-            task_payload,
-            score_fn=lambda n, s: 1.0,
-            steps=1,
-            parent_trace=object(),
-        ),
+    result = runner.run_ic_iteration(
+        _runner_task(str(tmp_path)),
+        score_fn=lambda n, s: 1.0,
+        steps=1,
+        parent_trace=object(),
     )
-    assert result["node_count"] == 2
+    assert result.node_count == 2
     tool_obs = next(
         cast(dict[str, Any], obs)
-        for obs in result["observations"]
+        for obs in result.observations
         if isinstance(obs, dict) and obs.get("role") == "tool"
     )
     payload = cast(dict[str, Any], tool_obs["result"])
@@ -528,36 +554,21 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     def fake_finalize(task, obs, parent_trace=None):
-        assert isinstance(task, dict)
+        assert isinstance(task, LCATask)
         assert isinstance(obs, list)
-        return runner.LocalizationRunnerResult(predicted_files=["a.py"], observations=obs, source="finalize")
+        return _runner_result(task, ["a.py"], observations=obs, source="finalize")
 
     monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
 
-    task_payload = {
-        "identity": LCATaskIdentity(
-            dataset_name="lca",
-            dataset_config="py",
-            dataset_split="dev",
-            repo_owner="o",
-            repo_name="r",
-            base_sha="abc",
-        ).model_dump(),
-        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-        "repo": str(tmp_path),
-    }
-    result = cast(
-        dict[str, Any],
-        runner.run_jc_iteration(
-            task_payload,
-            steps=1,
-            parent_trace=object(),
-        ),
+    result = runner.run_jc_iteration(
+        _runner_task(str(tmp_path)),
+        steps=1,
+        parent_trace=object(),
     )
-    assert result["node_count"] == 0
+    assert result.node_count == 0
     tool_obs = next(
         cast(dict[str, Any], obs)
-        for obs in result["observations"]
+        for obs in result.observations
         if isinstance(obs, dict) and obs.get("role") == "tool"
     )
     assert tool_obs["result"] == {"called": "search_files", "args": {"query": "foo"}}
@@ -592,8 +603,8 @@ def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
     def fake_finalize(task, obs, parent_trace=None):
         finalized["called"] = True
         finalize_calls.append({"task": task, "observations": obs})
-        return runner.LocalizationRunnerResult(
-            predicted_files=["src/app.py"], reasoning="r", observations=obs, source="finalize"
+        return _runner_result(
+            task, ["src/app.py"], reasoning="r", observations=obs, source="finalize"
         )
 
     monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
@@ -620,32 +631,18 @@ def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "run_agent", fake_run_agent)
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
-    result = cast(
-        dict[str, Any],
-        runner.run_ic_iteration(
-            {
-                "identity": LCATaskIdentity(
-                    dataset_name="lca",
-                    dataset_config="py",
-                    dataset_split="dev",
-                    repo_owner="o",
-                    repo_name="r",
-                    base_sha="abc",
-                ).model_dump(),
-                "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-                "repo": str(repo_dir),
-            },
-            score_fn=None,
-            steps=1,
-            parent_trace=object(),
-        ),
+    result = runner.run_ic_iteration(
+        _runner_task(str(repo_dir)),
+        score_fn=None,
+        steps=1,
+        parent_trace=object(),
     )
     assert captured.get("repo") == str(repo_dir)
     assert captured.get("tool_specs")
     assert captured.get("dispatches") == [("resolve", {"path": "p"})]
-    assert result.get("predicted_files") == ["src/app.py"]
+    assert result.prediction.predicted_files == ["src/app.py"]
     assert finalized["called"] is True
-    assert finalize_calls and "identity" in finalize_calls[0]["task"]
+    assert finalize_calls and isinstance(finalize_calls[0]["task"], LCATask)
 
 
 def test_finalization_uses_json_schema(monkeypatch, tmp_path):
@@ -707,21 +704,8 @@ def test_finalization_uses_json_schema(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
-    task_payload = {
-        "identity": LCATaskIdentity(
-            dataset_name="lca",
-            dataset_config="py",
-            dataset_split="dev",
-            repo_owner="o",
-            repo_name="r",
-            base_sha="abc",
-        ).model_dump(),
-        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-        "repo": str(tmp_path),
-    }
-
-    result = runner.run_ic_iteration(task_payload, score_fn=None, steps=1, parent_trace=object())
-    assert result["predicted_files"] == ["src/app.py"]
+    result = runner.run_ic_iteration(_runner_task(str(tmp_path)), score_fn=None, steps=1, parent_trace=object())
+    assert result.prediction.predicted_files == ["src/app.py"]
     assert len(calls) >= 2
     explore_call = calls[0]
     finalize_call = calls[-1]
@@ -840,26 +824,15 @@ def test_finalization_json_schema_uses_provider_supported_subset(monkeypatch, tm
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(tmp_path),
-        },
+        _runner_task(str(tmp_path)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
 
     assert schema_payloads
-    assert result["predicted_files"] == ["src/app.py"]
-    assert result["source"] == "finalize"
+    assert result.prediction.predicted_files == ["src/app.py"]
+    assert result.source == "finalize"
 
 
 def test_apply_tool_results_preserves_assistant_tool_response_order():

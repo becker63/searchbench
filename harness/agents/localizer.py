@@ -23,11 +23,10 @@ from harness.backends.jc import JCodeMunchBackend
 from harness.backends.mcp import serialize_tool_result_for_model
 from harness.utils.env import get_cerebras_api_key, get_runner_model, getenv
 from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import LCATask, LocalizationPrediction, LocalizationRunResult
 
-from harness.agents.common import AgentTaskPayload, usage_from_response
+from harness.agents.common import serialize_lca_task_for_prompt, usage_from_response
 
 _MAX_TOTAL_MESSAGE_CHARS = 24000
 _MAX_TOOL_CONTENT_CHARS = 4000
@@ -40,68 +39,6 @@ _AGGRESSIVE_SYSTEM_CHARS = 1500
 _AGGRESSIVE_USER_CHARS = 1500
 
 _LOGGER = logging.getLogger(__name__)
-
-
-class AgentTask(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    identity: LCATaskIdentity
-    repo: str
-    context: LCAContext
-    extra: dict[str, object] = Field(default_factory=dict)
-
-    def to_payload(self) -> dict[str, object]:
-        payload_model = AgentTaskPayload(
-            identity=self.identity.model_dump(),
-            repo=self.repo,
-            context=self.context.model_dump(),
-            extra=self.extra,
-        )
-        return payload_model.model_dump()
-
-
-class LocalizationRunnerResult(BaseModel):
-    """Typed localization runner output boundary."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    predicted_files: list[str] = Field(default_factory=list)
-    reasoning: str | None = None
-    observations: list[dict[str, object]] = Field(default_factory=list)
-    node_count: int | None = None
-    raw: dict[str, object] | None = None
-    source: str | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize(cls, value: object) -> object:
-        if isinstance(value, Mapping):
-            files_raw = value.get("predicted_files", [])
-            normalized: list[str] = []
-            seen: set[str] = set()
-            if isinstance(files_raw, list):
-                for item in files_raw:
-                    if not isinstance(item, str):
-                        continue
-                    cleaned = item.strip().lower()
-                    if cleaned and cleaned not in seen:
-                        seen.add(cleaned)
-                        normalized.append(cleaned)
-            elif isinstance(files_raw, str):
-                for part in files_raw.replace("\n", ",").split(","):
-                    cleaned = part.strip().lower()
-                    if cleaned and cleaned not in seen:
-                        seen.add(cleaned)
-                        normalized.append(cleaned)
-            return {**value, "predicted_files": normalized}
-        return value
-
-
-def _require_str(mapping: dict[str, Any], key: str) -> str:
-    value = mapping.get(key)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"task must include a non-empty string for '{key}'")
-    return value
 
 
 def _require_parent(parent: object | None, owner: str = "runner agent") -> object:
@@ -117,6 +54,32 @@ def _safe_update(span: object | None, **kwargs: object) -> None:
             updater(**kwargs)
         except Exception:
             pass
+
+
+def _prediction_from_output(
+    predicted_files: object,
+    reasoning: object = None,
+) -> LocalizationPrediction:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    candidates: list[object]
+    if isinstance(predicted_files, str):
+        candidates = list(predicted_files.replace("\n", ",").split(","))
+    elif isinstance(predicted_files, list):
+        candidates = predicted_files
+    else:
+        candidates = []
+    for item in candidates:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip().lower()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            normalized.append(cleaned)
+    return LocalizationPrediction(
+        predicted_files=normalized,
+        reasoning=reasoning if isinstance(reasoning, str) else None,
+    )
 
 
 def _sanitize_agent_task(agent_task: Mapping[str, object]) -> dict[str, object]:
@@ -962,11 +925,12 @@ def _format_finalization_messages(agent_task: dict[str, object], observations: l
 
 
 def _finalize_localization(
-    agent_task: dict[str, object],
+    task: LCATask,
     observations: list[dict[str, object]],
     parent_trace: object | None = None,
-) -> LocalizationRunnerResult:
+) -> LocalizationRunResult:
     client, model = _make_client()
+    agent_task = serialize_lca_task_for_prompt(task)
     repo_value = agent_task.get("repo") if isinstance(agent_task, Mapping) else None
     repo_root = repo_value if isinstance(repo_value, str) else None
     prepared_observations = _clean_observations_for_finalization(observations, repo_root)
@@ -1001,10 +965,13 @@ def _finalize_localization(
         else:
             raise RuntimeError("Structured output missing content")
         obs.update(output=_truncate_for_metadata(parsed))
-        result = LocalizationRunnerResult.model_validate(
+        result = LocalizationRunResult.model_validate(
             {
-                "predicted_files": parsed.get("predicted_files", []),
-                "reasoning": parsed.get("reasoning"),
+                "task": task,
+                "prediction": _prediction_from_output(
+                    parsed.get("predicted_files", []),
+                    parsed.get("reasoning"),
+                ),
                 "observations": prepared_observations or observations,
                 "raw": {
                     "final": parsed,
@@ -1018,19 +985,20 @@ def _finalize_localization(
 
 def _fallback_localization_result(
     *,
+    task: LCATask,
     normalized: Mapping[str, object],
     observations: list[dict[str, object]],
     node_count: int | None,
     repo_root: str | None,
     error: object,
-) -> LocalizationRunnerResult:
+) -> LocalizationRunResult:
     predicted_files, reasoning, diagnostics = _extract_localization_prediction(
         normalized,
         repo_root=repo_root,
     )
-    return LocalizationRunnerResult(
-        predicted_files=predicted_files,
-        reasoning=reasoning,
+    return LocalizationRunResult(
+        task=task,
+        prediction=_prediction_from_output(predicted_files, reasoning),
         observations=observations,
         node_count=node_count,
         raw={
@@ -1044,27 +1012,31 @@ def _fallback_localization_result(
 
 def _finalize_or_recover(
     *,
-    agent_task: dict[str, object],
+    task: LCATask,
     observations: list[dict[str, object]],
     normalized: Mapping[str, object],
     node_count: int | None,
     parent_span: object,
-) -> LocalizationRunnerResult:
+) -> LocalizationRunResult:
     try:
-        final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
+        final = _finalize_localization(task, observations, parent_trace=parent_span)
     except Exception as exc:  # noqa: BLE001
+        agent_task = serialize_lca_task_for_prompt(task)
         repo_value = agent_task.get("repo")
         return _fallback_localization_result(
+            task=task,
             normalized=normalized,
             observations=observations,
             node_count=node_count,
             repo_root=repo_value if isinstance(repo_value, str) else None,
             error=exc,
         )
-    if final.predicted_files:
+    if final.prediction.predicted_files:
         return final
+    agent_task = serialize_lca_task_for_prompt(task)
     repo_value = agent_task.get("repo")
     return _fallback_localization_result(
+        task=task,
         normalized=normalized,
         observations=observations,
         node_count=node_count,
@@ -1075,15 +1047,17 @@ def _finalize_or_recover(
 
 def _runner_error_result(
     *,
+    task: LCATask,
     normalized: Mapping[str, object],
     observations: list[dict[str, object]],
     node_count: int | None,
-) -> LocalizationRunnerResult | None:
+) -> LocalizationRunResult | None:
     error = normalized.get("error")
     if not error or observations:
         return None
-    return LocalizationRunnerResult(
-        predicted_files=[],
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(predicted_files=[]),
         observations=[],
         node_count=node_count,
         raw={
@@ -1098,33 +1072,24 @@ def _runner_error_result(
 
 
 def run_ic_iteration(
-    task: dict[str, object],
+    task: LCATask,
     score_fn: Callable[..., float] | None = None,
     steps: int = 5,
     parent_trace: object | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner="iterative_context")
-    repo = _require_str(task, "repo")
-    identity = LCATaskIdentity.model_validate(task.get("identity") or {})
-    context = LCAContext.model_validate(task.get("context") or {})
-    try:
-        agent_task_model = AgentTask(
-            identity=identity,
-            repo=repo,
-            context=context,
-            extra={k: v for k, v in task.items() if k not in {"identity", "context", "repo", "changed_files"}},
-        )
-    except ValidationError as exc:
-        raise RuntimeError(f"Invalid agent task: {exc}") from exc
-    agent_task = agent_task_model.to_payload()
+    if not task.repo:
+        raise ValueError("LCATask.repo is required for iterative_context execution")
+    repo = task.repo
+    agent_task = serialize_lca_task_for_prompt(task)
 
     backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
     tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
     system_prompt = build_ic_system_prompt(tool_specs)
     with start_observation(
-        name="iterative_context",
-        parent=parent_span,
-        metadata={"backend": "iterative_context", "repo": repo, "identity": identity.task_id()},
+            name="iterative_context",
+            parent=parent_span,
+            metadata={"backend": "iterative_context", "repo": repo, "identity": task.identity.task_id()},
     ) as backend_obs:
         try:
             raw = run_agent(
@@ -1172,13 +1137,14 @@ def run_ic_iteration(
         backend_obs.update(metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
 
     final = _runner_error_result(
+        task=task,
         normalized=normalized,
         observations=observations,
         node_count=node_count_val if node_count_val is not None else normalized_node_count,
     )
     if final is None:
         final = _finalize_or_recover(
-            agent_task=agent_task,
+            task=task,
             observations=observations,
             normalized=normalized,
             node_count=node_count_val if node_count_val is not None else normalized_node_count,
@@ -1188,45 +1154,35 @@ def run_ic_iteration(
         final.observations = observations
     if final.node_count is None:
         final.node_count = node_count_val if node_count_val is not None else normalized_node_count
-    result_dict = final.model_dump()
     full_graph = normalized.get("full_graph")
     if full_graph is not None:
-        result_dict["full_graph"] = full_graph
-        if result_dict.get("node_count") in (None, 0) and isinstance(full_graph, Mapping):
+        final.full_graph = full_graph
+        if final.node_count in (None, 0) and isinstance(full_graph, Mapping):
             nodes = full_graph.get("nodes")
             if isinstance(nodes, list):
-                result_dict["node_count"] = len(nodes)
-    result_dict["backend"] = "ic"
-    return result_dict
+                final.node_count = len(nodes)
+    final.backend = "ic"
+    return final
 
 
 def run_jc_iteration(
-    task: dict[str, object],
+    task: LCATask,
     steps: int = 5,
     parent_trace: object | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner="jcodemunch")
-    repo = _require_str(task, "repo")
-    identity = LCATaskIdentity.model_validate(task.get("identity") or {})
-    context = LCAContext.model_validate(task.get("context") or {})
-    try:
-        agent_task_model = AgentTask(
-            identity=identity,
-            repo=repo,
-            context=context,
-            extra={k: v for k, v in task.items() if k not in {"identity", "context", "repo", "changed_files"}},
-        )
-    except ValidationError as exc:
-        raise RuntimeError(f"Invalid agent task: {exc}") from exc
-    agent_task = agent_task_model.to_payload()
+    if not task.repo:
+        raise ValueError("LCATask.repo is required for jcodemunch execution")
+    repo = task.repo
+    agent_task = serialize_lca_task_for_prompt(task)
 
     backend = JCodeMunchBackend(repo=repo)
     tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
     system_prompt = build_jc_system_prompt(tool_specs)
     with start_observation(
-        name="jcodemunch",
-        parent=parent_span,
-        metadata={"backend": "jcodemunch", "repo": repo, "identity": identity.task_id()},
+            name="jcodemunch",
+            parent=parent_span,
+            metadata={"backend": "jcodemunch", "repo": repo, "identity": task.identity.task_id()},
     ) as backend_obs:
         try:
             raw = run_agent(
@@ -1258,13 +1214,14 @@ def run_jc_iteration(
         backend_obs.update(metadata={"node_count": node_count_val or 0})
 
     final = _runner_error_result(
+        task=task,
         normalized=normalized,
         observations=observations,
         node_count=node_count_val,
     )
     if final is None:
         final = _finalize_or_recover(
-            agent_task=agent_task,
+            task=task,
             observations=observations,
             normalized=normalized,
             node_count=node_count_val,
@@ -1274,9 +1231,8 @@ def run_jc_iteration(
         final.observations = observations
     if final.node_count is None:
         final.node_count = node_count_val
-    result_dict = final.model_dump()
-    result_dict["backend"] = "jc"
-    return result_dict
+    final.backend = "jc"
+    return final
 
 
 __all__ = [
@@ -1284,4 +1240,6 @@ __all__ = [
     "run_jc_iteration",
     "run_agent",
     "run_agent_with_retry",
+    "LocalizationPrediction",
+    "LocalizationRunResult",
 ]

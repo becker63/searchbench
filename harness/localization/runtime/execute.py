@@ -15,9 +15,10 @@ from harness.localization.materialization.materialize import (
     RepoMaterializer,
 )
 from harness.localization.models import (
-    LCAPrediction,
     LCATask,
     LocalizationEvidence,
+    LocalizationPrediction,
+    LocalizationRunResult,
 )
 from harness.scoring import ScoreBundle, ScoreEngine, summarize_task_score
 from harness.localization.telemetry import build_localization_telemetry
@@ -86,38 +87,37 @@ def _run_runner(
     repo_path: Path,
     trace: object | None,
     runner: Callable[
-        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+        [LCATask, str, object | None], LocalizationRunResult
     ]
     | None,
-) -> tuple[list[str], Mapping[str, object] | None]:
+) -> LocalizationRunResult:
     runner_fn = runner or _default_runner
     try:
-        predicted_files, runner_result = runner_fn(task, str(repo_path), trace)
+        runner_result = runner_fn(task, str(repo_path), trace)
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
         raise LocalizationEvaluationError(
             LocalizationFailureCategory.RUNNER, str(exc), task_id=task.task_id
         ) from exc
-    if not predicted_files:
+    if not runner_result.prediction.predicted_files:
         raise LocalizationEvaluationError(
             LocalizationFailureCategory.RUNNER,
             "Localization runner produced no predicted_files",
             task_id=task.task_id,
         )
-    result_map = runner_result if isinstance(runner_result, Mapping) else None
-    return predicted_files, result_map
+    return runner_result
 
 
-def _score_prefix_from_runner_result(runner_result: Mapping[str, object] | None) -> str:
+def _score_prefix_from_runner_result(runner_result: LocalizationRunResult | None) -> str:
     if runner_result is None:
         return "localization"
-    backend = runner_result.get("backend")
+    backend = runner_result.backend
     if backend in {"ic", "iterative_context"}:
         return "ic"
     if backend in {"jc", "jcodemunch"}:
         return "jc"
-    source = runner_result.get("source")
+    source = runner_result.source
     if source in {"ic", "iterative_context"}:
         return "ic"
     if source in {"jc", "jcodemunch"}:
@@ -127,28 +127,19 @@ def _score_prefix_from_runner_result(runner_result: Mapping[str, object] | None)
 
 def _default_runner(
     lca_task: LCATask, repo_path: str, parent: object | None
-) -> tuple[list[str], Mapping[str, object] | None]:
+) -> LocalizationRunResult:
     from harness.agents.localizer import run_ic_iteration as run_ic_iteration_fn
-    result = run_ic_iteration_fn(
-        {
-            "identity": lca_task.identity.model_dump(),
-            "context": lca_task.context.model_dump(),
-            "repo": repo_path,
-        },
-        score_fn=None,
-        steps=5,
-        parent_trace=parent,
-    )
-    if not isinstance(result, Mapping):
+    result = run_ic_iteration_fn(lca_task.with_repo(repo_path), score_fn=None, steps=5, parent_trace=parent)
+    if not isinstance(result, LocalizationRunResult):
         raise RuntimeError("Localization runner returned an invalid result")
-    predicted = result.get("predicted_files")
+    predicted = result.prediction.predicted_files
     if not isinstance(predicted, list):
         raise RuntimeError("Localization runner produced no predicted_files")
     predictions = [p for p in predicted if isinstance(p, str) and p.strip()]
     if not predictions:
-        source = result.get("source")
+        source = result.source
         if source == "runner_error":
-            raw = result.get("raw")
+            raw = result.raw
             error = raw.get("error") if isinstance(raw, Mapping) else None
             detail = f": {error}" if isinstance(error, str) and error else ""
             raise RuntimeError(
@@ -162,11 +153,11 @@ def _default_runner(
         raise RuntimeError(
             f"Localization runner produced an empty predicted_files list{detail}"
         )
-    return predictions, result
+    return result
 
 
 def _score_task(
-    task: LCATask, prediction: LCAPrediction, repo_path: Path, token_usage: TokenUsageRecord | None = None
+    task: LCATask, prediction: LocalizationPrediction, repo_path: Path, token_usage: TokenUsageRecord | None = None
 ) -> ScoreBundle:
     try:
         anchor_text = "\n".join([task.context.issue_title or "", task.context.issue_body or ""]).strip()
@@ -248,11 +239,11 @@ def run_localization_task(
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: Callable[
-        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+        [LCATask, str, object | None], LocalizationRunResult
     ]
     | None = None,
 ) -> Tuple[
-    LCAPrediction,
+    LocalizationPrediction,
     ScoreBundle,
     LocalizationEvidence | None,
     RepoMaterializationResult | None,
@@ -289,10 +280,10 @@ def run_localization_task(
                 task_id=task.task_id,
             ) from exc
         repo_path = _resolve_repo_path(task, materialization_result)
-        predicted_files, runner_result = _run_runner(task, repo_path, trace, runner)
-        prediction = LCAPrediction(predicted_files=predicted_files)
+        runner_result = _run_runner(task, repo_path, trace, runner)
+        prediction = runner_result.prediction
         usage = extract_token_usage_record(
-            runner_result if isinstance(runner_result, Mapping) else None,
+            runner_result.model_dump(),
             source="runner",
         )
         score_bundle = _score_task(task, prediction, repo_path, usage)

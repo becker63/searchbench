@@ -6,7 +6,8 @@ from typing import Any, Iterator, List
 
 import pytest
 
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.orchestration import feedback as feedback_module
 from harness.orchestration import runtime as runtime_module
 from harness.orchestration.machine import OptimizationStateMachine, RepairStateMachine
 from harness.orchestration.types import (
@@ -17,17 +18,14 @@ from harness.orchestration.types import (
     FeedbackPackage,
     IterationTasks,
     ICResult,
-    ICTaskPayload,
     IterationRecord,
     JCResult,
-    JCTaskPayload,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
     PreparedTasks,
     RepairContext,
     RepairMachineModel,
-    TaskPayload,
 )
 from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
@@ -55,6 +53,11 @@ class RecordingSpan:
         pass
 
 
+class EmptyPipeline:
+    def run(self, repo_root: Path, observation: object | None = None, allow_no_parent: bool = False) -> list[StepResult]:
+        return []
+
+
 def _make_feedback() -> FeedbackPackage:
     scorer_ctx = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
     return FeedbackPackage(
@@ -76,7 +79,7 @@ def _make_eval() -> EvaluationResult:
     )
 
 
-def _task_payload() -> TaskPayload:
+def _task() -> LCATask:
     identity = LCATaskIdentity(
         dataset_name="lca",
         dataset_config="py",
@@ -86,26 +89,30 @@ def _task_payload() -> TaskPayload:
         base_sha="abc",
     )
     context = LCAContext(issue_title="bug", issue_body="details")
-    return TaskPayload(identity=identity, context=context, repo="repo", changed_files=["a.py"])
+    return LCATask(
+        identity=identity,
+        context=context,
+        gold=LCAGold(changed_files=["a.py"]),
+        repo="repo",
+    )
 
 
 def test_prepared_tasks_emit_models() -> None:
-    base = _task_payload()
-    prepared = PreparedTasks(base_task=base, resolved_repo_path="resolved", jc_repo_id="jc-id")
+    base = _task()
+    prepared = PreparedTasks(task=base, resolved_repo_path="resolved", jc_repo_id="jc-id")
     iteration_tasks = prepared.build_iteration_tasks()
     assert isinstance(iteration_tasks, IterationTasks)
-    assert isinstance(iteration_tasks.ic_task, ICTaskPayload)
-    assert isinstance(iteration_tasks.jc_task, JCTaskPayload)
-    assert iteration_tasks.ic_task.repo == "resolved"
-    assert iteration_tasks.jc_task.repo == "jc-id"
+    assert isinstance(iteration_tasks.task, LCATask)
+    assert iteration_tasks.task.repo == "resolved"
+    assert iteration_tasks.jc_repo_id == "jc-id"
 
 
 def test_build_iteration_feedback_produces_typed_writer_brief(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     frontier = FrontierContext(signature="sig", graph_models="", types="", examples="", notes="")
-    monkeypatch.setattr(runtime_module, "load_tests", lambda repo_root: object())
-    monkeypatch.setattr(runtime_module, "format_tests_for_prompt", lambda tests: "tests")
-    monkeypatch.setattr(runtime_module, "build_frontier_context", lambda repo_root: frontier)
-    monkeypatch.setattr(runtime_module, "format_frontier_context", lambda ctx: "frontier")
+    monkeypatch.setattr(feedback_module, "load_tests", lambda repo_root: object())
+    monkeypatch.setattr(feedback_module, "format_tests_for_prompt", lambda tests: "tests")
+    monkeypatch.setattr(feedback_module, "build_frontier_context", lambda repo_root: frontier)
+    monkeypatch.setattr(feedback_module, "format_frontier_context", lambda ctx: "frontier")
     evaluation = EvaluationResult(
         metrics=EvaluationMetrics.model_validate(
             {"score": 0.25, "iteration_regression": True, "additional_metrics": [{"name": "gold_hop", "value": 0.5}]}
@@ -183,21 +190,9 @@ def _repair_deps(
 
     deps = LoopDependencies(
         prepare_iteration_tasks=lambda task, trace=None: PreparedTasks(
-            base_task=task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task),
+            task=task,
             resolved_repo_path=".",
             jc_repo_id=".",
-            ic_task=ICTaskPayload(
-                identity=_task_payload().identity,
-                context=_task_payload().context,
-                repo=".",
-                changed_files=["a.py"],
-            ),
-            jc_task=JCTaskPayload(
-                identity=_task_payload().identity,
-                context=_task_payload().context,
-                repo=".",
-                changed_files=["a.py"],
-            ),
         ),
         evaluate_policy_on_item=lambda *a, **k: _make_eval(),  # type: ignore[arg-type]
         build_iteration_feedback=lambda *a, **k: _make_feedback(),  # type: ignore[arg-type]
@@ -212,7 +207,7 @@ def _repair_deps(
         get_writer_model=lambda: "model",
         start_observation=start_observation,
         find_repo_root=lambda: Path("."),
-        default_pipeline=lambda: object(),
+        default_pipeline=lambda: EmptyPipeline(),
     )
     return deps, spans, seen_parent, events
 
@@ -327,28 +322,15 @@ def test_failed_candidate_not_marked_accepted() -> None:
 def _opt_deps(ctx: LoopContext) -> LoopDependencies:
     span = RecordingSpan()
 
-    def prepare_iteration_tasks(task: TaskPayload, trace: object | None = None) -> PreparedTasks:
-        base_task = task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task)
+    def prepare_iteration_tasks(task: LCATask, trace: object | None = None) -> PreparedTasks:
         return PreparedTasks(
-            base_task=base_task,
+            task=task.with_repo("."),
             resolved_repo_path=".",
             jc_repo_id=".",
-            ic_task=ICTaskPayload(
-                identity=base_task.identity,
-                context=base_task.context,
-                repo=".",
-                changed_files=base_task.changed_files,
-            ),
-            jc_task=JCTaskPayload(
-                identity=base_task.identity,
-                context=base_task.context,
-                repo=".",
-                changed_files=base_task.changed_files,
-            ),
         )
 
     def evaluate_policy_on_item(
-        ic_task: ICTaskPayload,
+        task: LCATask,
         baseline,
         iteration_span: object | None = None,
         iteration_index: int | None = None,
@@ -380,14 +362,14 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
         get_writer_model=lambda: "model",
         start_observation=lambda **k: span,  # RecordingSpan is a context manager
         find_repo_root=lambda: Path("."),
-        default_pipeline=lambda: object(),
+        default_pipeline=lambda: EmptyPipeline(),
     )
     return deps
 
 
 def test_optimization_completes_and_records_history() -> None:
     ctx = LoopContext(
-        task=_task_payload(),
+        task=_task(),
         iterations=1,
         session_id=None,
         baseline_snapshot=None,

@@ -22,7 +22,7 @@ from harness.localization.models import (
     LocalizationEvidence,
     LocalizationGold,
     LocalizationPrediction,
-    normalize_lca_task,
+    LocalizationRunResult,
 )
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
@@ -247,7 +247,7 @@ def compute_baseline_for_task(
     dataset_version: str | None = None,
     parent_trace: object | None = None,
     runner: Callable[
-        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+        [LCATask, str, object | None], LocalizationRunResult
     ]
     | None = None,
     dataset_source: str | None = None,
@@ -284,9 +284,7 @@ def compute_baseline_for_task(
                     task_id=failure.task_id or task.task_id,  # type: ignore[arg-type]
                 )
             task_result = eval_result.items[0]
-            prediction_model = LocalizationPrediction(
-                predicted_files=task_result.prediction
-            )
+            prediction_model = task_result.prediction
             score_summary = summarize_task_score(task.task_id, task_result.score_bundle)
             evidence = task_result.evidence
             materialization = task_result.materialization
@@ -393,10 +391,3 @@ def load_baseline_bundle(path: Path) -> BaselineBundle:
         return BaselineBundle.model_validate(data)
     except ValidationError as exc:
         raise ValueError(f"Invalid baseline bundle: {exc}") from exc
-
-
-def normalize_baseline_task(data: Mapping[str, object]) -> LCATask:
-    """
-    Helper to coerce legacy mappings into LCATask for baseline compatibility.
-    """
-    return normalize_lca_task(data)

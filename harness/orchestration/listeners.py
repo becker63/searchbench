@@ -1,9 +1,9 @@
-from __future__ import annotations
-
 """
 State machine listeners for tracing/metrics lifecycles.
 No session creation; reacts to machine events only.
 """
+
+from __future__ import annotations
 
 import json
 from typing import Any, ContextManager, Protocol
@@ -116,8 +116,8 @@ class OptimizationTracingListener:
             metadata={
                 "iteration": ctx.current_iteration,
                 "iterations": ctx.iterations,
-                "task": iteration_tasks.ic_task.model_dump(),
-                "jc_repo": iteration_tasks.jc_task.repo,
+                "task": iteration_tasks.task.model_dump(),
+                "jc_repo": iteration_tasks.jc_repo_id,
             },
         )
         opt_model.current_iteration_span = cm.__enter__()

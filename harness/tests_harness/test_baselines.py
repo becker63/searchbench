@@ -11,6 +11,7 @@ from harness.localization.models import (
     LCATaskIdentity,
     LocalizationGold,
     LocalizationPrediction,
+    LocalizationRunResult,
 )
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
 from harness.scoring import ScoreContext, ScoreEngine, summarize_batch_scores, summarize_task_score
@@ -39,6 +40,14 @@ def _install_dummy_langfuse(monkeypatch):
             return _CM()
 
     monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
+
+
+def _runner_result(task: LCATask, predicted_files: list[str]) -> LocalizationRunResult:
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(predicted_files=predicted_files),
+        source="runner",
+    )
 
 
 def _task(repo: str | None = None) -> LCATask:
@@ -77,7 +86,7 @@ def _eval_result(task: LCATask) -> LocalizationEvaluationResult:
             LocalizationEvaluationTaskResult(
                 task=task,
                 score_bundle=bundle,
-                prediction=["a.py"],
+                prediction=LocalizationPrediction(predicted_files=["a.py"]),
                 evidence=None,
                 materialization=None,
                 trace_id=None,
@@ -97,7 +106,7 @@ def test_resolve_and_bundle_roundtrip(tmp_path):
     snap = baselines.compute_baseline_for_task(
         task,
         dataset_version="v1",
-        runner=lambda *_: (["a.py"], {"source": "runner"}),
+        runner=lambda task, *_: _runner_result(task, ["a.py"]),
     )
     bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="v1")
     path = tmp_path / "bundle.json"

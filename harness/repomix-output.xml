@@ -88,10 +88,14 @@ localization/
   telemetry.py
 orchestration/
   __init__.py
+  dependencies.py
+  evaluation.py
+  feedback.py
   listeners.py
   machine.py
   runtime.py
   types.py
+  writer.py
 pipeline/
   __init__.py
   pipeline.py
@@ -144,6 +148,7 @@ tests_harness/
   conftest.py
   test_backend_adapters.py
   test_baselines.py
+  test_canonical_lca_task_model.py
   test_cerebras_pricing.py
   test_cli_guardrails.py
   test_datasets.py
@@ -162,6 +167,8 @@ tests_harness/
   test_loop_viz.py
   test_model_strictness.py
   test_observability.py
+  test_orchestration_dependencies.py
+  test_orchestration_flow_modules.py
   test_pipeline_models.py
   test_pipeline_steps_scope.py
   test_pipeline_warning_semantics.py
@@ -213,16 +220,18 @@ This section contains the contents of the repository's files.
 </file>
 
 <file path="agents/common.py">
-from __future__ import annotations
-
 """
 Shared agent utilities that are reused by runner and writer agents.
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
+
+from harness.localization.models import LCATask
 
 
 class UsageEntry(BaseModel):
@@ -309,43 +318,21 @@ def usage_from_response(resp: Any) -> UsageEnvelope | None:
     )
 
 
-__all__ = ["usage_from_response"]
+def serialize_lca_task_for_prompt(task: LCATask) -> dict[str, object]:
+    """
+    Convert the canonical internal task into the localizer prompt transport payload.
+    Gold labels stay out of the prompt payload.
+    """
+    if not task.repo:
+        raise ValueError("LCATask.repo is required for localizer prompt serialization")
+    return {
+        "identity": task.identity.model_dump(),
+        "repo": task.repo,
+        "context": task.context.model_dump(),
+    }
 
 
-class AgentTaskPayload(BaseModel):
-    """Validated agent task payload for runner agents."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    identity: dict[str, object]
-    repo: str
-    context: dict[str, object]
-    extra: dict[str, object] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_blocks(cls, value: object) -> object:
-        if isinstance(value, Mapping):
-            identity_val = value.get("identity")
-            context_val = value.get("context")
-
-            def _maybe_dump(obj: object) -> object:
-                model_dump = getattr(obj, "model_dump", None)
-                if callable(model_dump):
-                    try:
-                        return model_dump()
-                    except Exception:
-                        return obj
-                return obj
-
-            normalized_identity = _maybe_dump(identity_val)
-            normalized_context = _maybe_dump(context_val)
-            return {
-                **value,
-                "identity": normalized_identity,
-                "context": normalized_context,
-            }
-        return value
+__all__ = ["serialize_lca_task_for_prompt", "usage_from_response"]
 </file>
 
 <file path="agents/localizer.py">
@@ -374,11 +361,10 @@ from harness.backends.jc import JCodeMunchBackend
 from harness.backends.mcp import serialize_tool_result_for_model
 from harness.utils.env import get_cerebras_api_key, get_runner_model, getenv
 from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import LCATask, LocalizationPrediction, LocalizationRunResult
 
-from harness.agents.common import AgentTaskPayload, usage_from_response
+from harness.agents.common import serialize_lca_task_for_prompt, usage_from_response
 
 _MAX_TOTAL_MESSAGE_CHARS = 24000
 _MAX_TOOL_CONTENT_CHARS = 4000
@@ -391,68 +377,6 @@ _AGGRESSIVE_SYSTEM_CHARS = 1500
 _AGGRESSIVE_USER_CHARS = 1500
 
 _LOGGER = logging.getLogger(__name__)
-
-
-class AgentTask(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    identity: LCATaskIdentity
-    repo: str
-    context: LCAContext
-    extra: dict[str, object] = Field(default_factory=dict)
-
-    def to_payload(self) -> dict[str, object]:
-        payload_model = AgentTaskPayload(
-            identity=self.identity.model_dump(),
-            repo=self.repo,
-            context=self.context.model_dump(),
-            extra=self.extra,
-        )
-        return payload_model.model_dump()
-
-
-class LocalizationRunnerResult(BaseModel):
-    """Typed localization runner output boundary."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    predicted_files: list[str] = Field(default_factory=list)
-    reasoning: str | None = None
-    observations: list[dict[str, object]] = Field(default_factory=list)
-    node_count: int | None = None
-    raw: dict[str, object] | None = None
-    source: str | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize(cls, value: object) -> object:
-        if isinstance(value, Mapping):
-            files_raw = value.get("predicted_files", [])
-            normalized: list[str] = []
-            seen: set[str] = set()
-            if isinstance(files_raw, list):
-                for item in files_raw:
-                    if not isinstance(item, str):
-                        continue
-                    cleaned = item.strip().lower()
-                    if cleaned and cleaned not in seen:
-                        seen.add(cleaned)
-                        normalized.append(cleaned)
-            elif isinstance(files_raw, str):
-                for part in files_raw.replace("\n", ",").split(","):
-                    cleaned = part.strip().lower()
-                    if cleaned and cleaned not in seen:
-                        seen.add(cleaned)
-                        normalized.append(cleaned)
-            return {**value, "predicted_files": normalized}
-        return value
-
-
-def _require_str(mapping: dict[str, Any], key: str) -> str:
-    value = mapping.get(key)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"task must include a non-empty string for '{key}'")
-    return value
 
 
 def _require_parent(parent: object | None, owner: str = "runner agent") -> object:
@@ -468,6 +392,32 @@ def _safe_update(span: object | None, **kwargs: object) -> None:
             updater(**kwargs)
         except Exception:
             pass
+
+
+def _prediction_from_output(
+    predicted_files: object,
+    reasoning: object = None,
+) -> LocalizationPrediction:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    candidates: list[object]
+    if isinstance(predicted_files, str):
+        candidates = list(predicted_files.replace("\n", ",").split(","))
+    elif isinstance(predicted_files, list):
+        candidates = predicted_files
+    else:
+        candidates = []
+    for item in candidates:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip().lower()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            normalized.append(cleaned)
+    return LocalizationPrediction(
+        predicted_files=normalized,
+        reasoning=reasoning if isinstance(reasoning, str) else None,
+    )
 
 
 def _sanitize_agent_task(agent_task: Mapping[str, object]) -> dict[str, object]:
@@ -1313,11 +1263,12 @@ def _format_finalization_messages(agent_task: dict[str, object], observations: l
 
 
 def _finalize_localization(
-    agent_task: dict[str, object],
+    task: LCATask,
     observations: list[dict[str, object]],
     parent_trace: object | None = None,
-) -> LocalizationRunnerResult:
+) -> LocalizationRunResult:
     client, model = _make_client()
+    agent_task = serialize_lca_task_for_prompt(task)
     repo_value = agent_task.get("repo") if isinstance(agent_task, Mapping) else None
     repo_root = repo_value if isinstance(repo_value, str) else None
     prepared_observations = _clean_observations_for_finalization(observations, repo_root)
@@ -1352,10 +1303,13 @@ def _finalize_localization(
         else:
             raise RuntimeError("Structured output missing content")
         obs.update(output=_truncate_for_metadata(parsed))
-        result = LocalizationRunnerResult.model_validate(
+        result = LocalizationRunResult.model_validate(
             {
-                "predicted_files": parsed.get("predicted_files", []),
-                "reasoning": parsed.get("reasoning"),
+                "task": task,
+                "prediction": _prediction_from_output(
+                    parsed.get("predicted_files", []),
+                    parsed.get("reasoning"),
+                ),
                 "observations": prepared_observations or observations,
                 "raw": {
                     "final": parsed,
@@ -1369,19 +1323,20 @@ def _finalize_localization(
 
 def _fallback_localization_result(
     *,
+    task: LCATask,
     normalized: Mapping[str, object],
     observations: list[dict[str, object]],
     node_count: int | None,
     repo_root: str | None,
     error: object,
-) -> LocalizationRunnerResult:
+) -> LocalizationRunResult:
     predicted_files, reasoning, diagnostics = _extract_localization_prediction(
         normalized,
         repo_root=repo_root,
     )
-    return LocalizationRunnerResult(
-        predicted_files=predicted_files,
-        reasoning=reasoning,
+    return LocalizationRunResult(
+        task=task,
+        prediction=_prediction_from_output(predicted_files, reasoning),
         observations=observations,
         node_count=node_count,
         raw={
@@ -1395,27 +1350,31 @@ def _fallback_localization_result(
 
 def _finalize_or_recover(
     *,
-    agent_task: dict[str, object],
+    task: LCATask,
     observations: list[dict[str, object]],
     normalized: Mapping[str, object],
     node_count: int | None,
     parent_span: object,
-) -> LocalizationRunnerResult:
+) -> LocalizationRunResult:
     try:
-        final = _finalize_localization(agent_task, observations, parent_trace=parent_span)
+        final = _finalize_localization(task, observations, parent_trace=parent_span)
     except Exception as exc:  # noqa: BLE001
+        agent_task = serialize_lca_task_for_prompt(task)
         repo_value = agent_task.get("repo")
         return _fallback_localization_result(
+            task=task,
             normalized=normalized,
             observations=observations,
             node_count=node_count,
             repo_root=repo_value if isinstance(repo_value, str) else None,
             error=exc,
         )
-    if final.predicted_files:
+    if final.prediction.predicted_files:
         return final
+    agent_task = serialize_lca_task_for_prompt(task)
     repo_value = agent_task.get("repo")
     return _fallback_localization_result(
+        task=task,
         normalized=normalized,
         observations=observations,
         node_count=node_count,
@@ -1426,15 +1385,17 @@ def _finalize_or_recover(
 
 def _runner_error_result(
     *,
+    task: LCATask,
     normalized: Mapping[str, object],
     observations: list[dict[str, object]],
     node_count: int | None,
-) -> LocalizationRunnerResult | None:
+) -> LocalizationRunResult | None:
     error = normalized.get("error")
     if not error or observations:
         return None
-    return LocalizationRunnerResult(
-        predicted_files=[],
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(predicted_files=[]),
         observations=[],
         node_count=node_count,
         raw={
@@ -1449,33 +1410,24 @@ def _runner_error_result(
 
 
 def run_ic_iteration(
-    task: dict[str, object],
+    task: LCATask,
     score_fn: Callable[..., float] | None = None,
     steps: int = 5,
     parent_trace: object | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner="iterative_context")
-    repo = _require_str(task, "repo")
-    identity = LCATaskIdentity.model_validate(task.get("identity") or {})
-    context = LCAContext.model_validate(task.get("context") or {})
-    try:
-        agent_task_model = AgentTask(
-            identity=identity,
-            repo=repo,
-            context=context,
-            extra={k: v for k, v in task.items() if k not in {"identity", "context", "repo", "changed_files"}},
-        )
-    except ValidationError as exc:
-        raise RuntimeError(f"Invalid agent task: {exc}") from exc
-    agent_task = agent_task_model.to_payload()
+    if not task.repo:
+        raise ValueError("LCATask.repo is required for iterative_context execution")
+    repo = task.repo
+    agent_task = serialize_lca_task_for_prompt(task)
 
     backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
     tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
     system_prompt = build_ic_system_prompt(tool_specs)
     with start_observation(
-        name="iterative_context",
-        parent=parent_span,
-        metadata={"backend": "iterative_context", "repo": repo, "identity": identity.task_id()},
+            name="iterative_context",
+            parent=parent_span,
+            metadata={"backend": "iterative_context", "repo": repo, "identity": task.identity.task_id()},
     ) as backend_obs:
         try:
             raw = run_agent(
@@ -1523,13 +1475,14 @@ def run_ic_iteration(
         backend_obs.update(metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
 
     final = _runner_error_result(
+        task=task,
         normalized=normalized,
         observations=observations,
         node_count=node_count_val if node_count_val is not None else normalized_node_count,
     )
     if final is None:
         final = _finalize_or_recover(
-            agent_task=agent_task,
+            task=task,
             observations=observations,
             normalized=normalized,
             node_count=node_count_val if node_count_val is not None else normalized_node_count,
@@ -1539,45 +1492,35 @@ def run_ic_iteration(
         final.observations = observations
     if final.node_count is None:
         final.node_count = node_count_val if node_count_val is not None else normalized_node_count
-    result_dict = final.model_dump()
     full_graph = normalized.get("full_graph")
     if full_graph is not None:
-        result_dict["full_graph"] = full_graph
-        if result_dict.get("node_count") in (None, 0) and isinstance(full_graph, Mapping):
+        final.full_graph = full_graph
+        if final.node_count in (None, 0) and isinstance(full_graph, Mapping):
             nodes = full_graph.get("nodes")
             if isinstance(nodes, list):
-                result_dict["node_count"] = len(nodes)
-    result_dict["backend"] = "ic"
-    return result_dict
+                final.node_count = len(nodes)
+    final.backend = "ic"
+    return final
 
 
 def run_jc_iteration(
-    task: dict[str, object],
+    task: LCATask,
     steps: int = 5,
     parent_trace: object | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner="jcodemunch")
-    repo = _require_str(task, "repo")
-    identity = LCATaskIdentity.model_validate(task.get("identity") or {})
-    context = LCAContext.model_validate(task.get("context") or {})
-    try:
-        agent_task_model = AgentTask(
-            identity=identity,
-            repo=repo,
-            context=context,
-            extra={k: v for k, v in task.items() if k not in {"identity", "context", "repo", "changed_files"}},
-        )
-    except ValidationError as exc:
-        raise RuntimeError(f"Invalid agent task: {exc}") from exc
-    agent_task = agent_task_model.to_payload()
+    if not task.repo:
+        raise ValueError("LCATask.repo is required for jcodemunch execution")
+    repo = task.repo
+    agent_task = serialize_lca_task_for_prompt(task)
 
     backend = JCodeMunchBackend(repo=repo)
     tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
     system_prompt = build_jc_system_prompt(tool_specs)
     with start_observation(
-        name="jcodemunch",
-        parent=parent_span,
-        metadata={"backend": "jcodemunch", "repo": repo, "identity": identity.task_id()},
+            name="jcodemunch",
+            parent=parent_span,
+            metadata={"backend": "jcodemunch", "repo": repo, "identity": task.identity.task_id()},
     ) as backend_obs:
         try:
             raw = run_agent(
@@ -1609,13 +1552,14 @@ def run_jc_iteration(
         backend_obs.update(metadata={"node_count": node_count_val or 0})
 
     final = _runner_error_result(
+        task=task,
         normalized=normalized,
         observations=observations,
         node_count=node_count_val,
     )
     if final is None:
         final = _finalize_or_recover(
-            agent_task=agent_task,
+            task=task,
             observations=observations,
             normalized=normalized,
             node_count=node_count_val,
@@ -1625,9 +1569,8 @@ def run_jc_iteration(
         final.observations = observations
     if final.node_count is None:
         final.node_count = node_count_val
-    result_dict = final.model_dump()
-    result_dict["backend"] = "jc"
-    return result_dict
+    final.backend = "jc"
+    return final
 
 
 __all__ = [
@@ -1635,6 +1578,8 @@ __all__ = [
     "run_jc_iteration",
     "run_agent",
     "run_agent_with_retry",
+    "LocalizationPrediction",
+    "LocalizationRunResult",
 ]
 </file>
 
@@ -2496,7 +2441,7 @@ import sys
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Any, Iterable, Iterator, Mapping, Sequence
+from typing import IO, Any, Iterable, Iterator, Sequence
 
 try:
     import termios  # type: ignore
@@ -2617,7 +2562,7 @@ def _raw_mode(file_obj: IO[Any]) -> Iterator[None]:
 
 
 def evaluate_localization_batch(
-    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
+    tasks: Sequence[LCATask],
     *,
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
@@ -2708,17 +2653,6 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def _print_mat_summary(prefix: str, identity: Any, materialization: Any) -> None:
     if materialization:
         print(f"[MAT] {prefix} {identity}: {materialization.summary()}")
-
-
-def _fmt_identity(identity: Any) -> str:
-    if isinstance(identity, dict):
-        return str(
-            identity.get("id")
-            or identity.get("task_id")
-            or identity.get("repo")
-            or identity
-        )
-    return str(identity)
 
 
 def _coerce_int(value: object, default: int = 0) -> int:
@@ -3143,7 +3077,7 @@ def main(argv: list[str] | None = None) -> None:
             for item in results.items:
                 _print_mat_summary(
                     "experiment",
-                    _fmt_identity(item.task.get("identity")),
+                    item.task.task_id,
                     item.materialization,
                 )
     except HFDatasetLoadError as exc:
@@ -3601,18 +3535,23 @@ def describe_repo_mapping(request: RepoMaterializationRequest) -> str:
 <file path="localization/runtime/evaluate.py">
 from __future__ import annotations
 
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
-from harness.localization.models import LCATask, LocalizationEvidence, normalize_lca_task
+from harness.localization.models import (
+    LCATask,
+    LocalizationEvidence,
+    LocalizationPrediction,
+    LocalizationRunResult,
+)
 from harness.localization.runtime.execute import run_localization_task
 from harness.scoring import BatchScoreSummary, ScoreBundle, summarize_batch_scores
 from harness.scoring.token_usage import TokenUsageRecord
 
-LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]]
+LocalizationRunner = Callable[[LCATask, str, object | None], LocalizationRunResult]
 
 # Allows tests or callers to inject a deterministic runner without touching core wiring.
 DEFAULT_LOCALIZATION_RUNNER: LocalizationRunner | None = None
@@ -3635,7 +3574,7 @@ class LocalizationEvaluationTaskResult(BaseModel):
 
     task: LCATask
     score_bundle: ScoreBundle
-    prediction: list[str] = Field(default_factory=list)
+    prediction: LocalizationPrediction
     evidence: LocalizationEvidence | None = None
     materialization: RepoMaterializationResult | None = None
     trace_id: str | None = None
@@ -3651,8 +3590,16 @@ class LocalizationEvaluationResult(BaseModel):
     failure: LocalizationEvaluationFailure | None = None
 
 
+def prediction_filenames(prediction: LocalizationPrediction) -> list[str]:
+    """
+    Explicit boundary for consumers that expose only filenames outside the
+    semantic prediction stage.
+    """
+    return list(prediction.predicted_files)
+
+
 def evaluate_localization_batch(
-    tasks: Sequence[LCATask | Mapping[str, object]],
+    tasks: Sequence[LCATask],
     *,
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
@@ -3663,10 +3610,9 @@ def evaluate_localization_batch(
     Shared localization evaluation backend used by the optimization/repair machine and hosted wrappers.
     Executes each task via run_localization_task, aggregates score bundles, and returns typed results/failures.
     """
-    normalized_tasks = [t if isinstance(t, LCATask) else normalize_lca_task(t) for t in tasks]
     resolved_runner = runner or DEFAULT_LOCALIZATION_RUNNER
     task_results: list[LocalizationEvaluationTaskResult] = []
-    for task in normalized_tasks:
+    for task in tasks:
         try:
             run_result = run_localization_task(
                 task,
@@ -3683,7 +3629,7 @@ def evaluate_localization_batch(
                 LocalizationEvaluationTaskResult(
                     task=task,
                     score_bundle=score_bundle,
-                    prediction=list(prediction.predicted_files),
+                    prediction=prediction,
                     evidence=evidence,
                     materialization=materialization,
                     trace_id=getattr(parent_trace, "id", None),
@@ -3733,9 +3679,10 @@ from harness.localization.materialization.materialize import (
     RepoMaterializer,
 )
 from harness.localization.models import (
-    LCAPrediction,
     LCATask,
     LocalizationEvidence,
+    LocalizationPrediction,
+    LocalizationRunResult,
 )
 from harness.scoring import ScoreBundle, ScoreEngine, summarize_task_score
 from harness.localization.telemetry import build_localization_telemetry
@@ -3804,38 +3751,37 @@ def _run_runner(
     repo_path: Path,
     trace: object | None,
     runner: Callable[
-        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+        [LCATask, str, object | None], LocalizationRunResult
     ]
     | None,
-) -> tuple[list[str], Mapping[str, object] | None]:
+) -> LocalizationRunResult:
     runner_fn = runner or _default_runner
     try:
-        predicted_files, runner_result = runner_fn(task, str(repo_path), trace)
+        runner_result = runner_fn(task, str(repo_path), trace)
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
         raise LocalizationEvaluationError(
             LocalizationFailureCategory.RUNNER, str(exc), task_id=task.task_id
         ) from exc
-    if not predicted_files:
+    if not runner_result.prediction.predicted_files:
         raise LocalizationEvaluationError(
             LocalizationFailureCategory.RUNNER,
             "Localization runner produced no predicted_files",
             task_id=task.task_id,
         )
-    result_map = runner_result if isinstance(runner_result, Mapping) else None
-    return predicted_files, result_map
+    return runner_result
 
 
-def _score_prefix_from_runner_result(runner_result: Mapping[str, object] | None) -> str:
+def _score_prefix_from_runner_result(runner_result: LocalizationRunResult | None) -> str:
     if runner_result is None:
         return "localization"
-    backend = runner_result.get("backend")
+    backend = runner_result.backend
     if backend in {"ic", "iterative_context"}:
         return "ic"
     if backend in {"jc", "jcodemunch"}:
         return "jc"
-    source = runner_result.get("source")
+    source = runner_result.source
     if source in {"ic", "iterative_context"}:
         return "ic"
     if source in {"jc", "jcodemunch"}:
@@ -3845,28 +3791,19 @@ def _score_prefix_from_runner_result(runner_result: Mapping[str, object] | None)
 
 def _default_runner(
     lca_task: LCATask, repo_path: str, parent: object | None
-) -> tuple[list[str], Mapping[str, object] | None]:
+) -> LocalizationRunResult:
     from harness.agents.localizer import run_ic_iteration as run_ic_iteration_fn
-    result = run_ic_iteration_fn(
-        {
-            "identity": lca_task.identity.model_dump(),
-            "context": lca_task.context.model_dump(),
-            "repo": repo_path,
-        },
-        score_fn=None,
-        steps=5,
-        parent_trace=parent,
-    )
-    if not isinstance(result, Mapping):
+    result = run_ic_iteration_fn(lca_task.with_repo(repo_path), score_fn=None, steps=5, parent_trace=parent)
+    if not isinstance(result, LocalizationRunResult):
         raise RuntimeError("Localization runner returned an invalid result")
-    predicted = result.get("predicted_files")
+    predicted = result.prediction.predicted_files
     if not isinstance(predicted, list):
         raise RuntimeError("Localization runner produced no predicted_files")
     predictions = [p for p in predicted if isinstance(p, str) and p.strip()]
     if not predictions:
-        source = result.get("source")
+        source = result.source
         if source == "runner_error":
-            raw = result.get("raw")
+            raw = result.raw
             error = raw.get("error") if isinstance(raw, Mapping) else None
             detail = f": {error}" if isinstance(error, str) and error else ""
             raise RuntimeError(
@@ -3880,11 +3817,11 @@ def _default_runner(
         raise RuntimeError(
             f"Localization runner produced an empty predicted_files list{detail}"
         )
-    return predictions, result
+    return result
 
 
 def _score_task(
-    task: LCATask, prediction: LCAPrediction, repo_path: Path, token_usage: TokenUsageRecord | None = None
+    task: LCATask, prediction: LocalizationPrediction, repo_path: Path, token_usage: TokenUsageRecord | None = None
 ) -> ScoreBundle:
     try:
         anchor_text = "\n".join([task.context.issue_title or "", task.context.issue_body or ""]).strip()
@@ -3966,11 +3903,11 @@ def run_localization_task(
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: Callable[
-        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+        [LCATask, str, object | None], LocalizationRunResult
     ]
     | None = None,
 ) -> Tuple[
-    LCAPrediction,
+    LocalizationPrediction,
     ScoreBundle,
     LocalizationEvidence | None,
     RepoMaterializationResult | None,
@@ -4007,10 +3944,10 @@ def run_localization_task(
                 task_id=task.task_id,
             ) from exc
         repo_path = _resolve_repo_path(task, materialization_result)
-        predicted_files, runner_result = _run_runner(task, repo_path, trace, runner)
-        prediction = LCAPrediction(predicted_files=predicted_files)
+        runner_result = _run_runner(task, repo_path, trace, runner)
+        prediction = runner_result.prediction
         usage = extract_token_usage_record(
-            runner_result if isinstance(runner_result, Mapping) else None,
+            runner_result.model_dump(),
             source="runner",
         )
         score_bundle = _score_task(task, prediction, repo_path, usage)
@@ -4036,7 +3973,6 @@ from typing import Iterable, List, Mapping, Optional, cast
 
 from harness.localization.models import (
     LCAGold,
-    LCAPrediction,
     LCATaskIdentity,
     LocalizationDatasetInfo,
     LocalizationEvalRecord,
@@ -4061,7 +3997,7 @@ def _coerce_paths(value: Iterable[object]) -> List[str]:
     return canonicalize_paths(coerced)
 
 
-def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> List[str]:
+def _normalize_prediction(prediction: LocalizationPrediction | Mapping[str, object]) -> List[str]:
     if isinstance(prediction, Mapping):
         predicted_files_raw = prediction.get("predicted_files", [])
         return _coerce_paths(cast(Iterable[object], predicted_files_raw))
@@ -4077,7 +4013,7 @@ def _normalize_gold(gold: LCAGold | Mapping[str, object]) -> List[str]:
 
 def build_localization_score_eval_record(
     identity: LCATaskIdentity,
-    prediction: LCAPrediction | Mapping[str, object],
+    prediction: LocalizationPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
     score_context: ScoreContext,
     score_bundle: ScoreBundle,
@@ -4886,7 +4822,14 @@ def debug_summary(store: GraphStore) -> dict[str, int]:
 <file path="localization/__init__.py">
 # pyright: reportUnusedImport=false
 
-from .models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
+from .models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+    LocalizationRunResult,
+)
 from .scoring import build_localization_score_context, score_localization
 from .runtime.records import localization_eval_identity
 from .materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer
@@ -4896,9 +4839,10 @@ from . import static_graph
 __all__ = [
     "LCAContext",
     "LCAGold",
-    "LCAPrediction",
     "LCATask",
     "LCATaskIdentity",
+    "LocalizationPrediction",
+    "LocalizationRunResult",
     "RepoMaterializationRequest",
     "RepoMaterializationResult",
     "RepoMaterializer",
@@ -5047,22 +4991,38 @@ class LCAGold(BaseModel):
         return _normalize_path_list(self.changed_files)
 
 
-class LCAPrediction(BaseModel):
+class LocalizationPrediction(BaseModel):
     """
-    Canonical prediction: file paths only (no rank/confidence/score).
+    Canonical semantic localization prediction.
+
+    Execution metadata belongs in the runner result envelope, not here.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     predicted_files: List[str]
+    reasoning: Optional[str] = None
+    evidence: Optional["LocalizationEvidence"] = None
 
     def normalized_predicted_files(self) -> List[str]:
         return _normalize_path_list(self.predicted_files)
 
+    @classmethod
+    def from_raw(cls, value: Sequence[str] | Mapping[str, object]) -> "LocalizationPrediction":
+        if isinstance(value, Mapping):
+            files = value.get("predicted_files", [])
+            if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
+                return cls(predicted_files=[str(f) for f in files])
+            return cls(predicted_files=[])
+        return cls(predicted_files=[str(v) for v in value])
+
 
 class LCATask(BaseModel):
     """
-    LCA bug-localization task model grouping identity, runtime context, gold, and optional diagnostics.
+    Canonical internal LCA bug-localization task model.
+
+    Runtime, orchestration, evaluation, scoring, and agent execution should pass
+    this model internally. Dict/json payloads are transport edge concerns.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -5096,6 +5056,32 @@ class LCATask(BaseModel):
         """
         return self.gold.normalized_changed_files()
 
+    def with_repo(self, repo: str) -> "LCATask":
+        """
+        Return this task with a concrete repository path or backend repo id.
+        """
+        return self.model_copy(update={"repo": repo})
+
+
+class LocalizationRunResult(BaseModel):
+    """
+    Execution envelope for one localization runner invocation.
+
+    Semantic output is carried only in `prediction`; runtime artifacts stay on
+    this envelope.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: LCATask
+    prediction: LocalizationPrediction
+    observations: List[dict[str, object]] = Field(default_factory=list)
+    node_count: Optional[int] = None
+    raw: Optional[dict[str, object]] = None
+    source: Optional[str] = None
+    backend: Optional[str] = None
+    full_graph: Optional[object] = None
+
 
 class LocalizationDatasetInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -5115,21 +5101,6 @@ class LocalizationRepoInfo(BaseModel):
     pull_url: Optional[str] = None
     language: Optional[str] = None
     license: Optional[str] = None
-
-
-class LocalizationPrediction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    predicted_files: List[str]
-
-    @classmethod
-    def from_raw(cls, value: Sequence[str] | Mapping[str, object]) -> "LocalizationPrediction":
-        if isinstance(value, Mapping):
-            files = value.get("predicted_files", [])
-            if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
-                return cls(predicted_files=[str(f) for f in files])
-            return cls(predicted_files=[])
-        return cls(predicted_files=[str(v) for v in value])
 
 
 class LocalizationGold(BaseModel):
@@ -5376,7 +5347,7 @@ def normalize_lca_task(data: Mapping[str, object] | LCATask, defaults: tuple[str
 </file>
 
 <file path="localization/scoring.py">
-"""Localization adapter that derives score context and delegates to scoring."""
+"""Localization scoring helpers that derive score context and delegate to scoring."""
 
 from __future__ import annotations
 
@@ -5386,7 +5357,7 @@ from typing import Iterable, Mapping, cast
 from harness.scoring import ScoreBundle, ScoreConfig, ScoreContext, ScoreEngine
 from harness.scoring.token_usage import TokenUsageRecord
 
-from .models import LCAGold, LCAPrediction, canonicalize_paths
+from .models import LCAGold, LocalizationPrediction, canonicalize_paths
 from .static_graph import (
     GraphStore,
     compute_hop_distance_summary,
@@ -5398,7 +5369,7 @@ from .static_graph import (
 from .static_graph.store import debug_summary
 
 
-def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> tuple[str, ...]:
+def _normalize_prediction(prediction: LocalizationPrediction | Mapping[str, object]) -> tuple[str, ...]:
     if isinstance(prediction, Mapping):
         predicted_files_raw = prediction.get("predicted_files", [])
         return tuple(canonicalize_paths([str(p) for p in cast(Iterable[object], predicted_files_raw)]))
@@ -5447,7 +5418,7 @@ def _derive_token_count(token_usage: TokenUsageRecord | None) -> float | None:
 
 def build_localization_score_context(
     *,
-    prediction: LCAPrediction | Mapping[str, object],
+    prediction: LocalizationPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
     repo_path: Path,
     anchor_text: str,
@@ -5526,7 +5497,7 @@ def build_localization_score_context(
 
 def score_localization(
     *,
-    prediction: LCAPrediction | Mapping[str, object],
+    prediction: LocalizationPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
     repo_path: Path,
     anchor_text: str,
@@ -5612,6 +5583,7 @@ def build_localization_telemetry(
 
 <file path="orchestration/__init__.py">
 """Orchestration: state machines, listeners, and runtime coordination."""
+# pyright: reportImportCycles=false
 
 from .runtime import (  # pyright: ignore[reportPrivateUsage,reportUnusedImport]
     _clean_policy_code,  # pyright: ignore[reportPrivateUsage]
@@ -5645,7 +5617,6 @@ from .types import (
     RepairMachineModel,
     RepairOutcome,
     RunMetadata,
-    TaskPayload,
     iteration_record_to_public_dict,
 )
 
@@ -5656,6 +5627,7 @@ __all__ = [
     "_read_policy",
     "_write_policy",
     "_clean_policy_code",
+    "_hash_tests_dir",
     "index_folder",
     "emit_score",
     "load_frontier_policy",
@@ -5679,18 +5651,658 @@ __all__ = [
     "RepairMachineModel",
     "RepairOutcome",
     "RunMetadata",
-    "TaskPayload",
     "iteration_record_to_public_dict",
 ]
 </file>
 
-<file path="orchestration/listeners.py">
+<file path="orchestration/dependencies.py">
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Protocol
+
+from harness.localization.materialization.materialize import RepoMaterializer
+from harness.localization.models import LCATask
+from harness.localization.runtime.evaluate import (
+    LocalizationEvaluationResult,
+    LocalizationRunner,
+)
+from harness.pipeline.types import PipelineClassification, StepResult
+from harness.prompts import WriterOptimizationBrief
+from harness.utils.diff import DiffSummary
+from harness.utils.type_loader import FrontierContext
+from .types import (
+    AcceptedPolicyMeta,
+    AttemptPolicyGeneration,
+    BuildIterationFeedback,
+    EvaluatePolicyOnItem,
+    FailedRepairDetails,
+    LoopDependencies,
+    PreparedTasks,
+    SpanHandle,
+    StartObservation,
+    SupportsPipelineRun,
+    format_failure_context_payload,
+)
+
+
+IndexFolder = Callable[[str], Mapping[str, object]]
+ReadPolicy = Callable[[], str]
+WritePolicy = Callable[[str], None]
+GetWriterModel = Callable[[], str | None]
+FindRepoRoot = Callable[[], Path]
+PipelineFactory = Callable[[], SupportsPipelineRun]
+ClassifyResults = Callable[[list[StepResult]], PipelineClassification]
+TestSpecs = list[tuple[str, str]]
+LoadTests = Callable[[Path], TestSpecs]
+FormatTestsForPrompt = Callable[[TestSpecs], str]
+BuildFrontierContext = Callable[[Path], FrontierContext]
+FormatFrontierContext = Callable[[FrontierContext], str]
+FormatDiff = Callable[[DiffSummary], str]
+InterpretDiff = Callable[[DiffSummary], str]
+
+
+class EvaluateLocalizationBatch(Protocol):
+    def __call__(
+        self,
+        tasks: Sequence[LCATask],
+        *,
+        dataset_source: str | None = None,
+        materializer: RepoMaterializer | None = None,
+        parent_trace: object | None = None,
+        runner: LocalizationRunner | None = None,
+    ) -> LocalizationEvaluationResult: ...
+
+
+class PolicyGenerator(Protocol):
+    def __call__(
+        self,
+        current_policy: str,
+        tests: str,
+        frontier_context: str,
+        frontier_context_details: FrontierContext,
+        optimization_brief: WriterOptimizationBrief,
+        feedback: dict[str, object] | None = None,
+        parent_trace: object | None = None,
+        failure_context: str | None = None,
+        repair_attempt: int = 0,
+    ) -> str: ...
+
+
+class EmitScore(Protocol):
+    def __call__(
+        self,
+        *,
+        name: str,
+        value: float | int | bool | str,
+        data_type: str | None = None,
+        trace_id: str | None = None,
+        observation_id: str | None = None,
+        session_id: str | None = None,
+        config_id: str | None = None,
+        comment: str | None = None,
+        score_id: str | None = None,
+    ) -> None: ...
+
+
+class ComputeRawDiff(Protocol):
+    def __call__(
+        self,
+        prev_score: float,
+        curr_score: float,
+        prev_classified: object,
+        curr_classified: object,
+    ) -> DiffSummary: ...
+
+
+@dataclass(frozen=True)
+class RuntimeCollaborators:
+    index_folder: IndexFolder
+    evaluate_localization_batch: EvaluateLocalizationBatch
+    load_tests: LoadTests
+    format_tests_for_prompt: FormatTestsForPrompt
+    build_frontier_context: BuildFrontierContext
+    format_frontier_context: FormatFrontierContext
+    compute_diff: ComputeRawDiff
+    format_diff: FormatDiff
+    interpret_diff: InterpretDiff
+    generate_policy: PolicyGenerator
+    emit_score: EmitScore
+    classify_results: ClassifyResults
+    read_policy: ReadPolicy
+    write_policy: WritePolicy
+    get_writer_model: GetWriterModel
+    start_observation: StartObservation
+    find_repo_root: FindRepoRoot
+    default_pipeline: PipelineFactory
+
+
+def prepare_iteration_tasks(
+    task: LCATask,
+    parent_trace: SpanHandle | None,
+    *,
+    start_observation: StartObservation,
+    index_folder: IndexFolder,
+) -> PreparedTasks:
+    resolved_repo_path = task.repo
+    jc_repo_id: str | None = None
+    if isinstance(task.repo, str):
+        with start_observation(
+            name="index_repo",
+            parent=parent_trace,
+            metadata={"repo": task.repo},
+        ) as index_obs:
+            result = index_folder(task.repo)
+            repo_id = str(result.get("repo", ""))
+            jc_repo_id = repo_id
+            try:
+                index_obs.update(metadata={"repo": repo_id})
+            except Exception:
+                pass
+    if resolved_repo_path is None:
+        raise RuntimeError("Task missing repo")
+    return PreparedTasks(
+        task=task.with_repo(resolved_repo_path),
+        resolved_repo_path=resolved_repo_path,
+        jc_repo_id=jc_repo_id,
+    )
+
+
+def compute_pipeline_diff(
+    prev_score: float,
+    current_score: float,
+    prev_classified: PipelineClassification,
+    current_classified: PipelineClassification,
+    *,
+    compute_diff: ComputeRawDiff,
+) -> DiffSummary:
+    return compute_diff(
+        prev_score,
+        current_score,
+        prev_classified.model_dump(),
+        current_classified.model_dump(),
+    )
+
+
+def step_succeeded(step: StepResult) -> bool:
+    return step.exit_code == 0
+
+
+def first_failed_step(steps: list[StepResult]) -> StepResult | None:
+    for step in steps:
+        if not step_succeeded(step):
+            return step
+    return None
+
+
+def run_policy_pipeline(
+    pipeline: SupportsPipelineRun,
+    repo_root: Path,
+    repair_obs: SpanHandle | None = None,
+    allow_no_parent: bool = False,
+    *,
+    emit_score: EmitScore,
+) -> tuple[list[StepResult], bool]:
+    try:
+        raw_results = list(
+            pipeline.run(
+                repo_root,
+                observation=repair_obs,
+                allow_no_parent=allow_no_parent,
+            )
+        )
+    except TypeError:
+        raw_results = list(pipeline.run(repo_root, observation=repair_obs))
+    step_results = [
+        step if isinstance(step, StepResult) else StepResult.from_external(step)
+        for step in raw_results
+    ]
+    trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
+    observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
+    session_id_val = (
+        getattr(repair_obs, "session_id", None) if repair_obs is not None else None
+    )
+    if not any([trace_id, observation_id, session_id_val]):
+        return step_results, all(step_succeeded(result) for result in step_results)
+
+    for step in step_results:
+        score_id = (
+            f"{observation_id or trace_id}-pipeline.{step.name}.exit_code"
+            if (observation_id or trace_id)
+            else None
+        )
+        emit_score(
+            name=f"pipeline.{step.name}.exit_code",
+            value=step.exit_code,
+            data_type="NUMERIC",
+            trace_id=trace_id,
+            observation_id=observation_id,
+            session_id=session_id_val,
+            score_id=score_id,
+        )
+        pass_score_id = (
+            f"{observation_id or trace_id}-pipeline.{step.name}.passed"
+            if (observation_id or trace_id)
+            else None
+        )
+        emit_score(
+            name=f"pipeline.{step.name}.passed",
+            value=int(step.success),
+            data_type="BOOLEAN",
+            trace_id=trace_id,
+            observation_id=observation_id,
+            session_id=session_id_val,
+            score_id=pass_score_id,
+        )
+    return step_results, all(step_succeeded(result) for result in step_results)
+
+
+def finalize_successful_policy(
+    *,
+    new_code: str,
+    attempts_used: int,
+    max_repair_attempts: int,
+    repair_obs: object | None = None,
+    read_policy: ReadPolicy,
+) -> tuple[str, AcceptedPolicyMeta]:
+    del repair_obs
+    final_policy = read_policy()
+    meta = AcceptedPolicyMeta(
+        accepted_policy_source="post_pipeline_disk",
+        accepted_policy_changed_by_pipeline=final_policy != new_code,
+        repair_attempts=attempts_used - 1,
+        max_policy_repairs=max_repair_attempts,
+    )
+    return final_policy, meta
+
+
+def format_pipeline_failure_context(
+    pipeline_results: list[StepResult],
+    classified: PipelineClassification | None,
+    writer_error: str | None,
+    model_name: str | None,
+    repair_attempt: int,
+) -> str:
+    return format_failure_context_payload(
+        pipeline_results,
+        classified,
+        writer_error,
+        model_name,
+        repair_attempt,
+    )
+
+
+def finalize_failed_repair(
+    *,
+    pipeline_results: list[StepResult],
+    classified: PipelineClassification,
+    writer_model: str | None,
+    attempts_used: int,
+    writer_error: str | None,
+    read_policy: ReadPolicy,
+) -> FailedRepairDetails:
+    failed_step = first_failed_step(pipeline_results)
+    failed_summary = None
+    if failed_step:
+        stderr = failed_step.stderr
+        stdout = failed_step.stdout
+        text = stderr.strip() if stderr.strip() else stdout.strip()
+        failed_summary = text[:400] if text else None
+    failure_context = format_pipeline_failure_context(
+        pipeline_results,
+        classified,
+        writer_error,
+        writer_model,
+        attempts_used,
+    )
+    return FailedRepairDetails(
+        failure_context=failure_context,
+        policy_code=read_policy(),
+        failed_step=failed_step.name if failed_step else None,
+        failed_exit_code=failed_step.exit_code if failed_step else None,
+        failed_summary=failed_summary,
+        error="pipeline_failed",
+    )
+
+
+def build_loop_dependencies(
+    collaborators: RuntimeCollaborators,
+    *,
+    evaluate_policy_on_item: EvaluatePolicyOnItem,
+    build_iteration_feedback: BuildIterationFeedback,
+    attempt_policy_generation: AttemptPolicyGeneration,
+) -> LoopDependencies:
+    def prepare_tasks(task: LCATask, parent_trace: SpanHandle | None) -> PreparedTasks:
+        return prepare_iteration_tasks(
+            task,
+            parent_trace,
+            start_observation=collaborators.start_observation,
+            index_folder=collaborators.index_folder,
+        )
+
+    def run_pipeline(
+        pipeline: SupportsPipelineRun,
+        repo_root: Path,
+        repair_obs: SpanHandle | None = None,
+        allow_no_parent: bool = False,
+    ) -> tuple[list[StepResult], bool]:
+        return run_policy_pipeline(
+            pipeline,
+            repo_root,
+            repair_obs=repair_obs,
+            allow_no_parent=allow_no_parent,
+            emit_score=collaborators.emit_score,
+        )
+
+    def finalize_success(
+        *,
+        new_code: str,
+        attempts_used: int,
+        max_repair_attempts: int,
+        repair_obs: object | None = None,
+    ) -> tuple[str, AcceptedPolicyMeta]:
+        return finalize_successful_policy(
+            new_code=new_code,
+            attempts_used=attempts_used,
+            max_repair_attempts=max_repair_attempts,
+            repair_obs=repair_obs,
+            read_policy=collaborators.read_policy,
+        )
+
+    def finalize_failure(
+        *,
+        pipeline_results: list[StepResult],
+        classified: PipelineClassification,
+        writer_model: str | None,
+        attempts_used: int,
+        writer_error: str | None,
+    ) -> FailedRepairDetails:
+        return finalize_failed_repair(
+            pipeline_results=pipeline_results,
+            classified=classified,
+            writer_model=writer_model,
+            attempts_used=attempts_used,
+            writer_error=writer_error,
+            read_policy=collaborators.read_policy,
+        )
+
+    return LoopDependencies(
+        prepare_iteration_tasks=prepare_tasks,
+        evaluate_policy_on_item=evaluate_policy_on_item,
+        build_iteration_feedback=build_iteration_feedback,
+        attempt_policy_generation=attempt_policy_generation,
+        run_policy_pipeline=run_pipeline,
+        finalize_successful_policy=finalize_success,
+        finalize_failed_repair=finalize_failure,
+        classify_results=collaborators.classify_results,
+        format_pipeline_failure_context=format_pipeline_failure_context,
+        read_policy=collaborators.read_policy,
+        write_policy=collaborators.write_policy,
+        get_writer_model=collaborators.get_writer_model,
+        start_observation=collaborators.start_observation,
+        find_repo_root=collaborators.find_repo_root,
+        default_pipeline=collaborators.default_pipeline,
+    )
+</file>
+
+<file path="orchestration/evaluation.py">
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from harness.localization.models import LCATask
+from harness.localization.runtime.evaluate import (
+    evaluate_localization_batch,
+    prediction_filenames,
+)
+from harness.orchestration.types import (
+    EvaluationMetrics,
+    EvaluationResult,
+    ICResult,
+    JCResult,
+)
+from harness.prompts import WriterScoreSummary, build_writer_score_summary_from_bundle
+
+if TYPE_CHECKING:
+    from harness.telemetry.hosted.baselines import BaselineSnapshot
+
+
+_POLICY_PATH = Path(__file__).resolve().parent.parent / "policy" / "current.py"
+
+
+def _read_policy(path: Path = _POLICY_PATH) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _failure_evaluation_result(error: str) -> EvaluationResult:
+    failure_metrics: dict[str, float | int | bool | None] = {
+        "score": -10.0,
+        "iteration_regression": False,
+    }
+    return EvaluationResult(
+        metrics=EvaluationMetrics.model_validate(failure_metrics),
+        ic_result=ICResult(entries=[]),
+        jc_result=JCResult(entries=[]),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary=None,
+        policy_code="",
+        success=False,
+        error=error,
+        score_summary=WriterScoreSummary(
+            primary_name="composed_score",
+            primary_score=-10.0,
+            composed_score=-10.0,
+            optimization_goal="maximize",
+        ),
+    )
+
+
+def evaluate_policy_on_item(
+    task: LCATask,
+    baseline_snapshot: "BaselineSnapshot | None",
+    iteration_span: object | None = None,
+    iteration_index: int | None = None,
+) -> EvaluationResult:
+    del baseline_snapshot, iteration_index
+    eval_result = evaluate_localization_batch(
+        tasks=[task],
+        dataset_source=None,
+        materializer=None,
+        parent_trace=iteration_span,
+    )
+    if eval_result.failure:
+        category = getattr(
+            eval_result.failure.category,
+            "value",
+            eval_result.failure.category,
+        )
+        return _failure_evaluation_result(f"{category}: {eval_result.failure.message}")
+    if not eval_result.items:
+        return _failure_evaluation_result("evaluation_failed: no_results")
+
+    task_result = eval_result.items[0]
+    score_bundle = task_result.score_bundle
+    score_value = (
+        score_bundle.composed_score
+        if score_bundle.composed_score is not None
+        else -10.0
+    )
+    additional_metrics = [
+        {"name": name, "value": result.value}
+        for name, result in score_bundle.results.items()
+        if result.value is not None
+    ]
+    eval_metrics = EvaluationMetrics.model_validate(
+        {
+            "score": score_value,
+            "iteration_regression": False,
+            "additional_metrics": additional_metrics,
+        }
+    )
+    return EvaluationResult(
+        metrics=eval_metrics,
+        ic_result=ICResult.model_validate(
+            {"predicted_files": prediction_filenames(task_result.prediction)}
+        ),
+        jc_result=JCResult(entries=[]),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary=None,
+        policy_code=_read_policy(),
+        control_score=eval_result.machine_score,
+        score_summary=build_writer_score_summary_from_bundle(score_bundle),
+    )
+</file>
+
+<file path="orchestration/feedback.py">
+from __future__ import annotations
+
+from pathlib import Path
+
+from harness.orchestration.dependencies import compute_pipeline_diff
+from harness.orchestration.types import EvaluationResult, FeedbackPackage
+from harness.pipeline.types import PipelineClassification
+from harness.prompts import (
+    WriterFeedbackFinding,
+    WriterGuidance,
+    build_writer_optimization_brief,
+)
+from harness.utils.diff import compute_diff, format_diff, interpret_diff
+from harness.utils.test_loader import format_tests_for_prompt, load_tests
+from harness.utils.type_loader import build_frontier_context, format_frontier_context
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, (int, float, str)):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _writer_guidance_from_evaluation(evaluation: EvaluationResult) -> WriterGuidance:
+    if evaluation.error or not evaluation.success:
+        return WriterGuidance(
+            mode="repair",
+            instructions=[
+                "Resolve the evaluation failure before attempting score optimization.",
+                "Preserve the exact frontier_priority signature and return a float.",
+            ],
+        )
+    regression = evaluation.metrics.get("iteration_regression")
+    if regression is True:
+        return WriterGuidance(
+            mode="repair_regression",
+            instructions=[
+                "Undo the regression while preserving any validation fixes.",
+                "Do not optimize a component by lowering the composed objective.",
+            ],
+        )
+    if evaluation.score_summary and evaluation.score_summary.composed_score is not None:
+        return WriterGuidance(
+            mode="optimize",
+            instructions=[
+                "The policy is evaluable; improve the composed score without breaking validation.",
+                "Prefer changes that improve weighted visible score components in their stated direction.",
+            ],
+        )
+    return WriterGuidance(
+        mode="repair_then_optimize",
+        instructions=[
+            "First make the policy valid under tests and type checks.",
+            "When valid, improve the composed objective while preserving correctness.",
+        ],
+    )
+
+
+def build_iteration_feedback(
+    evaluation: EvaluationResult,
+    prev_score: float | None,
+    prev_classified: PipelineClassification | None,
+    repo_root: Path,
+) -> FeedbackPackage:
+    tests = load_tests(repo_root)
+    tests_str = format_tests_for_prompt(tests)
+    frontier_ctx = build_frontier_context(repo_root)
+    frontier_ctx_str = format_frontier_context(frontier_ctx)
+
+    diff_summary = ""
+    diff_guidance = ""
+    if prev_score is not None and prev_classified is not None:
+        try:
+            diff = compute_pipeline_diff(
+                prev_score,
+                _as_float(evaluation.metrics.get("score", 0.0)),
+                prev_classified,
+                prev_classified,
+                compute_diff=compute_diff,
+            )
+            diff_summary = format_diff(diff)
+            diff_guidance = interpret_diff(diff)
+        except Exception:
+            diff_summary = ""
+            diff_guidance = ""
+
+    findings: list[WriterFeedbackFinding] = []
+    if evaluation.error:
+        findings.append(
+            WriterFeedbackFinding(
+                kind="evaluation_error",
+                message=evaluation.error,
+                severity="error",
+                source="evaluation",
+            )
+        )
+    for key, value in evaluation.metrics.items():
+        normalized_val: str | float | int | bool | None
+        if isinstance(value, (str, float, int, bool)) or value is None:
+            normalized_val = value
+        else:
+            normalized_val = str(value)
+        severity = (
+            "warning"
+            if key == "iteration_regression" and value is True
+            else "info"
+        )
+        findings.append(
+            WriterFeedbackFinding(
+                kind="metric",
+                message=f"{key} = {normalized_val}",
+                value=normalized_val,
+                severity=severity,
+                source="evaluation.metrics",
+            )
+        )
+
+    guidance = _writer_guidance_from_evaluation(evaluation)
+    optimization_brief = build_writer_optimization_brief(
+        score_summary=evaluation.score_summary,
+        findings=findings,
+        comparison_summary=evaluation.comparison_summary,
+        diff_summary=diff_summary or None,
+        diff_guidance=diff_guidance or None,
+        guidance=guidance.instructions,
+        mode=guidance.mode,
+    )
+
+    return FeedbackPackage(
+        tests=tests_str,
+        frontier_context=frontier_ctx_str,
+        frontier_context_details=frontier_ctx,
+        optimization_brief=optimization_brief,
+    )
+</file>
+
+<file path="orchestration/listeners.py">
 """
 State machine listeners for tracing/metrics lifecycles.
 No session creation; reacts to machine events only.
 """
+
+from __future__ import annotations
 
 import json
 from typing import Any, ContextManager, Protocol
@@ -5803,8 +6415,8 @@ class OptimizationTracingListener:
             metadata={
                 "iteration": ctx.current_iteration,
                 "iterations": ctx.iterations,
-                "task": iteration_tasks.ic_task.model_dump(),
-                "jc_repo": iteration_tasks.jc_task.repo,
+                "task": iteration_tasks.task.model_dump(),
+                "jc_repo": iteration_tasks.jc_repo_id,
             },
         )
         opt_model.current_iteration_span = cm.__enter__()
@@ -5926,7 +6538,6 @@ from .types import (
     RepairMachineModel,
     RepairOutcome,
     SpanHandle,
-    TaskPayload,
 )
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterGuidance
@@ -6229,15 +6840,10 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             self.context.prepared_tasks = None
             self.model.prep_ok = False
         if self.context.prepared_tasks is None:
-            base_task = (
-                self.context.task
-                if isinstance(self.context.task, TaskPayload)
-                else TaskPayload.model_validate(self.context.task)
-            )
-            repo_val = base_task.repo
-            resolved_repo = repo_val if isinstance(repo_val, str) else None
             self.context.prepared_tasks = PreparedTasks(
-                base_task=base_task, resolved_repo_path=resolved_repo, jc_repo_id=None
+                task=self.context.task,
+                resolved_repo_path=self.context.task.repo,
+                jc_repo_id=None,
             )
             self.model.prep_ok = True
 
@@ -6254,7 +6860,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         iteration_tasks = prepared_tasks.build_iteration_tasks()
         eval_metadata = {
             "iteration": self.context.current_iteration,
-            "task": iteration_tasks.ic_task.identity.task_id(),
+            "task": iteration_tasks.task.identity.task_id(),
         }
         with self.deps.start_observation(
             name="localization_evaluation",
@@ -6262,7 +6868,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             metadata=eval_metadata,
         ) as eval_span:
             self.model.current_evaluation = self.deps.evaluate_policy_on_item(
-                iteration_tasks.ic_task,
+                iteration_tasks.task,
                 self.context.baseline_snapshot,
                 eval_span,
                 self.context.current_iteration,
@@ -6450,91 +7056,81 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
 
 <file path="orchestration/runtime.py">
 """
-Single-run optimizer coordinator: build loop context/deps and invoke the optimization machine.
-Does not parse CLI or dataset concerns; expects normalized inputs and resolved session_id.
+Single-run optimizer coordinator.
+
+This module owns the public loop entrypoint, dependency assembly, state-machine
+startup, fallback record construction, and compatibility patch points.
 """
 
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol, cast
+from typing import TYPE_CHECKING
 
 from jcodemunch_mcp.tools.index_folder import index_folder
 
 from harness.agents.localizer import run_ic_iteration
+from harness.agents.writer import generate_policy
 from harness.localization.materialization.materialize import RepoMaterializer
-from harness.localization.runtime.evaluate import LocalizationRunner
-from harness.telemetry.tracing import (
-    flush_langfuse,
-    propagate_context,
-    start_observation,
+from harness.localization.models import LCATask
+from harness.localization.runtime.evaluate import (
+    LocalizationEvaluationResult,
+    LocalizationRunner,
 )
-from harness.telemetry.tracing.score_emitter import emit_score
 from harness.pipeline import PipelineClassification, classify_results, default_pipeline
 from harness.pipeline.types import StepResult
 from harness.policy.load import load_frontier_policy
+from harness.telemetry.tracing import flush_langfuse, propagate_context, start_observation
+from harness.telemetry.tracing.score_emitter import emit_score
 from harness.utils.diff import compute_diff, format_diff, interpret_diff
 from harness.utils.env import get_writer_model
 from harness.utils.repo_root import find_repo_root
 from harness.utils.test_loader import format_tests_for_prompt, load_tests
 from harness.utils.type_loader import (
-    FrontierContext,
     build_frontier_context,
     format_frontier_context,
     load_frontier_examples,
     load_frontier_types,
     load_graph_models,
 )
-from harness.agents.writer import generate_policy
-from harness.localization.models import LCAContext, LCATask, LCATaskIdentity, LCAGold
-from harness.orchestration.types import SpanHandle
-from harness.prompts import (
-    WriterFeedbackFinding,
-    WriterGuidance,
-    WriterOptimizationBrief,
-    WriterScoreSummary,
-    build_writer_optimization_brief,
-    build_writer_score_summary_from_bundle,
-)
 
-if TYPE_CHECKING:
-    from harness.telemetry.hosted.baselines import BaselineSnapshot
-    from iterative_context.graph_models import Graph, GraphNode
-
+from . import dependencies as dependency_wiring
+from .evaluation import evaluate_policy_on_item
+from .feedback import build_iteration_feedback
 from .machine import OptimizationStateMachine
 from .types import (
     AcceptedPolicyMeta,
     EvaluationMetrics,
-    EvaluationResult,
     FailedRepairDetails,
-    FeedbackPackage,
-    ICResult,
-    ICTaskPayload,
     IterationRecord,
-    JCResult,
-    JCTaskPayload,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
     PreparedTasks,
     RunMetadata,
-    TaskPayload,
-    format_failure_context_payload,
+    SpanHandle,
+    SupportsPipelineRun,
 )
+from .writer import attempt_policy_generation, clean_policy_code
+
+if TYPE_CHECKING:
+    from harness.telemetry.hosted.baselines import BaselineSnapshot
+    from iterative_context.graph_models import Graph, GraphNode
+
 
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy" / "current.py"
 _MAX_POLICY_REPAIRS = 3
-_MAX_FAILURE_SUMMARY_CHARS = 400
 
 
-# Re-exported helpers so callers can monkeypatch harness.orchestration.runtime.* directly.
-_REEXPORTED = (
+# Compatibility exports used by tests and legacy monkeypatch call sites.
+_COMPATIBILITY_EXPORTS = (
     index_folder,
     load_frontier_policy,
     load_graph_models,
+    load_frontier_examples,
+    load_frontier_types,
     run_ic_iteration,
     compute_diff,
     format_diff,
@@ -6545,8 +7141,6 @@ _REEXPORTED = (
     load_tests,
     build_frontier_context,
     format_frontier_context,
-    load_frontier_examples,
-    load_frontier_types,
     generate_policy,
     classify_results,
     default_pipeline,
@@ -6556,16 +7150,15 @@ _REEXPORTED = (
 
 
 def evaluate_localization_batch(
-    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
+    tasks: Sequence[LCATask],
     *,
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
-):
+) -> LocalizationEvaluationResult:
     """
-    Thin wrapper to keep monkeypatching stable while avoiding import cycles.
-    Forwards keyword arguments directly to harness.localization.runtime.evaluate.evaluate_localization_batch.
+    Stable wrapper for tests and callers that patch runtime-level evaluation.
     """
     from harness.localization.runtime.evaluate import evaluate_localization_batch as _evaluate_localization_batch
 
@@ -6580,30 +7173,18 @@ def evaluate_localization_batch(
 
 def frontier_priority(node: "GraphNode", graph: "Graph", step: int) -> float:
     """
-    Delegate to policy.frontier_priority while keeping a stable monkeypatchable attribute on this module.
+    Stable wrapper around the active policy function.
     """
     from harness.policy import frontier_priority as _frontier_priority
 
     return _frontier_priority(node, graph, step)
 
 
-def _pkg_attr(name: str) -> Any:
-    mod = import_module("harness.orchestration.runtime")
-    return getattr(mod, name)
-
-
-def _as_float(value: Any) -> float:
-    try:
-        return float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def _read_policy(path: Path = _POLICY_PATH) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _write_policy(code: str, path: Path = _POLICY_PATH) -> None:  # pyright: ignore[reportUnusedFunction]
+def _write_policy(code: str, path: Path = _POLICY_PATH) -> None:
     if path.name not in ("policy.py", "current.py"):
         raise RuntimeError("Unauthorized write attempt")
     tmp_path = path.with_suffix(".tmp")
@@ -6612,16 +7193,10 @@ def _write_policy(code: str, path: Path = _POLICY_PATH) -> None:  # pyright: ign
 
 
 def _clean_policy_code(code: str) -> str:
-    if "```" in code:
-        parts = code.split("```")
-        if len(parts) >= 2:
-            code = parts[1]
-            if code.startswith("python"):
-                code = code[len("python") :].lstrip()
-    return code.strip()
+    return clean_policy_code(code)
 
 
-def _hash_tests_dir(repo_root: Path) -> str:  # pyright: ignore[reportUnusedFunction]
+def _hash_tests_dir(repo_root: Path) -> str:
     tests_path = repo_root / "iterative-context" / "tests"
     hasher = hashlib.sha256()
     if not tests_path.exists():
@@ -6632,335 +7207,15 @@ def _hash_tests_dir(repo_root: Path) -> str:  # pyright: ignore[reportUnusedFunc
     return hasher.hexdigest()
 
 
-def _step_succeeded(step: StepResult) -> bool:
-    return step.exit_code == 0
-
-
-def _first_failed_step(steps: Sequence[StepResult]) -> StepResult | None:
-    for step in steps:
-        if not _step_succeeded(step):
-            return step
-    return None
-
-
-def _format_pipeline_failure_context(
-    pipeline_results: list[StepResult],
-    classified: PipelineClassification | None,
-    writer_error: str | None,
-    model_name: str | None,
-    repair_attempt: int,
-) -> str:
-    return format_failure_context_payload(
-        pipeline_results,
-        classified,
-        writer_error,
-        model_name,
-        repair_attempt,
-    )
-
-
-class SupportsPipelineRun(Protocol):
-    def run(
-        self,
-        repo_root: Path,
-        observation: SpanHandle | None = None,
-        allow_no_parent: bool = False,
-    ) -> list[StepResult]: ...
-
-
 def prepare_iteration_tasks(
-    task: TaskPayload, parent_trace: SpanHandle | None = None
+    task: LCATask,
+    parent_trace: SpanHandle | None = None,
 ) -> PreparedTasks:
-    """Resolve repo paths and index JC repo once for the run."""
-    repo_path_val = task.repo
-    resolved_repo_path = repo_path_val
-    jc_repo_id: str | None = None
-    start_obs_func: Callable[..., ContextManager[SpanHandle]] = _pkg_attr("start_observation")
-    index_folder_fn: Callable[[str], Mapping[str, object]] = _pkg_attr("index_folder")
-    if isinstance(repo_path_val, str):
-        try:
-            with start_obs_func(
-                name="index_repo",
-                parent=parent_trace,
-                metadata={"repo": repo_path_val},
-            ) as index_obs:
-                result = index_folder_fn(repo_path_val)
-                repo_id = str(result.get("repo", ""))
-                jc_repo_id = repo_id
-                if hasattr(index_obs, "update"):
-                    try:
-                        index_obs.update(metadata={"repo": repo_id})  # type: ignore[call-arg]
-                    except Exception:
-                        pass
-        except Exception:
-            # Propagate failure; lifecycle handled by context manager.
-            raise
-    if resolved_repo_path is None:
-        raise RuntimeError("Task missing repo")
-    ic_task = ICTaskPayload(
-        identity=task.identity,
-        context=task.context,
-        repo=resolved_repo_path,
-        changed_files=task.changed_files,
-    )
-    jc_task = JCTaskPayload(
-        identity=task.identity,
-        context=task.context,
-        repo=jc_repo_id or resolved_repo_path,
-        changed_files=task.changed_files,
-    )
-    return PreparedTasks(
-        base_task=task,
-        resolved_repo_path=resolved_repo_path,
-        jc_repo_id=jc_repo_id,
-        ic_task=ic_task,
-        jc_task=jc_task,
-    )
-
-
-def evaluate_policy_on_item(
-    ic_task: ICTaskPayload,
-    baseline_snapshot: "BaselineSnapshot | None",
-    iteration_span: object | None = None,
-    iteration_index: int | None = None,
-) -> EvaluationResult:
-    """Execute localization evaluation via the shared LCA evaluation backend."""
-    lca_task = LCATask(
-        identity=LCATaskIdentity(
-            dataset_name=ic_task.identity.dataset_name,
-            dataset_config=ic_task.identity.dataset_config,
-            dataset_split=ic_task.identity.dataset_split,
-            repo_owner=ic_task.identity.repo_owner,
-            repo_name=ic_task.identity.repo_name,
-            base_sha=ic_task.identity.base_sha,
-            issue_url=ic_task.identity.issue_url,
-            pull_url=ic_task.identity.pull_url,
-        ),
-        context=LCAContext.model_validate(ic_task.context.model_dump()),
-        gold=LCAGold(changed_files=list(ic_task.changed_files)),
-        repo=ic_task.repo,
-    )
-    eval_result = evaluate_localization_batch(
-        tasks=[lca_task],
-        dataset_source=None,
-        materializer=None,
-        parent_trace=iteration_span,
-    )
-    if eval_result.failure:
-        failure_metrics: dict[str, float | int | bool | None] = {
-            "score": -10.0,
-            "iteration_regression": False,
-        }
-        return EvaluationResult(
-            metrics=EvaluationMetrics.model_validate(failure_metrics),
-            ic_result=ICResult(entries=[]),
-            jc_result=JCResult(entries=[]),
-            jc_metrics=EvaluationMetrics(),
-            comparison_summary=None,
-            policy_code="",
-            success=False,
-            error=f"{getattr(eval_result.failure.category, 'value', eval_result.failure.category)}: {eval_result.failure.message}",
-            score_summary=WriterScoreSummary(
-                primary_name="composed_score",
-                primary_score=-10.0,
-                composed_score=-10.0,
-                optimization_goal="maximize",
-            ),
-        )
-    if not eval_result.items:
-        empty_metrics: dict[str, float | int | bool | None] = {
-            "score": -10.0,
-            "iteration_regression": False,
-        }
-        return EvaluationResult(
-            metrics=EvaluationMetrics.model_validate(empty_metrics),
-            ic_result=ICResult(entries=[]),
-            jc_result=JCResult(entries=[]),
-            jc_metrics=EvaluationMetrics(),
-            comparison_summary=None,
-            policy_code="",
-            success=False,
-            error="evaluation_failed: no_results",
-            score_summary=WriterScoreSummary(
-                primary_name="composed_score",
-                primary_score=-10.0,
-                composed_score=-10.0,
-                optimization_goal="maximize",
-            ),
-    )
-    task_result = eval_result.items[0]
-    score_bundle = task_result.score_bundle
-    machine_score_val = eval_result.machine_score
-    score_value = score_bundle.composed_score if score_bundle.composed_score is not None else -10.0
-    additional_metrics = [
-        {"name": name, "value": result.value}
-        for name, result in score_bundle.results.items()
-        if result.value is not None
-    ]
-    eval_metrics = EvaluationMetrics.model_validate(
-        {"score": score_value, "iteration_regression": False, "additional_metrics": additional_metrics}
-    )
-    ic_result_map = {"predicted_files": task_result.prediction}
-    return EvaluationResult(
-        metrics=eval_metrics,
-        ic_result=ICResult.model_validate(ic_result_map),
-        jc_result=JCResult(entries=[]),
-        jc_metrics=EvaluationMetrics(),
-        comparison_summary=None,
-        policy_code=_read_policy(),
-        control_score=machine_score_val,
-        score_summary=build_writer_score_summary_from_bundle(score_bundle),
-    )
-
-
-def build_iteration_feedback(
-    evaluation: EvaluationResult,
-    prev_score: float | None,
-    prev_classified: PipelineClassification | None,
-    repo_root: Path,
-) -> FeedbackPackage:
-    """Package evaluation outputs into writer-facing inputs."""
-    load_tests_fn = cast(Callable[[Path], object], _pkg_attr("load_tests"))
-    format_tests_for_prompt_fn = cast(
-        Callable[[object], str], _pkg_attr("format_tests_for_prompt")
-    )
-    build_frontier_context_fn = cast(Callable[[Path], FrontierContext], _pkg_attr("build_frontier_context"))
-    format_frontier_context_fn = cast(Callable[..., str], _pkg_attr("format_frontier_context"))
-    compute_diff_fn = cast(Callable[..., object], _pkg_attr("compute_diff"))
-    format_diff_fn = cast(Callable[[object], str], _pkg_attr("format_diff"))
-    interpret_diff_fn = cast(Callable[[object], str], _pkg_attr("interpret_diff"))
-
-    tests = load_tests_fn(repo_root)
-    tests_str = format_tests_for_prompt_fn(tests)
-    frontier_ctx = build_frontier_context_fn(repo_root)
-    frontier_ctx_str = format_frontier_context_fn(frontier_ctx)
-
-    diff_summary = ""
-    diff_guidance = ""
-    if prev_score is not None and prev_classified is not None:
-        try:
-            diff = compute_diff_fn(
-                prev_score,
-                _as_float(evaluation.metrics.get("score", 0.0)),
-                prev_classified.model_dump(),
-                prev_classified.model_dump(),
-            )
-            diff_summary = format_diff_fn(diff)
-            diff_guidance = interpret_diff_fn(diff)
-        except Exception:
-            diff_summary = ""
-            diff_guidance = ""
-
-    findings: list[WriterFeedbackFinding] = []
-    if evaluation.error:
-        findings.append(
-            WriterFeedbackFinding(
-                kind="evaluation_error",
-                message=evaluation.error,
-                severity="error",
-                source="evaluation",
-            )
-        )
-    for key, value in evaluation.metrics.items():
-        normalized_val: str | float | int | bool | None
-        if isinstance(value, (str, float, int, bool)) or value is None:
-            normalized_val = value
-        else:
-            normalized_val = str(value)
-        severity = "warning" if key == "iteration_regression" and value is True else "info"
-        findings.append(
-            WriterFeedbackFinding(
-                kind="metric",
-                message=f"{key} = {normalized_val}",
-                value=normalized_val,
-                severity=severity,
-                source="evaluation.metrics",
-            )
-        )
-
-    guidance = _writer_guidance_from_evaluation(evaluation)
-    optimization_brief = build_writer_optimization_brief(
-        score_summary=evaluation.score_summary,
-        findings=findings,
-        comparison_summary=evaluation.comparison_summary,
-        diff_summary=diff_summary or None,
-        diff_guidance=diff_guidance or None,
-        guidance=guidance.instructions,
-        mode=guidance.mode,
-    )
-
-    return FeedbackPackage(
-        tests=tests_str,
-        frontier_context=frontier_ctx_str,
-        frontier_context_details=frontier_ctx,
-        optimization_brief=optimization_brief,
-    )
-
-
-def attempt_policy_generation(
-    *,
-    initial_policy: str,
-    tests: str,
-    frontier_context: str,
-    frontier_context_details: FrontierContext,
-    optimization_brief: WriterOptimizationBrief,
-    failure_context_str: str | None,
-    repair_attempt: int,
-    parent_trace: object | None = None,
-    pipeline_feedback: PipelineClassification | None = None,
-) -> tuple[str | None, str | None]:
-    try:
-        generator = cast(Callable[..., str], _pkg_attr("generate_policy"))
-        brief = optimization_brief
-        new_code = generator(
-            current_policy=initial_policy,
-            tests=tests,
-            frontier_context=frontier_context,
-            frontier_context_details=frontier_context_details,
-            optimization_brief=brief,
-            feedback={"pipeline_feedback": pipeline_feedback.model_dump()} if pipeline_feedback else {},
-            parent_trace=parent_trace,
-            failure_context=failure_context_str,
-            repair_attempt=repair_attempt,
-        )
-        new_code = _clean_policy_code(new_code)
-        return new_code, None
-    except Exception as e:  # noqa: BLE001
-        return None, str(e)
-
-
-def _writer_guidance_from_evaluation(evaluation: EvaluationResult) -> WriterGuidance:
-    if evaluation.error or not evaluation.success:
-        return WriterGuidance(
-            mode="repair",
-            instructions=[
-                "Resolve the evaluation failure before attempting score optimization.",
-                "Preserve the exact frontier_priority signature and return a float.",
-            ],
-        )
-    regression = evaluation.metrics.get("iteration_regression")
-    if regression is True:
-        return WriterGuidance(
-            mode="repair_regression",
-            instructions=[
-                "Undo the regression while preserving any validation fixes.",
-                "Do not optimize a component by lowering the composed objective.",
-            ],
-        )
-    if evaluation.score_summary and evaluation.score_summary.composed_score is not None:
-        return WriterGuidance(
-            mode="optimize",
-            instructions=[
-                "The policy is evaluable; improve the composed score without breaking validation.",
-                "Prefer changes that improve weighted visible score components in their stated direction.",
-            ],
-        )
-    return WriterGuidance(
-        mode="repair_then_optimize",
-        instructions=[
-            "First make the policy valid under tests and type checks.",
-            "When valid, improve the composed objective while preserving correctness.",
-        ],
+    return dependency_wiring.prepare_iteration_tasks(
+        task,
+        parent_trace,
+        start_observation=start_observation,
+        index_folder=index_folder,
     )
 
 
@@ -6970,59 +7225,13 @@ def run_policy_pipeline(
     repair_obs: SpanHandle | None = None,
     allow_no_parent: bool = False,
 ) -> tuple[list[StepResult], bool]:
-    try:
-        raw_results: list[object] = list(
-            pipeline.run(
-                repo_root, observation=repair_obs, allow_no_parent=allow_no_parent
-            )
-        )
-    except TypeError:
-        raw_results = list(pipeline.run(repo_root, observation=repair_obs))
-    step_results = [
-        step if isinstance(step, StepResult) else StepResult.from_external(step)
-        for step in raw_results
-    ]
-    trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
-    observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
-    session_id_val = (
-        getattr(repair_obs, "session_id", None) if repair_obs is not None else None
+    return dependency_wiring.run_policy_pipeline(
+        pipeline,
+        repo_root,
+        repair_obs=repair_obs,
+        allow_no_parent=allow_no_parent,
+        emit_score=emit_score,
     )
-    emit_score_fn = cast(Callable[..., None], _pkg_attr("emit_score"))
-    if not any([trace_id, observation_id, session_id_val]):
-        pipeline_success = all(_step_succeeded(r) for r in step_results)
-        return step_results, pipeline_success
-    for step in step_results:
-        data_type = "NUMERIC"
-        score_id = (
-            f"{observation_id or trace_id}-pipeline.{step.name}.exit_code"
-            if (observation_id or trace_id)
-            else None
-        )
-        emit_score_fn(
-            name=f"pipeline.{step.name}.exit_code",
-            value=step.exit_code,
-            data_type=data_type,
-            trace_id=trace_id,
-            observation_id=observation_id,
-            session_id=session_id_val,
-            score_id=score_id,
-        )
-        pass_score_id = (
-            f"{observation_id or trace_id}-pipeline.{step.name}.passed"
-            if (observation_id or trace_id)
-            else None
-        )
-        emit_score_fn(
-            name=f"pipeline.{step.name}.passed",
-            value=int(step.success),
-            data_type="BOOLEAN",
-            trace_id=trace_id,
-            observation_id=observation_id,
-            session_id=session_id_val,
-            score_id=pass_score_id,
-        )
-    pipeline_success = all(_step_succeeded(r) for r in step_results)
-    return step_results, pipeline_success
 
 
 def finalize_successful_policy(
@@ -7032,14 +7241,13 @@ def finalize_successful_policy(
     max_repair_attempts: int,
     repair_obs: object | None = None,
 ) -> tuple[str, AcceptedPolicyMeta]:
-    final_policy = _read_policy()
-    meta = AcceptedPolicyMeta(
-        accepted_policy_source="post_pipeline_disk",
-        accepted_policy_changed_by_pipeline=final_policy != new_code,
-        repair_attempts=attempts_used - 1,
-        max_policy_repairs=max_repair_attempts,
+    return dependency_wiring.finalize_successful_policy(
+        new_code=new_code,
+        attempts_used=attempts_used,
+        max_repair_attempts=max_repair_attempts,
+        repair_obs=repair_obs,
+        read_policy=_read_policy,
     )
-    return final_policy, meta
 
 
 def finalize_failed_repair(
@@ -7050,130 +7258,66 @@ def finalize_failed_repair(
     attempts_used: int,
     writer_error: str | None,
 ) -> FailedRepairDetails:
-    failed_step = _first_failed_step(pipeline_results)
-    failed_summary = None
-    if failed_step:
-        stderr = failed_step.stderr
-        stdout = failed_step.stdout
-        text = stderr.strip() if stderr.strip() else stdout.strip()
-        failed_summary = text[:_MAX_FAILURE_SUMMARY_CHARS] if text else None
-    failure_context_str = _format_pipeline_failure_context(
-        pipeline_results, classified, writer_error, writer_model, attempts_used
+    return dependency_wiring.finalize_failed_repair(
+        pipeline_results=pipeline_results,
+        classified=classified,
+        writer_model=writer_model,
+        attempts_used=attempts_used,
+        writer_error=writer_error,
+        read_policy=_read_policy,
     )
-    return FailedRepairDetails(
-        failure_context=failure_context_str,
-        policy_code=_read_policy(),
-        failed_step=failed_step.name if failed_step else None,
-        failed_exit_code=failed_step.exit_code if failed_step else None,
-        failed_summary=failed_summary,
-        error="pipeline_failed",
+
+
+def _runtime_collaborators() -> dependency_wiring.RuntimeCollaborators:
+    return dependency_wiring.RuntimeCollaborators(
+        index_folder=index_folder,
+        evaluate_localization_batch=evaluate_localization_batch,
+        load_tests=load_tests,
+        format_tests_for_prompt=format_tests_for_prompt,
+        build_frontier_context=build_frontier_context,
+        format_frontier_context=format_frontier_context,
+        compute_diff=compute_diff,
+        format_diff=format_diff,
+        interpret_diff=interpret_diff,
+        generate_policy=generate_policy,
+        emit_score=emit_score,
+        classify_results=classify_results,
+        read_policy=_read_policy,
+        write_policy=_write_policy,
+        get_writer_model=get_writer_model,
+        start_observation=start_observation,
+        find_repo_root=find_repo_root,
+        default_pipeline=default_pipeline,
     )
 
 
 def _build_dependencies() -> LoopDependencies:
-    classify_results_fn: Callable[[list[StepResult]], PipelineClassification] = _pkg_attr("classify_results")
-    format_pipeline_failure_context_fn = _format_pipeline_failure_context
-    read_policy_fn = _pkg_attr("_read_policy")
-    write_policy_fn = _pkg_attr("_write_policy")
-    get_writer_model_fn: Callable[[], str | None] = _pkg_attr("get_writer_model")
-    start_obs_fn: Callable[..., ContextManager[SpanHandle]] = _pkg_attr("start_observation")
-    find_repo_root_fn: Callable[[], Path] = _pkg_attr("find_repo_root")
-    default_pipeline_fn: Callable[[], SupportsPipelineRun] = _pkg_attr("default_pipeline")
-    return LoopDependencies(
-        prepare_iteration_tasks=prepare_iteration_tasks,
+    return dependency_wiring.build_loop_dependencies(
+        _runtime_collaborators(),
         evaluate_policy_on_item=evaluate_policy_on_item,
         build_iteration_feedback=build_iteration_feedback,
         attempt_policy_generation=attempt_policy_generation,
-        run_policy_pipeline=run_policy_pipeline,
-        finalize_successful_policy=finalize_successful_policy,
-        finalize_failed_repair=finalize_failed_repair,
-        classify_results=lambda results: classify_results_fn(list(results)),
-        format_pipeline_failure_context=format_pipeline_failure_context_fn,
-        read_policy=cast(Callable[[], str], read_policy_fn),
-        write_policy=cast(Callable[[str], None], write_policy_fn),
-        get_writer_model=get_writer_model_fn,
-        start_observation=start_obs_fn,
-        find_repo_root=find_repo_root_fn,
-        default_pipeline=default_pipeline_fn,
     )
 
 
-def run_loop(
-    task: Mapping[str, object] | TaskPayload,
-    iterations: int = 5,
-    parent_trace: SpanHandle | None = None,
-    baseline_snapshot: BaselineSnapshot | None = None,
-    session_id: str | None = None,
+def _fallback_history(
+    opt_model: OptimizationMachineModel,
+    parent_trace: SpanHandle | None,
 ) -> list[IterationRecord]:
-    """
-    Closed-loop optimizer: execute, score, rewrite policy, repeat.
-    """
-    base_task = TaskPayload.model_validate(task)
-    root_meta = RunMetadata(
-        task=base_task, iterations=iterations, session_id=session_id
+    repo_root = find_repo_root()
+    pipeline = default_pipeline()
+    fallback_parent = opt_model.context.run_trace or parent_trace
+    pipeline_results, pipeline_success = run_policy_pipeline(
+        pipeline,
+        repo_root,
+        repair_obs=fallback_parent,
+        allow_no_parent=fallback_parent is None,
     )
-    with start_observation(
-        name="run_loop",
-        parent=parent_trace,
-        input=base_task.model_dump(),
-        metadata=root_meta.model_dump(),
-    ) as run_span:
-        with propagate_context(
-            trace_name="run_loop",
-            session_id=session_id,
-            metadata={"iterations": iterations, "session_id": session_id},
-        ):
-            baseline_model = (
-                BaselineSnapshot.model_validate(baseline_snapshot)
-                if isinstance(baseline_snapshot, Mapping)
-                else baseline_snapshot
-            )
-            context = LoopContext(
-                task=base_task,
-                iterations=iterations,
-                session_id=session_id,
-                parent_trace=parent_trace,
-                run_metadata=root_meta,
-                baseline_snapshot=baseline_model,
-                run_trace=run_span,
-            )
-            opt_model = OptimizationMachineModel(
-                context=context,
-                deps=_build_dependencies(),
-                max_policy_repairs=_MAX_POLICY_REPAIRS,
-            )
-            machine = OptimizationStateMachine(opt_model)
-            history: list[IterationRecord] = []
-            try:
-                history = machine.run()
-            finally:
-                if hasattr(run_span, "update"):
-                    try:
-                        run_span.update(metadata={"iterations_completed": len(history)})  # type: ignore[call-arg]
-                    except Exception:
-                        pass
-                flush_langfuse_fn = cast(Callable[[], None], _pkg_attr("flush_langfuse"))
-                flush_langfuse_fn()
-    if not history:
-        repo_root = cast(Callable[[], Path], _pkg_attr("find_repo_root"))()
-        pipeline = cast(
-            Callable[[], SupportsPipelineRun], _pkg_attr("default_pipeline")
-        )()
-        fallback_parent = opt_model.context.run_trace or parent_trace
-        pipeline_results, pipeline_success = run_policy_pipeline(
-            pipeline,
-            repo_root,
-            repair_obs=fallback_parent,
-            allow_no_parent=fallback_parent is None,
-        )
-        classify_results_fn = cast(
-            Callable[[list[StepResult]], PipelineClassification],
-            _pkg_attr("classify_results"),
-        )
-        classified = classify_results_fn(pipeline_results)
-        failed_step = _first_failed_step(pipeline_results)
-        metrics_map: dict[str, float | int | bool | None] = {}
-        record = IterationRecord(
+    classified = classify_results(pipeline_results)
+    failed_step = dependency_wiring.first_failed_step(pipeline_results)
+    metrics_map: dict[str, float | int | bool | None] = {}
+    return [
+        IterationRecord(
             iteration=0,
             metrics=EvaluationMetrics.model_validate(metrics_map),
             pipeline_passed=pipeline_success,
@@ -7187,7 +7331,64 @@ def run_loop(
             max_policy_repairs=_MAX_POLICY_REPAIRS,
             writer_error="writer_failed" if not pipeline_success else None,
         )
-        history = [record]
+    ]
+
+
+def _baseline_snapshot_model(
+    baseline_snapshot: "BaselineSnapshot | Mapping[str, object] | None",
+) -> "BaselineSnapshot | None":
+    if isinstance(baseline_snapshot, Mapping):
+        from harness.telemetry.hosted.baselines import BaselineSnapshot as BaselineSnapshotModel
+
+        return BaselineSnapshotModel.model_validate(baseline_snapshot)
+    return baseline_snapshot
+
+
+def run_loop(
+    task: LCATask,
+    iterations: int = 5,
+    parent_trace: SpanHandle | None = None,
+    baseline_snapshot: "BaselineSnapshot | Mapping[str, object] | None" = None,
+    session_id: str | None = None,
+) -> list[IterationRecord]:
+    """
+    Closed-loop optimizer: execute, score, rewrite policy, repeat.
+    """
+    root_meta = RunMetadata(task=task, iterations=iterations, session_id=session_id)
+    opt_model: OptimizationMachineModel | None = None
+    history: list[IterationRecord] = []
+    with start_observation(
+        name="run_loop",
+        parent=parent_trace,
+        input=task.model_dump(),
+        metadata=root_meta.model_dump(),
+    ) as run_span:
+        with propagate_context(
+            trace_name="run_loop",
+            session_id=session_id,
+            metadata={"iterations": iterations, "session_id": session_id},
+        ):
+            context = LoopContext(
+                task=task,
+                iterations=iterations,
+                session_id=session_id,
+                parent_trace=parent_trace,
+                run_metadata=root_meta,
+                baseline_snapshot=_baseline_snapshot_model(baseline_snapshot),
+                run_trace=run_span,
+            )
+            opt_model = OptimizationMachineModel(
+                context=context,
+                deps=_build_dependencies(),
+                max_policy_repairs=_MAX_POLICY_REPAIRS,
+            )
+            machine = OptimizationStateMachine(opt_model)
+            try:
+                history = machine.run()
+            finally:
+                flush_langfuse()
+    if not history and opt_model is not None:
+        history = _fallback_history(opt_model, parent_trace)
     return history
 </file>
 
@@ -7201,8 +7402,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterOptimizationBrief, WriterScoreSummary
+from harness.telemetry.tracing import UsageDetails
 from harness.utils.type_loader import FrontierContext
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import LCATask
 
 if TYPE_CHECKING:
     from harness.telemetry.hosted.baselines import BaselineSnapshot
@@ -7219,6 +7421,106 @@ class SpanHandle(Protocol):
     def end(self, **kwargs: object) -> None: ...
 
     def update(self, **kwargs: object) -> None: ...
+
+
+@runtime_checkable
+class SupportsPipelineRun(Protocol):
+    def run(
+        self,
+        repo_root: Path,
+        observation: SpanHandle | None = None,
+        allow_no_parent: bool = False,
+    ) -> list[StepResult]: ...
+
+
+@runtime_checkable
+class StartObservation(Protocol):
+    def __call__(
+        self,
+        name: str,
+        *,
+        parent: object | None = None,
+        as_type: str = "span",
+        input: object | None = None,
+        model: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+        usage_details: UsageDetails | None = None,
+    ) -> ContextManager[SpanHandle]: ...
+
+
+@runtime_checkable
+class AttemptPolicyGeneration(Protocol):
+    def __call__(
+        self,
+        *,
+        initial_policy: str,
+        tests: str,
+        frontier_context: str,
+        frontier_context_details: FrontierContext,
+        optimization_brief: WriterOptimizationBrief,
+        failure_context_str: str | None,
+        repair_attempt: int,
+        parent_trace: object | None = None,
+        pipeline_feedback: PipelineClassification | None = None,
+    ) -> tuple[str | None, str | None]: ...
+
+
+@runtime_checkable
+class EvaluatePolicyOnItem(Protocol):
+    def __call__(
+        self,
+        task: LCATask,
+        baseline_snapshot: "BaselineSnapshot | None",
+        iteration_span: SpanHandle | None,
+        iteration_index: int | None,
+    ) -> "EvaluationResult": ...
+
+
+@runtime_checkable
+class BuildIterationFeedback(Protocol):
+    def __call__(
+        self,
+        evaluation: "EvaluationResult",
+        prev_score: float | None,
+        prev_classified: PipelineClassification | None,
+        repo_root: Path,
+    ) -> "FeedbackPackage": ...
+
+
+@runtime_checkable
+class RunPolicyPipeline(Protocol):
+    def __call__(
+        self,
+        pipeline: SupportsPipelineRun,
+        repo_root: Path,
+        repair_obs: SpanHandle | None = None,
+        allow_no_parent: bool = False,
+    ) -> tuple[list[StepResult], bool]: ...
+
+
+@runtime_checkable
+class FinalizeSuccessfulPolicy(Protocol):
+    def __call__(
+        self,
+        *,
+        new_code: str,
+        attempts_used: int,
+        max_repair_attempts: int,
+        repair_obs: object | None = None,
+    ) -> tuple[str, "AcceptedPolicyMeta"]: ...
+
+
+@runtime_checkable
+class FinalizeFailedRepair(Protocol):
+    def __call__(
+        self,
+        *,
+        pipeline_results: list[StepResult],
+        classified: PipelineClassification,
+        writer_model: str | None,
+        attempts_used: int,
+        writer_error: str | None,
+    ) -> "FailedRepairDetails": ...
 
 
 class MetricEntry(BaseModel):
@@ -7310,106 +7612,57 @@ class JCResult(ICResult):
     model_config = ConfigDict(extra="forbid")
 
 
-class TaskPayload(BaseModel):
-    """Localization-native task payload passed into orchestration/evaluation agents."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    identity: LCATaskIdentity
-    context: LCAContext
-    repo: str
-    changed_files: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_mapping(cls, value: object) -> object:
-        if isinstance(value, Mapping):
-            identity_val = value.get("identity") or {}
-            context_val = value.get("context") or {}
-            return {
-                "identity": identity_val,
-                "context": context_val,
-                "repo": value.get("repo"),
-                "changed_files": value.get("changed_files", []),
-            }
-        return value
-
-
-class ICTaskPayload(TaskPayload):
-    """Iteration task payload for localization runs (IC backend)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class JCTaskPayload(TaskPayload):
-    """Iteration task payload for localization runs (JC backend)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-
 class RunMetadata(BaseModel):
     """Run-level metadata persisted for tracing and external visibility."""
 
     model_config = ConfigDict(extra="forbid")
 
     iterations: int
-    task: TaskPayload
+    task: LCATask
     session_id: str | None = None
 
 class PreparedTasks(BaseModel):
-    """Resolved IC/JC tasks for a single iteration."""
+    """Canonical task plus execution metadata resolved once for the loop."""
 
     model_config = ConfigDict(extra="forbid")
 
-    base_task: TaskPayload
+    task: LCATask
     resolved_repo_path: str | None
     jc_repo_id: str | None
-    ic_task: ICTaskPayload | None = None
-    jc_task: JCTaskPayload | None = None
 
     def _resolve_ic_repo(self) -> str:
         if self.resolved_repo_path is not None:
             return self.resolved_repo_path
-        return self.base_task.repo
+        if self.task.repo is not None:
+            return self.task.repo
+        raise RuntimeError("Task missing repo")
 
     def _resolve_jc_repo(self) -> str:
         if self.jc_repo_id is not None:
             return self.jc_repo_id
         if self.resolved_repo_path is not None:
             return self.resolved_repo_path
-        return self.base_task.repo
+        if self.task.repo is not None:
+            return self.task.repo
+        raise RuntimeError("Task missing repo")
 
-    def to_ic_request(self) -> ICTaskPayload:
-        if self.ic_task is not None:
-            return self.ic_task
-        return ICTaskPayload(
-            identity=self.base_task.identity,
-            context=self.base_task.context,
-            repo=self._resolve_ic_repo(),
-            changed_files=self.base_task.changed_files,
-        )
+    def ic_task(self) -> LCATask:
+        return self.task.with_repo(self._resolve_ic_repo())
 
-    def to_jc_request(self) -> JCTaskPayload:
-        if self.jc_task is not None:
-            return self.jc_task
-        return JCTaskPayload(
-            identity=self.base_task.identity,
-            context=self.base_task.context,
-            repo=self._resolve_jc_repo(),
-            changed_files=self.base_task.changed_files,
-        )
+    def jc_task(self) -> LCATask:
+        return self.task.with_repo(self._resolve_jc_repo())
 
     def build_iteration_tasks(self) -> "IterationTasks":
-        return IterationTasks(ic_task=self.to_ic_request(), jc_task=self.to_jc_request())
+        return IterationTasks(task=self.ic_task(), jc_repo_id=self.jc_repo_id)
 
 
 class IterationTasks(BaseModel):
-    """Concrete task payloads for an iteration."""
+    """Canonical iteration task plus optional backend execution metadata."""
 
     model_config = ConfigDict(extra="forbid")
 
-    ic_task: ICTaskPayload
-    jc_task: JCTaskPayload
+    task: LCATask
+    jc_repo_id: str | None = None
 
 
 class EvaluationResult(BaseModel):
@@ -7491,7 +7744,7 @@ class IterationRecord(BaseModel):
 class LoopContext(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
-    task: TaskPayload
+    task: LCATask
     iterations: int
     session_id: str | None = None
     parent_trace: SpanHandle | None = None
@@ -7511,21 +7764,21 @@ class LoopDependencies(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    prepare_iteration_tasks: Callable[[TaskPayload, SpanHandle | None], PreparedTasks]
-    evaluate_policy_on_item: Callable[[ICTaskPayload, "BaselineSnapshot | None", SpanHandle | None, int | None], EvaluationResult]
-    build_iteration_feedback: Callable[[EvaluationResult, float | None, PipelineClassification | None, Path], FeedbackPackage]
-    attempt_policy_generation: Callable[..., tuple[str | None, str | None]]
-    run_policy_pipeline: Callable[..., tuple[list[StepResult], bool]]
-    finalize_successful_policy: Callable[..., tuple[str, "AcceptedPolicyMeta"]]
-    finalize_failed_repair: Callable[..., "FailedRepairDetails"]
+    prepare_iteration_tasks: Callable[[LCATask, SpanHandle | None], PreparedTasks]
+    evaluate_policy_on_item: EvaluatePolicyOnItem
+    build_iteration_feedback: BuildIterationFeedback
+    attempt_policy_generation: AttemptPolicyGeneration
+    run_policy_pipeline: RunPolicyPipeline
+    finalize_successful_policy: FinalizeSuccessfulPolicy
+    finalize_failed_repair: FinalizeFailedRepair
     classify_results: Callable[[list[StepResult]], PipelineClassification]
     format_pipeline_failure_context: Callable[[list[StepResult], PipelineClassification | None, str | None, str | None, int], str]
     read_policy: Callable[[], str]
     write_policy: Callable[[str], None]
     get_writer_model: Callable[[], str | None]
-    start_observation: Callable[..., ContextManager[SpanHandle]]
+    start_observation: StartObservation
     find_repo_root: Callable[[], Path]
-    default_pipeline: Callable[[], object]
+    default_pipeline: Callable[[], SupportsPipelineRun]
 
 
 class RepairContext(BaseModel):
@@ -7544,7 +7797,7 @@ class RepairContext(BaseModel):
     success: bool = False
     pipeline_passed: bool = False
     candidate_code: str | None = None
-    pipeline: object | None = None
+    pipeline: SupportsPipelineRun | None = None
     repair_observation: SpanHandle | None = None
     writer_error: str | None = None
     pipeline_feedback: PipelineClassification | None = None
@@ -7671,6 +7924,57 @@ def _rebuild_forward_refs() -> None:
 
 
 _rebuild_forward_refs()
+</file>
+
+<file path="orchestration/writer.py">
+from __future__ import annotations
+
+from harness.agents.writer import generate_policy
+from harness.pipeline.types import PipelineClassification
+from harness.prompts import WriterOptimizationBrief
+from harness.utils.type_loader import FrontierContext
+
+
+def clean_policy_code(code: str) -> str:
+    if "```" in code:
+        parts = code.split("```")
+        if len(parts) >= 2:
+            code = parts[1]
+            if code.startswith("python"):
+                code = code[len("python") :].lstrip()
+    return code.strip()
+
+
+def attempt_policy_generation(
+    *,
+    initial_policy: str,
+    tests: str,
+    frontier_context: str,
+    frontier_context_details: FrontierContext,
+    optimization_brief: WriterOptimizationBrief,
+    failure_context_str: str | None,
+    repair_attempt: int,
+    parent_trace: object | None = None,
+    pipeline_feedback: PipelineClassification | None = None,
+) -> tuple[str | None, str | None]:
+    try:
+        feedback = {}
+        if pipeline_feedback is not None:
+            feedback = {"pipeline_feedback": pipeline_feedback.model_dump()}
+        new_code = generate_policy(
+            current_policy=initial_policy,
+            tests=tests,
+            frontier_context=frontier_context,
+            frontier_context_details=frontier_context_details,
+            optimization_brief=optimization_brief,
+            feedback=feedback,
+            parent_trace=parent_trace,
+            failure_context=failure_context_str,
+            repair_attempt=repair_attempt,
+        )
+        return clean_policy_code(new_code), None
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
 </file>
 
 <file path="pipeline/__init__.py">
@@ -10059,7 +10363,7 @@ from harness.localization.models import (
     LocalizationEvidence,
     LocalizationGold,
     LocalizationPrediction,
-    normalize_lca_task,
+    LocalizationRunResult,
 )
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
@@ -10284,7 +10588,7 @@ def compute_baseline_for_task(
     dataset_version: str | None = None,
     parent_trace: object | None = None,
     runner: Callable[
-        [LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]
+        [LCATask, str, object | None], LocalizationRunResult
     ]
     | None = None,
     dataset_source: str | None = None,
@@ -10321,9 +10625,7 @@ def compute_baseline_for_task(
                     task_id=failure.task_id or task.task_id,  # type: ignore[arg-type]
                 )
             task_result = eval_result.items[0]
-            prediction_model = LocalizationPrediction(
-                predicted_files=task_result.prediction
-            )
+            prediction_model = task_result.prediction
             score_summary = summarize_task_score(task.task_id, task_result.score_bundle)
             evidence = task_result.evidence
             materialization = task_result.materialization
@@ -10430,13 +10732,6 @@ def load_baseline_bundle(path: Path) -> BaselineBundle:
         return BaselineBundle.model_validate(data)
     except ValidationError as exc:
         raise ValueError(f"Invalid baseline bundle: {exc}") from exc
-
-
-def normalize_baseline_task(data: Mapping[str, object]) -> LCATask:
-    """
-    Helper to coerce legacy mappings into LCATask for baseline compatibility.
-    """
-    return normalize_lca_task(data)
 </file>
 
 <file path="telemetry/hosted/datasets.py">
@@ -10606,10 +10901,11 @@ from harness.localization.materialization.materialize import (
     RepoMaterializationResult,
     RepoMaterializer,
 )
-from harness.localization.models import LCATask, normalize_lca_task
+from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
+    prediction_filenames,
 )
 from harness.scoring import summarize_score_summaries, summarize_task_score
 from harness.scoring.batch import TaskScoreSummary
@@ -10645,7 +10941,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class LocalizationRunItemResult(BaseModel):
-    task: Mapping[str, object]
+    task: LCATask
     score_summary: TaskScoreSummary
     prediction: list[str] = Field(default_factory=list)
     trace_id: str | None = None
@@ -10653,7 +10949,7 @@ class LocalizationRunItemResult(BaseModel):
     token_usage: TokenUsageRecord | None = None
 
 
-class LocalizationRunResult(BaseModel):
+class HostedLocalizationRunResult(BaseModel):
     dataset_name: str
     dataset_version: str | None = None
     items: list[LocalizationRunItemResult] = Field(default_factory=list)
@@ -10971,16 +11267,6 @@ def _run_baseline_parallel(
     return ordered_results, failure_payload
 
 
-def _normalize_task_payload(
-    task: LCATask | Mapping[str, object],
-) -> Mapping[str, object]:
-    if isinstance(task, Mapping):
-        return task
-    if hasattr(task, "model_dump"):
-        return task.model_dump()
-    raise RuntimeError("Localization task must be a mapping or Pydantic model")
-
-
 def _emit_experiment_dataset_aggregates(
     span: object | None,
     results: Sequence[LocalizationRunItemResult],
@@ -11013,7 +11299,7 @@ def _emit_experiment_dataset_aggregates(
 
 
 def _run_experiment_task(
-    task: LCATask | Mapping[str, object],
+    task: LCATask,
     parent_trace: object,
     materializer: RepoMaterializer | None,
     session_id: str | None,
@@ -11025,12 +11311,10 @@ def _run_experiment_task(
             LocalizationFailureCategory.UNKNOWN,
             "missing parent trace",
         )
-    task_payload = _normalize_task_payload(task)
-    normalized_task = normalize_lca_task(task_payload)
     try:
         with propagate_context(session_id=session_id):
             eval_result = evaluate_localization_batch(
-                tasks=[normalized_task],
+                tasks=[task],
                 dataset_source="huggingface",
                 materializer=materializer,
                 parent_trace=parent_trace,
@@ -11039,17 +11323,17 @@ def _run_experiment_task(
             failure = eval_result.failure or LocalizationEvaluationFailure(
                 category=LocalizationFailureCategory.UNKNOWN,
                 message="experiment_evaluation_failed",
-                task_id=normalized_task.task_id,
+                task_id=task.task_id,
             )
             raise _TaskFailure(-1, failure.task_id, failure.category, failure.message)
         task_result = eval_result.items[0]
         score_summary = summarize_task_score(
-            normalized_task.task_id, task_result.score_bundle
+            task.task_id, task_result.score_bundle
         )
         return LocalizationRunItemResult(
-            task=normalized_task.model_dump(),
+            task=task,
             score_summary=score_summary,
-            prediction=task_result.prediction,
+            prediction=prediction_filenames(task_result.prediction),
             trace_id=getattr(parent_trace, "id", None),
             materialization=task_result.materialization,
             token_usage=task_result.token_usage,
@@ -11059,12 +11343,12 @@ def _run_experiment_task(
     except LocalizationEvaluationError as exc:
         category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
         raise _TaskFailure(
-            -1, getattr(normalized_task, "task_id", None), category, str(exc)
+            -1, getattr(task, "task_id", None), category, str(exc)
         ) from exc
     except Exception as exc:  # noqa: BLE001
         raise _TaskFailure(
             -1,
-            getattr(normalized_task, "task_id", None),
+            getattr(task, "task_id", None),
             LocalizationFailureCategory.UNKNOWN,
             str(exc),
         ) from exc
@@ -11142,7 +11426,7 @@ def run_hosted_localization_experiment(
     req: HostedLocalizationRunRequest,
     materializer: RepoMaterializer | None = None,
     tasks: list[LCATask] | None = None,
-) -> LocalizationRunResult:
+) -> HostedLocalizationRunResult:
     tasks = tasks or _resolve_items(req)
     if not tasks:
         raise RuntimeError("No localization tasks available for experiment run")
@@ -11220,7 +11504,7 @@ def run_hosted_localization_experiment(
             )
     flush_langfuse()
     reducer_summary = _build_reducer_summary(results)
-    return LocalizationRunResult(
+    return HostedLocalizationRunResult(
         dataset_name=req.dataset,
         dataset_version=req.version,
         items=results,
@@ -11236,14 +11520,10 @@ def _build_reducer_summary(
         return None
     task_inputs = []
     for item in results:
-        try:
-            normalized_task = normalize_lca_task(item.task)
-        except Exception:
-            continue
         task_inputs.append(
             build_task_input(
-                identity=normalized_task.identity,
-                task_id=normalized_task.task_id,
+                identity=item.task.identity,
+                task_id=item.task.task_id,
                 score_summary=item.score_summary,
                 candidate_usage=item.token_usage,
                 baseline_usage=None,
@@ -12604,9 +12884,50 @@ from harness.backends.mcp import (
     run_async,
     serialize_tool_result_for_model,
 )
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+    LocalizationRunResult,
+)
 from harness.prompts import build_jc_system_prompt
 from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
+
+
+def _runner_task(repo: str) -> LCATask:
+    return LCATask(
+        identity=LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ),
+        context=LCAContext(issue_title="bug", issue_body="details"),
+        gold=LCAGold(changed_files=["a.py"]),
+        repo=repo,
+    )
+
+
+def _runner_result(
+    task: LCATask,
+    predicted_files: list[str] | None = None,
+    reasoning: str | None = None,
+    observations: list[dict[str, object]] | None = None,
+    source: str | None = None,
+) -> LocalizationRunResult:
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(
+            predicted_files=predicted_files or [],
+            reasoning=reasoning,
+        ),
+        observations=observations or [],
+        source=source,
+    )
 
 
 async def _sample_coroutine(loop_ids: list[int] | None = None) -> str:
@@ -13040,38 +13361,23 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     def fake_finalize(task, obs, parent_trace=None):
         # Expect a separate no-tools finalize call; simulate schema result.
-        assert isinstance(task, dict)
+        assert isinstance(task, LCATask)
         assert isinstance(obs, list)
         # Ensure the schema path is used (response_format=json_schema would have been required upstream).
-        return runner.LocalizationRunnerResult(predicted_files=["a.py"], observations=obs, source="finalize")
+        return _runner_result(task, ["a.py"], observations=obs, source="finalize")
 
     monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
 
-    task_payload = {
-        "identity": LCATaskIdentity(
-            dataset_name="lca",
-            dataset_config="py",
-            dataset_split="dev",
-            repo_owner="o",
-            repo_name="r",
-            base_sha="abc",
-        ).model_dump(),
-        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-        "repo": str(tmp_path),
-    }
-    result = cast(
-        dict[str, Any],
-        runner.run_ic_iteration(
-            task_payload,
-            score_fn=lambda n, s: 1.0,
-            steps=1,
-            parent_trace=object(),
-        ),
+    result = runner.run_ic_iteration(
+        _runner_task(str(tmp_path)),
+        score_fn=lambda n, s: 1.0,
+        steps=1,
+        parent_trace=object(),
     )
-    assert result["node_count"] == 2
+    assert result.node_count == 2
     tool_obs = next(
         cast(dict[str, Any], obs)
-        for obs in result["observations"]
+        for obs in result.observations
         if isinstance(obs, dict) and obs.get("role") == "tool"
     )
     payload = cast(dict[str, Any], tool_obs["result"])
@@ -13114,36 +13420,21 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     def fake_finalize(task, obs, parent_trace=None):
-        assert isinstance(task, dict)
+        assert isinstance(task, LCATask)
         assert isinstance(obs, list)
-        return runner.LocalizationRunnerResult(predicted_files=["a.py"], observations=obs, source="finalize")
+        return _runner_result(task, ["a.py"], observations=obs, source="finalize")
 
     monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
 
-    task_payload = {
-        "identity": LCATaskIdentity(
-            dataset_name="lca",
-            dataset_config="py",
-            dataset_split="dev",
-            repo_owner="o",
-            repo_name="r",
-            base_sha="abc",
-        ).model_dump(),
-        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-        "repo": str(tmp_path),
-    }
-    result = cast(
-        dict[str, Any],
-        runner.run_jc_iteration(
-            task_payload,
-            steps=1,
-            parent_trace=object(),
-        ),
+    result = runner.run_jc_iteration(
+        _runner_task(str(tmp_path)),
+        steps=1,
+        parent_trace=object(),
     )
-    assert result["node_count"] == 0
+    assert result.node_count == 0
     tool_obs = next(
         cast(dict[str, Any], obs)
-        for obs in result["observations"]
+        for obs in result.observations
         if isinstance(obs, dict) and obs.get("role") == "tool"
     )
     assert tool_obs["result"] == {"called": "search_files", "args": {"query": "foo"}}
@@ -13178,8 +13469,8 @@ def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
     def fake_finalize(task, obs, parent_trace=None):
         finalized["called"] = True
         finalize_calls.append({"task": task, "observations": obs})
-        return runner.LocalizationRunnerResult(
-            predicted_files=["src/app.py"], reasoning="r", observations=obs, source="finalize"
+        return _runner_result(
+            task, ["src/app.py"], reasoning="r", observations=obs, source="finalize"
         )
 
     monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
@@ -13206,32 +13497,18 @@ def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "run_agent", fake_run_agent)
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
-    result = cast(
-        dict[str, Any],
-        runner.run_ic_iteration(
-            {
-                "identity": LCATaskIdentity(
-                    dataset_name="lca",
-                    dataset_config="py",
-                    dataset_split="dev",
-                    repo_owner="o",
-                    repo_name="r",
-                    base_sha="abc",
-                ).model_dump(),
-                "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-                "repo": str(repo_dir),
-            },
-            score_fn=None,
-            steps=1,
-            parent_trace=object(),
-        ),
+    result = runner.run_ic_iteration(
+        _runner_task(str(repo_dir)),
+        score_fn=None,
+        steps=1,
+        parent_trace=object(),
     )
     assert captured.get("repo") == str(repo_dir)
     assert captured.get("tool_specs")
     assert captured.get("dispatches") == [("resolve", {"path": "p"})]
-    assert result.get("predicted_files") == ["src/app.py"]
+    assert result.prediction.predicted_files == ["src/app.py"]
     assert finalized["called"] is True
-    assert finalize_calls and "identity" in finalize_calls[0]["task"]
+    assert finalize_calls and isinstance(finalize_calls[0]["task"], LCATask)
 
 
 def test_finalization_uses_json_schema(monkeypatch, tmp_path):
@@ -13293,21 +13570,8 @@ def test_finalization_uses_json_schema(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
-    task_payload = {
-        "identity": LCATaskIdentity(
-            dataset_name="lca",
-            dataset_config="py",
-            dataset_split="dev",
-            repo_owner="o",
-            repo_name="r",
-            base_sha="abc",
-        ).model_dump(),
-        "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-        "repo": str(tmp_path),
-    }
-
-    result = runner.run_ic_iteration(task_payload, score_fn=None, steps=1, parent_trace=object())
-    assert result["predicted_files"] == ["src/app.py"]
+    result = runner.run_ic_iteration(_runner_task(str(tmp_path)), score_fn=None, steps=1, parent_trace=object())
+    assert result.prediction.predicted_files == ["src/app.py"]
     assert len(calls) >= 2
     explore_call = calls[0]
     finalize_call = calls[-1]
@@ -13426,26 +13690,15 @@ def test_finalization_json_schema_uses_provider_supported_subset(monkeypatch, tm
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(tmp_path),
-        },
+        _runner_task(str(tmp_path)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
 
     assert schema_payloads
-    assert result["predicted_files"] == ["src/app.py"]
-    assert result["source"] == "finalize"
+    assert result.prediction.predicted_files == ["src/app.py"]
+    assert result.source == "finalize"
 
 
 def test_apply_tool_results_preserves_assistant_tool_response_order():
@@ -13586,6 +13839,7 @@ from harness.localization.models import (
     LCATaskIdentity,
     LocalizationGold,
     LocalizationPrediction,
+    LocalizationRunResult,
 )
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
 from harness.scoring import ScoreContext, ScoreEngine, summarize_batch_scores, summarize_task_score
@@ -13614,6 +13868,14 @@ def _install_dummy_langfuse(monkeypatch):
             return _CM()
 
     monkeypatch.setattr("harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient())
+
+
+def _runner_result(task: LCATask, predicted_files: list[str]) -> LocalizationRunResult:
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(predicted_files=predicted_files),
+        source="runner",
+    )
 
 
 def _task(repo: str | None = None) -> LCATask:
@@ -13652,7 +13914,7 @@ def _eval_result(task: LCATask) -> LocalizationEvaluationResult:
             LocalizationEvaluationTaskResult(
                 task=task,
                 score_bundle=bundle,
-                prediction=["a.py"],
+                prediction=LocalizationPrediction(predicted_files=["a.py"]),
                 evidence=None,
                 materialization=None,
                 trace_id=None,
@@ -13672,7 +13934,7 @@ def test_resolve_and_bundle_roundtrip(tmp_path):
     snap = baselines.compute_baseline_for_task(
         task,
         dataset_version="v1",
-        runner=lambda *_: (["a.py"], {"source": "runner"}),
+        runner=lambda task, *_: _runner_result(task, ["a.py"]),
     )
     bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="v1")
     path = tmp_path / "bundle.json"
@@ -14010,6 +14272,90 @@ def test_baseline_cache_path_respects_env_and_dataset(monkeypatch, tmp_path):
     )
     expected = cache_root / "JetBrains-Research__lca-bug-localization" / "py" / "dev" / "rev1.json"
     assert path == expected
+</file>
+
+<file path="tests_harness/test_canonical_lca_task_model.py">
+from __future__ import annotations
+
+import inspect
+from typing import get_type_hints
+
+from harness.agents.common import serialize_lca_task_for_prompt
+from harness.agents.localizer import run_ic_iteration, run_jc_iteration
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    normalize_lca_task,
+)
+from harness import orchestration
+from harness.orchestration import dependencies as orchestration_dependencies
+from harness.orchestration import runtime
+from harness.orchestration import types as orchestration_types
+
+DELETED_TASK_WRAPPERS = (
+    "TaskPayload",
+    "ICTaskPayload",
+    "JCTaskPayload",
+    "AgentTaskPayload",
+    "AgentTask",
+)
+
+
+def _task() -> LCATask:
+    return LCATask(
+        identity=LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ),
+        context=LCAContext(issue_title="bug", issue_body="details"),
+        gold=LCAGold(changed_files=["a.py"]),
+        repo="repo",
+    )
+
+
+def test_duplicate_internal_task_wrappers_are_not_exported_from_orchestration() -> None:
+    for name in DELETED_TASK_WRAPPERS:
+        assert not hasattr(orchestration_types, name)
+        assert not hasattr(orchestration, name)
+
+
+def test_localization_module_exports_single_internal_task_model() -> None:
+    assert LCATask.__name__ == "LCATask"
+    assert normalize_lca_task({"changed_files": []}).__class__ is LCATask
+
+
+def test_orchestration_records_reference_lca_task_directly() -> None:
+    assert orchestration_types.RunMetadata.model_fields["task"].annotation is LCATask
+    assert orchestration_types.PreparedTasks.model_fields["task"].annotation is LCATask
+    assert orchestration_types.IterationTasks.model_fields["task"].annotation is LCATask
+    assert orchestration_types.LoopContext.model_fields["task"].annotation is LCATask
+    assert inspect.signature(orchestration_dependencies.prepare_iteration_tasks).parameters["task"].annotation in {LCATask, "LCATask"}
+    assert inspect.signature(runtime.evaluate_policy_on_item).parameters["task"].annotation in {LCATask, "LCATask"}
+    assert inspect.signature(runtime.run_loop).parameters["task"].annotation in {LCATask, "LCATask"}
+
+
+def test_ic_and_jc_share_lca_task_input_type() -> None:
+    assert inspect.signature(run_ic_iteration).parameters["task"].name == "task"
+    assert inspect.signature(run_jc_iteration).parameters["task"].name == "task"
+    assert get_type_hints(run_ic_iteration)["task"] is LCATask
+    assert get_type_hints(run_jc_iteration)["task"] is LCATask
+
+
+def test_prompt_serializer_is_one_way_edge_payload() -> None:
+    task = _task()
+    payload = serialize_lca_task_for_prompt(task)
+
+    assert payload["identity"] == task.identity.model_dump()
+    assert payload["context"] == task.context.model_dump()
+    assert payload["repo"] == task.repo
+    assert "gold" not in payload
+    assert "changed_files" not in payload
 </file>
 
 <file path="tests_harness/test_cerebras_pricing.py">
@@ -14579,9 +14925,8 @@ from harness.localization.runtime.execute import (
     _resolve_repo_path,
     _run_runner,
     _score_task,
-    run_localization_task,
 )
-from harness.localization.models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
+from harness.localization.models import LCAContext, LCAGold, LocalizationPrediction, LCATask, LCATaskIdentity
 
 
 def _task(repo: Path) -> LCATask:
@@ -14628,7 +14973,7 @@ def test_score_task_failure_is_typed(tmp_path, monkeypatch):
 
     monkeypatch.setattr("harness.localization.runtime.execute.build_localization_score_eval_record", bad_eval)
     with pytest.raises(LocalizationEvaluationError) as exc:
-        _score_task(task, LCAPrediction(predicted_files=["a.py"]), repo)
+        _score_task(task, LocalizationPrediction(predicted_files=["a.py"]), repo)
     assert exc.value.category == LocalizationFailureCategory.SCORING
 </file>
 
@@ -14640,8 +14985,18 @@ import time
 import pytest
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.runtime.evaluate import (
+    LocalizationEvaluationResult,
+    LocalizationEvaluationTaskResult,
+    prediction_filenames,
+)
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+)
 from harness.scoring import ScoreContext, ScoreEngine, summarize_batch_scores
 from harness.telemetry.hosted import experiments
 
@@ -14660,11 +15015,14 @@ def _task(repo: str) -> LCATask:
     return LCATask(identity=identity, context=context, gold=gold, repo=repo)
 
 
-def _eval_result(task: LCATask, prediction: list[str] | None = None) -> LocalizationEvaluationResult:
-    prediction = prediction or ["a.py"]
+def _eval_result(
+    task: LCATask,
+    prediction: LocalizationPrediction | None = None,
+) -> LocalizationEvaluationResult:
+    prediction = prediction or LocalizationPrediction(predicted_files=["a.py"])
     bundle = ScoreEngine().evaluate(
         ScoreContext(
-            predicted_files=tuple(prediction),
+            predicted_files=tuple(prediction.predicted_files),
             gold_files=("a.py",),
             gold_min_hops=0,
             issue_min_hops=0,
@@ -14711,6 +15069,7 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     )
     result = experiments.run_hosted_localization_experiment(req, materializer=None)
     assert calls
+    assert isinstance(calls[0]["tasks"][0], LCATask)
     assert result.items[0].prediction == ["a.py"]
 
 
@@ -14718,11 +15077,11 @@ def test_experiment_dataset_aggregates_emit_component_scores(monkeypatch, tmp_pa
     task = _task(str(tmp_path / "repo"))
     eval_result = _eval_result(task)
     item = experiments.LocalizationRunItemResult(
-        task=task.model_dump(),
+        task=task,
         score_summary=eval_result.items[0].score_bundle.model_copy(
             update={"item_id": task.task_id}
         ),
-        prediction=["a.py"],
+        prediction=prediction_filenames(eval_result.items[0].prediction),
     )
     emitted: list[dict[str, object]] = []
     updates: list[dict[str, object]] = []
@@ -14759,7 +15118,7 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
     def fake_backend(**kwargs):
         task = kwargs["tasks"][0]
         time.sleep(durations[task.task_id])
-        return _eval_result(task, [task.task_id])
+        return _eval_result(task, LocalizationPrediction(predicted_files=[task.task_id]))
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -14787,7 +15146,7 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
         calls.append(task.task_id)
         if task.task_id == t2.task_id:
             raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, "runner failed", task_id=task.task_id)
-        return _eval_result(task, [task.task_id])
+        return _eval_result(task, LocalizationPrediction(predicted_files=[task.task_id]))
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -14815,7 +15174,7 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
     def fake_backend(**kwargs):
         task = kwargs["tasks"][0]
         calls.append(task.task_id)
-        return _eval_result(task, [task.task_id])
+        return _eval_result(task, LocalizationPrediction(predicted_files=[task.task_id]))
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -15337,11 +15696,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
-from harness.localization.runtime.evaluate import evaluate_localization_batch
+from harness.localization.models import LCAContext, LCAGold, LocalizationPrediction, LCATask, LCATaskIdentity
+from harness.localization.runtime.evaluate import (
+    LocalizationEvaluationTaskResult,
+    evaluate_localization_batch,
+)
 from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine
 from harness.orchestration.runtime import evaluate_policy_on_item
-from harness.orchestration.types import ICTaskPayload
 
 
 def _make_task(tmp_path: Path) -> LCATask:
@@ -15376,7 +15737,7 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(
         "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
+        lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     result = evaluate_localization_batch(
@@ -15387,6 +15748,12 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
     assert result.score_summary.aggregate_composed_score == 1.0
     assert result.machine_score == result.score_summary.aggregate_composed_score
     assert result.items and result.items[0].score_bundle.composed_score == 1.0
+    assert (
+        LocalizationEvaluationTaskResult.model_fields["prediction"].annotation
+        is LocalizationPrediction
+    )
+    assert isinstance(result.items[0].prediction, LocalizationPrediction)
+    assert result.items[0].prediction.predicted_files == ["a.py"]
 
 
 def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None:
@@ -15407,23 +15774,17 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
     assert result.failure.category == LocalizationFailureCategory.RUNNER
 
 
-def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
+def test_orchestration_runtime_uses_shared_backend(monkeypatch, tmp_path) -> None:
     bundle = _bundle()
     task = _make_task(tmp_path)
 
     monkeypatch.setattr(
         "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
+        lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda: "policy", raising=False)
-    ic_task = ICTaskPayload(
-        identity=task.identity,
-        context=task.context,
-        repo=str(tmp_path),
-        changed_files=["a.py"],
-    )
-    eval_result = evaluate_policy_on_item(ic_task, None, None, 0)
+    eval_result = evaluate_policy_on_item(task, None, None, 0)
     assert eval_result.metrics.get("score") == 1.0
     assert eval_result.ic_result.get("predicted_files") == ["a.py"]
     assert eval_result.control_score == 1.0
@@ -15435,7 +15796,7 @@ def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(
         "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
+        lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     result = evaluate_localization_batch(
@@ -15469,7 +15830,7 @@ def test_score_summary_failure_is_typed(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(
         "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
+        lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     monkeypatch.setattr(
@@ -15680,7 +16041,7 @@ from pathlib import Path
 
 from harness.localization.models import (
     LCATaskIdentity,
-    LCAPrediction,
+    LCATask,
     LCAGold,
     LCAContext,
     LocalizationDatasetInfo,
@@ -15690,6 +16051,7 @@ from harness.localization.models import (
     LocalizationGold,
     LocalizationPrediction,
     LocalizationRepoInfo,
+    LocalizationRunResult,
     LocalizationTelemetryEnvelope,
     canonicalize_paths,
 )
@@ -15697,9 +16059,53 @@ from harness.scoring import ScoreContext, ScoreEngine, summarize_task_score
 from harness.localization.runtime.records import build_localization_score_eval_record
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.runtime.execute import run_localization_task
+from harness.localization.errors import LocalizationEvaluationError
 import harness.localization.runtime.execute as executor_module
 import harness.agents.localizer as runner
-from harness.localization.errors import LocalizationEvaluationError
+
+
+def _runner_result(
+    task: LCATask,
+    predicted_files: list[str] | None = None,
+    reasoning: str | None = None,
+    observations: list[dict[str, object]] | None = None,
+    source: str | None = None,
+    backend: str | None = None,
+) -> LocalizationRunResult:
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(
+            predicted_files=predicted_files or [],
+            reasoning=reasoning,
+        ),
+        observations=observations or [],
+        source=source,
+        backend=backend,
+    )
+
+
+def _runner_task(repo: str) -> LCATask:
+    return LCATask(
+        identity=LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ),
+        context=LCAContext(issue_title="bug", issue_body="details"),
+        gold=LCAGold(changed_files=["a.py"]),
+        repo=repo,
+    )
+
+
+def test_localization_run_result_separates_prediction_from_execution() -> None:
+    fields = LocalizationRunResult.model_fields
+    assert "prediction" in fields
+    assert "predicted_files" not in fields
+    assert "reasoning" not in fields
+    assert set(LocalizationPrediction.model_fields) >= {"predicted_files", "reasoning"}
 
 
 def test_identity_is_deterministic():
@@ -15733,7 +16139,7 @@ def test_eval_builder_is_model_first():
         base_sha="sha",
         issue_url="url",
     )
-    pred = LCAPrediction(predicted_files=["a.py"])
+    pred = LocalizationPrediction(predicted_files=["a.py"])
     gold = LCAGold(changed_files=["a.py"])
     evidence = LocalizationEvidence(items=[LocalizationEvidenceItem(file="a.py", hints=["line 1"])])
     score_context = ScoreContext(
@@ -15840,7 +16246,7 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     prediction, score_bundle, _evidence, _mat, _usage = run_localization_task(
         lca_task,
-        runner=lambda *_args: (["predicted.py"], {"source": "runner"}),
+        runner=lambda task, *_args: _runner_result(task, ["predicted.py"], source="runner"),
     )
     assert prediction.predicted_files == ["predicted.py"]
     assert score_bundle.composed_score is None
@@ -15884,7 +16290,7 @@ def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
     monkeypatch.setattr(executor_module, "emit_score_for_handle", lambda *a, **k: None)
     prediction, score_bundle, *_ = run_localization_task(
         lca_task,
-        runner=lambda *_args: (["SRC\\foo.py"], {"source": "runner"}),
+        runner=lambda task, *_args: _runner_result(task, ["SRC\\foo.py"], source="runner"),
     )
     assert prediction.predicted_files == ["SRC\\foo.py"]
     assert updates
@@ -15952,7 +16358,7 @@ def test_localization_task_emits_backend_prefixed_score_bundle(monkeypatch, tmp_
 
     run_localization_task(
         lca_task,
-        runner=lambda *_args: (["a.py"], {"backend": "ic"}),
+        runner=lambda task, *_args: _runner_result(task, ["a.py"], backend="ic"),
     )
 
     names = {item["name"] for item in emitted}
@@ -16008,12 +16414,11 @@ def test_localization_task_scores_runner_usage_as_visible_component(monkeypatch,
 
     _prediction, score_bundle, _evidence, _mat, usage = run_localization_task(
         lca_task,
-        runner=lambda *_args: (
-            ["src/app.py"],
-            {
-                "backend": "ic",
-                "usage_details": {"input": 10, "output": 5, "total": 15},
-            },
+        runner=lambda task, *_args: LocalizationRunResult(
+            task=task,
+            prediction=LocalizationPrediction(predicted_files=["src/app.py"]),
+            backend="ic",
+            raw={"usage_details": {"input": 10, "output": 5, "total": 15}},
         ),
     )
 
@@ -16086,14 +16491,14 @@ def test_localization_langfuse_boundary_node_count_visible_without_malformed_bun
     def span_cm():
         yield TaskSpan()
 
-    def runner_with_visible_node_count(*_args):
+    def runner_with_visible_node_count(task: LCATask, *_args):
         executor_module.emit_score_for_handle(
             BackendSpan(),
             name="ic.node_count",
             value=2.0,
             data_type="NUMERIC",
         )
-        return ["a.py"], {"backend": "ic"}
+        return _runner_result(task, ["a.py"], backend="ic")
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     monkeypatch.setattr(executor_module, "_score_task", lambda *a, **k: bundle)
@@ -16117,8 +16522,8 @@ def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=["src/app.py"], reasoning="r", observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, ["src/app.py"], reasoning="r", observations=obs, source="finalize"
         ),
     )
 
@@ -16138,25 +16543,15 @@ def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(repo_dir),
-        },
+        _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
     assert captured
     assert "changed_files" not in captured[0]
-    assert result.get("predicted_files") == ["src/app.py"]
+    assert result.prediction.predicted_files == ["src/app.py"]
+    assert not hasattr(result, "predicted_files")
 
 
 def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_path):
@@ -16178,8 +16573,8 @@ def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=[], observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, [], observations=obs, source="finalize"
         ),
     )
     monkeypatch.setattr(
@@ -16204,26 +16599,15 @@ def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_
     repo_dir.mkdir()
 
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(repo_dir),
-        },
+        _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
 
-    assert result["predicted_files"] == ["src/recovered.py"]
-    assert result["source"] == "fallback"
-    assert result["reasoning"] == "from observations"
+    assert result.prediction.predicted_files == ["src/recovered.py"]
+    assert result.source == "fallback"
+    assert result.prediction.reasoning == "from observations"
 
 
 def test_run_ic_iteration_recovers_nested_tool_result_candidates(monkeypatch, tmp_path):
@@ -16251,8 +16635,8 @@ def test_run_ic_iteration_recovers_nested_tool_result_candidates(monkeypatch, tm
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=[], observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, [], observations=obs, source="finalize"
         ),
     )
     monkeypatch.setattr(
@@ -16275,25 +16659,14 @@ def test_run_ic_iteration_recovers_nested_tool_result_candidates(monkeypatch, tm
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(repo_dir),
-        },
+        _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
 
-    assert result["predicted_files"] == ["src/nested.py", "pkg/other.py"]
-    assert result["source"] == "fallback"
+    assert result.prediction.predicted_files == ["src/nested.py", "pkg/other.py"]
+    assert result.source == "fallback"
 
 
 def test_run_ic_iteration_recovers_when_finalization_request_fails(monkeypatch, tmp_path):
@@ -16337,25 +16710,14 @@ def test_run_ic_iteration_recovers_when_finalization_request_fails(monkeypatch, 
     repo_dir.mkdir()
 
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(repo_dir),
-        },
+        _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
 
-    assert result["predicted_files"] == ["src/from_tool.py"]
-    assert result["source"] == "fallback"
+    assert result.prediction.predicted_files == ["src/from_tool.py"]
+    assert result.source == "fallback"
 
 
 def test_candidate_file_collection_normalizes_and_dedupes(tmp_path):
@@ -16431,8 +16793,8 @@ def test_run_localization_task_empty_finalize_and_empty_fallback_is_typed(
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=[], observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, [], observations=obs, source="finalize"
         ),
     )
     monkeypatch.setattr(
@@ -16522,11 +16884,16 @@ from __future__ import annotations
 
 import pytest
 
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+)
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
 from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine, summarize_batch_scores
 from harness.orchestration.runtime import evaluate_policy_on_item
-from harness.orchestration.types import ICTaskPayload
 
 
 def _identity() -> LCATaskIdentity:
@@ -16551,27 +16918,27 @@ def _bundle(gold_hops: int, issue_hops: int) -> ScoreBundle:
     )
 
 
-def _ic_task(tmp_path) -> ICTaskPayload:
-    return ICTaskPayload(
+def _task(tmp_path) -> LCATask:
+    return LCATask(
         identity=_identity(),
         context=LCAContext(issue_title="bug", issue_body="body"),
+        gold=LCAGold(changed_files=["a.py"]),
         repo=str(tmp_path),
-        changed_files=["a.py"],
     )
 
 
 def test_machine_uses_batch_composed_score(monkeypatch, tmp_path):
-    ic_task = _ic_task(tmp_path)
+    task = _task(tmp_path)
     score_bundle = _bundle(gold_hops=1, issue_hops=1)
     task_result = LocalizationEvaluationTaskResult(
         task=LCATask(
-            identity=ic_task.identity,
-            context=ic_task.context,
+            identity=task.identity,
+            context=task.context,
             gold=LCAGold(changed_files=["a.py"]),
-            repo=ic_task.repo,
+            repo=task.repo,
         ),
         score_bundle=score_bundle,
-        prediction=["a.py"],
+        prediction=LocalizationPrediction(predicted_files=["a.py"]),
     )
     score_summary = summarize_batch_scores({"task": score_bundle})
     eval_result = LocalizationEvaluationResult(
@@ -16581,28 +16948,28 @@ def test_machine_uses_batch_composed_score(monkeypatch, tmp_path):
         failure=None,
     )
 
-    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", lambda **kwargs: eval_result)
-    result = evaluate_policy_on_item(ic_task, None, None, 0)
+    monkeypatch.setattr("harness.orchestration.evaluation.evaluate_localization_batch", lambda **kwargs: eval_result)
+    result = evaluate_policy_on_item(task, None, None, 0)
 
     assert result.control_score == pytest.approx(score_summary.aggregate_composed_score)
     assert result.metrics.get("score") == pytest.approx(score_bundle.composed_score)
 
 
 def test_control_score_changes_with_composed_bundle(monkeypatch, tmp_path):
-    ic_task = _ic_task(tmp_path)
+    task = _task(tmp_path)
     first_bundle = _bundle(gold_hops=2, issue_hops=2)
     second_bundle = _bundle(gold_hops=0, issue_hops=0)
 
     def backend_for(bundle: ScoreBundle) -> LocalizationEvaluationResult:
         task_result = LocalizationEvaluationTaskResult(
             task=LCATask(
-                identity=ic_task.identity,
-                context=ic_task.context,
+                identity=task.identity,
+                context=task.context,
                 gold=LCAGold(changed_files=["a.py"]),
-                repo=ic_task.repo,
+                repo=task.repo,
             ),
             score_bundle=bundle,
-            prediction=["a.py"],
+            prediction=LocalizationPrediction(predicted_files=["a.py"]),
         )
         summary = summarize_batch_scores({"task": bundle})
         return LocalizationEvaluationResult(
@@ -16612,11 +16979,11 @@ def test_control_score_changes_with_composed_bundle(monkeypatch, tmp_path):
             failure=None,
         )
 
-    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", lambda **kwargs: backend_for(first_bundle))
-    res_first = evaluate_policy_on_item(ic_task, None, None, 0)
+    monkeypatch.setattr("harness.orchestration.evaluation.evaluate_localization_batch", lambda **kwargs: backend_for(first_bundle))
+    res_first = evaluate_policy_on_item(task, None, None, 0)
 
-    monkeypatch.setattr("harness.orchestration.runtime.evaluate_localization_batch", lambda **kwargs: backend_for(second_bundle))
-    res_second = evaluate_policy_on_item(ic_task, None, None, 0)
+    monkeypatch.setattr("harness.orchestration.evaluation.evaluate_localization_batch", lambda **kwargs: backend_for(second_bundle))
+    res_second = evaluate_policy_on_item(task, None, None, 0)
 
     assert res_first.control_score == pytest.approx(first_bundle.composed_score)
     assert res_second.control_score == pytest.approx(second_bundle.composed_score)
@@ -16632,7 +16999,8 @@ from typing import Any, Iterator, List
 
 import pytest
 
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.orchestration import feedback as feedback_module
 from harness.orchestration import runtime as runtime_module
 from harness.orchestration.machine import OptimizationStateMachine, RepairStateMachine
 from harness.orchestration.types import (
@@ -16643,17 +17011,14 @@ from harness.orchestration.types import (
     FeedbackPackage,
     IterationTasks,
     ICResult,
-    ICTaskPayload,
     IterationRecord,
     JCResult,
-    JCTaskPayload,
     LoopContext,
     LoopDependencies,
     OptimizationMachineModel,
     PreparedTasks,
     RepairContext,
     RepairMachineModel,
-    TaskPayload,
 )
 from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
@@ -16681,6 +17046,11 @@ class RecordingSpan:
         pass
 
 
+class EmptyPipeline:
+    def run(self, repo_root: Path, observation: object | None = None, allow_no_parent: bool = False) -> list[StepResult]:
+        return []
+
+
 def _make_feedback() -> FeedbackPackage:
     scorer_ctx = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
     return FeedbackPackage(
@@ -16702,7 +17072,7 @@ def _make_eval() -> EvaluationResult:
     )
 
 
-def _task_payload() -> TaskPayload:
+def _task() -> LCATask:
     identity = LCATaskIdentity(
         dataset_name="lca",
         dataset_config="py",
@@ -16712,26 +17082,30 @@ def _task_payload() -> TaskPayload:
         base_sha="abc",
     )
     context = LCAContext(issue_title="bug", issue_body="details")
-    return TaskPayload(identity=identity, context=context, repo="repo", changed_files=["a.py"])
+    return LCATask(
+        identity=identity,
+        context=context,
+        gold=LCAGold(changed_files=["a.py"]),
+        repo="repo",
+    )
 
 
 def test_prepared_tasks_emit_models() -> None:
-    base = _task_payload()
-    prepared = PreparedTasks(base_task=base, resolved_repo_path="resolved", jc_repo_id="jc-id")
+    base = _task()
+    prepared = PreparedTasks(task=base, resolved_repo_path="resolved", jc_repo_id="jc-id")
     iteration_tasks = prepared.build_iteration_tasks()
     assert isinstance(iteration_tasks, IterationTasks)
-    assert isinstance(iteration_tasks.ic_task, ICTaskPayload)
-    assert isinstance(iteration_tasks.jc_task, JCTaskPayload)
-    assert iteration_tasks.ic_task.repo == "resolved"
-    assert iteration_tasks.jc_task.repo == "jc-id"
+    assert isinstance(iteration_tasks.task, LCATask)
+    assert iteration_tasks.task.repo == "resolved"
+    assert iteration_tasks.jc_repo_id == "jc-id"
 
 
 def test_build_iteration_feedback_produces_typed_writer_brief(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     frontier = FrontierContext(signature="sig", graph_models="", types="", examples="", notes="")
-    monkeypatch.setattr(runtime_module, "load_tests", lambda repo_root: object())
-    monkeypatch.setattr(runtime_module, "format_tests_for_prompt", lambda tests: "tests")
-    monkeypatch.setattr(runtime_module, "build_frontier_context", lambda repo_root: frontier)
-    monkeypatch.setattr(runtime_module, "format_frontier_context", lambda ctx: "frontier")
+    monkeypatch.setattr(feedback_module, "load_tests", lambda repo_root: object())
+    monkeypatch.setattr(feedback_module, "format_tests_for_prompt", lambda tests: "tests")
+    monkeypatch.setattr(feedback_module, "build_frontier_context", lambda repo_root: frontier)
+    monkeypatch.setattr(feedback_module, "format_frontier_context", lambda ctx: "frontier")
     evaluation = EvaluationResult(
         metrics=EvaluationMetrics.model_validate(
             {"score": 0.25, "iteration_regression": True, "additional_metrics": [{"name": "gold_hop", "value": 0.5}]}
@@ -16809,21 +17183,9 @@ def _repair_deps(
 
     deps = LoopDependencies(
         prepare_iteration_tasks=lambda task, trace=None: PreparedTasks(
-            base_task=task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task),
+            task=task,
             resolved_repo_path=".",
             jc_repo_id=".",
-            ic_task=ICTaskPayload(
-                identity=_task_payload().identity,
-                context=_task_payload().context,
-                repo=".",
-                changed_files=["a.py"],
-            ),
-            jc_task=JCTaskPayload(
-                identity=_task_payload().identity,
-                context=_task_payload().context,
-                repo=".",
-                changed_files=["a.py"],
-            ),
         ),
         evaluate_policy_on_item=lambda *a, **k: _make_eval(),  # type: ignore[arg-type]
         build_iteration_feedback=lambda *a, **k: _make_feedback(),  # type: ignore[arg-type]
@@ -16838,7 +17200,7 @@ def _repair_deps(
         get_writer_model=lambda: "model",
         start_observation=start_observation,
         find_repo_root=lambda: Path("."),
-        default_pipeline=lambda: object(),
+        default_pipeline=lambda: EmptyPipeline(),
     )
     return deps, spans, seen_parent, events
 
@@ -16953,28 +17315,15 @@ def test_failed_candidate_not_marked_accepted() -> None:
 def _opt_deps(ctx: LoopContext) -> LoopDependencies:
     span = RecordingSpan()
 
-    def prepare_iteration_tasks(task: TaskPayload, trace: object | None = None) -> PreparedTasks:
-        base_task = task if isinstance(task, TaskPayload) else TaskPayload.model_validate(task)
+    def prepare_iteration_tasks(task: LCATask, trace: object | None = None) -> PreparedTasks:
         return PreparedTasks(
-            base_task=base_task,
+            task=task.with_repo("."),
             resolved_repo_path=".",
             jc_repo_id=".",
-            ic_task=ICTaskPayload(
-                identity=base_task.identity,
-                context=base_task.context,
-                repo=".",
-                changed_files=base_task.changed_files,
-            ),
-            jc_task=JCTaskPayload(
-                identity=base_task.identity,
-                context=base_task.context,
-                repo=".",
-                changed_files=base_task.changed_files,
-            ),
         )
 
     def evaluate_policy_on_item(
-        ic_task: ICTaskPayload,
+        task: LCATask,
         baseline,
         iteration_span: object | None = None,
         iteration_index: int | None = None,
@@ -17006,14 +17355,14 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
         get_writer_model=lambda: "model",
         start_observation=lambda **k: span,  # RecordingSpan is a context manager
         find_repo_root=lambda: Path("."),
-        default_pipeline=lambda: object(),
+        default_pipeline=lambda: EmptyPipeline(),
     )
     return deps
 
 
 def test_optimization_completes_and_records_history() -> None:
     ctx = LoopContext(
-        task=_task_payload(),
+        task=_task(),
         iterations=1,
         session_id=None,
         baseline_snapshot=None,
@@ -17298,6 +17647,402 @@ def test_propagate_context_strict_rejects_selection(monkeypatch):
     importlib.reload(lf_mod)
     with pytest.raises(ValueError):
         lf_mod.propagate_context(metadata={"selection": {"preview": ["a" * 300]}})
+</file>
+
+<file path="tests_harness/test_orchestration_dependencies.py">
+from __future__ import annotations
+
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.runtime.evaluate import LocalizationEvaluationResult
+from harness.orchestration.dependencies import RuntimeCollaborators, build_loop_dependencies
+from harness.orchestration.types import (
+    AcceptedPolicyMeta,
+    EvaluationMetrics,
+    EvaluationResult,
+    FailedRepairDetails,
+    FeedbackPackage,
+    ICResult,
+    JCResult,
+)
+from harness.pipeline.types import PipelineClassification, StepResult
+from harness.prompts import WriterOptimizationBrief, build_writer_optimization_brief
+from harness.utils.diff import DiffSummary
+from harness.utils.type_loader import FrontierContext
+
+
+class RecordingSpan:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, object]] = []
+
+    def end(self, **kwargs: object) -> None:
+        self.updates.append(dict(kwargs))
+
+    def update(self, **kwargs: object) -> None:
+        self.updates.append(dict(kwargs))
+
+
+class EmptyPipeline:
+    def run(
+        self,
+        repo_root: Path,
+        observation: RecordingSpan | None = None,
+        allow_no_parent: bool = False,
+    ) -> list[StepResult]:
+        return []
+
+
+def _task() -> LCATask:
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    return LCATask(
+        identity=identity,
+        context=LCAContext(issue_title="bug", issue_body="details"),
+        gold=LCAGold(changed_files=["a.py"]),
+        repo="repo",
+    )
+
+
+def _evaluation() -> EvaluationResult:
+    return EvaluationResult(
+        metrics=EvaluationMetrics.model_validate({"score": 1.0}),
+        ic_result=ICResult(),
+        jc_result=JCResult(),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary=None,
+        policy_code="policy",
+    )
+
+
+def _feedback() -> FeedbackPackage:
+    frontier = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
+    return FeedbackPackage(
+        tests="tests",
+        frontier_context="frontier",
+        frontier_context_details=frontier,
+        optimization_brief=build_writer_optimization_brief(guidance=["hint"]),
+    )
+
+
+def test_build_loop_dependencies_wires_explicit_collaborators(tmp_path: Path) -> None:
+    spans: list[RecordingSpan] = []
+    indexed: list[str] = []
+    emitted_scores: list[str] = []
+    pipeline = EmptyPipeline()
+
+    @contextmanager
+    def start_observation(
+        name: str,
+        *,
+        parent: object | None = None,
+        as_type: str = "span",
+        input: object | None = None,
+        model: str | None = None,
+        metadata: dict[str, object] | None = None,
+        usage_details: object | None = None,
+    ) -> Iterator[RecordingSpan]:
+        span = RecordingSpan()
+        spans.append(span)
+        yield span
+
+    def generate_policy(
+        current_policy: str,
+        tests: str,
+        frontier_context: str,
+        frontier_context_details: FrontierContext,
+        optimization_brief: WriterOptimizationBrief,
+        feedback: dict[str, object] | None = None,
+        parent_trace: object | None = None,
+        failure_context: str | None = None,
+        repair_attempt: int = 0,
+    ) -> str:
+        return current_policy
+
+    collaborators = RuntimeCollaborators(
+        index_folder=lambda repo: indexed.append(repo) or {"repo": "indexed-repo"},
+        evaluate_localization_batch=lambda tasks, **kwargs: LocalizationEvaluationResult(),
+        load_tests=lambda repo_root: [],
+        format_tests_for_prompt=lambda tests: "tests",
+        build_frontier_context=lambda repo_root: FrontierContext(signature="", graph_models="", types="", examples="", notes=""),
+        format_frontier_context=lambda ctx: "frontier",
+        compute_diff=lambda prev, current, old, new: DiffSummary(0.0, set(), set(), False),
+        format_diff=lambda diff: "diff",
+        interpret_diff=lambda diff: "guidance",
+        generate_policy=generate_policy,
+        emit_score=lambda **kwargs: emitted_scores.append(str(kwargs["name"])),
+        classify_results=lambda results: PipelineClassification(passed=[step.name for step in results]),
+        read_policy=lambda: "policy",
+        write_policy=lambda code: None,
+        get_writer_model=lambda: "model",
+        start_observation=start_observation,
+        find_repo_root=lambda: tmp_path,
+        default_pipeline=lambda: pipeline,
+    )
+
+    deps = build_loop_dependencies(
+        collaborators,
+        evaluate_policy_on_item=lambda task, baseline, span, index: _evaluation(),
+        build_iteration_feedback=lambda evaluation, prev, classified, repo: _feedback(),
+        attempt_policy_generation=lambda **kwargs: ("policy", None),
+    )
+
+    prepared = deps.prepare_iteration_tasks(_task(), None)
+    assert prepared.ic_task().repo == "repo"
+    assert prepared.jc_task().repo == "indexed-repo"
+    assert indexed == ["repo"]
+    assert spans and spans[0].updates == [{"metadata": {"repo": "indexed-repo"}}]
+
+    assert deps.read_policy() == "policy"
+    assert deps.find_repo_root() == tmp_path
+    assert deps.default_pipeline() is pipeline
+    assert deps.classify_results([StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")]).passed == ["step"]
+    assert deps.run_policy_pipeline(pipeline, tmp_path) == ([], True)
+    assert emitted_scores == []
+    assert deps.finalize_successful_policy(
+        new_code="candidate",
+        attempts_used=2,
+        max_repair_attempts=3,
+    ) == (
+        "policy",
+        AcceptedPolicyMeta(
+            accepted_policy_source="post_pipeline_disk",
+            accepted_policy_changed_by_pipeline=True,
+            repair_attempts=1,
+            max_policy_repairs=3,
+        ),
+    )
+    assert isinstance(
+        deps.finalize_failed_repair(
+            pipeline_results=[StepResult(name="step", success=False, exit_code=1, stdout="", stderr="bad")],
+            classified=PipelineClassification(type_errors="bad"),
+            writer_model="model",
+            attempts_used=1,
+            writer_error=None,
+        ),
+        FailedRepairDetails,
+    )
+
+
+def test_refactored_orchestration_surface_has_no_cast_usage() -> None:
+    root = Path(__file__).resolve().parents[1]
+    paths = [
+        root / "orchestration" / "runtime.py",
+        root / "orchestration" / "dependencies.py",
+    ]
+
+    offenders = [
+        str(path.relative_to(root))
+        for path in paths
+        if "cast(" in path.read_text(encoding="utf-8")
+    ]
+
+    assert offenders == []
+</file>
+
+<file path="tests_harness/test_orchestration_flow_modules.py">
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+)
+from harness.localization.runtime.evaluate import (
+    LocalizationEvaluationResult,
+    LocalizationEvaluationTaskResult,
+)
+from harness.orchestration import evaluation, feedback, writer
+from harness.orchestration.types import (
+    EvaluationMetrics,
+    EvaluationResult,
+    ICResult,
+    JCResult,
+)
+from harness.pipeline.types import PipelineClassification
+from harness.prompts import WriterOptimizationBrief, build_writer_optimization_brief
+from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine, summarize_batch_scores
+from harness.utils.type_loader import FrontierContext
+
+
+def _identity() -> LCATaskIdentity:
+    return LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+
+
+def _task(tmp_path: Path) -> LCATask:
+    return LCATask(
+        identity=_identity(),
+        context=LCAContext(issue_title="bug", issue_body="body"),
+        gold=LCAGold(changed_files=["a.py"]),
+        repo=str(tmp_path),
+    )
+
+
+def _score_bundle() -> ScoreBundle:
+    return ScoreEngine().evaluate(
+        ScoreContext(
+            predicted_files=("a.py",),
+            gold_files=("a.py",),
+            gold_min_hops=1,
+            issue_min_hops=1,
+        )
+    )
+
+
+def test_evaluation_module_builds_loop_result(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    bundle = _score_bundle()
+    task_result = LocalizationEvaluationTaskResult(
+        task=task,
+        score_bundle=bundle,
+        prediction=LocalizationPrediction(predicted_files=["a.py"]),
+    )
+    summary = summarize_batch_scores({"task": bundle})
+
+    def evaluate_batch(**kwargs: object) -> LocalizationEvaluationResult:
+        assert kwargs["tasks"]
+        return LocalizationEvaluationResult(
+            score_summary=summary,
+            machine_score=summary.aggregate_composed_score,
+            items=[task_result],
+            failure=None,
+        )
+
+    monkeypatch.setattr(evaluation, "evaluate_localization_batch", evaluate_batch)
+    monkeypatch.setattr(evaluation, "_read_policy", lambda: "policy")
+
+    result = evaluation.evaluate_policy_on_item(task, None, None, 0)
+
+    assert result.policy_code == "policy"
+    assert result.control_score == pytest.approx(summary.aggregate_composed_score)
+    assert result.metrics.get("score") == pytest.approx(bundle.composed_score)
+    assert result.ic_result.get("predicted_files") == ["a.py"]
+
+
+def test_feedback_module_builds_writer_package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    frontier = FrontierContext(signature="sig", graph_models="", types="", examples="", notes="")
+    evaluation_result = EvaluationResult(
+        metrics=EvaluationMetrics.model_validate(
+            {
+                "score": 0.25,
+                "iteration_regression": True,
+                "additional_metrics": [{"name": "gold_hop", "value": 0.5}],
+            }
+        ),
+        ic_result=ICResult(),
+        jc_result=JCResult(),
+        jc_metrics=EvaluationMetrics(),
+        comparison_summary="baseline comparison",
+        policy_code="policy",
+        error="runner failed",
+        success=False,
+    )
+
+    monkeypatch.setattr(feedback, "load_tests", lambda repo_root: [("test.py", "def test_ok(): pass")])
+    monkeypatch.setattr(feedback, "format_tests_for_prompt", lambda tests: "tests")
+    monkeypatch.setattr(feedback, "build_frontier_context", lambda repo_root: frontier)
+    monkeypatch.setattr(feedback, "format_frontier_context", lambda ctx: "frontier")
+
+    package = feedback.build_iteration_feedback(
+        evaluation_result,
+        None,
+        None,
+        tmp_path,
+    )
+
+    assert package.tests == "tests"
+    assert package.frontier_context == "frontier"
+    assert package.frontier_context_details == frontier
+    assert package.optimization_brief.guidance.mode == "repair"
+    assert package.optimization_brief.comparison.summary == "baseline comparison"
+    assert any(
+        finding.message == "runner failed"
+        for finding in package.optimization_brief.findings
+    )
+
+
+def test_writer_module_normalizes_success_and_reports_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    frontier = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
+    brief = build_writer_optimization_brief(guidance=["hint"])
+
+    def generator(
+        current_policy: str,
+        tests: str,
+        frontier_context: str,
+        frontier_context_details: FrontierContext,
+        optimization_brief: WriterOptimizationBrief,
+        feedback: dict[str, object] | None = None,
+        parent_trace: object | None = None,
+        failure_context: str | None = None,
+        repair_attempt: int = 0,
+    ) -> str:
+        assert feedback == {
+            "pipeline_feedback": PipelineClassification(type_errors="bad").model_dump()
+        }
+        return "```python\ndef frontier_priority(node, graph, step):\n    return 1.0\n```"
+
+    monkeypatch.setattr(writer, "generate_policy", generator)
+    code, error = writer.attempt_policy_generation(
+        initial_policy="old",
+        tests="tests",
+        frontier_context="frontier",
+        frontier_context_details=frontier,
+        optimization_brief=brief,
+        failure_context_str=None,
+        repair_attempt=0,
+        pipeline_feedback=PipelineClassification(type_errors="bad"),
+    )
+
+    assert error is None
+    assert code == "def frontier_priority(node, graph, step):\n    return 1.0"
+
+    def failing_generator(
+        current_policy: str,
+        tests: str,
+        frontier_context: str,
+        frontier_context_details: FrontierContext,
+        optimization_brief: WriterOptimizationBrief,
+        feedback: dict[str, object] | None = None,
+        parent_trace: object | None = None,
+        failure_context: str | None = None,
+        repair_attempt: int = 0,
+    ) -> str:
+        raise RuntimeError("writer broke")
+
+    monkeypatch.setattr(writer, "generate_policy", failing_generator)
+    code, error = writer.attempt_policy_generation(
+        initial_policy="old",
+        tests="tests",
+        frontier_context="frontier",
+        frontier_context_details=frontier,
+        optimization_brief=brief,
+        failure_context_str=None,
+        repair_attempt=1,
+    )
+
+    assert code is None
+    assert error == "writer broke"
 </file>
 
 <file path="tests_harness/test_pipeline_models.py">
@@ -17852,14 +18597,11 @@ def test_pytest_scope_limited():
 <file path="tests_harness/test_repo_resolution_execution.py">
 from __future__ import annotations
 
-from typing import Mapping
-
-from harness.localization.models import LCAContext, LCATaskIdentity
-from harness.orchestration import IterationRecord, TaskPayload, run_loop
-from harness.orchestration.types import EvaluationMetrics
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.orchestration import run_loop
 
 
-def _payload(repo: str) -> TaskPayload:
+def _task(repo: str) -> LCATask:
     identity = LCATaskIdentity(
         dataset_name="lca",
         dataset_config="py",
@@ -17869,7 +18611,7 @@ def _payload(repo: str) -> TaskPayload:
         base_sha="abc",
     )
     context = LCAContext(issue_title="bug", issue_body="details")
-    return TaskPayload(identity=identity, context=context, repo=repo, changed_files=["a.py"])
+    return LCATask(identity=identity, context=context, gold=LCAGold(changed_files=["a.py"]), repo=repo)
 
 
 def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
@@ -17897,8 +18639,8 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     monkeypatch.setattr("harness.orchestration.runtime.index_folder", lambda repo: {"repo": "local/fake-repo-id"})
     monkeypatch.setattr("harness.orchestration.runtime.load_frontier_policy", lambda: lambda *_: 1.0)
 
-    def fake_run_ic_iteration(task: Mapping[str, object], *args, **kwargs):
-        ic_repos.append(task.get("repo"))
+    def fake_run_ic_iteration(task: LCATask, *args, **kwargs):
+        ic_repos.append(task.repo)
         return {"observations": [{"tool": "x"}], "node_count": 1}
 
     monkeypatch.setattr("harness.agents.localizer.run_ic_iteration", fake_run_ic_iteration)
@@ -17925,8 +18667,8 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     monkeypatch.setattr("harness.orchestration.runtime.emit_score", lambda *a, **k: None)
     monkeypatch.setattr("harness.orchestration.runtime.flush_langfuse", lambda: None)
 
-    payload = _payload(str(repo_dir))
-    run_loop(payload, iterations=1)
+    task = _task(str(repo_dir))
+    run_loop(task, iterations=1)
     assert ic_repos == [str(repo_dir)]
 </file>
 
@@ -18511,7 +19253,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.localization.models import LCAGold, LCAPrediction
+from harness.localization.models import LCAGold, LocalizationPrediction
 from harness.localization.scoring import build_localization_score_context, score_localization
 from harness.localization.static_graph import (
     GraphStore,
@@ -18579,7 +19321,7 @@ def test_score_localization_uses_static_graph_context(monkeypatch, tmp_path: Pat
     monkeypatch.setattr(scoring_mod, "ingest_repo", fake_ingest)
     monkeypatch.setattr(loc_mod.static_graph, "ingest_repo", fake_ingest)
 
-    prediction = LCAPrediction(predicted_files=["repo/file_b.py"])
+    prediction = LocalizationPrediction(predicted_files=["repo/file_b.py"])
     gold = LCAGold(changed_files=["repo/file_a.py"])
     usage = TokenUsageRecord(available=True, usage=TokenUsage(total_tokens=100))
     ctx = build_localization_score_context(
@@ -18622,7 +19364,7 @@ def test_score_context_resolves_real_ingest_repo_relative_paths(monkeypatch, tmp
     monkeypatch.setattr(ingest_mod, "ImportInfo", None)
 
     ctx = build_localization_score_context(
-        prediction=LCAPrediction(predicted_files=["src/app.py"]),
+        prediction=LocalizationPrediction(predicted_files=["src/app.py"]),
         gold=LCAGold(changed_files=["src/app.py"]),
         repo_path=repo,
         anchor_text="Failure points at `src/app.py`.",
@@ -18642,7 +19384,7 @@ def test_score_context_resolves_real_ingest_repo_relative_paths(monkeypatch, tmp
     assert ctx.diagnostics["resolved_gold_count"] == 1
 
     bundle = score_localization(
-        prediction=LCAPrediction(predicted_files=["src/app.py"]),
+        prediction=LocalizationPrediction(predicted_files=["src/app.py"]),
         gold=LCAGold(changed_files=["src/app.py"]),
         repo_path=repo,
         anchor_text="Failure points at `src/app.py`.",
@@ -18678,7 +19420,7 @@ def test_score_localization_missing_token_usage_keeps_default_composed_score(mon
     monkeypatch.setattr(scoring_mod, "ingest_repo", fake_ingest)
 
     bundle = score_localization(
-        prediction=LCAPrediction(predicted_files=["repo/file_b.py"]),
+        prediction=LocalizationPrediction(predicted_files=["repo/file_b.py"]),
         gold=LCAGold(changed_files=["repo/file_a.py"]),
         repo_path=tmp_path,
         anchor_text="`repo/file_a.py`",
@@ -18805,7 +19547,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 import pytest
 
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+    LocalizationRunResult,
+)
 from harness.agents import localizer as runner
 from harness.agents import common as agent_common
 from harness.agents import writer
@@ -18838,7 +19587,7 @@ class DummySpan:
         pass
 
 
-def _agent_payload(repo: str = "r") -> dict[str, object]:
+def _agent_task(repo: str = "r") -> LCATask:
     identity = LCATaskIdentity(
         dataset_name="lca",
         dataset_config="py",
@@ -18848,7 +19597,25 @@ def _agent_payload(repo: str = "r") -> dict[str, object]:
         base_sha="abc",
     )
     context = LCAContext(issue_title="bug", issue_body="details")
-    return {"identity": identity.model_dump(), "context": context.model_dump(), "repo": repo}
+    return LCATask(identity=identity, context=context, gold=LCAGold(changed_files=["a.py"]), repo=repo)
+
+
+def _agent_payload(repo: str = "r") -> dict[str, object]:
+    return agent_common.serialize_lca_task_for_prompt(_agent_task(repo))
+
+
+def _runner_result(
+    task: LCATask,
+    predicted_files: list[str],
+    observations: list[dict[str, object]],
+    source: str,
+) -> LocalizationRunResult:
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(predicted_files=predicted_files),
+        observations=observations,
+        source=source,
+    )
 
 
 def test_run_ic_iteration_emits_scores(monkeypatch):
@@ -18872,15 +19639,15 @@ def test_run_ic_iteration_emits_scores(monkeypatch):
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=["src/app.py"], observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, ["src/app.py"], obs, "finalize"
         ),
     )
 
     parent = object()
-    task_payload = _agent_payload("r")
-    result = runner.run_ic_iteration(task_payload, score_fn=lambda n, g, step: 1.0, steps=1, parent_trace=parent)
-    assert result["node_count"] == 2
+    task = _agent_task("r")
+    result = runner.run_ic_iteration(task, score_fn=lambda n, g, step: 1.0, steps=1, parent_trace=parent)
+    assert result.node_count == 2
     assert ("ic.node_count", 2.0) in scores
 
 
@@ -19477,9 +20244,8 @@ from harness.orchestration.types import (
     EvaluationResult,
     ICResult,
     JCResult,
-    TaskPayload,
 )
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import FrontierContext
@@ -19492,14 +20258,27 @@ class _DummySpan:
     def update(self, **kwargs: object) -> None:
         return None
 
+
+class _DummyPipeline:
+    def run(
+        self,
+        repo_root: Path,
+        observation: object | None = None,
+        allow_no_parent: bool = False,
+    ) -> list[StepResult]:
+        return [
+            StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")
+        ]
+
+
 STUB_FRONTIER_CTX = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
 
 
 def _stub_deps() -> LoopDependencies:
     """Minimal dependency set for chart rendering (no side effects)."""
 
-    def _prepare(task: TaskPayload, trace: object | None = None) -> PreparedTasks:
-        return PreparedTasks(base_task=task, resolved_repo_path=task.repo, jc_repo_id=None)
+    def _prepare(task: LCATask, trace: object | None = None) -> PreparedTasks:
+        return PreparedTasks(task=task, resolved_repo_path=task.repo, jc_repo_id=None)
 
     dummy_eval = EvaluationResult(
         metrics=EvaluationMetrics(),
@@ -19573,7 +20352,7 @@ def _stub_deps() -> LoopDependencies:
         get_writer_model=lambda: "model",
         start_observation=lambda *a, **k: nullcontext(_DummySpan()),
         find_repo_root=lambda: Path("."),
-        default_pipeline=lambda: object(),
+        default_pipeline=lambda: _DummyPipeline(),
     )
 
 
@@ -19611,7 +20390,18 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
         base_sha="base",
     )
     context = LCAContext(issue_title="demo", issue_body="details")
-    loop_ctx = LoopContext(task=TaskPayload(identity=identity, context=context, repo="repo", changed_files=[]), iterations=1, baseline_snapshot=None, run_trace=_DummySpan())
+    task = LCATask(
+        identity=identity,
+        context=context,
+        gold=LCAGold(changed_files=[]),
+        repo="repo",
+    )
+    loop_ctx = LoopContext(
+        task=task,
+        iterations=1,
+        baseline_snapshot=None,
+        run_trace=_DummySpan(),
+    )
     opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
     opt_chart = OptimizationStateMachine(opt_model)
     return repair_chart, opt_chart

@@ -1,13 +1,15 @@
-from __future__ import annotations
-
 """
 Shared agent utilities that are reused by runner and writer agents.
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
+
+from harness.localization.models import LCATask
 
 
 class UsageEntry(BaseModel):
@@ -94,40 +96,18 @@ def usage_from_response(resp: Any) -> UsageEnvelope | None:
     )
 
 
-__all__ = ["usage_from_response"]
+def serialize_lca_task_for_prompt(task: LCATask) -> dict[str, object]:
+    """
+    Convert the canonical internal task into the localizer prompt transport payload.
+    Gold labels stay out of the prompt payload.
+    """
+    if not task.repo:
+        raise ValueError("LCATask.repo is required for localizer prompt serialization")
+    return {
+        "identity": task.identity.model_dump(),
+        "repo": task.repo,
+        "context": task.context.model_dump(),
+    }
 
 
-class AgentTaskPayload(BaseModel):
-    """Validated agent task payload for runner agents."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    identity: dict[str, object]
-    repo: str
-    context: dict[str, object]
-    extra: dict[str, object] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_blocks(cls, value: object) -> object:
-        if isinstance(value, Mapping):
-            identity_val = value.get("identity")
-            context_val = value.get("context")
-
-            def _maybe_dump(obj: object) -> object:
-                model_dump = getattr(obj, "model_dump", None)
-                if callable(model_dump):
-                    try:
-                        return model_dump()
-                    except Exception:
-                        return obj
-                return obj
-
-            normalized_identity = _maybe_dump(identity_val)
-            normalized_context = _maybe_dump(context_val)
-            return {
-                **value,
-                "identity": normalized_identity,
-                "context": normalized_context,
-            }
-        return value
+__all__ = ["serialize_lca_task_for_prompt", "usage_from_response"]

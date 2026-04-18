@@ -110,22 +110,38 @@ class LCAGold(BaseModel):
         return _normalize_path_list(self.changed_files)
 
 
-class LCAPrediction(BaseModel):
+class LocalizationPrediction(BaseModel):
     """
-    Canonical prediction: file paths only (no rank/confidence/score).
+    Canonical semantic localization prediction.
+
+    Execution metadata belongs in the runner result envelope, not here.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     predicted_files: List[str]
+    reasoning: Optional[str] = None
+    evidence: Optional["LocalizationEvidence"] = None
 
     def normalized_predicted_files(self) -> List[str]:
         return _normalize_path_list(self.predicted_files)
 
+    @classmethod
+    def from_raw(cls, value: Sequence[str] | Mapping[str, object]) -> "LocalizationPrediction":
+        if isinstance(value, Mapping):
+            files = value.get("predicted_files", [])
+            if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
+                return cls(predicted_files=[str(f) for f in files])
+            return cls(predicted_files=[])
+        return cls(predicted_files=[str(v) for v in value])
+
 
 class LCATask(BaseModel):
     """
-    LCA bug-localization task model grouping identity, runtime context, gold, and optional diagnostics.
+    Canonical internal LCA bug-localization task model.
+
+    Runtime, orchestration, evaluation, scoring, and agent execution should pass
+    this model internally. Dict/json payloads are transport edge concerns.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -159,6 +175,32 @@ class LCATask(BaseModel):
         """
         return self.gold.normalized_changed_files()
 
+    def with_repo(self, repo: str) -> "LCATask":
+        """
+        Return this task with a concrete repository path or backend repo id.
+        """
+        return self.model_copy(update={"repo": repo})
+
+
+class LocalizationRunResult(BaseModel):
+    """
+    Execution envelope for one localization runner invocation.
+
+    Semantic output is carried only in `prediction`; runtime artifacts stay on
+    this envelope.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: LCATask
+    prediction: LocalizationPrediction
+    observations: List[dict[str, object]] = Field(default_factory=list)
+    node_count: Optional[int] = None
+    raw: Optional[dict[str, object]] = None
+    source: Optional[str] = None
+    backend: Optional[str] = None
+    full_graph: Optional[object] = None
+
 
 class LocalizationDatasetInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -178,21 +220,6 @@ class LocalizationRepoInfo(BaseModel):
     pull_url: Optional[str] = None
     language: Optional[str] = None
     license: Optional[str] = None
-
-
-class LocalizationPrediction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    predicted_files: List[str]
-
-    @classmethod
-    def from_raw(cls, value: Sequence[str] | Mapping[str, object]) -> "LocalizationPrediction":
-        if isinstance(value, Mapping):
-            files = value.get("predicted_files", [])
-            if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
-                return cls(predicted_files=[str(f) for f in files])
-            return cls(predicted_files=[])
-        return cls(predicted_files=[str(v) for v in value])
 
 
 class LocalizationGold(BaseModel):

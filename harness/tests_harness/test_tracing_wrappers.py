@@ -3,7 +3,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 import pytest
 
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+    LocalizationRunResult,
+)
 from harness.agents import localizer as runner
 from harness.agents import common as agent_common
 from harness.agents import writer
@@ -36,7 +43,7 @@ class DummySpan:
         pass
 
 
-def _agent_payload(repo: str = "r") -> dict[str, object]:
+def _agent_task(repo: str = "r") -> LCATask:
     identity = LCATaskIdentity(
         dataset_name="lca",
         dataset_config="py",
@@ -46,7 +53,25 @@ def _agent_payload(repo: str = "r") -> dict[str, object]:
         base_sha="abc",
     )
     context = LCAContext(issue_title="bug", issue_body="details")
-    return {"identity": identity.model_dump(), "context": context.model_dump(), "repo": repo}
+    return LCATask(identity=identity, context=context, gold=LCAGold(changed_files=["a.py"]), repo=repo)
+
+
+def _agent_payload(repo: str = "r") -> dict[str, object]:
+    return agent_common.serialize_lca_task_for_prompt(_agent_task(repo))
+
+
+def _runner_result(
+    task: LCATask,
+    predicted_files: list[str],
+    observations: list[dict[str, object]],
+    source: str,
+) -> LocalizationRunResult:
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(predicted_files=predicted_files),
+        observations=observations,
+        source=source,
+    )
 
 
 def test_run_ic_iteration_emits_scores(monkeypatch):
@@ -70,15 +95,15 @@ def test_run_ic_iteration_emits_scores(monkeypatch):
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=["src/app.py"], observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, ["src/app.py"], obs, "finalize"
         ),
     )
 
     parent = object()
-    task_payload = _agent_payload("r")
-    result = runner.run_ic_iteration(task_payload, score_fn=lambda n, g, step: 1.0, steps=1, parent_trace=parent)
-    assert result["node_count"] == 2
+    task = _agent_task("r")
+    result = runner.run_ic_iteration(task, score_fn=lambda n, g, step: 1.0, steps=1, parent_trace=parent)
+    assert result.node_count == 2
     assert ("ic.node_count", 2.0) in scores
 
 

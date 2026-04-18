@@ -1,4 +1,5 @@
 """Orchestration: state machines, listeners, and runtime coordination."""
+# pyright: reportImportCycles=false
 
 from .runtime import (  # pyright: ignore[reportPrivateUsage,reportUnusedImport]
     _clean_policy_code,  # pyright: ignore[reportPrivateUsage]
@@ -32,7 +33,6 @@ from .types import (
     RepairMachineModel,
     RepairOutcome,
     RunMetadata,
-    TaskPayload,
     iteration_record_to_public_dict,
 )
 
@@ -43,6 +43,7 @@ __all__ = [
     "_read_policy",
     "_write_policy",
     "_clean_policy_code",
+    "_hash_tests_dir",
     "index_folder",
     "emit_score",
     "load_frontier_policy",
@@ -66,6 +67,5 @@ __all__ = [
     "RepairMachineModel",
     "RepairOutcome",
     "RunMetadata",
-    "TaskPayload",
     "iteration_record_to_public_dict",
 ]

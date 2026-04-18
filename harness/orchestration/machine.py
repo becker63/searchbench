@@ -26,7 +26,6 @@ from .types import (
     RepairMachineModel,
     RepairOutcome,
     SpanHandle,
-    TaskPayload,
 )
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterGuidance
@@ -329,15 +328,10 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             self.context.prepared_tasks = None
             self.model.prep_ok = False
         if self.context.prepared_tasks is None:
-            base_task = (
-                self.context.task
-                if isinstance(self.context.task, TaskPayload)
-                else TaskPayload.model_validate(self.context.task)
-            )
-            repo_val = base_task.repo
-            resolved_repo = repo_val if isinstance(repo_val, str) else None
             self.context.prepared_tasks = PreparedTasks(
-                base_task=base_task, resolved_repo_path=resolved_repo, jc_repo_id=None
+                task=self.context.task,
+                resolved_repo_path=self.context.task.repo,
+                jc_repo_id=None,
             )
             self.model.prep_ok = True
 
@@ -354,7 +348,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         iteration_tasks = prepared_tasks.build_iteration_tasks()
         eval_metadata = {
             "iteration": self.context.current_iteration,
-            "task": iteration_tasks.ic_task.identity.task_id(),
+            "task": iteration_tasks.task.identity.task_id(),
         }
         with self.deps.start_observation(
             name="localization_evaluation",
@@ -362,7 +356,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             metadata=eval_metadata,
         ) as eval_span:
             self.model.current_evaluation = self.deps.evaluate_policy_on_item(
-                iteration_tasks.ic_task,
+                iteration_tasks.task,
                 self.context.baseline_snapshot,
                 eval_span,
                 self.context.current_iteration,

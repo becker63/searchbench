@@ -12,7 +12,7 @@ import sys
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Any, Iterable, Iterator, Mapping, Sequence
+from typing import IO, Any, Iterable, Iterator, Sequence
 
 try:
     import termios  # type: ignore
@@ -133,7 +133,7 @@ def _raw_mode(file_obj: IO[Any]) -> Iterator[None]:
 
 
 def evaluate_localization_batch(
-    tasks: Sequence[LCATask] | Sequence[Mapping[str, object]],
+    tasks: Sequence[LCATask],
     *,
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
@@ -224,17 +224,6 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def _print_mat_summary(prefix: str, identity: Any, materialization: Any) -> None:
     if materialization:
         print(f"[MAT] {prefix} {identity}: {materialization.summary()}")
-
-
-def _fmt_identity(identity: Any) -> str:
-    if isinstance(identity, dict):
-        return str(
-            identity.get("id")
-            or identity.get("task_id")
-            or identity.get("repo")
-            or identity
-        )
-    return str(identity)
 
 
 def _coerce_int(value: object, default: int = 0) -> int:
@@ -659,7 +648,7 @@ def main(argv: list[str] | None = None) -> None:
             for item in results.items:
                 _print_mat_summary(
                     "experiment",
-                    _fmt_identity(item.task.get("identity")),
+                    item.task.task_id,
                     item.materialization,
                 )
     except HFDatasetLoadError as exc:

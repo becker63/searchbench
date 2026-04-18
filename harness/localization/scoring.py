@@ -1,4 +1,4 @@
-"""Localization adapter that derives score context and delegates to scoring."""
+"""Localization scoring helpers that derive score context and delegate to scoring."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Iterable, Mapping, cast
 from harness.scoring import ScoreBundle, ScoreConfig, ScoreContext, ScoreEngine
 from harness.scoring.token_usage import TokenUsageRecord
 
-from .models import LCAGold, LCAPrediction, canonicalize_paths
+from .models import LCAGold, LocalizationPrediction, canonicalize_paths
 from .static_graph import (
     GraphStore,
     compute_hop_distance_summary,
@@ -20,7 +20,7 @@ from .static_graph import (
 from .static_graph.store import debug_summary
 
 
-def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> tuple[str, ...]:
+def _normalize_prediction(prediction: LocalizationPrediction | Mapping[str, object]) -> tuple[str, ...]:
     if isinstance(prediction, Mapping):
         predicted_files_raw = prediction.get("predicted_files", [])
         return tuple(canonicalize_paths([str(p) for p in cast(Iterable[object], predicted_files_raw)]))
@@ -69,7 +69,7 @@ def _derive_token_count(token_usage: TokenUsageRecord | None) -> float | None:
 
 def build_localization_score_context(
     *,
-    prediction: LCAPrediction | Mapping[str, object],
+    prediction: LocalizationPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
     repo_path: Path,
     anchor_text: str,
@@ -148,7 +148,7 @@ def build_localization_score_context(
 
 def score_localization(
     *,
-    prediction: LCAPrediction | Mapping[str, object],
+    prediction: LocalizationPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
     repo_path: Path,
     anchor_text: str,

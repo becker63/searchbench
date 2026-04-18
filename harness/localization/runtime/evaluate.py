@@ -1,17 +1,22 @@
 from __future__ import annotations
 
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
 from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
-from harness.localization.models import LCATask, LocalizationEvidence, normalize_lca_task
+from harness.localization.models import (
+    LCATask,
+    LocalizationEvidence,
+    LocalizationPrediction,
+    LocalizationRunResult,
+)
 from harness.localization.runtime.execute import run_localization_task
 from harness.scoring import BatchScoreSummary, ScoreBundle, summarize_batch_scores
 from harness.scoring.token_usage import TokenUsageRecord
 
-LocalizationRunner = Callable[[LCATask, str, object | None], tuple[list[str], Mapping[str, object] | None]]
+LocalizationRunner = Callable[[LCATask, str, object | None], LocalizationRunResult]
 
 # Allows tests or callers to inject a deterministic runner without touching core wiring.
 DEFAULT_LOCALIZATION_RUNNER: LocalizationRunner | None = None
@@ -34,7 +39,7 @@ class LocalizationEvaluationTaskResult(BaseModel):
 
     task: LCATask
     score_bundle: ScoreBundle
-    prediction: list[str] = Field(default_factory=list)
+    prediction: LocalizationPrediction
     evidence: LocalizationEvidence | None = None
     materialization: RepoMaterializationResult | None = None
     trace_id: str | None = None
@@ -50,8 +55,16 @@ class LocalizationEvaluationResult(BaseModel):
     failure: LocalizationEvaluationFailure | None = None
 
 
+def prediction_filenames(prediction: LocalizationPrediction) -> list[str]:
+    """
+    Explicit boundary for consumers that expose only filenames outside the
+    semantic prediction stage.
+    """
+    return list(prediction.predicted_files)
+
+
 def evaluate_localization_batch(
-    tasks: Sequence[LCATask | Mapping[str, object]],
+    tasks: Sequence[LCATask],
     *,
     dataset_source: str | None = None,
     materializer: RepoMaterializer | None = None,
@@ -62,10 +75,9 @@ def evaluate_localization_batch(
     Shared localization evaluation backend used by the optimization/repair machine and hosted wrappers.
     Executes each task via run_localization_task, aggregates score bundles, and returns typed results/failures.
     """
-    normalized_tasks = [t if isinstance(t, LCATask) else normalize_lca_task(t) for t in tasks]
     resolved_runner = runner or DEFAULT_LOCALIZATION_RUNNER
     task_results: list[LocalizationEvaluationTaskResult] = []
-    for task in normalized_tasks:
+    for task in tasks:
         try:
             run_result = run_localization_task(
                 task,
@@ -82,7 +94,7 @@ def evaluate_localization_batch(
                 LocalizationEvaluationTaskResult(
                     task=task,
                     score_bundle=score_bundle,
-                    prediction=list(prediction.predicted_files),
+                    prediction=prediction,
                     evidence=evidence,
                     materialization=materialization,
                     trace_id=getattr(parent_trace, "id", None),

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from typing import Mapping
-
-from harness.localization.models import LCAContext, LCATaskIdentity
-from harness.orchestration import IterationRecord, TaskPayload, run_loop
-from harness.orchestration.types import EvaluationMetrics
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.orchestration import run_loop
 
 
-def _payload(repo: str) -> TaskPayload:
+def _task(repo: str) -> LCATask:
     identity = LCATaskIdentity(
         dataset_name="lca",
         dataset_config="py",
@@ -17,7 +14,7 @@ def _payload(repo: str) -> TaskPayload:
         base_sha="abc",
     )
     context = LCAContext(issue_title="bug", issue_body="details")
-    return TaskPayload(identity=identity, context=context, repo=repo, changed_files=["a.py"])
+    return LCATask(identity=identity, context=context, gold=LCAGold(changed_files=["a.py"]), repo=repo)
 
 
 def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
@@ -45,8 +42,8 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     monkeypatch.setattr("harness.orchestration.runtime.index_folder", lambda repo: {"repo": "local/fake-repo-id"})
     monkeypatch.setattr("harness.orchestration.runtime.load_frontier_policy", lambda: lambda *_: 1.0)
 
-    def fake_run_ic_iteration(task: Mapping[str, object], *args, **kwargs):
-        ic_repos.append(task.get("repo"))
+    def fake_run_ic_iteration(task: LCATask, *args, **kwargs):
+        ic_repos.append(task.repo)
         return {"observations": [{"tool": "x"}], "node_count": 1}
 
     monkeypatch.setattr("harness.agents.localizer.run_ic_iteration", fake_run_ic_iteration)
@@ -73,6 +70,6 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     monkeypatch.setattr("harness.orchestration.runtime.emit_score", lambda *a, **k: None)
     monkeypatch.setattr("harness.orchestration.runtime.flush_langfuse", lambda: None)
 
-    payload = _payload(str(repo_dir))
-    run_loop(payload, iterations=1)
+    task = _task(str(repo_dir))
+    run_loop(task, iterations=1)
     assert ic_repos == [str(repo_dir)]

@@ -3,11 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
-from harness.localization.runtime.evaluate import evaluate_localization_batch
+from harness.localization.models import LCAContext, LCAGold, LocalizationPrediction, LCATask, LCATaskIdentity
+from harness.localization.runtime.evaluate import (
+    LocalizationEvaluationTaskResult,
+    evaluate_localization_batch,
+)
 from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine
 from harness.orchestration.runtime import evaluate_policy_on_item
-from harness.orchestration.types import ICTaskPayload
 
 
 def _make_task(tmp_path: Path) -> LCATask:
@@ -42,7 +44,7 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(
         "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
+        lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     result = evaluate_localization_batch(
@@ -53,6 +55,12 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
     assert result.score_summary.aggregate_composed_score == 1.0
     assert result.machine_score == result.score_summary.aggregate_composed_score
     assert result.items and result.items[0].score_bundle.composed_score == 1.0
+    assert (
+        LocalizationEvaluationTaskResult.model_fields["prediction"].annotation
+        is LocalizationPrediction
+    )
+    assert isinstance(result.items[0].prediction, LocalizationPrediction)
+    assert result.items[0].prediction.predicted_files == ["a.py"]
 
 
 def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None:
@@ -73,23 +81,17 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
     assert result.failure.category == LocalizationFailureCategory.RUNNER
 
 
-def test_machine_adapter_uses_shared_backend(monkeypatch, tmp_path) -> None:
+def test_orchestration_runtime_uses_shared_backend(monkeypatch, tmp_path) -> None:
     bundle = _bundle()
     task = _make_task(tmp_path)
 
     monkeypatch.setattr(
         "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
+        lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda: "policy", raising=False)
-    ic_task = ICTaskPayload(
-        identity=task.identity,
-        context=task.context,
-        repo=str(tmp_path),
-        changed_files=["a.py"],
-    )
-    eval_result = evaluate_policy_on_item(ic_task, None, None, 0)
+    eval_result = evaluate_policy_on_item(task, None, None, 0)
     assert eval_result.metrics.get("score") == 1.0
     assert eval_result.ic_result.get("predicted_files") == ["a.py"]
     assert eval_result.control_score == 1.0
@@ -101,7 +103,7 @@ def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(
         "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
+        lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     result = evaluate_localization_batch(
@@ -135,7 +137,7 @@ def test_score_summary_failure_is_typed(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(
         "harness.localization.runtime.evaluate.run_localization_task",
-        lambda *a, **k: (LCAPrediction(predicted_files=["a.py"]), bundle, None, None),
+        lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
     monkeypatch.setattr(

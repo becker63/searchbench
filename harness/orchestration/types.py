@@ -7,8 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterOptimizationBrief, WriterScoreSummary
+from harness.telemetry.tracing import UsageDetails
 from harness.utils.type_loader import FrontierContext
-from harness.localization.models import LCAContext, LCATaskIdentity
+from harness.localization.models import LCATask
 
 if TYPE_CHECKING:
     from harness.telemetry.hosted.baselines import BaselineSnapshot
@@ -25,6 +26,106 @@ class SpanHandle(Protocol):
     def end(self, **kwargs: object) -> None: ...
 
     def update(self, **kwargs: object) -> None: ...
+
+
+@runtime_checkable
+class SupportsPipelineRun(Protocol):
+    def run(
+        self,
+        repo_root: Path,
+        observation: SpanHandle | None = None,
+        allow_no_parent: bool = False,
+    ) -> list[StepResult]: ...
+
+
+@runtime_checkable
+class StartObservation(Protocol):
+    def __call__(
+        self,
+        name: str,
+        *,
+        parent: object | None = None,
+        as_type: str = "span",
+        input: object | None = None,
+        model: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+        usage_details: UsageDetails | None = None,
+    ) -> ContextManager[SpanHandle]: ...
+
+
+@runtime_checkable
+class AttemptPolicyGeneration(Protocol):
+    def __call__(
+        self,
+        *,
+        initial_policy: str,
+        tests: str,
+        frontier_context: str,
+        frontier_context_details: FrontierContext,
+        optimization_brief: WriterOptimizationBrief,
+        failure_context_str: str | None,
+        repair_attempt: int,
+        parent_trace: object | None = None,
+        pipeline_feedback: PipelineClassification | None = None,
+    ) -> tuple[str | None, str | None]: ...
+
+
+@runtime_checkable
+class EvaluatePolicyOnItem(Protocol):
+    def __call__(
+        self,
+        task: LCATask,
+        baseline_snapshot: "BaselineSnapshot | None",
+        iteration_span: SpanHandle | None,
+        iteration_index: int | None,
+    ) -> "EvaluationResult": ...
+
+
+@runtime_checkable
+class BuildIterationFeedback(Protocol):
+    def __call__(
+        self,
+        evaluation: "EvaluationResult",
+        prev_score: float | None,
+        prev_classified: PipelineClassification | None,
+        repo_root: Path,
+    ) -> "FeedbackPackage": ...
+
+
+@runtime_checkable
+class RunPolicyPipeline(Protocol):
+    def __call__(
+        self,
+        pipeline: SupportsPipelineRun,
+        repo_root: Path,
+        repair_obs: SpanHandle | None = None,
+        allow_no_parent: bool = False,
+    ) -> tuple[list[StepResult], bool]: ...
+
+
+@runtime_checkable
+class FinalizeSuccessfulPolicy(Protocol):
+    def __call__(
+        self,
+        *,
+        new_code: str,
+        attempts_used: int,
+        max_repair_attempts: int,
+        repair_obs: object | None = None,
+    ) -> tuple[str, "AcceptedPolicyMeta"]: ...
+
+
+@runtime_checkable
+class FinalizeFailedRepair(Protocol):
+    def __call__(
+        self,
+        *,
+        pipeline_results: list[StepResult],
+        classified: PipelineClassification,
+        writer_model: str | None,
+        attempts_used: int,
+        writer_error: str | None,
+    ) -> "FailedRepairDetails": ...
 
 
 class MetricEntry(BaseModel):
@@ -116,106 +217,57 @@ class JCResult(ICResult):
     model_config = ConfigDict(extra="forbid")
 
 
-class TaskPayload(BaseModel):
-    """Localization-native task payload passed into orchestration/evaluation agents."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    identity: LCATaskIdentity
-    context: LCAContext
-    repo: str
-    changed_files: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_mapping(cls, value: object) -> object:
-        if isinstance(value, Mapping):
-            identity_val = value.get("identity") or {}
-            context_val = value.get("context") or {}
-            return {
-                "identity": identity_val,
-                "context": context_val,
-                "repo": value.get("repo"),
-                "changed_files": value.get("changed_files", []),
-            }
-        return value
-
-
-class ICTaskPayload(TaskPayload):
-    """Iteration task payload for localization runs (IC backend)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class JCTaskPayload(TaskPayload):
-    """Iteration task payload for localization runs (JC backend)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-
 class RunMetadata(BaseModel):
     """Run-level metadata persisted for tracing and external visibility."""
 
     model_config = ConfigDict(extra="forbid")
 
     iterations: int
-    task: TaskPayload
+    task: LCATask
     session_id: str | None = None
 
 class PreparedTasks(BaseModel):
-    """Resolved IC/JC tasks for a single iteration."""
+    """Canonical task plus execution metadata resolved once for the loop."""
 
     model_config = ConfigDict(extra="forbid")
 
-    base_task: TaskPayload
+    task: LCATask
     resolved_repo_path: str | None
     jc_repo_id: str | None
-    ic_task: ICTaskPayload | None = None
-    jc_task: JCTaskPayload | None = None
 
     def _resolve_ic_repo(self) -> str:
         if self.resolved_repo_path is not None:
             return self.resolved_repo_path
-        return self.base_task.repo
+        if self.task.repo is not None:
+            return self.task.repo
+        raise RuntimeError("Task missing repo")
 
     def _resolve_jc_repo(self) -> str:
         if self.jc_repo_id is not None:
             return self.jc_repo_id
         if self.resolved_repo_path is not None:
             return self.resolved_repo_path
-        return self.base_task.repo
+        if self.task.repo is not None:
+            return self.task.repo
+        raise RuntimeError("Task missing repo")
 
-    def to_ic_request(self) -> ICTaskPayload:
-        if self.ic_task is not None:
-            return self.ic_task
-        return ICTaskPayload(
-            identity=self.base_task.identity,
-            context=self.base_task.context,
-            repo=self._resolve_ic_repo(),
-            changed_files=self.base_task.changed_files,
-        )
+    def ic_task(self) -> LCATask:
+        return self.task.with_repo(self._resolve_ic_repo())
 
-    def to_jc_request(self) -> JCTaskPayload:
-        if self.jc_task is not None:
-            return self.jc_task
-        return JCTaskPayload(
-            identity=self.base_task.identity,
-            context=self.base_task.context,
-            repo=self._resolve_jc_repo(),
-            changed_files=self.base_task.changed_files,
-        )
+    def jc_task(self) -> LCATask:
+        return self.task.with_repo(self._resolve_jc_repo())
 
     def build_iteration_tasks(self) -> "IterationTasks":
-        return IterationTasks(ic_task=self.to_ic_request(), jc_task=self.to_jc_request())
+        return IterationTasks(task=self.ic_task(), jc_repo_id=self.jc_repo_id)
 
 
 class IterationTasks(BaseModel):
-    """Concrete task payloads for an iteration."""
+    """Canonical iteration task plus optional backend execution metadata."""
 
     model_config = ConfigDict(extra="forbid")
 
-    ic_task: ICTaskPayload
-    jc_task: JCTaskPayload
+    task: LCATask
+    jc_repo_id: str | None = None
 
 
 class EvaluationResult(BaseModel):
@@ -297,7 +349,7 @@ class IterationRecord(BaseModel):
 class LoopContext(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
-    task: TaskPayload
+    task: LCATask
     iterations: int
     session_id: str | None = None
     parent_trace: SpanHandle | None = None
@@ -317,21 +369,21 @@ class LoopDependencies(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    prepare_iteration_tasks: Callable[[TaskPayload, SpanHandle | None], PreparedTasks]
-    evaluate_policy_on_item: Callable[[ICTaskPayload, "BaselineSnapshot | None", SpanHandle | None, int | None], EvaluationResult]
-    build_iteration_feedback: Callable[[EvaluationResult, float | None, PipelineClassification | None, Path], FeedbackPackage]
-    attempt_policy_generation: Callable[..., tuple[str | None, str | None]]
-    run_policy_pipeline: Callable[..., tuple[list[StepResult], bool]]
-    finalize_successful_policy: Callable[..., tuple[str, "AcceptedPolicyMeta"]]
-    finalize_failed_repair: Callable[..., "FailedRepairDetails"]
+    prepare_iteration_tasks: Callable[[LCATask, SpanHandle | None], PreparedTasks]
+    evaluate_policy_on_item: EvaluatePolicyOnItem
+    build_iteration_feedback: BuildIterationFeedback
+    attempt_policy_generation: AttemptPolicyGeneration
+    run_policy_pipeline: RunPolicyPipeline
+    finalize_successful_policy: FinalizeSuccessfulPolicy
+    finalize_failed_repair: FinalizeFailedRepair
     classify_results: Callable[[list[StepResult]], PipelineClassification]
     format_pipeline_failure_context: Callable[[list[StepResult], PipelineClassification | None, str | None, str | None, int], str]
     read_policy: Callable[[], str]
     write_policy: Callable[[str], None]
     get_writer_model: Callable[[], str | None]
-    start_observation: Callable[..., ContextManager[SpanHandle]]
+    start_observation: StartObservation
     find_repo_root: Callable[[], Path]
-    default_pipeline: Callable[[], object]
+    default_pipeline: Callable[[], SupportsPipelineRun]
 
 
 class RepairContext(BaseModel):
@@ -350,7 +402,7 @@ class RepairContext(BaseModel):
     success: bool = False
     pipeline_passed: bool = False
     candidate_code: str | None = None
-    pipeline: object | None = None
+    pipeline: SupportsPipelineRun | None = None
     repair_observation: SpanHandle | None = None
     writer_error: str | None = None
     pipeline_feedback: PipelineClassification | None = None

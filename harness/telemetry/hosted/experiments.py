@@ -19,10 +19,11 @@ from harness.localization.materialization.materialize import (
     RepoMaterializationResult,
     RepoMaterializer,
 )
-from harness.localization.models import LCATask, normalize_lca_task
+from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
+    prediction_filenames,
 )
 from harness.scoring import summarize_score_summaries, summarize_task_score
 from harness.scoring.batch import TaskScoreSummary
@@ -58,7 +59,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class LocalizationRunItemResult(BaseModel):
-    task: Mapping[str, object]
+    task: LCATask
     score_summary: TaskScoreSummary
     prediction: list[str] = Field(default_factory=list)
     trace_id: str | None = None
@@ -66,7 +67,7 @@ class LocalizationRunItemResult(BaseModel):
     token_usage: TokenUsageRecord | None = None
 
 
-class LocalizationRunResult(BaseModel):
+class HostedLocalizationRunResult(BaseModel):
     dataset_name: str
     dataset_version: str | None = None
     items: list[LocalizationRunItemResult] = Field(default_factory=list)
@@ -384,16 +385,6 @@ def _run_baseline_parallel(
     return ordered_results, failure_payload
 
 
-def _normalize_task_payload(
-    task: LCATask | Mapping[str, object],
-) -> Mapping[str, object]:
-    if isinstance(task, Mapping):
-        return task
-    if hasattr(task, "model_dump"):
-        return task.model_dump()
-    raise RuntimeError("Localization task must be a mapping or Pydantic model")
-
-
 def _emit_experiment_dataset_aggregates(
     span: object | None,
     results: Sequence[LocalizationRunItemResult],
@@ -426,7 +417,7 @@ def _emit_experiment_dataset_aggregates(
 
 
 def _run_experiment_task(
-    task: LCATask | Mapping[str, object],
+    task: LCATask,
     parent_trace: object,
     materializer: RepoMaterializer | None,
     session_id: str | None,
@@ -438,12 +429,10 @@ def _run_experiment_task(
             LocalizationFailureCategory.UNKNOWN,
             "missing parent trace",
         )
-    task_payload = _normalize_task_payload(task)
-    normalized_task = normalize_lca_task(task_payload)
     try:
         with propagate_context(session_id=session_id):
             eval_result = evaluate_localization_batch(
-                tasks=[normalized_task],
+                tasks=[task],
                 dataset_source="huggingface",
                 materializer=materializer,
                 parent_trace=parent_trace,
@@ -452,17 +441,17 @@ def _run_experiment_task(
             failure = eval_result.failure or LocalizationEvaluationFailure(
                 category=LocalizationFailureCategory.UNKNOWN,
                 message="experiment_evaluation_failed",
-                task_id=normalized_task.task_id,
+                task_id=task.task_id,
             )
             raise _TaskFailure(-1, failure.task_id, failure.category, failure.message)
         task_result = eval_result.items[0]
         score_summary = summarize_task_score(
-            normalized_task.task_id, task_result.score_bundle
+            task.task_id, task_result.score_bundle
         )
         return LocalizationRunItemResult(
-            task=normalized_task.model_dump(),
+            task=task,
             score_summary=score_summary,
-            prediction=task_result.prediction,
+            prediction=prediction_filenames(task_result.prediction),
             trace_id=getattr(parent_trace, "id", None),
             materialization=task_result.materialization,
             token_usage=task_result.token_usage,
@@ -472,12 +461,12 @@ def _run_experiment_task(
     except LocalizationEvaluationError as exc:
         category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
         raise _TaskFailure(
-            -1, getattr(normalized_task, "task_id", None), category, str(exc)
+            -1, getattr(task, "task_id", None), category, str(exc)
         ) from exc
     except Exception as exc:  # noqa: BLE001
         raise _TaskFailure(
             -1,
-            getattr(normalized_task, "task_id", None),
+            getattr(task, "task_id", None),
             LocalizationFailureCategory.UNKNOWN,
             str(exc),
         ) from exc
@@ -555,7 +544,7 @@ def run_hosted_localization_experiment(
     req: HostedLocalizationRunRequest,
     materializer: RepoMaterializer | None = None,
     tasks: list[LCATask] | None = None,
-) -> LocalizationRunResult:
+) -> HostedLocalizationRunResult:
     tasks = tasks or _resolve_items(req)
     if not tasks:
         raise RuntimeError("No localization tasks available for experiment run")
@@ -633,7 +622,7 @@ def run_hosted_localization_experiment(
             )
     flush_langfuse()
     reducer_summary = _build_reducer_summary(results)
-    return LocalizationRunResult(
+    return HostedLocalizationRunResult(
         dataset_name=req.dataset,
         dataset_version=req.version,
         items=results,
@@ -649,14 +638,10 @@ def _build_reducer_summary(
         return None
     task_inputs = []
     for item in results:
-        try:
-            normalized_task = normalize_lca_task(item.task)
-        except Exception:
-            continue
         task_inputs.append(
             build_task_input(
-                identity=normalized_task.identity,
-                task_id=normalized_task.task_id,
+                identity=item.task.identity,
+                task_id=item.task.task_id,
                 score_summary=item.score_summary,
                 candidate_usage=item.token_usage,
                 baseline_usage=None,

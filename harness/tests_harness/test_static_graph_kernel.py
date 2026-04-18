@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.localization.models import LCAGold, LCAPrediction
+from harness.localization.models import LCAGold, LocalizationPrediction
 from harness.localization.scoring import build_localization_score_context, score_localization
 from harness.localization.static_graph import (
     GraphStore,
@@ -73,7 +73,7 @@ def test_score_localization_uses_static_graph_context(monkeypatch, tmp_path: Pat
     monkeypatch.setattr(scoring_mod, "ingest_repo", fake_ingest)
     monkeypatch.setattr(loc_mod.static_graph, "ingest_repo", fake_ingest)
 
-    prediction = LCAPrediction(predicted_files=["repo/file_b.py"])
+    prediction = LocalizationPrediction(predicted_files=["repo/file_b.py"])
     gold = LCAGold(changed_files=["repo/file_a.py"])
     usage = TokenUsageRecord(available=True, usage=TokenUsage(total_tokens=100))
     ctx = build_localization_score_context(
@@ -116,7 +116,7 @@ def test_score_context_resolves_real_ingest_repo_relative_paths(monkeypatch, tmp
     monkeypatch.setattr(ingest_mod, "ImportInfo", None)
 
     ctx = build_localization_score_context(
-        prediction=LCAPrediction(predicted_files=["src/app.py"]),
+        prediction=LocalizationPrediction(predicted_files=["src/app.py"]),
         gold=LCAGold(changed_files=["src/app.py"]),
         repo_path=repo,
         anchor_text="Failure points at `src/app.py`.",
@@ -136,7 +136,7 @@ def test_score_context_resolves_real_ingest_repo_relative_paths(monkeypatch, tmp
     assert ctx.diagnostics["resolved_gold_count"] == 1
 
     bundle = score_localization(
-        prediction=LCAPrediction(predicted_files=["src/app.py"]),
+        prediction=LocalizationPrediction(predicted_files=["src/app.py"]),
         gold=LCAGold(changed_files=["src/app.py"]),
         repo_path=repo,
         anchor_text="Failure points at `src/app.py`.",
@@ -172,7 +172,7 @@ def test_score_localization_missing_token_usage_keeps_default_composed_score(mon
     monkeypatch.setattr(scoring_mod, "ingest_repo", fake_ingest)
 
     bundle = score_localization(
-        prediction=LCAPrediction(predicted_files=["repo/file_b.py"]),
+        prediction=LocalizationPrediction(predicted_files=["repo/file_b.py"]),
         gold=LCAGold(changed_files=["repo/file_a.py"]),
         repo_path=tmp_path,
         anchor_text="`repo/file_a.py`",

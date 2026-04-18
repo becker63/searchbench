@@ -5,7 +5,6 @@ from typing import Iterable, List, Mapping, Optional, cast
 
 from harness.localization.models import (
     LCAGold,
-    LCAPrediction,
     LCATaskIdentity,
     LocalizationDatasetInfo,
     LocalizationEvalRecord,
@@ -30,7 +29,7 @@ def _coerce_paths(value: Iterable[object]) -> List[str]:
     return canonicalize_paths(coerced)
 
 
-def _normalize_prediction(prediction: LCAPrediction | Mapping[str, object]) -> List[str]:
+def _normalize_prediction(prediction: LocalizationPrediction | Mapping[str, object]) -> List[str]:
     if isinstance(prediction, Mapping):
         predicted_files_raw = prediction.get("predicted_files", [])
         return _coerce_paths(cast(Iterable[object], predicted_files_raw))
@@ -46,7 +45,7 @@ def _normalize_gold(gold: LCAGold | Mapping[str, object]) -> List[str]:
 
 def build_localization_score_eval_record(
     identity: LCATaskIdentity,
-    prediction: LCAPrediction | Mapping[str, object],
+    prediction: LocalizationPrediction | Mapping[str, object],
     gold: LCAGold | Mapping[str, object],
     score_context: ScoreContext,
     score_bundle: ScoreBundle,

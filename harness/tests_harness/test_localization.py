@@ -3,7 +3,7 @@ from pathlib import Path
 
 from harness.localization.models import (
     LCATaskIdentity,
-    LCAPrediction,
+    LCATask,
     LCAGold,
     LCAContext,
     LocalizationDatasetInfo,
@@ -13,6 +13,7 @@ from harness.localization.models import (
     LocalizationGold,
     LocalizationPrediction,
     LocalizationRepoInfo,
+    LocalizationRunResult,
     LocalizationTelemetryEnvelope,
     canonicalize_paths,
 )
@@ -20,9 +21,53 @@ from harness.scoring import ScoreContext, ScoreEngine, summarize_task_score
 from harness.localization.runtime.records import build_localization_score_eval_record
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.runtime.execute import run_localization_task
+from harness.localization.errors import LocalizationEvaluationError
 import harness.localization.runtime.execute as executor_module
 import harness.agents.localizer as runner
-from harness.localization.errors import LocalizationEvaluationError
+
+
+def _runner_result(
+    task: LCATask,
+    predicted_files: list[str] | None = None,
+    reasoning: str | None = None,
+    observations: list[dict[str, object]] | None = None,
+    source: str | None = None,
+    backend: str | None = None,
+) -> LocalizationRunResult:
+    return LocalizationRunResult(
+        task=task,
+        prediction=LocalizationPrediction(
+            predicted_files=predicted_files or [],
+            reasoning=reasoning,
+        ),
+        observations=observations or [],
+        source=source,
+        backend=backend,
+    )
+
+
+def _runner_task(repo: str) -> LCATask:
+    return LCATask(
+        identity=LCATaskIdentity(
+            dataset_name="lca",
+            dataset_config="py",
+            dataset_split="dev",
+            repo_owner="o",
+            repo_name="r",
+            base_sha="abc",
+        ),
+        context=LCAContext(issue_title="bug", issue_body="details"),
+        gold=LCAGold(changed_files=["a.py"]),
+        repo=repo,
+    )
+
+
+def test_localization_run_result_separates_prediction_from_execution() -> None:
+    fields = LocalizationRunResult.model_fields
+    assert "prediction" in fields
+    assert "predicted_files" not in fields
+    assert "reasoning" not in fields
+    assert set(LocalizationPrediction.model_fields) >= {"predicted_files", "reasoning"}
 
 
 def test_identity_is_deterministic():
@@ -56,7 +101,7 @@ def test_eval_builder_is_model_first():
         base_sha="sha",
         issue_url="url",
     )
-    pred = LCAPrediction(predicted_files=["a.py"])
+    pred = LocalizationPrediction(predicted_files=["a.py"])
     gold = LCAGold(changed_files=["a.py"])
     evidence = LocalizationEvidence(items=[LocalizationEvidenceItem(file="a.py", hints=["line 1"])])
     score_context = ScoreContext(
@@ -163,7 +208,7 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     prediction, score_bundle, _evidence, _mat, _usage = run_localization_task(
         lca_task,
-        runner=lambda *_args: (["predicted.py"], {"source": "runner"}),
+        runner=lambda task, *_args: _runner_result(task, ["predicted.py"], source="runner"),
     )
     assert prediction.predicted_files == ["predicted.py"]
     assert score_bundle.composed_score is None
@@ -207,7 +252,7 @@ def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
     monkeypatch.setattr(executor_module, "emit_score_for_handle", lambda *a, **k: None)
     prediction, score_bundle, *_ = run_localization_task(
         lca_task,
-        runner=lambda *_args: (["SRC\\foo.py"], {"source": "runner"}),
+        runner=lambda task, *_args: _runner_result(task, ["SRC\\foo.py"], source="runner"),
     )
     assert prediction.predicted_files == ["SRC\\foo.py"]
     assert updates
@@ -275,7 +320,7 @@ def test_localization_task_emits_backend_prefixed_score_bundle(monkeypatch, tmp_
 
     run_localization_task(
         lca_task,
-        runner=lambda *_args: (["a.py"], {"backend": "ic"}),
+        runner=lambda task, *_args: _runner_result(task, ["a.py"], backend="ic"),
     )
 
     names = {item["name"] for item in emitted}
@@ -331,12 +376,11 @@ def test_localization_task_scores_runner_usage_as_visible_component(monkeypatch,
 
     _prediction, score_bundle, _evidence, _mat, usage = run_localization_task(
         lca_task,
-        runner=lambda *_args: (
-            ["src/app.py"],
-            {
-                "backend": "ic",
-                "usage_details": {"input": 10, "output": 5, "total": 15},
-            },
+        runner=lambda task, *_args: LocalizationRunResult(
+            task=task,
+            prediction=LocalizationPrediction(predicted_files=["src/app.py"]),
+            backend="ic",
+            raw={"usage_details": {"input": 10, "output": 5, "total": 15}},
         ),
     )
 
@@ -409,14 +453,14 @@ def test_localization_langfuse_boundary_node_count_visible_without_malformed_bun
     def span_cm():
         yield TaskSpan()
 
-    def runner_with_visible_node_count(*_args):
+    def runner_with_visible_node_count(task: LCATask, *_args):
         executor_module.emit_score_for_handle(
             BackendSpan(),
             name="ic.node_count",
             value=2.0,
             data_type="NUMERIC",
         )
-        return ["a.py"], {"backend": "ic"}
+        return _runner_result(task, ["a.py"], backend="ic")
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     monkeypatch.setattr(executor_module, "_score_task", lambda *a, **k: bundle)
@@ -440,8 +484,8 @@ def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=["src/app.py"], reasoning="r", observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, ["src/app.py"], reasoning="r", observations=obs, source="finalize"
         ),
     )
 
@@ -461,25 +505,15 @@ def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(repo_dir),
-        },
+        _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
     assert captured
     assert "changed_files" not in captured[0]
-    assert result.get("predicted_files") == ["src/app.py"]
+    assert result.prediction.predicted_files == ["src/app.py"]
+    assert not hasattr(result, "predicted_files")
 
 
 def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_path):
@@ -501,8 +535,8 @@ def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=[], observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, [], observations=obs, source="finalize"
         ),
     )
     monkeypatch.setattr(
@@ -527,26 +561,15 @@ def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_
     repo_dir.mkdir()
 
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(repo_dir),
-        },
+        _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
 
-    assert result["predicted_files"] == ["src/recovered.py"]
-    assert result["source"] == "fallback"
-    assert result["reasoning"] == "from observations"
+    assert result.prediction.predicted_files == ["src/recovered.py"]
+    assert result.source == "fallback"
+    assert result.prediction.reasoning == "from observations"
 
 
 def test_run_ic_iteration_recovers_nested_tool_result_candidates(monkeypatch, tmp_path):
@@ -574,8 +597,8 @@ def test_run_ic_iteration_recovers_nested_tool_result_candidates(monkeypatch, tm
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=[], observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, [], observations=obs, source="finalize"
         ),
     )
     monkeypatch.setattr(
@@ -598,25 +621,14 @@ def test_run_ic_iteration_recovers_nested_tool_result_candidates(monkeypatch, tm
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(repo_dir),
-        },
+        _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
 
-    assert result["predicted_files"] == ["src/nested.py", "pkg/other.py"]
-    assert result["source"] == "fallback"
+    assert result.prediction.predicted_files == ["src/nested.py", "pkg/other.py"]
+    assert result.source == "fallback"
 
 
 def test_run_ic_iteration_recovers_when_finalization_request_fails(monkeypatch, tmp_path):
@@ -660,25 +672,14 @@ def test_run_ic_iteration_recovers_when_finalization_request_fails(monkeypatch, 
     repo_dir.mkdir()
 
     result = runner.run_ic_iteration(
-        {
-            "identity": LCATaskIdentity(
-                dataset_name="lca",
-                dataset_config="py",
-                dataset_split="dev",
-                repo_owner="o",
-                repo_name="r",
-                base_sha="abc",
-            ).model_dump(),
-            "context": LCAContext(issue_title="bug", issue_body="details").model_dump(),
-            "repo": str(repo_dir),
-        },
+        _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
         parent_trace=object(),
     )
 
-    assert result["predicted_files"] == ["src/from_tool.py"]
-    assert result["source"] == "fallback"
+    assert result.prediction.predicted_files == ["src/from_tool.py"]
+    assert result.source == "fallback"
 
 
 def test_candidate_file_collection_normalizes_and_dedupes(tmp_path):
@@ -754,8 +755,8 @@ def test_run_localization_task_empty_finalize_and_empty_fallback_is_typed(
     monkeypatch.setattr(
         runner,
         "_finalize_localization",
-        lambda task, obs, parent_trace=None: runner.LocalizationRunnerResult(
-            predicted_files=[], observations=obs, source="finalize"
+        lambda task, obs, parent_trace=None: _runner_result(
+            task, [], observations=obs, source="finalize"
         ),
     )
     monkeypatch.setattr(

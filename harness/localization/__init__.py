@@ -1,6 +1,13 @@
 # pyright: reportUnusedImport=false
 
-from .models import LCAContext, LCAGold, LCAPrediction, LCATask, LCATaskIdentity
+from .models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+    LocalizationRunResult,
+)
 from .scoring import build_localization_score_context, score_localization
 from .runtime.records import localization_eval_identity
 from .materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer
@@ -10,9 +17,10 @@ from . import static_graph
 __all__ = [
     "LCAContext",
     "LCAGold",
-    "LCAPrediction",
     "LCATask",
     "LCATaskIdentity",
+    "LocalizationPrediction",
+    "LocalizationRunResult",
     "RepoMaterializationRequest",
     "RepoMaterializationResult",
     "RepoMaterializer",

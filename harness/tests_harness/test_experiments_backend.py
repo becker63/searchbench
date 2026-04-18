@@ -5,8 +5,18 @@ import time
 import pytest
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.runtime.evaluate import (
+    LocalizationEvaluationResult,
+    LocalizationEvaluationTaskResult,
+    prediction_filenames,
+)
+from harness.localization.models import (
+    LCAContext,
+    LCAGold,
+    LCATask,
+    LCATaskIdentity,
+    LocalizationPrediction,
+)
 from harness.scoring import ScoreContext, ScoreEngine, summarize_batch_scores
 from harness.telemetry.hosted import experiments
 
@@ -25,11 +35,14 @@ def _task(repo: str) -> LCATask:
     return LCATask(identity=identity, context=context, gold=gold, repo=repo)
 
 
-def _eval_result(task: LCATask, prediction: list[str] | None = None) -> LocalizationEvaluationResult:
-    prediction = prediction or ["a.py"]
+def _eval_result(
+    task: LCATask,
+    prediction: LocalizationPrediction | None = None,
+) -> LocalizationEvaluationResult:
+    prediction = prediction or LocalizationPrediction(predicted_files=["a.py"])
     bundle = ScoreEngine().evaluate(
         ScoreContext(
-            predicted_files=tuple(prediction),
+            predicted_files=tuple(prediction.predicted_files),
             gold_files=("a.py",),
             gold_min_hops=0,
             issue_min_hops=0,
@@ -76,6 +89,7 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     )
     result = experiments.run_hosted_localization_experiment(req, materializer=None)
     assert calls
+    assert isinstance(calls[0]["tasks"][0], LCATask)
     assert result.items[0].prediction == ["a.py"]
 
 
@@ -83,11 +97,11 @@ def test_experiment_dataset_aggregates_emit_component_scores(monkeypatch, tmp_pa
     task = _task(str(tmp_path / "repo"))
     eval_result = _eval_result(task)
     item = experiments.LocalizationRunItemResult(
-        task=task.model_dump(),
+        task=task,
         score_summary=eval_result.items[0].score_bundle.model_copy(
             update={"item_id": task.task_id}
         ),
-        prediction=["a.py"],
+        prediction=prediction_filenames(eval_result.items[0].prediction),
     )
     emitted: list[dict[str, object]] = []
     updates: list[dict[str, object]] = []
@@ -124,7 +138,7 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
     def fake_backend(**kwargs):
         task = kwargs["tasks"][0]
         time.sleep(durations[task.task_id])
-        return _eval_result(task, [task.task_id])
+        return _eval_result(task, LocalizationPrediction(predicted_files=[task.task_id]))
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -152,7 +166,7 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
         calls.append(task.task_id)
         if task.task_id == t2.task_id:
             raise LocalizationEvaluationError(LocalizationFailureCategory.RUNNER, "runner failed", task_id=task.task_id)
-        return _eval_result(task, [task.task_id])
+        return _eval_result(task, LocalizationPrediction(predicted_files=[task.task_id]))
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
@@ -180,7 +194,7 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
     def fake_backend(**kwargs):
         task = kwargs["tasks"][0]
         calls.append(task.task_id)
-        return _eval_result(task, [task.task_id])
+        return _eval_result(task, LocalizationPrediction(predicted_files=[task.task_id]))
 
     monkeypatch.setattr(experiments, "evaluate_localization_batch", fake_backend)
     req = experiments.HostedLocalizationRunRequest(
