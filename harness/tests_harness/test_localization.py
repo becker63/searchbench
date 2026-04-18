@@ -153,7 +153,7 @@ def test_telemetry_builder_is_model_first():
         identity,
         score_summary=score_summary,
         changed_files_count=1,
-        dataset_source="langfuse",
+        dataset_provenance="langfuse",
         repo_language="py",
         repo_license="mit",
         evidence=evidence,
@@ -167,7 +167,7 @@ def test_telemetry_builder_is_model_first():
     dumped = envelope.model_dump()
     assert dumped["score_summary"]["composed_score"] == 1.0
     assert dumped["changed_files_count"] == 1
-    assert dumped["dataset_source"] == "langfuse"
+    assert dumped["dataset_provenance"] == "langfuse"
     assert dumped["evidence"]["items"][0]["file"] == "a.py"
     assert dumped["evidence"]["items"][0]["hints"] == ["hint"]
     assert dumped["materialization_events"]["events"] == ["clone", "checkout"]

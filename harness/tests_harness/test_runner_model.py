@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 from harness.agents.localizer import resolve_runner_model
 
 

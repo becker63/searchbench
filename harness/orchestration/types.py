@@ -12,7 +12,7 @@ from harness.utils.type_loader import FrontierContext
 from harness.localization.models import LCATask
 
 if TYPE_CHECKING:
-    from harness.telemetry.hosted.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import EvaluationRecord
 
 
 MetricValue = int | float | bool
@@ -75,7 +75,7 @@ class EvaluatePolicyOnItem(Protocol):
     def __call__(
         self,
         task: LCATask,
-        baseline_snapshot: "BaselineSnapshot | None",
+        baseline_record: "EvaluationRecord | None",
         iteration_span: SpanHandle | None,
         iteration_index: int | None,
     ) -> "EvaluationResult": ...
@@ -354,7 +354,7 @@ class LoopContext(BaseModel):
     session_id: str | None = None
     parent_trace: SpanHandle | None = None
     run_metadata: RunMetadata | None = None
-    baseline_snapshot: "BaselineSnapshot | None" = None
+    baseline_record: "EvaluationRecord | None" = None
     run_trace: SpanHandle | None
     history: list[IterationRecord] = Field(default_factory=list)
     prepared_tasks: PreparedTasks | None = None
@@ -518,12 +518,12 @@ class OptimizationMachineModel(BaseModel):
 
 def _rebuild_forward_refs() -> None:
     try:
-        from harness.telemetry.hosted.baselines import BaselineSnapshot  # local import to avoid cycles
+        from harness.telemetry.hosted.baselines import EvaluationRecord  # local import to avoid cycles
     except Exception:
-        BaselineSnapshot = object  # type: ignore[misc,assignment]
-    LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot, "RunMetadata": RunMetadata})
-    LoopDependencies.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
-    RepairContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
+        EvaluationRecord = object  # type: ignore[misc,assignment]
+    LoopContext.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord, "RunMetadata": RunMetadata})
+    LoopDependencies.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord})
+    RepairContext.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord})
     RepairMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
     OptimizationMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
 

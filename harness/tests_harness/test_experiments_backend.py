@@ -83,13 +83,12 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     req = experiments.HostedLocalizationRunRequest(
         dataset="d",
         version="v1",
-        dataset_config="c",
-        dataset_split="s",
         session=None,
     )
     result = experiments.run_hosted_localization_experiment(req, worktree_manager=None)
     assert calls
     assert isinstance(calls[0]["tasks"][0], LCATask)
+    assert calls[0]["dataset_provenance"] == "langfuse"
     assert result.items[0].prediction == ["a.py"]
 
 
@@ -144,8 +143,6 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
     req = experiments.HostedLocalizationRunRequest(
         dataset="d",
         version="v1",
-        dataset_config="c",
-        dataset_split="s",
         session=None,
         max_workers=2,
     )
@@ -172,8 +169,6 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
     req = experiments.HostedLocalizationRunRequest(
         dataset="d",
         version="v1",
-        dataset_config="c",
-        dataset_split="s",
         session=None,
         max_workers=2,
     )
@@ -200,8 +195,6 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
     req = experiments.HostedLocalizationRunRequest(
         dataset="d",
         version="v1",
-        dataset_config="c",
-        dataset_split="s",
         session=None,
         max_workers=1,
     )

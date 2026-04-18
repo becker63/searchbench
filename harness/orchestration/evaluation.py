@@ -17,7 +17,7 @@ from harness.orchestration.types import (
 from harness.prompts import WriterScoreSummary, build_writer_score_summary_from_bundle
 
 if TYPE_CHECKING:
-    from harness.telemetry.hosted.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import EvaluationRecord
 
 
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy" / "current.py"
@@ -52,14 +52,14 @@ def _failure_evaluation_result(error: str) -> EvaluationResult:
 
 def evaluate_policy_on_item(
     task: LCATask,
-    baseline_snapshot: "BaselineSnapshot | None",
+    baseline_record: "EvaluationRecord | None",
     iteration_span: object | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
-    del baseline_snapshot, iteration_index
+    del baseline_record, iteration_index
     eval_result = evaluate_localization_batch(
         tasks=[task],
-        dataset_source=None,
+        dataset_provenance=None,
         worktree_manager=None,
         parent_trace=iteration_span,
     )

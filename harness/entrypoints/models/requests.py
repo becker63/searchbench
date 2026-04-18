@@ -1,15 +1,8 @@
 from __future__ import annotations
 
-from enum import Enum
-
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from harness.telemetry.tracing.session_policy import SessionConfig
-
-
-class LocalizationDatasetSource(str, Enum):
-    LANGFUSE = "langfuse"
-    HUGGINGFACE = "huggingface"
 
 
 class HostedLocalizationBaselineRequest(BaseModel):
@@ -19,8 +12,6 @@ class HostedLocalizationBaselineRequest(BaseModel):
 
     dataset: str
     version: str | None = None
-    dataset_config: str | None = None
-    dataset_split: str | None = None
     session: SessionConfig | None = None
     max_items: int | None = None
     offset: int = 0
@@ -43,8 +34,6 @@ class HostedLocalizationRunRequest(BaseModel):
 
     dataset: str
     version: str | None = None
-    dataset_config: str | None = None
-    dataset_split: str | None = None
     session: SessionConfig | None = None
     max_items: int | None = None
     offset: int = 0

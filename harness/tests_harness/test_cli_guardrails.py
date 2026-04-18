@@ -14,6 +14,9 @@ from harness.telemetry.hosted.baselines import baseline_cache_path
 from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
 
 
+LANGFUSE_DATASET = "canonical-lca"
+
+
 def _task(repo_owner: str, repo_name: str, base_sha: str, dataset: str = "d", config: str = "c", split: str = "s") -> LCATask:
     identity = LCATaskIdentity(
         dataset_name=dataset,
@@ -29,16 +32,16 @@ def _task(repo_owner: str, repo_name: str, base_sha: str, dataset: str = "d", co
 
 
 def _stub_cli_baseline(monkeypatch, tmp_path, run_stub, cache_root=None, baseline_root=None):
-    hf_cache_dir = cache_root or tmp_path / "hf_cache"
+    worktree_cache_dir = cache_root or tmp_path / "worktree_cache"
     baseline_cache_dir = baseline_root or tmp_path / "baseline_cache"
-    monkeypatch.setenv("HF_LCA_CACHE_DIR", str(hf_cache_dir))
+    monkeypatch.setenv("HARNESS_WORKTREE_CACHE_DIR", str(worktree_cache_dir))
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(baseline_cache_dir))
     monkeypatch.setattr(run_module.harness_run, "ensure_langfuse_auth", lambda: None)
     monkeypatch.setattr(run_module.harness_run, "flush_langfuse", lambda: None)
     monkeypatch.setattr(
         run_module,
-        "fetch_hf_localization_dataset",
-        lambda *args, **kwargs: [_task("o", "r", "b", dataset=run_module.harness_run.HF_DATASET_NAME, config="py", split="dev")],
+        "fetch_localization_dataset",
+        lambda *args, **kwargs: [_task("o", "r", "b", dataset=LANGFUSE_DATASET, config="py", split="dev")],
     )
 
     def fake_select(tasks, max_items, offset):
@@ -58,13 +61,13 @@ def _stub_cli_baseline(monkeypatch, tmp_path, run_stub, cache_root=None, baselin
     )
     monkeypatch.setattr(run_module, "_require_confirmation", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_module, "run_hosted_localization_baseline", run_stub)
-    return hf_cache_dir, baseline_cache_dir
+    return worktree_cache_dir, baseline_cache_dir
 
 
 def _worktree_path(cache_root, *, repo_owner: str = "o", repo_name: str = "r", base_sha: str = "b", config: str = "py"):
     manager = WorktreeManager(cache_root=cache_root)
     request = RepoMaterializationRequest(
-        dataset_name=run_module.harness_run.HF_DATASET_NAME,
+        dataset_name=LANGFUSE_DATASET,
         dataset_config=config,
         dataset_split="dev",
         repo_owner=repo_owner,
@@ -75,24 +78,45 @@ def _worktree_path(cache_root, *, repo_owner: str = "o", repo_name: str = "r", b
 
 
 def test_parse_defaults():
-    args = run_module._parse_args(["baseline", "--config", "py", "--split", "dev"])
+    args = run_module._parse_args(["baseline", "--dataset", LANGFUSE_DATASET])
     assert args.max_items is None
     assert args.offset == 0
     assert args.command == "baseline"
-    args_exp = run_module._parse_args(["experiment", "--config", "java", "--split", "test", "--max-items", "5"])
+    args_exp = run_module._parse_args(["experiment", "--dataset", LANGFUSE_DATASET, "--max-items", "5"])
     assert args_exp.command == "experiment"
     assert args_exp.max_items == 5
 
 
 def test_removed_flags_rejected():
     with pytest.raises(SystemExit):
-        run_module._parse_args(["baseline", "--config", "py", "--split", "dev", "--dataset", "foo"])
+        run_module._parse_args(["baseline", "--dataset", LANGFUSE_DATASET, "--mode", "localization-baseline"])
     with pytest.raises(SystemExit):
-        run_module._parse_args(["baseline", "--config", "py", "--split", "dev", "--mode", "localization-baseline"])
+        run_module._parse_args(["experiment", "--dataset", LANGFUSE_DATASET, "--assume-input-tokens", "10"])
     with pytest.raises(SystemExit):
-        run_module._parse_args(["experiment", "--config", "py", "--split", "dev", "--assume-input-tokens", "10"])
+        run_module._parse_args(["experiment", "--dataset", LANGFUSE_DATASET, "--dataset-source", "huggingface"])
+
+
+def test_hf_flags_are_sync_only():
     with pytest.raises(SystemExit):
-        run_module._parse_args(["experiment", "--config", "py", "--split", "dev", "--dataset-source", "huggingface"])
+        run_module._parse_args(["baseline", "--dataset", LANGFUSE_DATASET, "--config", "py"])
+    with pytest.raises(SystemExit):
+        run_module._parse_args(["experiment", "--dataset", LANGFUSE_DATASET, "--revision", "rev1"])
+
+    args = run_module._parse_args([
+        "sync-hf",
+        "--dataset",
+        LANGFUSE_DATASET,
+        "--config",
+        "py",
+        "--split",
+        "dev",
+        "--revision",
+        "rev1",
+    ])
+    assert args.command == "sync-hf"
+    assert args.config == "py"
+    assert args.split == "dev"
+    assert args.revision == "rev1"
 
 
 def test_select_tasks_is_deterministic_and_offsets():
@@ -144,7 +168,7 @@ def test_confirmation_non_interactive_rejected(monkeypatch):
 def test_projection_only_skips_execution(monkeypatch):
     calls = {"baseline": 0}
 
-    def fake_fetch(name, dataset_config=None, dataset_split=None, revision=None):
+    def fake_fetch(name, version=None):
         return [_task("o", "r", "b")]
 
     def fake_projection(*args, **kwargs):
@@ -157,16 +181,14 @@ def test_projection_only_skips_execution(monkeypatch):
         calls["baseline"] += 1
         return None
 
-    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", fake_fetch)
+    monkeypatch.setattr(run_module, "fetch_localization_dataset", fake_fetch)
     monkeypatch.setattr(run_module, "_compute_projection", fake_projection)
     monkeypatch.setattr(run_module, "_require_confirmation", fake_confirm)
     monkeypatch.setattr(run_module, "run_hosted_localization_baseline", fake_run)
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--projection-only",
         "--yes",
         "--max-items",
@@ -179,39 +201,35 @@ def test_projection_only_skips_execution(monkeypatch):
 def test_projection_only_with_invalidation_skips_destructive_cache_removal(monkeypatch, tmp_path):
     calls = {"baseline": 0}
 
-    def fake_fetch(name, dataset_config=None, dataset_split=None, revision=None):
-        return [_task("o", "r", "b", dataset=name, config=dataset_config or "py", split=dataset_split or "dev")]
+    def fake_fetch(name, version=None):
+        return [_task("o", "r", "b", dataset=name, config="py", split="dev")]
 
     def fake_run(*args, **kwargs):
         calls["baseline"] += 1
         return None
 
-    monkeypatch.setenv("HF_LCA_CACHE_DIR", str(tmp_path / "hf_cache"))
+    monkeypatch.setenv("HARNESS_WORKTREE_CACHE_DIR", str(tmp_path / "worktree_cache"))
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path / "baseline_cache"))
     monkeypatch.setattr(run_module.harness_run, "ensure_langfuse_auth", lambda: None)
     monkeypatch.setattr(run_module.harness_run, "flush_langfuse", lambda: None)
-    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", fake_fetch)
+    monkeypatch.setattr(run_module, "fetch_localization_dataset", fake_fetch)
     monkeypatch.setattr(run_module, "_compute_projection", lambda *args, **kwargs: {"total": {"planned": 0, "hard_cap": 0}, "localization": {}, "writer": {}})
     monkeypatch.setattr(run_module, "_require_confirmation", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_module, "run_hosted_localization_baseline", fake_run)
     bundle_path = baseline_cache_path(
-        run_module.harness_run.HF_DATASET_NAME,
-        dataset_config="py",
-        dataset_split="dev",
+        LANGFUSE_DATASET,
         dataset_version=None,
     )
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     bundle_path.write_text("{}")
-    worktree_path = _worktree_path(tmp_path / "hf_cache")
+    worktree_path = _worktree_path(tmp_path / "worktree_cache")
     worktree_path.mkdir(parents=True)
     (worktree_path / ".complete").write_text("")
 
     run_module.main([
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--projection-only",
         "--yes",
         "--max-items",
@@ -225,11 +243,11 @@ def test_projection_only_with_invalidation_skips_destructive_cache_removal(monke
     assert (worktree_path / ".complete").exists()
 
 
-def test_hf_loader_is_used(monkeypatch):
+def test_langfuse_loader_is_used(monkeypatch):
     calls = {"loader": None, "baseline": None}
 
-    def fake_loader(name, dataset_config=None, dataset_split=None, revision=None):
-        calls["loader"] = (name, dataset_config, dataset_split, revision)
+    def fake_loader(name, version=None):
+        calls["loader"] = (name, version)
         return [SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))]
 
     def fake_select(tasks, max_items, offset):
@@ -241,23 +259,24 @@ def test_hf_loader_is_used(monkeypatch):
     def fake_confirm(skip_confirmation, selection, projection):
         calls["baseline"] = True
 
-    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", fake_loader)
+    monkeypatch.setattr(run_module, "fetch_localization_dataset", fake_loader)
     monkeypatch.setattr(run_module, "_select_tasks", fake_select)
     monkeypatch.setattr(run_module, "_compute_projection", fake_projection)
     monkeypatch.setattr(run_module, "_require_confirmation", fake_confirm)
     monkeypatch.setattr(run_module, "run_hosted_localization_baseline", lambda *args, **kwargs: None)
 
-    run_module.main(["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--yes"])
-    assert calls["loader"] == ("JetBrains-Research/lca-bug-localization", "py", "dev", None)
+    run_module.main(["baseline", "--dataset", LANGFUSE_DATASET, "--version", "v1", "--max-items", "1", "--yes"])
+    assert calls["loader"] == (LANGFUSE_DATASET, "v1")
 
 
-def test_requests_do_not_expose_dataset_source():
-    req = HostedLocalizationBaselineRequest(dataset="d", dataset_config="c", dataset_split="s")
-    assert "dataset_source" not in req.model_fields
+def test_requests_do_not_expose_dataset_provenance():
+    req = HostedLocalizationBaselineRequest(dataset="d")
+    assert req.dataset == "d"
+    assert "dataset_provenance" not in HostedLocalizationBaselineRequest.model_fields
 
 
 def test_max_workers_validation():
-    argv = ["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--max-workers", "0"]
+    argv = ["baseline", "--dataset", LANGFUSE_DATASET, "--max-items", "1", "--max-workers", "0"]
     with pytest.raises(ValueError):
         run_module.main(argv)
 
@@ -267,10 +286,10 @@ def test_cli_fresh_session_per_invocation(monkeypatch, tmp_path):
 
     def fake_run(req, worktree_manager=None, tasks=None):
         sessions.append(req.session)
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
     _stub_cli_baseline(monkeypatch, tmp_path, fake_run)
-    argv = ["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--yes"]
+    argv = ["baseline", "--dataset", LANGFUSE_DATASET, "--max-items", "1", "--yes"]
 
     run_module.main(argv)
     run_module.main(argv)
@@ -289,15 +308,13 @@ def test_cli_respects_explicit_session_id(monkeypatch, tmp_path):
 
     def fake_run(req, worktree_manager=None, tasks=None):
         sessions.append(req.session)
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
     _stub_cli_baseline(monkeypatch, tmp_path, fake_run)
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--max-items",
         "1",
         "--yes",
@@ -316,19 +333,17 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
 
     def fake_run(req, worktree_manager=None, tasks=None):
         calls.append(True)
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
-    hf_cache_root = tmp_path / "hf_cache_existing"
-    hf_cache_root.mkdir(parents=True, exist_ok=True)
-    (hf_cache_root / "marker.txt").write_text("cached")
-    worktree_path = _worktree_path(hf_cache_root)
+    checkout_cache_root = tmp_path / "checkout_cache_existing"
+    checkout_cache_root.mkdir(parents=True, exist_ok=True)
+    (checkout_cache_root / "marker.txt").write_text("cached")
+    worktree_path = _worktree_path(checkout_cache_root)
     worktree_path.mkdir(parents=True)
     (worktree_path / ".complete").write_text("")
-    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=checkout_cache_root)
     bundle_path = baseline_cache_path(
-        run_module.harness_run.HF_DATASET_NAME,
-        dataset_config="py",
-        dataset_split="dev",
+        LANGFUSE_DATASET,
         dataset_version=None,
     )
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -336,10 +351,8 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
 
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--max-items",
         "1",
         "--yes",
@@ -354,7 +367,7 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
     assert calls == [True]
     assert not bundle_path.exists()
     assert not worktree_path.exists()
-    assert (hf_cache_root / "marker.txt").exists(), "HF cache should remain untouched"
+    assert (checkout_cache_root / "marker.txt").exists(), "checkout cache root marker should remain untouched"
 
 
 def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys):
@@ -362,28 +375,24 @@ def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys
 
     def fake_run(req, worktree_manager=None, tasks=None):
         calls.append(True)
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
-    hf_cache_root = tmp_path / "hf_cache_missing"
-    hf_cache_root.mkdir(parents=True, exist_ok=True)
-    (hf_cache_root / "marker.txt").write_text("cached")
-    worktree_path = _worktree_path(hf_cache_root)
+    checkout_cache_root = tmp_path / "checkout_cache_missing"
+    checkout_cache_root.mkdir(parents=True, exist_ok=True)
+    (checkout_cache_root / "marker.txt").write_text("cached")
+    worktree_path = _worktree_path(checkout_cache_root)
     worktree_path.mkdir(parents=True)
     (worktree_path / ".complete").write_text("")
-    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=checkout_cache_root)
     bundle_path = baseline_cache_path(
-        run_module.harness_run.HF_DATASET_NAME,
-        dataset_config="py",
-        dataset_split="dev",
+        LANGFUSE_DATASET,
         dataset_version=None,
     )
 
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--max-items",
         "1",
         "--yes",
@@ -398,18 +407,18 @@ def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys
     assert calls == [True]
     assert not bundle_path.exists()
     assert not worktree_path.exists()
-    assert (hf_cache_root / "marker.txt").exists(), "HF cache should remain untouched"
+    assert (checkout_cache_root / "marker.txt").exists(), "checkout cache root marker should remain untouched"
 
 
 def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypatch, tmp_path):
     def fake_run(req, worktree_manager=None, tasks=None):
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
     selected_task = _task(
         "selected",
         "repo",
         "a" * 40,
-        dataset=run_module.harness_run.HF_DATASET_NAME,
+        dataset=LANGFUSE_DATASET,
         config="py",
         split="dev",
     )
@@ -417,19 +426,19 @@ def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypat
         "other",
         "repo",
         "b" * 40,
-        dataset=run_module.harness_run.HF_DATASET_NAME,
+        dataset=LANGFUSE_DATASET,
         config="py",
         split="dev",
     )
-    hf_cache_root = tmp_path / "hf_cache_targeted"
+    checkout_cache_root = tmp_path / "checkout_cache_targeted"
     selected_path = _worktree_path(
-        hf_cache_root,
+        checkout_cache_root,
         repo_owner="selected",
         repo_name="repo",
         base_sha="a" * 40,
     )
     other_path = _worktree_path(
-        hf_cache_root,
+        checkout_cache_root,
         repo_owner="other",
         repo_name="repo",
         base_sha="b" * 40,
@@ -438,10 +447,10 @@ def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypat
     other_path.mkdir(parents=True)
     (selected_path / ".complete").write_text("")
     (other_path / ".complete").write_text("")
-    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=checkout_cache_root)
     monkeypatch.setattr(
         run_module,
-        "fetch_hf_localization_dataset",
+        "fetch_localization_dataset",
         lambda *args, **kwargs: [selected_task, other_task],
     )
     monkeypatch.setattr(
@@ -461,10 +470,8 @@ def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypat
 
     run_module.main([
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--max-items",
         "1",
         "--yes",

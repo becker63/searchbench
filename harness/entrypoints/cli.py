@@ -34,8 +34,9 @@ from harness.telemetry.hosted.experiments import (
 )
 from harness.telemetry.hosted.hf_lca import (
     HFDatasetLoadError,
-    fetch_hf_localization_dataset,
+    sync_hf_localization_dataset_to_langfuse,
 )
+from harness.telemetry.hosted.datasets import fetch_localization_dataset
 from harness.telemetry.hosted.baselines import baseline_cache_path
 from harness.telemetry.tracing import flush_langfuse, ensure_langfuse_auth
 from harness.entrypoints.models.requests import (
@@ -46,10 +47,9 @@ from harness.telemetry.tracing.session_policy import SessionConfig
 
 WARNING_THRESHOLD = 50
 HF_DATASET_NAME = "JetBrains-Research/lca-bug-localization"
-HF_DATASET_SOURCE = "huggingface"
+LANGFUSE_DATASET_STORE = "langfuse"
 REMOVED_FLAGS = {
     "--mode",
-    "--dataset",
     "--dataset-source",
     "--dataset_source",
     "--repo-owner",
@@ -134,7 +134,7 @@ def _raw_mode(file_obj: IO[Any]) -> Iterator[None]:
 def evaluate_localization_batch(
     tasks: Sequence[LCATask],
     *,
-    dataset_source: str | None = None,
+    dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
@@ -144,7 +144,7 @@ def evaluate_localization_batch(
     """
     return _evaluate_localization_batch(
         tasks,
-        dataset_source=dataset_source,
+        dataset_provenance=dataset_provenance,
         worktree_manager=worktree_manager,
         parent_trace=parent_trace,
         runner=runner,
@@ -157,21 +157,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     for flag in REMOVED_FLAGS:
         if flag in argv:
             raise SystemExit(
-                f"{flag} is no longer supported; use HF baseline/experiment subcommands with --config/--split/--revision/--max-items/--offset."
+                f"{flag} is no longer supported; hosted runs use Langfuse datasets. Use baseline/experiment with --dataset/--version, or sync-hf for HF ingestion."
             )
     parser = argparse.ArgumentParser(
-        description="HF LCA localization runner (baseline/experiment)"
+        description="Langfuse-backed LCA localization runner"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def _add_common(sub: argparse.ArgumentParser) -> None:
         sub.add_argument(
-            "--config", required=True, help="HF dataset config (e.g., py/java/kt)"
+            "--dataset", required=True, help="Langfuse dataset name"
         )
         sub.add_argument(
-            "--split", required=True, help="HF dataset split (e.g., dev/test/train)"
+            "--version", help="Langfuse dataset version"
         )
-        sub.add_argument("--revision", help="HF dataset revision pin")
         sub.add_argument(
             "--max-items", type=int, help="Maximum number of dataset items to evaluate"
         )
@@ -211,11 +210,35 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     baseline_parser.add_argument(
         "--invalidate-baseline-cache",
         action="store_true",
-        help="Remove cached baseline bundle and selected repo worktree caches before running",
+        help="Remove cached evaluation bundle and selected repo worktree caches before running",
     )
 
     experiment_parser = subparsers.add_parser("experiment")
     _add_common(experiment_parser)
+
+    sync_parser = subparsers.add_parser("sync-hf")
+    sync_parser.add_argument(
+        "--hf-dataset",
+        default=HF_DATASET_NAME,
+        help="HuggingFace dataset to ingest",
+    )
+    sync_parser.add_argument(
+        "--dataset",
+        required=True,
+        help="Langfuse dataset to populate",
+    )
+    sync_parser.add_argument(
+        "--config",
+        required=True,
+        help="HF dataset config (e.g., py/java/kt)",
+    )
+    sync_parser.add_argument(
+        "--split",
+        required=True,
+        help="HF dataset split (e.g., dev/test/train)",
+    )
+    sync_parser.add_argument("--revision", help="HF dataset revision pin")
+    sync_parser.add_argument("--token", help="Optional HuggingFace token")
 
     return parser.parse_args(argv)
 
@@ -260,7 +283,7 @@ def _build_session_config(
 
 def _invalidate_baseline_cache(bundle_path: Path) -> None:
     """
-    Best-effort removal of the baseline bundle cache file.
+    Best-effort removal of the evaluation bundle cache file.
     """
     cache_path = bundle_path.resolve()
     if cache_path.exists():
@@ -316,9 +339,8 @@ def _select_tasks(
 
 def _print_selection(
     dataset: str,
-    dataset_config: str | None,
-    dataset_split: str | None,
-    source: str,
+    version: str | None,
+    store: str,
     selection: dict[str, object],
 ) -> None:
     limit = selection.get("limit")
@@ -327,12 +349,11 @@ def _print_selection(
     total_available = selection.get("total_available")
     preview = selection.get("preview") or []
     print(
-        "[SELECT] dataset=%s config=%s split=%s source=%s offset=%s limit=%s selected=%s total=%s"
+        "[SELECT] dataset=%s version=%s store=%s offset=%s limit=%s selected=%s total=%s"
         % (
             dataset,
-            dataset_config,
-            dataset_split,
-            source,
+            version,
+            store,
             offset,
             limit,
             selected_count,
@@ -508,30 +529,28 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     # Fail fast on Langfuse auth/base-url issues in the canonical path.
     ensure_langfuse_auth()
-    if args.max_workers is not None and args.max_workers <= 0:
+    if getattr(args, "max_workers", None) is not None and args.max_workers <= 0:
         raise ValueError("--max-workers must be a positive integer")
     worktree_manager = WorktreeManager()
     session_cfg = _build_session_config(
-        args.command or "cli", args.session_id, args.allow_session_fallback
+        args.command or "cli",
+        getattr(args, "session_id", None),
+        getattr(args, "allow_session_fallback", True),
     )
     baseline_bundle_path = (
         baseline_cache_path(
-            HF_DATASET_NAME,
-            dataset_config=args.config,
-            dataset_split=args.split,
-            dataset_version=args.revision,
+            args.dataset,
+            dataset_version=args.version,
         )
         if args.command == "baseline"
         else None
     )
     try:
         if args.command == "baseline":
-            print(f"[RUN] HF localization baseline for dataset '{HF_DATASET_NAME}'")
-            tasks = fetch_hf_localization_dataset(
-                HF_DATASET_NAME,
-                dataset_config=args.config,
-                dataset_split=args.split,
-                revision=args.revision,
+            print(f"[RUN] Langfuse localization baseline for dataset '{args.dataset}'")
+            tasks = fetch_localization_dataset(
+                args.dataset,
+                version=args.version,
             )
             if not tasks:
                 raise RuntimeError("No localization tasks available for baseline run")
@@ -540,10 +559,9 @@ def main(argv: list[str] | None = None) -> None:
             )
             _warn_if_unbounded(selection_info, args.max_items)
             _print_selection(
-                HF_DATASET_NAME,
-                args.config,
-                args.split,
-                HF_DATASET_SOURCE,
+                args.dataset,
+                args.version,
+                LANGFUSE_DATASET_STORE,
                 selection_info,
             )
             projection = _compute_projection(
@@ -560,10 +578,8 @@ def main(argv: list[str] | None = None) -> None:
                 _invalidate_baseline_cache(baseline_bundle_path)
                 _invalidate_worktree_checkouts_for_tasks(selected_tasks, worktree_manager)
             req = HostedLocalizationBaselineRequest(
-                dataset=HF_DATASET_NAME,
-                version=args.revision,
-                dataset_config=args.config,
-                dataset_split=args.split,
+                dataset=args.dataset,
+                version=args.version,
                 session=session_cfg,
                 max_items=args.max_items,
                 offset=args.offset,
@@ -577,22 +593,20 @@ def main(argv: list[str] | None = None) -> None:
             if bundle is None:
                 print("[RUN] Baseline run returned no bundle; skipping summary.")
                 return
-            print(f"[RUN] Baselines computed: {len(bundle.items)}")
+            print(f"[RUN] Baselines computed: {len(bundle.records)}")
             failure = getattr(bundle, "failure", None)
             if failure is not None:
                 category = getattr(failure.category, "value", failure.category)
                 print(
                     f"[RUN] Baseline run reported failure category={category} task_id={failure.task_id} message={failure.message}"
                 )
-            for snap in bundle.items:
-                _print_mat_summary("baseline", snap.identity, snap.materialization)
+            for record in bundle.records:
+                _print_mat_summary("baseline", record.identity, record.materialization)
         elif args.command == "experiment":
-            print(f"[RUN] HF localization experiment for dataset '{HF_DATASET_NAME}'")
-            tasks = fetch_hf_localization_dataset(
-                HF_DATASET_NAME,
-                dataset_config=args.config,
-                dataset_split=args.split,
-                revision=args.revision,
+            print(f"[RUN] Langfuse localization experiment for dataset '{args.dataset}'")
+            tasks = fetch_localization_dataset(
+                args.dataset,
+                version=args.version,
             )
             if not tasks:
                 raise RuntimeError("No localization tasks available for experiment run")
@@ -601,10 +615,9 @@ def main(argv: list[str] | None = None) -> None:
             )
             _warn_if_unbounded(selection_info, args.max_items)
             _print_selection(
-                HF_DATASET_NAME,
-                args.config,
-                args.split,
-                HF_DATASET_SOURCE,
+                args.dataset,
+                args.version,
+                LANGFUSE_DATASET_STORE,
                 selection_info,
             )
             projection = _compute_projection(
@@ -618,10 +631,8 @@ def main(argv: list[str] | None = None) -> None:
                 print("[RUN] Projection-only mode: exiting before execution.")
                 return
             req = HostedLocalizationRunRequest(
-                dataset=HF_DATASET_NAME,
-                version=args.revision,
-                dataset_config=args.config,
-                dataset_split=args.split,
+                dataset=args.dataset,
+                version=args.version,
                 session=session_cfg,
                 max_items=args.max_items,
                 offset=args.offset,
@@ -645,6 +656,26 @@ def main(argv: list[str] | None = None) -> None:
                     item.task.task_id,
                     item.materialization,
                 )
+        elif args.command == "sync-hf":
+            items = sync_hf_localization_dataset_to_langfuse(
+                hf_dataset=args.hf_dataset,
+                langfuse_dataset=args.dataset,
+                dataset_config=args.config,
+                dataset_split=args.split,
+                revision=args.revision,
+                token=args.token,
+            )
+            print(
+                "[SYNC] HF dataset=%s config=%s split=%s revision=%s -> Langfuse dataset=%s items=%s"
+                % (
+                    args.hf_dataset,
+                    args.config,
+                    args.split,
+                    args.revision,
+                    args.dataset,
+                    len(items),
+                )
+            )
     except HFDatasetLoadError as exc:
         print(f"[ERROR] HF dataset load failed (category={exc.category}): {exc}")
         raise

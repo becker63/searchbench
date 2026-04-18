@@ -6,7 +6,6 @@ import pytest
 
 from types import SimpleNamespace
 
-from harness.localization.models import LCATask
 import run as run_module
 
 
@@ -14,7 +13,7 @@ def test_auto_approve_requires_max_items(monkeypatch, tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     # Stub dataset fetch and projection to reach the yes/max-items validation quickly.
-    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", lambda *args, **kwargs: [SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))])
+    monkeypatch.setattr(run_module, "fetch_localization_dataset", lambda *args, **kwargs: [SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))])
     monkeypatch.setattr(
         run_module,
         "_select_tasks",
@@ -25,10 +24,8 @@ def test_auto_approve_requires_max_items(monkeypatch, tmp_path):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        "canonical-lca",
         "--yes",
     ]
     with pytest.raises(ValueError):

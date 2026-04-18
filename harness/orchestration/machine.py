@@ -49,7 +49,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from harness.telemetry.hosted.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import EvaluationRecord
 
 _BOUND_EVENT = cast(Any, BoundEvent)
 _MAX_POLICY_REPAIRS = 3
@@ -379,7 +379,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         ) as eval_span:
             self.model.current_evaluation = self.deps.evaluate_policy_on_item(
                 iteration_tasks.task,
-                self.context.baseline_snapshot,
+                self.context.baseline_record,
                 eval_span,
                 self.context.current_iteration,
             )
@@ -631,23 +631,23 @@ def _fallback_history(
     ]
 
 
-def _baseline_snapshot_model(
-    baseline_snapshot: "BaselineSnapshot | Mapping[str, object] | None",
-) -> "BaselineSnapshot | None":
-    if isinstance(baseline_snapshot, Mapping):
+def _baseline_record_model(
+    baseline_record: "EvaluationRecord | Mapping[str, object] | None",
+) -> "EvaluationRecord | None":
+    if isinstance(baseline_record, Mapping):
         from harness.telemetry.hosted.baselines import (
-            BaselineSnapshot as BaselineSnapshotModel,
+            EvaluationRecord as EvaluationRecordModel,
         )
 
-        return BaselineSnapshotModel.model_validate(baseline_snapshot)
-    return baseline_snapshot
+        return EvaluationRecordModel.model_validate(baseline_record)
+    return baseline_record
 
 
 def run_loop(
     task: LCATask,
     iterations: int = 5,
     parent_trace: SpanHandle | None = None,
-    baseline_snapshot: "BaselineSnapshot | Mapping[str, object] | None" = None,
+    baseline_record: "EvaluationRecord | Mapping[str, object] | None" = None,
     session_id: str | None = None,
 ) -> list[IterationRecord]:
     """
@@ -673,7 +673,7 @@ def run_loop(
                 session_id=session_id,
                 parent_trace=parent_trace,
                 run_metadata=root_meta,
-                baseline_snapshot=_baseline_snapshot_model(baseline_snapshot),
+                baseline_record=_baseline_record_model(baseline_record),
                 run_trace=run_span,
             )
             opt_model = OptimizationMachineModel(

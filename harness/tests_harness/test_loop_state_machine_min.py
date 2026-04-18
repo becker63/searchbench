@@ -397,7 +397,7 @@ def test_optimization_completes_and_records_history() -> None:
         task=_task(),
         iterations=1,
         session_id=None,
-        baseline_snapshot=None,
+        baseline_record=None,
         run_trace=RecordingSpan(),
         history=[],
         prepared_tasks=None,

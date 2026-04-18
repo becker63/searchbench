@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from iterative_context.server import IterativeContextToolRuntime, list_tools
 
-from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async, serialize_tool_result_for_model
+from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
 from harness.utils.openai_schema import ChatCompletionToolParam
 
 

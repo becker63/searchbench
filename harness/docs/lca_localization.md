@@ -22,19 +22,21 @@
 - Inputs: repo_owner/name and `base_sha`; dataset/config/split are task metadata and do not define checkout cache identity.
 - `WorktreeManager`: cached bare git mirror + repo@sha worktree checkout at `base_sha` with per-key lock, completion marker, and cache validation (worktree HEAD is checked against `base_sha` on reuse); stale locks and incomplete caches are pruned under the lock.
 - Outputs: local path at `base_sha`, cache hit/miss, cache_validated, mirror_fetched, worktree_created, checkout_verified, logs/events.
-- CLI logs: dataset/config/split, dataset source (langfuse|huggingface), cache hit/miss, git fetch/worktree/verification status, checkout `base_sha`, ready path, summary printed to stdout.
+- CLI logs: Langfuse dataset/version, cache hit/miss, git fetch/worktree/verification status, checkout `base_sha`, ready path, summary printed to stdout.
 - Telemetry: Langfuse owns dataset/experiment context; WorktreeManager emits checkout/cache events; runtime execution consumes the local checkout path. Failure categories are surfaced for lock, auth/fetch, checkout verification, and cache corruption.
 
-## Dataset Source (HF-only public CLI)
-- Public CLI baseline/experiment commands use the Hugging Face LCA dataset (`JetBrains-Research/lca-bug-localization`) directly, resolved via config/split/revision.
-- WorktreeManager still locks/cache-validates mirrors/worktrees per repo + base_sha, and logs checkout events as before.
+## Dataset Store
+- Langfuse is the canonical hosted benchmark store. Dataset items carry the `LCATask` payload in `input` and `changed_files` gold in `expected_output`.
+- Langfuse dataset versions define hosted benchmark reproducibility. The repo checkout for each task is defined by repo owner/name plus `base_sha`.
+- Hugging Face is sync-only ingestion tooling for populating Langfuse datasets. Hosted baseline/experiment commands do not load HF rows directly.
+- HF sync upserts by a deterministic item id derived from repo owner/name, `base_sha`, and issue/pull identity. HF config, split, revision, and target dataset name are recorded as provenance only.
 
-## CLI Examples (HF-only)
-- Baseline: `python run.py baseline --config py --split dev --max-items 25`
-- Experiment: `python run.py experiment --config java --split test --max-items 50`
-- Projection only: `python run.py experiment --config py --split dev --max-items 25 --projection-only`
-- Pinned revision: `python run.py baseline --config py --split dev --revision 4b7c1d2 --max-items 20`
-- Non-interactive: `python run.py experiment --config py --split dev --max-items 10 --yes`
+## CLI Examples
+- Baseline: `python run.py baseline --dataset lca-localization --version 2026-04-17T00:00:00Z --max-items 25`
+- Experiment: `python run.py experiment --dataset lca-localization --version 2026-04-17T00:00:00Z --max-items 50`
+- Projection only: `python run.py experiment --dataset lca-localization --max-items 25 --projection-only`
+- Hugging Face ingestion: `python run.py sync-hf --dataset lca-localization --config py --split dev --revision 4b7c1d2`
+- Non-interactive: `python run.py experiment --dataset lca-localization --max-items 10 --yes`
 
 ## Dataset Guardrails (Baselines/Experiments)
 - **Deterministic selection:** Tasks are sorted by task_id (dataset/config/split + repo owner/name + base_sha + issue/pull) before applying `--offset` (default 0) and `--max-items`. Selection metadata (offset, limit, selected count, total, identity preview) is printed and propagated.

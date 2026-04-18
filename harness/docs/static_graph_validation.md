@@ -1,7 +1,7 @@
 ## Static Hop Evaluator Validation Plan
 
 1. **Manual localization run**
-   - Materialize a repo snapshot and run `run_localization_task` with a known issue.
+   - Materialize a repo checkout and run `run_localization_task` with a known issue.
    - Verify metrics still report precision/recall/F1/hit and that `hop_token_score`/`distance_term`/`token_term` appear when extraction succeeds.
 2. **Hop-distance sanity check**
    - Confirm per-file hop diagnostics show finite hops for resolved predictions and `null` for unresolved ones (no fabricated nodes).

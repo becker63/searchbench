@@ -16,9 +16,12 @@ from .tracing import (
 from .tracing.score_emitter import ScorePayload, emit_score, emit_score_for_handle
 from .hosted.datasets import (
     LocalizationDataset,
+    LocalizationDatasetLoadError,
     fetch_localization_dataset,
+    langfuse_dataset_item_from_task,
     local_dataset,
     normalize_localization_task,
+    task_from_langfuse_dataset_item,
 )
 
 __all__ = [
@@ -34,11 +37,14 @@ __all__ = [
     "emit_score_for_handle",
     "ScorePayload",
     "LocalizationDataset",
+    "LocalizationDatasetLoadError",
     "fetch_localization_dataset",
+    "langfuse_dataset_item_from_task",
     "local_dataset",
     "normalize_localization_task",
-    "BaselineBundle",
-    "BaselineSnapshot",
+    "task_from_langfuse_dataset_item",
+    "EvaluationBundle",
+    "EvaluationRecord",
     "compute_baseline_for_task",
     "make_baseline_bundle",
     "require_baseline",
@@ -47,8 +53,8 @@ __all__ = [
 
 if TYPE_CHECKING:
     from harness.telemetry.hosted.baselines import (
-        BaselineBundle,
-        BaselineSnapshot,
+        EvaluationBundle,
+        EvaluationRecord,
         compute_baseline_for_task,
         make_baseline_bundle,
         require_baseline,
@@ -58,8 +64,8 @@ if TYPE_CHECKING:
 
 def __getattr__(name: str) -> Any:
     if name in {
-        "BaselineBundle",
-        "BaselineSnapshot",
+        "EvaluationBundle",
+        "EvaluationRecord",
         "compute_baseline_for_task",
         "make_baseline_bundle",
         "require_baseline",

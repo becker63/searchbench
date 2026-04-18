@@ -192,7 +192,7 @@ def _emit_telemetry(
     score_bundle: ScoreBundle,
     evidence: LocalizationEvidence | None,
     materialization: RepoMaterializationResult | None,
-    dataset_source: str | None,
+    dataset_provenance: str | None,
     trace: object | None,
     predicted_files: list[str],
     changed_files: list[str],
@@ -203,7 +203,7 @@ def _emit_telemetry(
         task.identity,
         score_summary=task_score_summary,
         changed_files_count=len(task.gold.normalized_changed_files()),
-        dataset_source=dataset_source,
+        dataset_provenance=dataset_provenance,
         repo_language=task.context.repo_language,
         repo_license=task.context.repo_license,
         evidence=evidence,
@@ -235,7 +235,7 @@ def _emit_telemetry(
 
 def run_localization_task(
     task: LCATask,
-    dataset_source: str | None = None,
+    dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: Callable[
@@ -292,7 +292,7 @@ def run_localization_task(
             score_bundle=score_bundle,
             evidence=task.evidence,
             materialization=checkout_result,
-            dataset_source=dataset_source,
+            dataset_provenance=dataset_provenance,
             trace=trace,
             predicted_files=prediction.normalized_predicted_files(),
             changed_files=task.gold.normalized_changed_files(),

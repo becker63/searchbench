@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import types
 import pytest
 
 from harness.policy import load as policy_loader

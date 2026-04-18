@@ -27,15 +27,15 @@ from harness.scoring import summarize_score_summaries, summarize_task_score
 from harness.scoring.batch import TaskScoreSummary
 from harness.scoring.token_usage import TokenUsageRecord
 from harness.telemetry.hosted.baselines import (
-    BaselineBundle,
-    BaselineSnapshot,
+    EvaluationBundle,
+    EvaluationRecord,
     compute_baseline_for_task,
     emit_baseline_dataset_aggregates,
     load_persisted_baseline_bundle,
     make_baseline_bundle,
     persist_baseline_bundle,
 )
-from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
+from harness.telemetry.hosted.datasets import fetch_localization_dataset
 from harness.scoring.reducers import (
     PolicyReducerSummary,
     build_task_input,
@@ -74,11 +74,9 @@ class HostedLocalizationRunResult(BaseModel):
 
 
 def _resolve_items(req: HostedLocalizationRunRequest) -> list[LCATask]:
-    return fetch_hf_localization_dataset(
+    return fetch_localization_dataset(
         req.dataset,
-        dataset_config=req.dataset_config,
-        dataset_split=req.dataset_split,
-        revision=req.version,
+        version=req.version,
     )
 
 
@@ -153,27 +151,23 @@ def run_hosted_localization_baseline(
     req: HostedLocalizationBaselineRequest,
     worktree_manager: WorktreeManager | None = None,
     tasks: list[LCATask] | None = None,
-) -> BaselineBundle:
+) -> EvaluationBundle:
     run_session_id = resolve_session_id(req.session, run_id=req.dataset)
     resolved_model = get_runner_model()
     _LOGGER.info("Localization baseline runner model resolved to %s", resolved_model)
     cached_bundle = load_persisted_baseline_bundle(
         dataset_name=req.dataset,
-        dataset_config=req.dataset_config,
-        dataset_split=req.dataset_split,
         dataset_version=req.version,
     )
     selected_tasks: list[LCATask] = []
-    snapshots: list[BaselineSnapshot] = []
+    records: list[EvaluationRecord] = []
     failure: LocalizationEvaluationFailure | None = None
     effective_workers = 1
     selection_info: Mapping[str, object] | None = None
     if cached_bundle is None:
-        tasks = tasks or fetch_hf_localization_dataset(
+        tasks = tasks or fetch_localization_dataset(
             req.dataset,
-            dataset_config=req.dataset_config,
-            dataset_split=req.dataset_split,
-            revision=req.version,
+            version=req.version,
         )
         if not tasks:
             raise RuntimeError("No localization tasks available for baseline run")
@@ -193,19 +187,17 @@ def run_hosted_localization_baseline(
             "limit": req.max_items,
         }
     else:
-        snapshots = list(cached_bundle.items)
+        records = list(cached_bundle.records)
         failure = cached_bundle.failure
-        selection_meta = {"selected_count": len(snapshots)}
+        selection_meta = {"selected_count": len(records)}
     with propagate_context(
         trace_name="localization_baseline_dataset",
         session_id=run_session_id,
         metadata={
             "dataset": req.dataset,
             "dataset_version": req.version,
-            "dataset_config": req.dataset_config,
-            "dataset_split": req.dataset_split,
             "run_kind": "localization_baseline",
-            "dataset_source": "huggingface",
+            "dataset_store": "langfuse",
         },
     ):
         with start_observation(
@@ -213,10 +205,8 @@ def run_hosted_localization_baseline(
             metadata={
                 "dataset": req.dataset,
                 "dataset_version": req.version,
-                "dataset_config": req.dataset_config,
-                "dataset_split": req.dataset_split,
                 "run_kind": "localization_baseline",
-                "dataset_source": "huggingface",
+                "dataset_store": "langfuse",
                 "selection": selection_meta,
                 "runner_model": resolved_model,
             },
@@ -225,18 +215,18 @@ def run_hosted_localization_baseline(
             if cached_bundle is None:
                 if effective_workers == 1:
                     for task in selected_tasks:
-                        snapshots.append(
+                        records.append(
                             compute_baseline_for_task(
                                 task,
                                 session_id=run_session_id,
                                 dataset_version=req.version,
                                 parent_trace=parent_trace,
-                                dataset_source="huggingface",
+                                dataset_provenance="langfuse",
                                 worktree_manager=worktree_manager,
                             )
                         )
                 else:
-                    snapshots, failure = _run_baseline_parallel(
+                    records, failure = _run_baseline_parallel(
                         selected_tasks,
                         effective_workers,
                         parent_trace,
@@ -246,12 +236,10 @@ def run_hosted_localization_baseline(
                     )
             emit_baseline_dataset_aggregates(
                 dataset_span,
-                snapshots,
+                records,
                 extra_metadata={
                     "cache_hit": cached_bundle is not None,
                     "dataset": req.dataset,
-                    "dataset_config": req.dataset_config,
-                    "dataset_split": req.dataset_split,
                     "dataset_version": req.version,
                     "selection": selection_meta,
                     "runner_model": resolved_model,
@@ -261,7 +249,7 @@ def run_hosted_localization_baseline(
     if cached_bundle is not None:
         return cached_bundle
     bundle = make_baseline_bundle(
-        snapshots,
+        records,
         dataset_name=req.dataset,
         dataset_version=req.version,
         metadata={"run_kind": "localization_baseline"},
@@ -270,8 +258,6 @@ def run_hosted_localization_baseline(
     persist_baseline_bundle(
         bundle,
         dataset_name=req.dataset,
-        dataset_config=req.dataset_config,
-        dataset_split=req.dataset_split,
         dataset_version=req.version,
     )
     return bundle
@@ -284,7 +270,7 @@ def _baseline_worker(
     worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
-) -> BaselineSnapshot:
+) -> EvaluationRecord:
     if parent_trace is None:
         raise _TaskFailure(
             index,
@@ -298,7 +284,7 @@ def _baseline_worker(
             session_id=session_id,
             dataset_version=dataset_version,
             parent_trace=parent_trace,
-            dataset_source="huggingface",
+            dataset_provenance="langfuse",
             worktree_manager=worktree_manager,
         )
     except LocalizationEvaluationError as exc:
@@ -322,11 +308,11 @@ def _run_baseline_parallel(
     worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
-) -> tuple[list[BaselineSnapshot], LocalizationEvaluationFailure | None]:
-    results: list[BaselineSnapshot | None] = [None] * len(tasks)
+) -> tuple[list[EvaluationRecord], LocalizationEvaluationFailure | None]:
+    results: list[EvaluationRecord | None] = [None] * len(tasks)
     failure: _TaskFailure | None = None
     next_index = 0
-    inflight: dict[concurrent.futures.Future[BaselineSnapshot], int] = {}
+    inflight: dict[concurrent.futures.Future[EvaluationRecord], int] = {}
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=effective_workers
@@ -431,7 +417,7 @@ def _run_experiment_task(
         with propagate_context(session_id=session_id):
             eval_result = evaluate_localization_batch(
                 tasks=[task],
-                dataset_source="huggingface",
+                dataset_provenance="langfuse",
                 worktree_manager=worktree_manager,
                 parent_trace=parent_trace,
             )
@@ -569,10 +555,8 @@ def run_hosted_localization_experiment(
         metadata={
             "dataset": req.dataset,
             "dataset_version": req.version,
-            "dataset_config": req.dataset_config,
-            "dataset_split": req.dataset_split,
             "run_kind": "localization_experiment",
-            "dataset_source": "huggingface",
+            "dataset_store": "langfuse",
         },
     ):
         with start_observation(
@@ -580,10 +564,8 @@ def run_hosted_localization_experiment(
             metadata={
                 "dataset": req.dataset,
                 "dataset_version": req.version,
-                "dataset_config": req.dataset_config,
-                "dataset_split": req.dataset_split,
                 "run_kind": "localization_experiment",
-                "dataset_source": "huggingface",
+                "dataset_store": "langfuse",
                 "selection": selection_meta,
                 "projection": projection_meta,
             },
@@ -612,8 +594,6 @@ def run_hosted_localization_experiment(
                 results,
                 extra_metadata={
                     "dataset": req.dataset,
-                    "dataset_config": req.dataset_config,
-                    "dataset_split": req.dataset_split,
                     "dataset_version": req.version,
                     "selection": selection_meta,
                 },

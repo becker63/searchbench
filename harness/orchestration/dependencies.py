@@ -51,7 +51,7 @@ class EvaluateLocalizationBatch(Protocol):
         self,
         tasks: Sequence[LCATask],
         *,
-        dataset_source: str | None = None,
+        dataset_provenance: str | None = None,
         worktree_manager: WorktreeManager | None = None,
         parent_trace: object | None = None,
         runner: LocalizationRunner | None = None,

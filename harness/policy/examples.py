@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Example frontier-priority policies aligned to Iterative Context's traversal contract.
 
@@ -21,6 +19,8 @@ Guidelines demonstrated here:
 - use graph methods directly when they are part of the intended contract
 - keep policies deterministic and side-effect free
 """
+
+from __future__ import annotations
 
 from iterative_context.graph_models import (  # type: ignore[import-not-found]
     Graph,

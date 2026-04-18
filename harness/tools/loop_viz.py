@@ -186,7 +186,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     loop_ctx = LoopContext(
         task=task,
         iterations=1,
-        baseline_snapshot=None,
+        baseline_record=None,
         run_trace=_DummySpan(),
     )
     opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)

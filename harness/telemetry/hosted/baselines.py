@@ -43,7 +43,16 @@ from harness.telemetry.tracing.score_emitter import (
 )
 
 
-class BaselineSnapshot(BaseModel):
+class EvaluationRecord(BaseModel):
+    """
+    Derived per-task evaluation result from one run.
+
+    This is not canonical benchmark state; Langfuse datasets and their versions
+    own canonical task data. Evaluation records package prediction, gold,
+    scoring, metadata, and execution details for comparison, export, analysis,
+    and orchestration feedback.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     dataset_name: str
@@ -65,13 +74,15 @@ class BaselineSnapshot(BaseModel):
     token_usage: TokenUsageRecord | None = None
 
 
-class BaselineBundle(BaseModel):
+class EvaluationBundle(BaseModel):
+    """Persistable collection of derived evaluation records for one run."""
+
     model_config = ConfigDict(extra="forbid")
 
     dataset_name: str
     dataset_version: str | None = None
     created_at: str | None = None
-    items: list[BaselineSnapshot] = Field(default_factory=list)
+    records: list[EvaluationRecord] = Field(default_factory=list)
     metadata: dict[str, object] = Field(default_factory=dict)
     failure: LocalizationEvaluationFailure | None = None
 
@@ -86,25 +97,25 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
 
 
 def _aggregate_score_summaries(
-    snapshots: Sequence[BaselineSnapshot],
+    records: Sequence[EvaluationRecord],
 ) -> BatchScoreSummary | None:
-    if not snapshots:
+    if not records:
         return None
-    total_count = len(snapshots)
+    total_count = len(records)
     composed_values = [
-        snap.score_summary.composed_score
-        for snap in snapshots
-        if snap.score_summary.composed_score is not None
+        record.score_summary.composed_score
+        for record in records
+        if record.score_summary.composed_score is not None
     ]
     component_names = sorted(
-        {name for snap in snapshots for name in snap.score_summary.component_scores}
+        {name for record in records for name in record.score_summary.component_scores}
     )
     components: dict[str, AggregateComponentScore] = {}
     for name in component_names:
         values = [
-            snap.score_summary.component_scores[name]
-            for snap in snapshots
-            if snap.score_summary.component_scores.get(name) is not None
+            record.score_summary.component_scores[name]
+            for record in records
+            if record.score_summary.component_scores.get(name) is not None
         ]
         numeric_values = [
             float(value) for value in values if isinstance(value, (int, float))
@@ -117,8 +128,8 @@ def _aggregate_score_summaries(
             missing_count=total_count - available_count,
             total_count=total_count,
             visible_to_agent=any(
-                name in snap.score_summary.visible_component_scores
-                for snap in snapshots
+                name in record.score_summary.visible_component_scores
+                for record in records
             ),
         )
     return BatchScoreSummary(
@@ -132,13 +143,13 @@ def _aggregate_score_summaries(
 
 def emit_baseline_dataset_aggregates(
     span: object | None,
-    snapshots: Sequence[BaselineSnapshot],
+    records: Sequence[EvaluationRecord],
     extra_metadata: Mapping[str, object] | None = None,
 ) -> None:
     """
     Emit aggregate baseline metrics to the dataset/root span for observability.
     """
-    aggregate_summary = _aggregate_score_summaries(snapshots)
+    aggregate_summary = _aggregate_score_summaries(records)
     if span is None or aggregate_summary is None:
         return
     emit_batch_score_summary(
@@ -148,7 +159,7 @@ def emit_baseline_dataset_aggregates(
         metadata_key="score_summary",
     )
     summary_metadata: dict[str, object] = {
-        "selected_count": len(snapshots),
+        "selected_count": len(records),
     }
     summary_metadata.update(
         batch_score_summary_metadata(aggregate_summary, metadata_key="score_summary")
@@ -159,21 +170,19 @@ def emit_baseline_dataset_aggregates(
 
 
 def index_baselines(
-    bundle: BaselineBundle | Sequence[BaselineSnapshot],
-) -> dict[str, BaselineSnapshot]:
-    items = bundle.items if isinstance(bundle, BaselineBundle) else list(bundle)
-    return {snap.identity: snap for snap in items}
+    bundle: EvaluationBundle | Sequence[EvaluationRecord],
+) -> dict[str, EvaluationRecord]:
+    records = bundle.records if isinstance(bundle, EvaluationBundle) else list(bundle)
+    return {record.identity: record for record in records}
 
 
 def baseline_cache_path(
     dataset_name: str,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
     dataset_version: str | None = None,
     root: Path | None = None,
 ) -> Path:
     """
-    Derive a deterministic baseline bundle cache path based on dataset identity.
+    Derive a deterministic evaluation bundle cache path for a Langfuse dataset version.
     """
     base_root = Path(
         root
@@ -187,28 +196,22 @@ def baseline_cache_path(
         return safe or default
 
     dataset_part = _clean(dataset_name, "dataset")
-    config_part = _clean(dataset_config, "config")
-    split_part = _clean(dataset_split, "split")
     version_part = _clean(dataset_version, "latest")
-    return base_root / dataset_part / config_part / split_part / f"{version_part}.json"
+    return base_root / dataset_part / f"{version_part}.json"
 
 
 def persist_baseline_bundle(
-    bundle: BaselineBundle,
+    bundle: EvaluationBundle,
     *,
     dataset_name: str,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
     dataset_version: str | None = None,
     cache_root: Path | None = None,
 ) -> Path:
     """
-    Persist a baseline bundle to the canonical cache path and return the path.
+    Persist an evaluation bundle to the baseline cache path and return the path.
     """
     path = baseline_cache_path(
         dataset_name,
-        dataset_config=dataset_config,
-        dataset_split=dataset_split,
         dataset_version=dataset_version,
         root=cache_root,
     )
@@ -219,18 +222,14 @@ def persist_baseline_bundle(
 def load_persisted_baseline_bundle(
     *,
     dataset_name: str,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
     dataset_version: str | None = None,
     cache_root: Path | None = None,
-) -> BaselineBundle | None:
+) -> EvaluationBundle | None:
     """
-    Load a cached baseline bundle from the canonical path if present.
+    Load a cached evaluation bundle from the baseline cache path if present.
     """
     path = baseline_cache_path(
         dataset_name,
-        dataset_config=dataset_config,
-        dataset_split=dataset_split,
         dataset_version=dataset_version,
         root=cache_root,
     )
@@ -248,9 +247,9 @@ def compute_baseline_for_task(
         [LCATask, str, object | None], LocalizationRunResult
     ]
     | None = None,
-    dataset_source: str | None = None,
+    dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
-) -> BaselineSnapshot:
+) -> EvaluationRecord:
     with propagate_context(session_id=session_id):
         with start_observation(
             name="localization_baseline_item",
@@ -265,7 +264,7 @@ def compute_baseline_for_task(
         ) as trace:
             eval_result = evaluate_localization_batch(
                 tasks=[task],
-                dataset_source=dataset_source,
+                dataset_provenance=dataset_provenance,
                 worktree_manager=worktree_manager,
                 parent_trace=trace,
                 runner=runner,
@@ -304,7 +303,7 @@ def compute_baseline_for_task(
                 metadata_key="score_summary",
                 emit_fn=emit_score_for_handle,
             )
-            return BaselineSnapshot(
+            return EvaluationRecord(
                 dataset_name=task.identity.dataset_name,
                 dataset_config=task.identity.dataset_config,
                 dataset_split=task.identity.dataset_split,
@@ -326,8 +325,8 @@ def compute_baseline_for_task(
                     "telemetry": telemetry.model_dump(exclude_none=True),
                     "score_summary": score_summary.model_dump(mode="json"),
                     "run_kind": "localization_baseline",
-                    "dataset_source": getattr(parent_trace, "metadata", {}).get(
-                        "dataset_source"
+                    "dataset_provenance": getattr(parent_trace, "metadata", {}).get(
+                        "dataset_provenance"
                     )
                     if parent_trace
                     else None,
@@ -337,55 +336,55 @@ def compute_baseline_for_task(
 
 
 def resolve_baseline(
-    baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask
-) -> BaselineSnapshot | None:
+    baselines: EvaluationBundle | Sequence[EvaluationRecord], task: LCATask
+) -> EvaluationRecord | None:
     indexed = index_baselines(baselines)
     return indexed.get(task.task_id)
 
 
 def require_baseline(
-    baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask
-) -> BaselineSnapshot:
+    baselines: EvaluationBundle | Sequence[EvaluationRecord], task: LCATask
+) -> EvaluationRecord:
     resolved = resolve_baseline(baselines, task)
     if resolved is None:
         raise ValueError(
-            f"No baseline snapshot found for localization task_id={task.task_id}"
+            f"No baseline record found for localization task_id={task.task_id}"
         )
     return resolved
 
 
 def make_baseline_bundle(
-    snapshots: list[BaselineSnapshot] | Sequence[Mapping[str, object]],
+    records: list[EvaluationRecord] | Sequence[Mapping[str, object]],
     dataset_name: str,
     dataset_version: str | None = None,
     metadata: Mapping[str, object] | None = None,
     failure: LocalizationEvaluationFailure | None = None,
-) -> BaselineBundle:
-    snapshot_models = [
-        snap
-        if isinstance(snap, BaselineSnapshot)
-        else BaselineSnapshot.model_validate(snap)
-        for snap in snapshots
+) -> EvaluationBundle:
+    record_models = [
+        record
+        if isinstance(record, EvaluationRecord)
+        else EvaluationRecord.model_validate(record)
+        for record in records
     ]
-    return BaselineBundle(
+    return EvaluationBundle(
         dataset_name=dataset_name,
         dataset_version=dataset_version,
         created_at=datetime.now(tz=timezone.utc).isoformat(),
-        items=snapshot_models,
+        records=record_models,
         metadata=dict(metadata) if metadata else {},
         failure=failure,
     )
 
 
-def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
+def save_baseline_bundle(bundle: EvaluationBundle, path: Path) -> None:
     serializable = bundle.model_dump(mode="json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(serializable, indent=2))
 
 
-def load_baseline_bundle(path: Path) -> BaselineBundle:
+def load_baseline_bundle(path: Path) -> EvaluationBundle:
     data: object = json.loads(path.read_text())
     try:
-        return BaselineBundle.model_validate(data)
+        return EvaluationBundle.model_validate(data)
     except ValidationError as exc:
-        raise ValueError(f"Invalid baseline bundle: {exc}") from exc
+        raise ValueError(f"Invalid evaluation bundle: {exc}") from exc

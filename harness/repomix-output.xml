@@ -1876,13 +1876,13 @@ __all__ = ["IterativeContextBackend", "JCodeMunchBackend"]
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from iterative_context.server import IterativeContextToolRuntime, list_tools
 
-from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async, serialize_tool_result_for_model
+from .mcp import mcp_tool_to_openai_tool, parse_text_content_payload, run_async
 from harness.utils.openai_schema import ChatCompletionToolParam
 
 
@@ -2232,19 +2232,21 @@ def serialize_tool_result_for_model(result: Any) -> str:
 - Inputs: repo_owner/name and `base_sha`; dataset/config/split are task metadata and do not define checkout cache identity.
 - `WorktreeManager`: cached bare git mirror + repo@sha worktree checkout at `base_sha` with per-key lock, completion marker, and cache validation (worktree HEAD is checked against `base_sha` on reuse); stale locks and incomplete caches are pruned under the lock.
 - Outputs: local path at `base_sha`, cache hit/miss, cache_validated, mirror_fetched, worktree_created, checkout_verified, logs/events.
-- CLI logs: dataset/config/split, dataset source (langfuse|huggingface), cache hit/miss, git fetch/worktree/verification status, checkout `base_sha`, ready path, summary printed to stdout.
+- CLI logs: Langfuse dataset/version, cache hit/miss, git fetch/worktree/verification status, checkout `base_sha`, ready path, summary printed to stdout.
 - Telemetry: Langfuse owns dataset/experiment context; WorktreeManager emits checkout/cache events; runtime execution consumes the local checkout path. Failure categories are surfaced for lock, auth/fetch, checkout verification, and cache corruption.
 
-## Dataset Source (HF-only public CLI)
-- Public CLI baseline/experiment commands use the Hugging Face LCA dataset (`JetBrains-Research/lca-bug-localization`) directly, resolved via config/split/revision.
-- WorktreeManager still locks/cache-validates mirrors/worktrees per repo + base_sha, and logs checkout events as before.
+## Dataset Store
+- Langfuse is the canonical hosted benchmark store. Dataset items carry the `LCATask` payload in `input` and `changed_files` gold in `expected_output`.
+- Langfuse dataset versions define hosted benchmark reproducibility. The repo checkout for each task is defined by repo owner/name plus `base_sha`.
+- Hugging Face is sync-only ingestion tooling for populating Langfuse datasets. Hosted baseline/experiment commands do not load HF rows directly.
+- HF sync upserts by a deterministic item id derived from repo owner/name, `base_sha`, and issue/pull identity. HF config, split, revision, and target dataset name are recorded as provenance only.
 
-## CLI Examples (HF-only)
-- Baseline: `python run.py baseline --config py --split dev --max-items 25`
-- Experiment: `python run.py experiment --config java --split test --max-items 50`
-- Projection only: `python run.py experiment --config py --split dev --max-items 25 --projection-only`
-- Pinned revision: `python run.py baseline --config py --split dev --revision 4b7c1d2 --max-items 20`
-- Non-interactive: `python run.py experiment --config py --split dev --max-items 10 --yes`
+## CLI Examples
+- Baseline: `python run.py baseline --dataset lca-localization --version 2026-04-17T00:00:00Z --max-items 25`
+- Experiment: `python run.py experiment --dataset lca-localization --version 2026-04-17T00:00:00Z --max-items 50`
+- Projection only: `python run.py experiment --dataset lca-localization --max-items 25 --projection-only`
+- Hugging Face ingestion: `python run.py sync-hf --dataset lca-localization --config py --split dev --revision 4b7c1d2`
+- Non-interactive: `python run.py experiment --dataset lca-localization --max-items 10 --yes`
 
 ## Dataset Guardrails (Baselines/Experiments)
 - **Deterministic selection:** Tasks are sorted by task_id (dataset/config/split + repo owner/name + base_sha + issue/pull) before applying `--offset` (default 0) and `--max-items`. Selection metadata (offset, limit, selected count, total, identity preview) is printed and propagated.
@@ -2291,7 +2293,7 @@ By default both machines are rendered; use `--machine optimization` or `--machin
 ## Static Hop Evaluator Validation Plan
 
 1. **Manual localization run**
-   - Materialize a repo snapshot and run `run_localization_task` with a known issue.
+   - Materialize a repo checkout and run `run_localization_task` with a known issue.
    - Verify metrics still report precision/recall/F1/hit and that `hop_token_score`/`distance_term`/`token_term` appear when extraction succeeds.
 2. **Hop-distance sanity check**
    - Confirm per-file hop diagnostics show finite hops for resolved predictions and `null` for unresolved ones (no fabricated nodes).
@@ -2353,16 +2355,9 @@ By default both machines are rendered; use `--machine optimization` or `--machin
 <file path="entrypoints/models/requests.py">
 from __future__ import annotations
 
-from enum import Enum
-
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from harness.telemetry.tracing.session_policy import SessionConfig
-
-
-class LocalizationDatasetSource(str, Enum):
-    LANGFUSE = "langfuse"
-    HUGGINGFACE = "huggingface"
 
 
 class HostedLocalizationBaselineRequest(BaseModel):
@@ -2372,8 +2367,6 @@ class HostedLocalizationBaselineRequest(BaseModel):
 
     dataset: str
     version: str | None = None
-    dataset_config: str | None = None
-    dataset_split: str | None = None
     session: SessionConfig | None = None
     max_items: int | None = None
     offset: int = 0
@@ -2396,8 +2389,6 @@ class HostedLocalizationRunRequest(BaseModel):
 
     dataset: str
     version: str | None = None
-    dataset_config: str | None = None
-    dataset_split: str | None = None
     session: SessionConfig | None = None
     max_items: int | None = None
     offset: int = 0
@@ -2454,8 +2445,9 @@ from harness.telemetry.hosted.experiments import (
 )
 from harness.telemetry.hosted.hf_lca import (
     HFDatasetLoadError,
-    fetch_hf_localization_dataset,
+    sync_hf_localization_dataset_to_langfuse,
 )
+from harness.telemetry.hosted.datasets import fetch_localization_dataset
 from harness.telemetry.hosted.baselines import baseline_cache_path
 from harness.telemetry.tracing import flush_langfuse, ensure_langfuse_auth
 from harness.entrypoints.models.requests import (
@@ -2466,10 +2458,9 @@ from harness.telemetry.tracing.session_policy import SessionConfig
 
 WARNING_THRESHOLD = 50
 HF_DATASET_NAME = "JetBrains-Research/lca-bug-localization"
-HF_DATASET_SOURCE = "huggingface"
+LANGFUSE_DATASET_STORE = "langfuse"
 REMOVED_FLAGS = {
     "--mode",
-    "--dataset",
     "--dataset-source",
     "--dataset_source",
     "--repo-owner",
@@ -2554,7 +2545,7 @@ def _raw_mode(file_obj: IO[Any]) -> Iterator[None]:
 def evaluate_localization_batch(
     tasks: Sequence[LCATask],
     *,
-    dataset_source: str | None = None,
+    dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
@@ -2564,7 +2555,7 @@ def evaluate_localization_batch(
     """
     return _evaluate_localization_batch(
         tasks,
-        dataset_source=dataset_source,
+        dataset_provenance=dataset_provenance,
         worktree_manager=worktree_manager,
         parent_trace=parent_trace,
         runner=runner,
@@ -2577,21 +2568,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     for flag in REMOVED_FLAGS:
         if flag in argv:
             raise SystemExit(
-                f"{flag} is no longer supported; use HF baseline/experiment subcommands with --config/--split/--revision/--max-items/--offset."
+                f"{flag} is no longer supported; hosted runs use Langfuse datasets. Use baseline/experiment with --dataset/--version, or sync-hf for HF ingestion."
             )
     parser = argparse.ArgumentParser(
-        description="HF LCA localization runner (baseline/experiment)"
+        description="Langfuse-backed LCA localization runner"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def _add_common(sub: argparse.ArgumentParser) -> None:
         sub.add_argument(
-            "--config", required=True, help="HF dataset config (e.g., py/java/kt)"
+            "--dataset", required=True, help="Langfuse dataset name"
         )
         sub.add_argument(
-            "--split", required=True, help="HF dataset split (e.g., dev/test/train)"
+            "--version", help="Langfuse dataset version"
         )
-        sub.add_argument("--revision", help="HF dataset revision pin")
         sub.add_argument(
             "--max-items", type=int, help="Maximum number of dataset items to evaluate"
         )
@@ -2631,11 +2621,35 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     baseline_parser.add_argument(
         "--invalidate-baseline-cache",
         action="store_true",
-        help="Remove cached baseline bundle and selected repo worktree caches before running",
+        help="Remove cached evaluation bundle and selected repo worktree caches before running",
     )
 
     experiment_parser = subparsers.add_parser("experiment")
     _add_common(experiment_parser)
+
+    sync_parser = subparsers.add_parser("sync-hf")
+    sync_parser.add_argument(
+        "--hf-dataset",
+        default=HF_DATASET_NAME,
+        help="HuggingFace dataset to ingest",
+    )
+    sync_parser.add_argument(
+        "--dataset",
+        required=True,
+        help="Langfuse dataset to populate",
+    )
+    sync_parser.add_argument(
+        "--config",
+        required=True,
+        help="HF dataset config (e.g., py/java/kt)",
+    )
+    sync_parser.add_argument(
+        "--split",
+        required=True,
+        help="HF dataset split (e.g., dev/test/train)",
+    )
+    sync_parser.add_argument("--revision", help="HF dataset revision pin")
+    sync_parser.add_argument("--token", help="Optional HuggingFace token")
 
     return parser.parse_args(argv)
 
@@ -2680,7 +2694,7 @@ def _build_session_config(
 
 def _invalidate_baseline_cache(bundle_path: Path) -> None:
     """
-    Best-effort removal of the baseline bundle cache file.
+    Best-effort removal of the evaluation bundle cache file.
     """
     cache_path = bundle_path.resolve()
     if cache_path.exists():
@@ -2736,9 +2750,8 @@ def _select_tasks(
 
 def _print_selection(
     dataset: str,
-    dataset_config: str | None,
-    dataset_split: str | None,
-    source: str,
+    version: str | None,
+    store: str,
     selection: dict[str, object],
 ) -> None:
     limit = selection.get("limit")
@@ -2747,12 +2760,11 @@ def _print_selection(
     total_available = selection.get("total_available")
     preview = selection.get("preview") or []
     print(
-        "[SELECT] dataset=%s config=%s split=%s source=%s offset=%s limit=%s selected=%s total=%s"
+        "[SELECT] dataset=%s version=%s store=%s offset=%s limit=%s selected=%s total=%s"
         % (
             dataset,
-            dataset_config,
-            dataset_split,
-            source,
+            version,
+            store,
             offset,
             limit,
             selected_count,
@@ -2928,30 +2940,28 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     # Fail fast on Langfuse auth/base-url issues in the canonical path.
     ensure_langfuse_auth()
-    if args.max_workers is not None and args.max_workers <= 0:
+    if getattr(args, "max_workers", None) is not None and args.max_workers <= 0:
         raise ValueError("--max-workers must be a positive integer")
     worktree_manager = WorktreeManager()
     session_cfg = _build_session_config(
-        args.command or "cli", args.session_id, args.allow_session_fallback
+        args.command or "cli",
+        getattr(args, "session_id", None),
+        getattr(args, "allow_session_fallback", True),
     )
     baseline_bundle_path = (
         baseline_cache_path(
-            HF_DATASET_NAME,
-            dataset_config=args.config,
-            dataset_split=args.split,
-            dataset_version=args.revision,
+            args.dataset,
+            dataset_version=args.version,
         )
         if args.command == "baseline"
         else None
     )
     try:
         if args.command == "baseline":
-            print(f"[RUN] HF localization baseline for dataset '{HF_DATASET_NAME}'")
-            tasks = fetch_hf_localization_dataset(
-                HF_DATASET_NAME,
-                dataset_config=args.config,
-                dataset_split=args.split,
-                revision=args.revision,
+            print(f"[RUN] Langfuse localization baseline for dataset '{args.dataset}'")
+            tasks = fetch_localization_dataset(
+                args.dataset,
+                version=args.version,
             )
             if not tasks:
                 raise RuntimeError("No localization tasks available for baseline run")
@@ -2960,10 +2970,9 @@ def main(argv: list[str] | None = None) -> None:
             )
             _warn_if_unbounded(selection_info, args.max_items)
             _print_selection(
-                HF_DATASET_NAME,
-                args.config,
-                args.split,
-                HF_DATASET_SOURCE,
+                args.dataset,
+                args.version,
+                LANGFUSE_DATASET_STORE,
                 selection_info,
             )
             projection = _compute_projection(
@@ -2980,10 +2989,8 @@ def main(argv: list[str] | None = None) -> None:
                 _invalidate_baseline_cache(baseline_bundle_path)
                 _invalidate_worktree_checkouts_for_tasks(selected_tasks, worktree_manager)
             req = HostedLocalizationBaselineRequest(
-                dataset=HF_DATASET_NAME,
-                version=args.revision,
-                dataset_config=args.config,
-                dataset_split=args.split,
+                dataset=args.dataset,
+                version=args.version,
                 session=session_cfg,
                 max_items=args.max_items,
                 offset=args.offset,
@@ -2997,22 +3004,20 @@ def main(argv: list[str] | None = None) -> None:
             if bundle is None:
                 print("[RUN] Baseline run returned no bundle; skipping summary.")
                 return
-            print(f"[RUN] Baselines computed: {len(bundle.items)}")
+            print(f"[RUN] Baselines computed: {len(bundle.records)}")
             failure = getattr(bundle, "failure", None)
             if failure is not None:
                 category = getattr(failure.category, "value", failure.category)
                 print(
                     f"[RUN] Baseline run reported failure category={category} task_id={failure.task_id} message={failure.message}"
                 )
-            for snap in bundle.items:
-                _print_mat_summary("baseline", snap.identity, snap.materialization)
+            for record in bundle.records:
+                _print_mat_summary("baseline", record.identity, record.materialization)
         elif args.command == "experiment":
-            print(f"[RUN] HF localization experiment for dataset '{HF_DATASET_NAME}'")
-            tasks = fetch_hf_localization_dataset(
-                HF_DATASET_NAME,
-                dataset_config=args.config,
-                dataset_split=args.split,
-                revision=args.revision,
+            print(f"[RUN] Langfuse localization experiment for dataset '{args.dataset}'")
+            tasks = fetch_localization_dataset(
+                args.dataset,
+                version=args.version,
             )
             if not tasks:
                 raise RuntimeError("No localization tasks available for experiment run")
@@ -3021,10 +3026,9 @@ def main(argv: list[str] | None = None) -> None:
             )
             _warn_if_unbounded(selection_info, args.max_items)
             _print_selection(
-                HF_DATASET_NAME,
-                args.config,
-                args.split,
-                HF_DATASET_SOURCE,
+                args.dataset,
+                args.version,
+                LANGFUSE_DATASET_STORE,
                 selection_info,
             )
             projection = _compute_projection(
@@ -3038,10 +3042,8 @@ def main(argv: list[str] | None = None) -> None:
                 print("[RUN] Projection-only mode: exiting before execution.")
                 return
             req = HostedLocalizationRunRequest(
-                dataset=HF_DATASET_NAME,
-                version=args.revision,
-                dataset_config=args.config,
-                dataset_split=args.split,
+                dataset=args.dataset,
+                version=args.version,
                 session=session_cfg,
                 max_items=args.max_items,
                 offset=args.offset,
@@ -3065,6 +3067,26 @@ def main(argv: list[str] | None = None) -> None:
                     item.task.task_id,
                     item.materialization,
                 )
+        elif args.command == "sync-hf":
+            items = sync_hf_localization_dataset_to_langfuse(
+                hf_dataset=args.hf_dataset,
+                langfuse_dataset=args.dataset,
+                dataset_config=args.config,
+                dataset_split=args.split,
+                revision=args.revision,
+                token=args.token,
+            )
+            print(
+                "[SYNC] HF dataset=%s config=%s split=%s revision=%s -> Langfuse dataset=%s items=%s"
+                % (
+                    args.hf_dataset,
+                    args.config,
+                    args.split,
+                    args.revision,
+                    args.dataset,
+                    len(items),
+                )
+            )
     except HFDatasetLoadError as exc:
         print(f"[ERROR] HF dataset load failed (category={exc.category}): {exc}")
         raise
@@ -3192,7 +3214,15 @@ class WorktreeManager:
         lock_timeout_seconds: int = 120,
         stale_lock_timeout_seconds: int = 300,
     ) -> None:
-        self.cache_root = cache_root or Path(os.environ.get("HF_LCA_CACHE_DIR", Path.home() / ".cache" / "harness" / "hf_repos"))
+        self.cache_root = cache_root or Path(
+            os.environ.get(
+                "HARNESS_WORKTREE_CACHE_DIR",
+                os.environ.get(
+                    "HF_LCA_CACHE_DIR",
+                    Path.home() / ".cache" / "harness" / "worktrees",
+                ),
+            )
+        )
         self.repo_base_url = repo_base_url or os.environ.get("HF_LCA_REPO_BASE", "https://github.com")
         self.lock_timeout_seconds = lock_timeout_seconds
         self.stale_lock_timeout_seconds = stale_lock_timeout_seconds
@@ -3588,7 +3618,7 @@ def prediction_filenames(prediction: LocalizationPrediction) -> list[str]:
 def evaluate_localization_batch(
     tasks: Sequence[LCATask],
     *,
-    dataset_source: str | None = None,
+    dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
@@ -3603,7 +3633,7 @@ def evaluate_localization_batch(
         try:
             run_result = run_localization_task(
                 task,
-                dataset_source=dataset_source,
+                dataset_provenance=dataset_provenance,
                 worktree_manager=worktree_manager,
                 parent_trace=parent_trace,
                 runner=resolved_runner,
@@ -3843,7 +3873,7 @@ def _emit_telemetry(
     score_bundle: ScoreBundle,
     evidence: LocalizationEvidence | None,
     materialization: RepoMaterializationResult | None,
-    dataset_source: str | None,
+    dataset_provenance: str | None,
     trace: object | None,
     predicted_files: list[str],
     changed_files: list[str],
@@ -3854,7 +3884,7 @@ def _emit_telemetry(
         task.identity,
         score_summary=task_score_summary,
         changed_files_count=len(task.gold.normalized_changed_files()),
-        dataset_source=dataset_source,
+        dataset_provenance=dataset_provenance,
         repo_language=task.context.repo_language,
         repo_license=task.context.repo_license,
         evidence=evidence,
@@ -3886,7 +3916,7 @@ def _emit_telemetry(
 
 def run_localization_task(
     task: LCATask,
-    dataset_source: str | None = None,
+    dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: Callable[
@@ -3943,7 +3973,7 @@ def run_localization_task(
             score_bundle=score_bundle,
             evidence=task.evidence,
             materialization=checkout_result,
-            dataset_source=dataset_source,
+            dataset_provenance=dataset_provenance,
             trace=trace,
             predicted_files=prediction.normalized_predicted_files(),
             changed_files=task.gold.normalized_changed_files(),
@@ -5197,7 +5227,7 @@ class LocalizationTelemetryEnvelope(BaseModel):
 
     identity: str
     dataset: LocalizationDatasetInfo
-    dataset_source: Optional[str] = None
+    dataset_provenance: Optional[str] = None
     repo: LocalizationRepoInfo
     score_summary: Any
     changed_files_count: Optional[int] = None
@@ -5525,7 +5555,7 @@ def build_localization_telemetry(
     identity: LCATaskIdentity,
     score_summary: TaskScoreSummary,
     changed_files_count: Optional[int] = None,
-    dataset_source: Optional[str] = None,
+    dataset_provenance: Optional[str] = None,
     repo_language: Optional[str] = None,
     repo_license: Optional[str] = None,
     evidence: Optional[LocalizationEvidence] = None,
@@ -5558,7 +5588,7 @@ def build_localization_telemetry(
     return LocalizationTelemetryEnvelope(
         identity=identity.task_id(),
         dataset=dataset_block,
-        dataset_source=dataset_source,
+        dataset_provenance=dataset_provenance,
         repo=repo_block,
         score_summary=score_summary,
         changed_files_count=changed_files_count,
@@ -5670,7 +5700,7 @@ class EvaluateLocalizationBatch(Protocol):
         self,
         tasks: Sequence[LCATask],
         *,
-        dataset_source: str | None = None,
+        dataset_provenance: str | None = None,
         worktree_manager: WorktreeManager | None = None,
         parent_trace: object | None = None,
         runner: LocalizationRunner | None = None,
@@ -6028,7 +6058,7 @@ from harness.orchestration.types import (
 from harness.prompts import WriterScoreSummary, build_writer_score_summary_from_bundle
 
 if TYPE_CHECKING:
-    from harness.telemetry.hosted.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import EvaluationRecord
 
 
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy" / "current.py"
@@ -6063,14 +6093,14 @@ def _failure_evaluation_result(error: str) -> EvaluationResult:
 
 def evaluate_policy_on_item(
     task: LCATask,
-    baseline_snapshot: "BaselineSnapshot | None",
+    baseline_record: "EvaluationRecord | None",
     iteration_span: object | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
-    del baseline_snapshot, iteration_index
+    del baseline_record, iteration_index
     eval_result = evaluate_localization_batch(
         tasks=[task],
-        dataset_source=None,
+        dataset_provenance=None,
         worktree_manager=None,
         parent_trace=iteration_span,
     )
@@ -6522,7 +6552,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from harness.telemetry.hosted.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import EvaluationRecord
 
 _BOUND_EVENT = cast(Any, BoundEvent)
 _MAX_POLICY_REPAIRS = 3
@@ -6852,7 +6882,7 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
         ) as eval_span:
             self.model.current_evaluation = self.deps.evaluate_policy_on_item(
                 iteration_tasks.task,
-                self.context.baseline_snapshot,
+                self.context.baseline_record,
                 eval_span,
                 self.context.current_iteration,
             )
@@ -7104,23 +7134,23 @@ def _fallback_history(
     ]
 
 
-def _baseline_snapshot_model(
-    baseline_snapshot: "BaselineSnapshot | Mapping[str, object] | None",
-) -> "BaselineSnapshot | None":
-    if isinstance(baseline_snapshot, Mapping):
+def _baseline_record_model(
+    baseline_record: "EvaluationRecord | Mapping[str, object] | None",
+) -> "EvaluationRecord | None":
+    if isinstance(baseline_record, Mapping):
         from harness.telemetry.hosted.baselines import (
-            BaselineSnapshot as BaselineSnapshotModel,
+            EvaluationRecord as EvaluationRecordModel,
         )
 
-        return BaselineSnapshotModel.model_validate(baseline_snapshot)
-    return baseline_snapshot
+        return EvaluationRecordModel.model_validate(baseline_record)
+    return baseline_record
 
 
 def run_loop(
     task: LCATask,
     iterations: int = 5,
     parent_trace: SpanHandle | None = None,
-    baseline_snapshot: "BaselineSnapshot | Mapping[str, object] | None" = None,
+    baseline_record: "EvaluationRecord | Mapping[str, object] | None" = None,
     session_id: str | None = None,
 ) -> list[IterationRecord]:
     """
@@ -7146,7 +7176,7 @@ def run_loop(
                 session_id=session_id,
                 parent_trace=parent_trace,
                 run_metadata=root_meta,
-                baseline_snapshot=_baseline_snapshot_model(baseline_snapshot),
+                baseline_record=_baseline_record_model(baseline_record),
                 run_trace=run_span,
             )
             opt_model = OptimizationMachineModel(
@@ -7179,7 +7209,7 @@ from harness.utils.type_loader import FrontierContext
 from harness.localization.models import LCATask
 
 if TYPE_CHECKING:
-    from harness.telemetry.hosted.baselines import BaselineSnapshot
+    from harness.telemetry.hosted.baselines import EvaluationRecord
 
 
 MetricValue = int | float | bool
@@ -7242,7 +7272,7 @@ class EvaluatePolicyOnItem(Protocol):
     def __call__(
         self,
         task: LCATask,
-        baseline_snapshot: "BaselineSnapshot | None",
+        baseline_record: "EvaluationRecord | None",
         iteration_span: SpanHandle | None,
         iteration_index: int | None,
     ) -> "EvaluationResult": ...
@@ -7521,7 +7551,7 @@ class LoopContext(BaseModel):
     session_id: str | None = None
     parent_trace: SpanHandle | None = None
     run_metadata: RunMetadata | None = None
-    baseline_snapshot: "BaselineSnapshot | None" = None
+    baseline_record: "EvaluationRecord | None" = None
     run_trace: SpanHandle | None
     history: list[IterationRecord] = Field(default_factory=list)
     prepared_tasks: PreparedTasks | None = None
@@ -7685,12 +7715,12 @@ class OptimizationMachineModel(BaseModel):
 
 def _rebuild_forward_refs() -> None:
     try:
-        from harness.telemetry.hosted.baselines import BaselineSnapshot  # local import to avoid cycles
+        from harness.telemetry.hosted.baselines import EvaluationRecord  # local import to avoid cycles
     except Exception:
-        BaselineSnapshot = object  # type: ignore[misc,assignment]
-    LoopContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot, "RunMetadata": RunMetadata})
-    LoopDependencies.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
-    RepairContext.model_rebuild(_types_namespace={"BaselineSnapshot": BaselineSnapshot})
+        EvaluationRecord = object  # type: ignore[misc,assignment]
+    LoopContext.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord, "RunMetadata": RunMetadata})
+    LoopDependencies.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord})
+    RepairContext.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord})
     RepairMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
     OptimizationMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
 
@@ -7791,15 +7821,15 @@ __all__ = [
 </file>
 
 <file path="pipeline/pipeline.py">
-from __future__ import annotations
-
 """
 Leaf operation: policy pipeline execution (lint/tests/etc.).
 No CLI or session policy; receives normalized inputs only.
 """
 
-from typing import Iterable, List
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Iterable, List
 
 from harness.telemetry.tracing import start_observation
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
@@ -8160,8 +8190,6 @@ def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:
 </file>
 
 <file path="policy/examples.py">
-from __future__ import annotations
-
 """
 Example frontier-priority policies aligned to Iterative Context's traversal contract.
 
@@ -8183,6 +8211,8 @@ Guidelines demonstrated here:
 - use graph methods directly when they are part of the intended contract
 - keep policies deterministic and side-effect free
 """
+
+from __future__ import annotations
 
 from iterative_context.graph_models import (  # type: ignore[import-not-found]
     Graph,
@@ -10168,7 +10198,16 @@ from harness.telemetry.tracing.score_emitter import (
 )
 
 
-class BaselineSnapshot(BaseModel):
+class EvaluationRecord(BaseModel):
+    """
+    Derived per-task evaluation result from one run.
+
+    This is not canonical benchmark state; Langfuse datasets and their versions
+    own canonical task data. Evaluation records package prediction, gold,
+    scoring, metadata, and execution details for comparison, export, analysis,
+    and orchestration feedback.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     dataset_name: str
@@ -10190,13 +10229,15 @@ class BaselineSnapshot(BaseModel):
     token_usage: TokenUsageRecord | None = None
 
 
-class BaselineBundle(BaseModel):
+class EvaluationBundle(BaseModel):
+    """Persistable collection of derived evaluation records for one run."""
+
     model_config = ConfigDict(extra="forbid")
 
     dataset_name: str
     dataset_version: str | None = None
     created_at: str | None = None
-    items: list[BaselineSnapshot] = Field(default_factory=list)
+    records: list[EvaluationRecord] = Field(default_factory=list)
     metadata: dict[str, object] = Field(default_factory=dict)
     failure: LocalizationEvaluationFailure | None = None
 
@@ -10211,25 +10252,25 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
 
 
 def _aggregate_score_summaries(
-    snapshots: Sequence[BaselineSnapshot],
+    records: Sequence[EvaluationRecord],
 ) -> BatchScoreSummary | None:
-    if not snapshots:
+    if not records:
         return None
-    total_count = len(snapshots)
+    total_count = len(records)
     composed_values = [
-        snap.score_summary.composed_score
-        for snap in snapshots
-        if snap.score_summary.composed_score is not None
+        record.score_summary.composed_score
+        for record in records
+        if record.score_summary.composed_score is not None
     ]
     component_names = sorted(
-        {name for snap in snapshots for name in snap.score_summary.component_scores}
+        {name for record in records for name in record.score_summary.component_scores}
     )
     components: dict[str, AggregateComponentScore] = {}
     for name in component_names:
         values = [
-            snap.score_summary.component_scores[name]
-            for snap in snapshots
-            if snap.score_summary.component_scores.get(name) is not None
+            record.score_summary.component_scores[name]
+            for record in records
+            if record.score_summary.component_scores.get(name) is not None
         ]
         numeric_values = [
             float(value) for value in values if isinstance(value, (int, float))
@@ -10242,8 +10283,8 @@ def _aggregate_score_summaries(
             missing_count=total_count - available_count,
             total_count=total_count,
             visible_to_agent=any(
-                name in snap.score_summary.visible_component_scores
-                for snap in snapshots
+                name in record.score_summary.visible_component_scores
+                for record in records
             ),
         )
     return BatchScoreSummary(
@@ -10257,13 +10298,13 @@ def _aggregate_score_summaries(
 
 def emit_baseline_dataset_aggregates(
     span: object | None,
-    snapshots: Sequence[BaselineSnapshot],
+    records: Sequence[EvaluationRecord],
     extra_metadata: Mapping[str, object] | None = None,
 ) -> None:
     """
     Emit aggregate baseline metrics to the dataset/root span for observability.
     """
-    aggregate_summary = _aggregate_score_summaries(snapshots)
+    aggregate_summary = _aggregate_score_summaries(records)
     if span is None or aggregate_summary is None:
         return
     emit_batch_score_summary(
@@ -10273,7 +10314,7 @@ def emit_baseline_dataset_aggregates(
         metadata_key="score_summary",
     )
     summary_metadata: dict[str, object] = {
-        "selected_count": len(snapshots),
+        "selected_count": len(records),
     }
     summary_metadata.update(
         batch_score_summary_metadata(aggregate_summary, metadata_key="score_summary")
@@ -10284,21 +10325,19 @@ def emit_baseline_dataset_aggregates(
 
 
 def index_baselines(
-    bundle: BaselineBundle | Sequence[BaselineSnapshot],
-) -> dict[str, BaselineSnapshot]:
-    items = bundle.items if isinstance(bundle, BaselineBundle) else list(bundle)
-    return {snap.identity: snap for snap in items}
+    bundle: EvaluationBundle | Sequence[EvaluationRecord],
+) -> dict[str, EvaluationRecord]:
+    records = bundle.records if isinstance(bundle, EvaluationBundle) else list(bundle)
+    return {record.identity: record for record in records}
 
 
 def baseline_cache_path(
     dataset_name: str,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
     dataset_version: str | None = None,
     root: Path | None = None,
 ) -> Path:
     """
-    Derive a deterministic baseline bundle cache path based on dataset identity.
+    Derive a deterministic evaluation bundle cache path for a Langfuse dataset version.
     """
     base_root = Path(
         root
@@ -10312,28 +10351,22 @@ def baseline_cache_path(
         return safe or default
 
     dataset_part = _clean(dataset_name, "dataset")
-    config_part = _clean(dataset_config, "config")
-    split_part = _clean(dataset_split, "split")
     version_part = _clean(dataset_version, "latest")
-    return base_root / dataset_part / config_part / split_part / f"{version_part}.json"
+    return base_root / dataset_part / f"{version_part}.json"
 
 
 def persist_baseline_bundle(
-    bundle: BaselineBundle,
+    bundle: EvaluationBundle,
     *,
     dataset_name: str,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
     dataset_version: str | None = None,
     cache_root: Path | None = None,
 ) -> Path:
     """
-    Persist a baseline bundle to the canonical cache path and return the path.
+    Persist an evaluation bundle to the baseline cache path and return the path.
     """
     path = baseline_cache_path(
         dataset_name,
-        dataset_config=dataset_config,
-        dataset_split=dataset_split,
         dataset_version=dataset_version,
         root=cache_root,
     )
@@ -10344,18 +10377,14 @@ def persist_baseline_bundle(
 def load_persisted_baseline_bundle(
     *,
     dataset_name: str,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
     dataset_version: str | None = None,
     cache_root: Path | None = None,
-) -> BaselineBundle | None:
+) -> EvaluationBundle | None:
     """
-    Load a cached baseline bundle from the canonical path if present.
+    Load a cached evaluation bundle from the baseline cache path if present.
     """
     path = baseline_cache_path(
         dataset_name,
-        dataset_config=dataset_config,
-        dataset_split=dataset_split,
         dataset_version=dataset_version,
         root=cache_root,
     )
@@ -10373,9 +10402,9 @@ def compute_baseline_for_task(
         [LCATask, str, object | None], LocalizationRunResult
     ]
     | None = None,
-    dataset_source: str | None = None,
+    dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
-) -> BaselineSnapshot:
+) -> EvaluationRecord:
     with propagate_context(session_id=session_id):
         with start_observation(
             name="localization_baseline_item",
@@ -10390,7 +10419,7 @@ def compute_baseline_for_task(
         ) as trace:
             eval_result = evaluate_localization_batch(
                 tasks=[task],
-                dataset_source=dataset_source,
+                dataset_provenance=dataset_provenance,
                 worktree_manager=worktree_manager,
                 parent_trace=trace,
                 runner=runner,
@@ -10429,7 +10458,7 @@ def compute_baseline_for_task(
                 metadata_key="score_summary",
                 emit_fn=emit_score_for_handle,
             )
-            return BaselineSnapshot(
+            return EvaluationRecord(
                 dataset_name=task.identity.dataset_name,
                 dataset_config=task.identity.dataset_config,
                 dataset_split=task.identity.dataset_split,
@@ -10451,8 +10480,8 @@ def compute_baseline_for_task(
                     "telemetry": telemetry.model_dump(exclude_none=True),
                     "score_summary": score_summary.model_dump(mode="json"),
                     "run_kind": "localization_baseline",
-                    "dataset_source": getattr(parent_trace, "metadata", {}).get(
-                        "dataset_source"
+                    "dataset_provenance": getattr(parent_trace, "metadata", {}).get(
+                        "dataset_provenance"
                     )
                     if parent_trace
                     else None,
@@ -10462,75 +10491,74 @@ def compute_baseline_for_task(
 
 
 def resolve_baseline(
-    baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask
-) -> BaselineSnapshot | None:
+    baselines: EvaluationBundle | Sequence[EvaluationRecord], task: LCATask
+) -> EvaluationRecord | None:
     indexed = index_baselines(baselines)
     return indexed.get(task.task_id)
 
 
 def require_baseline(
-    baselines: BaselineBundle | Sequence[BaselineSnapshot], task: LCATask
-) -> BaselineSnapshot:
+    baselines: EvaluationBundle | Sequence[EvaluationRecord], task: LCATask
+) -> EvaluationRecord:
     resolved = resolve_baseline(baselines, task)
     if resolved is None:
         raise ValueError(
-            f"No baseline snapshot found for localization task_id={task.task_id}"
+            f"No baseline record found for localization task_id={task.task_id}"
         )
     return resolved
 
 
 def make_baseline_bundle(
-    snapshots: list[BaselineSnapshot] | Sequence[Mapping[str, object]],
+    records: list[EvaluationRecord] | Sequence[Mapping[str, object]],
     dataset_name: str,
     dataset_version: str | None = None,
     metadata: Mapping[str, object] | None = None,
     failure: LocalizationEvaluationFailure | None = None,
-) -> BaselineBundle:
-    snapshot_models = [
-        snap
-        if isinstance(snap, BaselineSnapshot)
-        else BaselineSnapshot.model_validate(snap)
-        for snap in snapshots
+) -> EvaluationBundle:
+    record_models = [
+        record
+        if isinstance(record, EvaluationRecord)
+        else EvaluationRecord.model_validate(record)
+        for record in records
     ]
-    return BaselineBundle(
+    return EvaluationBundle(
         dataset_name=dataset_name,
         dataset_version=dataset_version,
         created_at=datetime.now(tz=timezone.utc).isoformat(),
-        items=snapshot_models,
+        records=record_models,
         metadata=dict(metadata) if metadata else {},
         failure=failure,
     )
 
 
-def save_baseline_bundle(bundle: BaselineBundle, path: Path) -> None:
+def save_baseline_bundle(bundle: EvaluationBundle, path: Path) -> None:
     serializable = bundle.model_dump(mode="json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(serializable, indent=2))
 
 
-def load_baseline_bundle(path: Path) -> BaselineBundle:
+def load_baseline_bundle(path: Path) -> EvaluationBundle:
     data: object = json.loads(path.read_text())
     try:
-        return BaselineBundle.model_validate(data)
+        return EvaluationBundle.model_validate(data)
     except ValidationError as exc:
-        raise ValueError(f"Invalid baseline bundle: {exc}") from exc
+        raise ValueError(f"Invalid evaluation bundle: {exc}") from exc
 </file>
 
 <file path="telemetry/hosted/datasets.py">
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-import logging
-
-from harness.localization.models import LCATask, normalize_lca_task
-from harness.entrypoints.models.requests import LocalizationDatasetSource
-from harness.telemetry.hosted.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
-
+from harness.localization.models import LCAGold, LCATask, normalize_lca_task
 from harness.telemetry.tracing import get_langfuse_client
+
+
+class LocalizationDatasetLoadError(RuntimeError):
+    """Raised when a Langfuse localization dataset item cannot be validated."""
 
 
 class LocalizationDataset(BaseModel):
@@ -10543,7 +10571,9 @@ class LocalizationDataset(BaseModel):
         return self.items
 
 
-def _defaults(dataset_name: str, dataset_config: str | None, dataset_split: str | None) -> tuple[str, str, str]:
+def _defaults(
+    dataset_name: str, dataset_config: str | None, dataset_split: str | None
+) -> tuple[str, str, str]:
     return (
         dataset_name,
         dataset_config or "unspecified-config",
@@ -10568,20 +10598,79 @@ def normalize_localization_task(
     return normalize_lca_task(item, defaults=defaults)
 
 
+def _field(raw: object, name: str) -> object:
+    if isinstance(raw, Mapping):
+        return raw.get(name)
+    return getattr(raw, name, None)
+
+
+def _require_mapping(value: object, field_name: str) -> Mapping[str, object]:
+    if isinstance(value, Mapping):
+        return value
+    raise LocalizationDatasetLoadError(
+        f"Langfuse dataset item {field_name} must be an object"
+    )
+
+
+def _expected_gold(expected_output: object) -> LCAGold:
+    expected = _require_mapping(expected_output, "expected_output")
+    try:
+        return LCAGold.model_validate(expected)
+    except Exception as exc:
+        raise LocalizationDatasetLoadError(
+            "Langfuse dataset item expected_output must contain valid changed_files gold"
+        ) from exc
+
+
+def task_from_langfuse_dataset_item(
+    raw: object,
+    *,
+    dataset_name: str,
+) -> LCATask:
+    """
+    Validate one Langfuse dataset item into the canonical localization task model.
+
+    Langfuse owns task payloads in `input` and gold localization data in
+    `expected_output`. Runtime code receives only the reconstructed `LCATask`.
+    """
+
+    input_payload = _require_mapping(_field(raw, "input"), "input")
+    gold = _expected_gold(_field(raw, "expected_output"))
+    task_payload = dict(input_payload)
+    task_payload["gold"] = gold.model_dump()
+    try:
+        return LCATask.model_validate(task_payload)
+    except Exception as exc:
+        raise LocalizationDatasetLoadError(
+            f"Langfuse dataset item input for {dataset_name!r} is not a valid LCATask payload"
+        ) from exc
+
+
+def langfuse_dataset_item_from_task(
+    task: LCATask,
+    *,
+    metadata: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Build the canonical Langfuse dataset item payload for one task."""
+
+    return {
+        "input": task.model_dump(mode="json", exclude={"gold"}),
+        "expected_output": task.gold.model_dump(mode="json"),
+        "metadata": dict(metadata) if metadata else {},
+    }
+
+
 def fetch_localization_dataset(
     name: str,
     version: str | None = None,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
 ) -> list[LCATask]:
     """
     Fetch localization tasks from Langfuse dataset items.
-    Expects each item to include LCA identity fields and changed_files; legacy symbol fields are not used.
     """
     client = get_langfuse_client()
     if not client:
         return []
-    client_any = cast(Any, client)
+    client_any: Any = client
     dataset: Any = None
     try:
         dataset = (
@@ -10594,59 +10683,21 @@ def fetch_localization_dataset(
     if dataset is None:
         return []
     try:
-        raw_items = dataset.items() if callable(getattr(dataset, "items", None)) else getattr(dataset, "items", [])
+        raw_items = (
+            dataset.items()
+            if callable(getattr(dataset, "items", None))
+            else getattr(dataset, "items", [])
+        )
     except Exception:
         raw_items = []
-    tasks: list[LCATask] = []
-    defaults = _defaults(name, dataset_config, dataset_split)
-    for raw in raw_items:
-        if not isinstance(raw, Mapping):
-            continue
-        # Langfuse typically stores payload under "input"
-        input_section = raw.get("input") if isinstance(raw.get("input"), Mapping) else raw
-        try:
-            tasks.append(normalize_lca_task(cast(Mapping[str, object], input_section), defaults=defaults))
-        except Exception:
-            continue
-    return tasks
 
-
-def fetch_localization_dataset_from_source(
-    source: LocalizationDatasetSource,
-    name: str,
-    version: str | None = None,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
-    token: str | None = None,
-) -> list[LCATask]:
-    """
-    Branching loader that supports Langfuse or Hugging Face; retained for internal use.
-    Public CLI should call the HF loader directly.
-    """
-    if source == LocalizationDatasetSource.HUGGINGFACE:
-        try:
-            return fetch_hf_localization_dataset(
-                name,
-                dataset_config=dataset_config,
-                dataset_split=dataset_split,
-                revision=version,
-                token=token,
-            )
-        except HFDatasetLoadError:
-            logging.exception(
-                "HF dataset load failed",
-                extra={
-                    "dataset": name,
-                    "dataset_config": dataset_config,
-                    "dataset_split": dataset_split,
-                    "dataset_version": version,
-                    "dataset_source": source.value,
-                },
-            )
-            raise
-        except Exception as exc:
-            raise HFDatasetLoadError(f"HF dataset load failed unexpectedly: {exc}", category="load") from exc
-    return fetch_localization_dataset(name=name, version=version, dataset_config=dataset_config, dataset_split=dataset_split)
+    return [
+        task_from_langfuse_dataset_item(
+            raw,
+            dataset_name=name,
+        )
+        for raw in raw_items
+    ]
 
 
 def local_dataset(
@@ -10657,7 +10708,10 @@ def local_dataset(
     dataset_split: str | None = None,
 ) -> LocalizationDataset:
     defaults = _defaults(name, dataset_config, dataset_split)
-    normalized_items = [normalize_lca_task(item, defaults=defaults) for item in items]  # type: ignore[arg-type]
+    normalized_items = [
+        item if isinstance(item, LCATask) else normalize_lca_task(item, defaults=defaults)
+        for item in items
+    ]
     return LocalizationDataset(name=name, version=version, items=normalized_items)
 </file>
 
@@ -10691,15 +10745,15 @@ from harness.scoring import summarize_score_summaries, summarize_task_score
 from harness.scoring.batch import TaskScoreSummary
 from harness.scoring.token_usage import TokenUsageRecord
 from harness.telemetry.hosted.baselines import (
-    BaselineBundle,
-    BaselineSnapshot,
+    EvaluationBundle,
+    EvaluationRecord,
     compute_baseline_for_task,
     emit_baseline_dataset_aggregates,
     load_persisted_baseline_bundle,
     make_baseline_bundle,
     persist_baseline_bundle,
 )
-from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
+from harness.telemetry.hosted.datasets import fetch_localization_dataset
 from harness.scoring.reducers import (
     PolicyReducerSummary,
     build_task_input,
@@ -10738,11 +10792,9 @@ class HostedLocalizationRunResult(BaseModel):
 
 
 def _resolve_items(req: HostedLocalizationRunRequest) -> list[LCATask]:
-    return fetch_hf_localization_dataset(
+    return fetch_localization_dataset(
         req.dataset,
-        dataset_config=req.dataset_config,
-        dataset_split=req.dataset_split,
-        revision=req.version,
+        version=req.version,
     )
 
 
@@ -10817,27 +10869,23 @@ def run_hosted_localization_baseline(
     req: HostedLocalizationBaselineRequest,
     worktree_manager: WorktreeManager | None = None,
     tasks: list[LCATask] | None = None,
-) -> BaselineBundle:
+) -> EvaluationBundle:
     run_session_id = resolve_session_id(req.session, run_id=req.dataset)
     resolved_model = get_runner_model()
     _LOGGER.info("Localization baseline runner model resolved to %s", resolved_model)
     cached_bundle = load_persisted_baseline_bundle(
         dataset_name=req.dataset,
-        dataset_config=req.dataset_config,
-        dataset_split=req.dataset_split,
         dataset_version=req.version,
     )
     selected_tasks: list[LCATask] = []
-    snapshots: list[BaselineSnapshot] = []
+    records: list[EvaluationRecord] = []
     failure: LocalizationEvaluationFailure | None = None
     effective_workers = 1
     selection_info: Mapping[str, object] | None = None
     if cached_bundle is None:
-        tasks = tasks or fetch_hf_localization_dataset(
+        tasks = tasks or fetch_localization_dataset(
             req.dataset,
-            dataset_config=req.dataset_config,
-            dataset_split=req.dataset_split,
-            revision=req.version,
+            version=req.version,
         )
         if not tasks:
             raise RuntimeError("No localization tasks available for baseline run")
@@ -10857,19 +10905,17 @@ def run_hosted_localization_baseline(
             "limit": req.max_items,
         }
     else:
-        snapshots = list(cached_bundle.items)
+        records = list(cached_bundle.records)
         failure = cached_bundle.failure
-        selection_meta = {"selected_count": len(snapshots)}
+        selection_meta = {"selected_count": len(records)}
     with propagate_context(
         trace_name="localization_baseline_dataset",
         session_id=run_session_id,
         metadata={
             "dataset": req.dataset,
             "dataset_version": req.version,
-            "dataset_config": req.dataset_config,
-            "dataset_split": req.dataset_split,
             "run_kind": "localization_baseline",
-            "dataset_source": "huggingface",
+            "dataset_store": "langfuse",
         },
     ):
         with start_observation(
@@ -10877,10 +10923,8 @@ def run_hosted_localization_baseline(
             metadata={
                 "dataset": req.dataset,
                 "dataset_version": req.version,
-                "dataset_config": req.dataset_config,
-                "dataset_split": req.dataset_split,
                 "run_kind": "localization_baseline",
-                "dataset_source": "huggingface",
+                "dataset_store": "langfuse",
                 "selection": selection_meta,
                 "runner_model": resolved_model,
             },
@@ -10889,18 +10933,18 @@ def run_hosted_localization_baseline(
             if cached_bundle is None:
                 if effective_workers == 1:
                     for task in selected_tasks:
-                        snapshots.append(
+                        records.append(
                             compute_baseline_for_task(
                                 task,
                                 session_id=run_session_id,
                                 dataset_version=req.version,
                                 parent_trace=parent_trace,
-                                dataset_source="huggingface",
+                                dataset_provenance="langfuse",
                                 worktree_manager=worktree_manager,
                             )
                         )
                 else:
-                    snapshots, failure = _run_baseline_parallel(
+                    records, failure = _run_baseline_parallel(
                         selected_tasks,
                         effective_workers,
                         parent_trace,
@@ -10910,12 +10954,10 @@ def run_hosted_localization_baseline(
                     )
             emit_baseline_dataset_aggregates(
                 dataset_span,
-                snapshots,
+                records,
                 extra_metadata={
                     "cache_hit": cached_bundle is not None,
                     "dataset": req.dataset,
-                    "dataset_config": req.dataset_config,
-                    "dataset_split": req.dataset_split,
                     "dataset_version": req.version,
                     "selection": selection_meta,
                     "runner_model": resolved_model,
@@ -10925,7 +10967,7 @@ def run_hosted_localization_baseline(
     if cached_bundle is not None:
         return cached_bundle
     bundle = make_baseline_bundle(
-        snapshots,
+        records,
         dataset_name=req.dataset,
         dataset_version=req.version,
         metadata={"run_kind": "localization_baseline"},
@@ -10934,8 +10976,6 @@ def run_hosted_localization_baseline(
     persist_baseline_bundle(
         bundle,
         dataset_name=req.dataset,
-        dataset_config=req.dataset_config,
-        dataset_split=req.dataset_split,
         dataset_version=req.version,
     )
     return bundle
@@ -10948,7 +10988,7 @@ def _baseline_worker(
     worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
-) -> BaselineSnapshot:
+) -> EvaluationRecord:
     if parent_trace is None:
         raise _TaskFailure(
             index,
@@ -10962,7 +11002,7 @@ def _baseline_worker(
             session_id=session_id,
             dataset_version=dataset_version,
             parent_trace=parent_trace,
-            dataset_source="huggingface",
+            dataset_provenance="langfuse",
             worktree_manager=worktree_manager,
         )
     except LocalizationEvaluationError as exc:
@@ -10986,11 +11026,11 @@ def _run_baseline_parallel(
     worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
-) -> tuple[list[BaselineSnapshot], LocalizationEvaluationFailure | None]:
-    results: list[BaselineSnapshot | None] = [None] * len(tasks)
+) -> tuple[list[EvaluationRecord], LocalizationEvaluationFailure | None]:
+    results: list[EvaluationRecord | None] = [None] * len(tasks)
     failure: _TaskFailure | None = None
     next_index = 0
-    inflight: dict[concurrent.futures.Future[BaselineSnapshot], int] = {}
+    inflight: dict[concurrent.futures.Future[EvaluationRecord], int] = {}
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=effective_workers
@@ -11095,7 +11135,7 @@ def _run_experiment_task(
         with propagate_context(session_id=session_id):
             eval_result = evaluate_localization_batch(
                 tasks=[task],
-                dataset_source="huggingface",
+                dataset_provenance="langfuse",
                 worktree_manager=worktree_manager,
                 parent_trace=parent_trace,
             )
@@ -11233,10 +11273,8 @@ def run_hosted_localization_experiment(
         metadata={
             "dataset": req.dataset,
             "dataset_version": req.version,
-            "dataset_config": req.dataset_config,
-            "dataset_split": req.dataset_split,
             "run_kind": "localization_experiment",
-            "dataset_source": "huggingface",
+            "dataset_store": "langfuse",
         },
     ):
         with start_observation(
@@ -11244,10 +11282,8 @@ def run_hosted_localization_experiment(
             metadata={
                 "dataset": req.dataset,
                 "dataset_version": req.version,
-                "dataset_config": req.dataset_config,
-                "dataset_split": req.dataset_split,
                 "run_kind": "localization_experiment",
-                "dataset_source": "huggingface",
+                "dataset_store": "langfuse",
                 "selection": selection_meta,
                 "projection": projection_meta,
             },
@@ -11276,8 +11312,6 @@ def run_hosted_localization_experiment(
                 results,
                 extra_metadata={
                     "dataset": req.dataset,
-                    "dataset_config": req.dataset_config,
-                    "dataset_split": req.dataset_split,
                     "dataset_version": req.version,
                     "selection": selection_meta,
                 },
@@ -11318,9 +11352,14 @@ def _build_reducer_summary(
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, List, Mapping, Sequence
+import hashlib
+import json
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 from harness.localization.models import LCATask, normalize_lca_task
+from harness.telemetry.hosted.datasets import langfuse_dataset_item_from_task
+from harness.telemetry.tracing import get_langfuse_client
 
 logger = logging.getLogger(__name__)
 
@@ -11334,6 +11373,30 @@ class HFDatasetLoadError(RuntimeError):
     def __init__(self, message: str, category: str = "unknown"):
         super().__init__(message)
         self.category = category
+
+
+def compute_lca_task_identity(task: LCATask) -> str:
+    """
+    Deterministic Langfuse dataset item id for one logical LCA example.
+
+    Identity is defined by the upstream example itself: repo owner, repo name,
+    base SHA, and issue/pull identity when available. If no issue or pull URL is
+    present, issue title/body are used as the fallback discriminator. Dataset
+    config, split, revision, and target Langfuse dataset are provenance only and
+    do not participate in this id.
+    """
+
+    payload = {
+        "repo_owner": task.identity.repo_owner,
+        "repo_name": task.identity.repo_name,
+        "base_sha": task.identity.base_sha,
+        "issue_url": task.identity.issue_url,
+        "pull_url": task.identity.pull_url,
+        "issue_title": task.context.issue_title if not (task.identity.issue_url or task.identity.pull_url) else None,
+        "issue_body": task.context.issue_body if not (task.identity.issue_url or task.identity.pull_url) else None,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"lca-{hashlib.sha256(encoded).hexdigest()[:32]}"
 
 
 def _require_dependency() -> Any:
@@ -11354,11 +11417,18 @@ def _validate_rows(rows: Iterable[Mapping[str, object]]) -> Sequence[Mapping[str
     """
     Validate that required LCA fields exist before normalization.
     """
-    validated: List[Mapping[str, object]] = []
+    validated: list[Mapping[str, object]] = []
     for row in rows:
         if not isinstance(row, Mapping):
             raise HFDatasetLoadError("HF row is not a mapping", category="schema")
-        required = ["repo_owner", "repo_name", "base_sha", "changed_files"]
+        required = [
+            "repo_owner",
+            "repo_name",
+            "base_sha",
+            "issue_title",
+            "issue_body",
+            "changed_files",
+        ]
         missing = [field for field in required if field not in row or row[field] in (None, "")]
         if missing:
             raise HFDatasetLoadError(f"HF row missing required fields: {missing}", category="schema")
@@ -11413,6 +11483,114 @@ def fetch_hf_localization_dataset(
             raise HFDatasetLoadError(f"HF row normalization failed: {exc}", category="schema") from exc
     logger.info("Loaded %d HF LCA rows (config=%s split=%s)", len(tasks), dataset_config, dataset_split)
     return tasks
+
+
+def hf_source_metadata(
+    *,
+    dataset_name: str,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+    revision: str | None = None,
+) -> dict[str, object]:
+    """Return provenance metadata for HF-to-Langfuse sync."""
+
+    return {
+        "source": "huggingface",
+        "source_dataset": dataset_name,
+        "source_config": dataset_config,
+        "source_split": dataset_split,
+        "source_revision": revision,
+    }
+
+
+def build_langfuse_items_from_hf_tasks(
+    tasks: Sequence[LCATask],
+    *,
+    dataset_name: str,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+    revision: str | None = None,
+) -> list[dict[str, object]]:
+    """Normalize HF-loaded tasks into canonical Langfuse dataset item payloads."""
+
+    metadata = hf_source_metadata(
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        revision=revision,
+    )
+    return [
+        langfuse_dataset_item_from_task(
+            task,
+            metadata={
+                **metadata,
+                "canonical_task_identity": compute_lca_task_identity(task),
+                "task_id": task.task_id,
+                "repo_owner": task.identity.repo_owner,
+                "repo_name": task.identity.repo_name,
+                "base_sha": task.identity.base_sha,
+            },
+        )
+        | {"id": compute_lca_task_identity(task)}
+        for task in tasks
+    ]
+
+
+def _upsert_langfuse_dataset_item(
+    client: object,
+    *,
+    dataset_name: str,
+    item: Mapping[str, object],
+) -> None:
+    item_id = item["id"]
+    payload = {
+        "dataset_name": dataset_name,
+        "id": item_id,
+        "input": item["input"],
+        "expected_output": item["expected_output"],
+        "metadata": item["metadata"],
+    }
+    upsert_item = getattr(client, "upsert_dataset_item", None)
+    if callable(upsert_item):
+        upsert_item(**payload)
+        return
+    raise HFDatasetLoadError(
+        "Langfuse client does not expose dataset item upsert API; cannot sync HF dataset idempotently",
+        category="langfuse-client",
+    )
+
+
+def sync_hf_localization_dataset_to_langfuse(
+    *,
+    hf_dataset: str,
+    langfuse_dataset: str,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+    revision: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, object]]:
+    """
+    Load HF localization rows, normalize them, and write Langfuse dataset items.
+    """
+
+    tasks = fetch_hf_localization_dataset(
+        hf_dataset,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        revision=revision,
+        token=token,
+    )
+    items = build_langfuse_items_from_hf_tasks(
+        tasks,
+        dataset_name=hf_dataset,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        revision=revision,
+    )
+    client = get_langfuse_client()
+    for item in items:
+        _upsert_langfuse_dataset_item(client, dataset_name=langfuse_dataset, item=item)
+    return items
 </file>
 
 <file path="telemetry/tracing/__init__.py">
@@ -12472,9 +12650,12 @@ from .tracing import (
 from .tracing.score_emitter import ScorePayload, emit_score, emit_score_for_handle
 from .hosted.datasets import (
     LocalizationDataset,
+    LocalizationDatasetLoadError,
     fetch_localization_dataset,
+    langfuse_dataset_item_from_task,
     local_dataset,
     normalize_localization_task,
+    task_from_langfuse_dataset_item,
 )
 
 __all__ = [
@@ -12490,11 +12671,14 @@ __all__ = [
     "emit_score_for_handle",
     "ScorePayload",
     "LocalizationDataset",
+    "LocalizationDatasetLoadError",
     "fetch_localization_dataset",
+    "langfuse_dataset_item_from_task",
     "local_dataset",
     "normalize_localization_task",
-    "BaselineBundle",
-    "BaselineSnapshot",
+    "task_from_langfuse_dataset_item",
+    "EvaluationBundle",
+    "EvaluationRecord",
     "compute_baseline_for_task",
     "make_baseline_bundle",
     "require_baseline",
@@ -12503,8 +12687,8 @@ __all__ = [
 
 if TYPE_CHECKING:
     from harness.telemetry.hosted.baselines import (
-        BaselineBundle,
-        BaselineSnapshot,
+        EvaluationBundle,
+        EvaluationRecord,
         compute_baseline_for_task,
         make_baseline_bundle,
         require_baseline,
@@ -12514,8 +12698,8 @@ if TYPE_CHECKING:
 
 def __getattr__(name: str) -> Any:
     if name in {
-        "BaselineBundle",
-        "BaselineSnapshot",
+        "EvaluationBundle",
+        "EvaluationRecord",
         "compute_baseline_for_task",
         "make_baseline_bundle",
         "require_baseline",
@@ -12534,17 +12718,16 @@ def __getattr__(name: str) -> Any:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Iterator
 from pathlib import Path
 import sys
+from typing import Any, Iterator
+
+import pytest
+from pydantic import BaseModel, ConfigDict, Field
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-import pytest
-from pydantic import BaseModel, ConfigDict, Field
-from harness import telemetry
 
 
 class TestSpan(BaseModel):
@@ -13711,12 +13894,12 @@ def test_resolve_and_bundle_roundtrip(tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     task = _task(str(repo_dir))
-    snap = baselines.compute_baseline_for_task(
+    record = baselines.compute_baseline_for_task(
         task,
         dataset_version="v1",
         runner=lambda task, *_: _runner_result(task, ["a.py"]),
     )
-    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="v1")
+    bundle = baselines.make_baseline_bundle([record], dataset_name=task.identity.dataset_name, dataset_version="v1")
     path = tmp_path / "bundle.json"
     baselines.save_baseline_bundle(bundle, path)
     loaded = baselines.load_baseline_bundle(path)
@@ -13748,16 +13931,16 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
         return _eval_result(task)
 
     monkeypatch.setattr(baselines, "evaluate_localization_batch", fake_backend)
-    snap = baselines.compute_baseline_for_task(task, dataset_version="v1", runner=None)
+    record = baselines.compute_baseline_for_task(task, dataset_version="v1", runner=None)
     assert calls
-    assert snap.score_summary.composed_score == 1.0
-    assert snap.prediction.predicted_files == ["a.py"]
+    assert record.score_summary.composed_score == 1.0
+    assert record.prediction.predicted_files == ["a.py"]
 
 
 def test_baseline_dataset_span_gets_aggregates(monkeypatch):
     task = _task()
-    snap_one = _snapshot(task, version="v1")
-    snap_two = _snapshot(task, version="v1", score_hops=1)
+    record_one = _record(task, version="v1")
+    record_two = _record(task, version="v1", score_hops=1)
     emitted: list[dict[str, object]] = []
     updates: list[dict[str, object]] = []
 
@@ -13771,7 +13954,7 @@ def test_baseline_dataset_span_gets_aggregates(monkeypatch):
         def update(self, **kwargs):
             updates.append(kwargs)
 
-    baselines.emit_baseline_dataset_aggregates(DummySpan(), [snap_one, snap_two])
+    baselines.emit_baseline_dataset_aggregates(DummySpan(), [record_one, record_two])
     names = {item["name"] for item in emitted}
     assert names == {
         "baseline.aggregate_composed_score",
@@ -13785,10 +13968,10 @@ def test_baseline_dataset_span_gets_aggregates(monkeypatch):
     assert metadata["score_summary"]["aggregate_composed_score"] == 0.75
 
 
-def _snapshot(task: LCATask, version: str = "v1", score_hops: int = 0) -> baselines.BaselineSnapshot:
+def _record(task: LCATask, version: str = "v1", score_hops: int = 0) -> baselines.EvaluationRecord:
     bundle = _score_bundle(score_hops)
     score_summary = summarize_task_score(task.task_id, bundle)
-    return baselines.BaselineSnapshot(
+    return baselines.EvaluationRecord(
         dataset_name=task.identity.dataset_name,
         dataset_config=task.identity.dataset_config,
         dataset_split=task.identity.dataset_split,
@@ -13806,19 +13989,15 @@ def _snapshot(task: LCATask, version: str = "v1", score_hops: int = 0) -> baseli
 def test_persist_and_load_baseline_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev1")
-    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="rev1")
+    record = _record(task, version="rev1")
+    bundle = baselines.make_baseline_bundle([record], dataset_name=task.identity.dataset_name, dataset_version="rev1")
     path = baselines.persist_baseline_bundle(
         bundle,
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev1",
     )
     expected = baselines.baseline_cache_path(
         task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev1",
         root=tmp_path,
     )
@@ -13827,24 +14006,20 @@ def test_persist_and_load_baseline_bundle(monkeypatch, tmp_path):
     json.loads(path.read_text())
     loaded = baselines.load_persisted_baseline_bundle(
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev1",
     )
     assert loaded is not None
-    assert loaded.items and loaded.items[0].identity == snap.identity
+    assert loaded.records and loaded.records[0].identity == record.identity
 
 
 def test_run_hosted_localization_baseline_uses_cached_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev2")
-    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="rev2")
+    record = _record(task, version="rev2")
+    bundle = baselines.make_baseline_bundle([record], dataset_name=task.identity.dataset_name, dataset_version="rev2")
     baselines.persist_baseline_bundle(
         bundle,
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev2",
     )
 
@@ -13854,23 +14029,21 @@ def test_run_hosted_localization_baseline_uses_cached_bundle(monkeypatch, tmp_pa
     def _raise_compute(*args, **kwargs):
         raise AssertionError("compute should not be called")
 
-    monkeypatch.setattr(experiments, "fetch_hf_localization_dataset", _raise_fetch)
+    monkeypatch.setattr(experiments, "fetch_localization_dataset", _raise_fetch)
     monkeypatch.setattr(experiments, "compute_baseline_for_task", _raise_compute)
 
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         version="rev2",
     )
     result = experiments.run_hosted_localization_baseline(req)
-    assert result.items and result.items[0].identity == snap.identity
+    assert result.records and result.records[0].identity == record.identity
 
 
 def test_run_hosted_localization_baseline_persists_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev3")
+    record = _record(task, version="rev3")
     calls = {"compute": 0, "fetch": 0}
 
     def fake_fetch(*args, **kwargs):
@@ -13879,51 +14052,43 @@ def test_run_hosted_localization_baseline_persists_bundle(monkeypatch, tmp_path)
 
     def fake_compute(*args, **kwargs):
         calls["compute"] += 1
-        return snap
+        return record
 
-    monkeypatch.setattr(experiments, "fetch_hf_localization_dataset", fake_fetch)
+    monkeypatch.setattr(experiments, "fetch_localization_dataset", fake_fetch)
     monkeypatch.setattr(experiments, "compute_baseline_for_task", fake_compute)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
 
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         version="rev3",
     )
     result = experiments.run_hosted_localization_baseline(req)
     assert calls["fetch"] == 1
     assert calls["compute"] == 1
-    assert result.items and result.items[0].identity == snap.identity
+    assert result.records and result.records[0].identity == record.identity
 
     bundle_path = baselines.baseline_cache_path(
         task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev3",
         root=tmp_path,
     )
     assert bundle_path.exists()
     loaded = baselines.load_persisted_baseline_bundle(
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev3",
     )
     assert loaded is not None
-    assert loaded.items and loaded.items[0].identity == snap.identity
+    assert loaded.records and loaded.records[0].identity == record.identity
 
 
 def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev-hit")
-    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="rev-hit")
+    record = _record(task, version="rev-hit")
+    bundle = baselines.make_baseline_bundle([record], dataset_name=task.identity.dataset_name, dataset_version="rev-hit")
     baselines.persist_baseline_bundle(
         bundle,
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev-hit",
     )
 
@@ -13958,17 +14123,15 @@ def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(
         experiments,
-        "fetch_hf_localization_dataset",
+        "fetch_localization_dataset",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch should not run")),
     )
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         version="rev-hit",
     )
     result = experiments.run_hosted_localization_baseline(req)
-    assert result.items and result.items[0].identity == task.task_id
+    assert result.records and result.records[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
     assert names == {
         "baseline.aggregate_composed_score",
@@ -13979,13 +14142,13 @@ def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
     metadata = metadata_updates[-1].get("metadata")
     assert metadata and metadata.get("cache_hit") is True
     assert metadata.get("selected_count") == 1
-    assert metadata["score_summary"]["aggregate_composed_score"] == snap.score_summary.composed_score
+    assert metadata["score_summary"]["aggregate_composed_score"] == record.score_summary.composed_score
 
 
 def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev-fresh")
+    record = _record(task, version="rev-fresh")
     captured_scores: list[dict[str, object]] = []
     metadata_updates: list[dict[str, object]] = []
 
@@ -14017,22 +14180,20 @@ def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(
         experiments,
-        "fetch_hf_localization_dataset",
+        "fetch_localization_dataset",
         lambda *a, **k: [task],
     )
     monkeypatch.setattr(
         experiments,
         "compute_baseline_for_task",
-        lambda *a, **k: snap,
+        lambda *a, **k: record,
     )
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         version="rev-fresh",
     )
     result = experiments.run_hosted_localization_baseline(req)
-    assert result.items and result.items[0].identity == task.task_id
+    assert result.records and result.records[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
     assert names == {
         "baseline.aggregate_composed_score",
@@ -14048,9 +14209,10 @@ def test_baseline_cache_path_respects_env_and_dataset(monkeypatch, tmp_path):
     cache_root = tmp_path / "baseline_cache"
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(cache_root))
     path = baselines.baseline_cache_path(
-        "JetBrains-Research/lca-bug-localization", dataset_config="py", dataset_split="dev", dataset_version="rev1"
+        "JetBrains-Research/lca-bug-localization",
+        dataset_version="rev1",
     )
-    expected = cache_root / "JetBrains-Research__lca-bug-localization" / "py" / "dev" / "rev1.json"
+    expected = cache_root / "JetBrains-Research__lca-bug-localization" / "rev1.json"
     assert path == expected
 </file>
 
@@ -14202,6 +14364,9 @@ from harness.telemetry.hosted.baselines import baseline_cache_path
 from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
 
 
+LANGFUSE_DATASET = "canonical-lca"
+
+
 def _task(repo_owner: str, repo_name: str, base_sha: str, dataset: str = "d", config: str = "c", split: str = "s") -> LCATask:
     identity = LCATaskIdentity(
         dataset_name=dataset,
@@ -14217,16 +14382,16 @@ def _task(repo_owner: str, repo_name: str, base_sha: str, dataset: str = "d", co
 
 
 def _stub_cli_baseline(monkeypatch, tmp_path, run_stub, cache_root=None, baseline_root=None):
-    hf_cache_dir = cache_root or tmp_path / "hf_cache"
+    worktree_cache_dir = cache_root or tmp_path / "worktree_cache"
     baseline_cache_dir = baseline_root or tmp_path / "baseline_cache"
-    monkeypatch.setenv("HF_LCA_CACHE_DIR", str(hf_cache_dir))
+    monkeypatch.setenv("HARNESS_WORKTREE_CACHE_DIR", str(worktree_cache_dir))
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(baseline_cache_dir))
     monkeypatch.setattr(run_module.harness_run, "ensure_langfuse_auth", lambda: None)
     monkeypatch.setattr(run_module.harness_run, "flush_langfuse", lambda: None)
     monkeypatch.setattr(
         run_module,
-        "fetch_hf_localization_dataset",
-        lambda *args, **kwargs: [_task("o", "r", "b", dataset=run_module.harness_run.HF_DATASET_NAME, config="py", split="dev")],
+        "fetch_localization_dataset",
+        lambda *args, **kwargs: [_task("o", "r", "b", dataset=LANGFUSE_DATASET, config="py", split="dev")],
     )
 
     def fake_select(tasks, max_items, offset):
@@ -14246,13 +14411,13 @@ def _stub_cli_baseline(monkeypatch, tmp_path, run_stub, cache_root=None, baselin
     )
     monkeypatch.setattr(run_module, "_require_confirmation", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_module, "run_hosted_localization_baseline", run_stub)
-    return hf_cache_dir, baseline_cache_dir
+    return worktree_cache_dir, baseline_cache_dir
 
 
 def _worktree_path(cache_root, *, repo_owner: str = "o", repo_name: str = "r", base_sha: str = "b", config: str = "py"):
     manager = WorktreeManager(cache_root=cache_root)
     request = RepoMaterializationRequest(
-        dataset_name=run_module.harness_run.HF_DATASET_NAME,
+        dataset_name=LANGFUSE_DATASET,
         dataset_config=config,
         dataset_split="dev",
         repo_owner=repo_owner,
@@ -14263,24 +14428,45 @@ def _worktree_path(cache_root, *, repo_owner: str = "o", repo_name: str = "r", b
 
 
 def test_parse_defaults():
-    args = run_module._parse_args(["baseline", "--config", "py", "--split", "dev"])
+    args = run_module._parse_args(["baseline", "--dataset", LANGFUSE_DATASET])
     assert args.max_items is None
     assert args.offset == 0
     assert args.command == "baseline"
-    args_exp = run_module._parse_args(["experiment", "--config", "java", "--split", "test", "--max-items", "5"])
+    args_exp = run_module._parse_args(["experiment", "--dataset", LANGFUSE_DATASET, "--max-items", "5"])
     assert args_exp.command == "experiment"
     assert args_exp.max_items == 5
 
 
 def test_removed_flags_rejected():
     with pytest.raises(SystemExit):
-        run_module._parse_args(["baseline", "--config", "py", "--split", "dev", "--dataset", "foo"])
+        run_module._parse_args(["baseline", "--dataset", LANGFUSE_DATASET, "--mode", "localization-baseline"])
     with pytest.raises(SystemExit):
-        run_module._parse_args(["baseline", "--config", "py", "--split", "dev", "--mode", "localization-baseline"])
+        run_module._parse_args(["experiment", "--dataset", LANGFUSE_DATASET, "--assume-input-tokens", "10"])
     with pytest.raises(SystemExit):
-        run_module._parse_args(["experiment", "--config", "py", "--split", "dev", "--assume-input-tokens", "10"])
+        run_module._parse_args(["experiment", "--dataset", LANGFUSE_DATASET, "--dataset-source", "huggingface"])
+
+
+def test_hf_flags_are_sync_only():
     with pytest.raises(SystemExit):
-        run_module._parse_args(["experiment", "--config", "py", "--split", "dev", "--dataset-source", "huggingface"])
+        run_module._parse_args(["baseline", "--dataset", LANGFUSE_DATASET, "--config", "py"])
+    with pytest.raises(SystemExit):
+        run_module._parse_args(["experiment", "--dataset", LANGFUSE_DATASET, "--revision", "rev1"])
+
+    args = run_module._parse_args([
+        "sync-hf",
+        "--dataset",
+        LANGFUSE_DATASET,
+        "--config",
+        "py",
+        "--split",
+        "dev",
+        "--revision",
+        "rev1",
+    ])
+    assert args.command == "sync-hf"
+    assert args.config == "py"
+    assert args.split == "dev"
+    assert args.revision == "rev1"
 
 
 def test_select_tasks_is_deterministic_and_offsets():
@@ -14332,7 +14518,7 @@ def test_confirmation_non_interactive_rejected(monkeypatch):
 def test_projection_only_skips_execution(monkeypatch):
     calls = {"baseline": 0}
 
-    def fake_fetch(name, dataset_config=None, dataset_split=None, revision=None):
+    def fake_fetch(name, version=None):
         return [_task("o", "r", "b")]
 
     def fake_projection(*args, **kwargs):
@@ -14345,16 +14531,14 @@ def test_projection_only_skips_execution(monkeypatch):
         calls["baseline"] += 1
         return None
 
-    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", fake_fetch)
+    monkeypatch.setattr(run_module, "fetch_localization_dataset", fake_fetch)
     monkeypatch.setattr(run_module, "_compute_projection", fake_projection)
     monkeypatch.setattr(run_module, "_require_confirmation", fake_confirm)
     monkeypatch.setattr(run_module, "run_hosted_localization_baseline", fake_run)
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--projection-only",
         "--yes",
         "--max-items",
@@ -14367,39 +14551,35 @@ def test_projection_only_skips_execution(monkeypatch):
 def test_projection_only_with_invalidation_skips_destructive_cache_removal(monkeypatch, tmp_path):
     calls = {"baseline": 0}
 
-    def fake_fetch(name, dataset_config=None, dataset_split=None, revision=None):
-        return [_task("o", "r", "b", dataset=name, config=dataset_config or "py", split=dataset_split or "dev")]
+    def fake_fetch(name, version=None):
+        return [_task("o", "r", "b", dataset=name, config="py", split="dev")]
 
     def fake_run(*args, **kwargs):
         calls["baseline"] += 1
         return None
 
-    monkeypatch.setenv("HF_LCA_CACHE_DIR", str(tmp_path / "hf_cache"))
+    monkeypatch.setenv("HARNESS_WORKTREE_CACHE_DIR", str(tmp_path / "worktree_cache"))
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path / "baseline_cache"))
     monkeypatch.setattr(run_module.harness_run, "ensure_langfuse_auth", lambda: None)
     monkeypatch.setattr(run_module.harness_run, "flush_langfuse", lambda: None)
-    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", fake_fetch)
+    monkeypatch.setattr(run_module, "fetch_localization_dataset", fake_fetch)
     monkeypatch.setattr(run_module, "_compute_projection", lambda *args, **kwargs: {"total": {"planned": 0, "hard_cap": 0}, "localization": {}, "writer": {}})
     monkeypatch.setattr(run_module, "_require_confirmation", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_module, "run_hosted_localization_baseline", fake_run)
     bundle_path = baseline_cache_path(
-        run_module.harness_run.HF_DATASET_NAME,
-        dataset_config="py",
-        dataset_split="dev",
+        LANGFUSE_DATASET,
         dataset_version=None,
     )
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     bundle_path.write_text("{}")
-    worktree_path = _worktree_path(tmp_path / "hf_cache")
+    worktree_path = _worktree_path(tmp_path / "worktree_cache")
     worktree_path.mkdir(parents=True)
     (worktree_path / ".complete").write_text("")
 
     run_module.main([
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--projection-only",
         "--yes",
         "--max-items",
@@ -14413,11 +14593,11 @@ def test_projection_only_with_invalidation_skips_destructive_cache_removal(monke
     assert (worktree_path / ".complete").exists()
 
 
-def test_hf_loader_is_used(monkeypatch):
+def test_langfuse_loader_is_used(monkeypatch):
     calls = {"loader": None, "baseline": None}
 
-    def fake_loader(name, dataset_config=None, dataset_split=None, revision=None):
-        calls["loader"] = (name, dataset_config, dataset_split, revision)
+    def fake_loader(name, version=None):
+        calls["loader"] = (name, version)
         return [SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))]
 
     def fake_select(tasks, max_items, offset):
@@ -14429,23 +14609,24 @@ def test_hf_loader_is_used(monkeypatch):
     def fake_confirm(skip_confirmation, selection, projection):
         calls["baseline"] = True
 
-    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", fake_loader)
+    monkeypatch.setattr(run_module, "fetch_localization_dataset", fake_loader)
     monkeypatch.setattr(run_module, "_select_tasks", fake_select)
     monkeypatch.setattr(run_module, "_compute_projection", fake_projection)
     monkeypatch.setattr(run_module, "_require_confirmation", fake_confirm)
     monkeypatch.setattr(run_module, "run_hosted_localization_baseline", lambda *args, **kwargs: None)
 
-    run_module.main(["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--yes"])
-    assert calls["loader"] == ("JetBrains-Research/lca-bug-localization", "py", "dev", None)
+    run_module.main(["baseline", "--dataset", LANGFUSE_DATASET, "--version", "v1", "--max-items", "1", "--yes"])
+    assert calls["loader"] == (LANGFUSE_DATASET, "v1")
 
 
-def test_requests_do_not_expose_dataset_source():
-    req = HostedLocalizationBaselineRequest(dataset="d", dataset_config="c", dataset_split="s")
-    assert "dataset_source" not in req.model_fields
+def test_requests_do_not_expose_dataset_provenance():
+    req = HostedLocalizationBaselineRequest(dataset="d")
+    assert req.dataset == "d"
+    assert "dataset_provenance" not in HostedLocalizationBaselineRequest.model_fields
 
 
 def test_max_workers_validation():
-    argv = ["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--max-workers", "0"]
+    argv = ["baseline", "--dataset", LANGFUSE_DATASET, "--max-items", "1", "--max-workers", "0"]
     with pytest.raises(ValueError):
         run_module.main(argv)
 
@@ -14455,10 +14636,10 @@ def test_cli_fresh_session_per_invocation(monkeypatch, tmp_path):
 
     def fake_run(req, worktree_manager=None, tasks=None):
         sessions.append(req.session)
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
     _stub_cli_baseline(monkeypatch, tmp_path, fake_run)
-    argv = ["baseline", "--config", "py", "--split", "dev", "--max-items", "1", "--yes"]
+    argv = ["baseline", "--dataset", LANGFUSE_DATASET, "--max-items", "1", "--yes"]
 
     run_module.main(argv)
     run_module.main(argv)
@@ -14477,15 +14658,13 @@ def test_cli_respects_explicit_session_id(monkeypatch, tmp_path):
 
     def fake_run(req, worktree_manager=None, tasks=None):
         sessions.append(req.session)
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
     _stub_cli_baseline(monkeypatch, tmp_path, fake_run)
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--max-items",
         "1",
         "--yes",
@@ -14504,19 +14683,17 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
 
     def fake_run(req, worktree_manager=None, tasks=None):
         calls.append(True)
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
-    hf_cache_root = tmp_path / "hf_cache_existing"
-    hf_cache_root.mkdir(parents=True, exist_ok=True)
-    (hf_cache_root / "marker.txt").write_text("cached")
-    worktree_path = _worktree_path(hf_cache_root)
+    checkout_cache_root = tmp_path / "checkout_cache_existing"
+    checkout_cache_root.mkdir(parents=True, exist_ok=True)
+    (checkout_cache_root / "marker.txt").write_text("cached")
+    worktree_path = _worktree_path(checkout_cache_root)
     worktree_path.mkdir(parents=True)
     (worktree_path / ".complete").write_text("")
-    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=checkout_cache_root)
     bundle_path = baseline_cache_path(
-        run_module.harness_run.HF_DATASET_NAME,
-        dataset_config="py",
-        dataset_split="dev",
+        LANGFUSE_DATASET,
         dataset_version=None,
     )
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -14524,10 +14701,8 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
 
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--max-items",
         "1",
         "--yes",
@@ -14542,7 +14717,7 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
     assert calls == [True]
     assert not bundle_path.exists()
     assert not worktree_path.exists()
-    assert (hf_cache_root / "marker.txt").exists(), "HF cache should remain untouched"
+    assert (checkout_cache_root / "marker.txt").exists(), "checkout cache root marker should remain untouched"
 
 
 def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys):
@@ -14550,28 +14725,24 @@ def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys
 
     def fake_run(req, worktree_manager=None, tasks=None):
         calls.append(True)
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
-    hf_cache_root = tmp_path / "hf_cache_missing"
-    hf_cache_root.mkdir(parents=True, exist_ok=True)
-    (hf_cache_root / "marker.txt").write_text("cached")
-    worktree_path = _worktree_path(hf_cache_root)
+    checkout_cache_root = tmp_path / "checkout_cache_missing"
+    checkout_cache_root.mkdir(parents=True, exist_ok=True)
+    (checkout_cache_root / "marker.txt").write_text("cached")
+    worktree_path = _worktree_path(checkout_cache_root)
     worktree_path.mkdir(parents=True)
     (worktree_path / ".complete").write_text("")
-    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=checkout_cache_root)
     bundle_path = baseline_cache_path(
-        run_module.harness_run.HF_DATASET_NAME,
-        dataset_config="py",
-        dataset_split="dev",
+        LANGFUSE_DATASET,
         dataset_version=None,
     )
 
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--max-items",
         "1",
         "--yes",
@@ -14586,18 +14757,18 @@ def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys
     assert calls == [True]
     assert not bundle_path.exists()
     assert not worktree_path.exists()
-    assert (hf_cache_root / "marker.txt").exists(), "HF cache should remain untouched"
+    assert (checkout_cache_root / "marker.txt").exists(), "checkout cache root marker should remain untouched"
 
 
 def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypatch, tmp_path):
     def fake_run(req, worktree_manager=None, tasks=None):
-        return SimpleNamespace(items=[], failure=None)
+        return SimpleNamespace(records=[], failure=None)
 
     selected_task = _task(
         "selected",
         "repo",
         "a" * 40,
-        dataset=run_module.harness_run.HF_DATASET_NAME,
+        dataset=LANGFUSE_DATASET,
         config="py",
         split="dev",
     )
@@ -14605,19 +14776,19 @@ def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypat
         "other",
         "repo",
         "b" * 40,
-        dataset=run_module.harness_run.HF_DATASET_NAME,
+        dataset=LANGFUSE_DATASET,
         config="py",
         split="dev",
     )
-    hf_cache_root = tmp_path / "hf_cache_targeted"
+    checkout_cache_root = tmp_path / "checkout_cache_targeted"
     selected_path = _worktree_path(
-        hf_cache_root,
+        checkout_cache_root,
         repo_owner="selected",
         repo_name="repo",
         base_sha="a" * 40,
     )
     other_path = _worktree_path(
-        hf_cache_root,
+        checkout_cache_root,
         repo_owner="other",
         repo_name="repo",
         base_sha="b" * 40,
@@ -14626,10 +14797,10 @@ def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypat
     other_path.mkdir(parents=True)
     (selected_path / ".complete").write_text("")
     (other_path / ".complete").write_text("")
-    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=hf_cache_root)
+    _stub_cli_baseline(monkeypatch, tmp_path, fake_run, cache_root=checkout_cache_root)
     monkeypatch.setattr(
         run_module,
-        "fetch_hf_localization_dataset",
+        "fetch_localization_dataset",
         lambda *args, **kwargs: [selected_task, other_task],
     )
     monkeypatch.setattr(
@@ -14649,10 +14820,8 @@ def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypat
 
     run_module.main([
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        LANGFUSE_DATASET,
         "--max-items",
         "1",
         "--yes",
@@ -14666,6 +14835,8 @@ def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypat
 
 <file path="tests_harness/test_datasets.py">
 from __future__ import annotations
+
+import pytest
 
 from harness.telemetry.hosted import datasets
 from harness.localization.models import LCATaskIdentity
@@ -14690,6 +14861,44 @@ def test_normalize_localization_task_builds_identity_and_defaults():
     assert normalized.repo == "/tmp/repo"
     assert normalized.changed_files == ["a.py", "b.py"]
     assert normalized.identity.task_id().startswith("lca-bug-localization:")
+
+
+def test_langfuse_item_contract_reconstructs_task_and_gold():
+    task = datasets.task_from_langfuse_dataset_item(
+        {
+            "input": {
+                "identity": {
+                    "dataset_name": "langfuse-dataset",
+                    "dataset_config": "py",
+                    "dataset_split": "dev",
+                    "repo_owner": "square",
+                    "repo_name": "okhttp",
+                    "base_sha": "abc",
+                },
+                "context": {"issue_title": "bug", "issue_body": "details"},
+            },
+            "expected_output": {"changed_files": ["src/Main.kt"]},
+        },
+        dataset_name="langfuse-dataset",
+    )
+
+    assert task.identity.dataset_name == "langfuse-dataset"
+    assert task.identity.repo_owner == "square"
+    assert task.changed_files == ["src/main.kt"]
+
+
+def test_langfuse_item_contract_rejects_missing_expected_output():
+    with pytest.raises(datasets.LocalizationDatasetLoadError):
+        datasets.task_from_langfuse_dataset_item(
+            {
+                "input": {
+                    "repo_owner": "square",
+                    "repo_name": "okhttp",
+                    "base_sha": "abc",
+                }
+            },
+            dataset_name="langfuse-dataset",
+        )
 </file>
 
 <file path="tests_harness/test_executor_helpers.py">
@@ -14841,13 +15050,12 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
     req = experiments.HostedLocalizationRunRequest(
         dataset="d",
         version="v1",
-        dataset_config="c",
-        dataset_split="s",
         session=None,
     )
     result = experiments.run_hosted_localization_experiment(req, worktree_manager=None)
     assert calls
     assert isinstance(calls[0]["tasks"][0], LCATask)
+    assert calls[0]["dataset_provenance"] == "langfuse"
     assert result.items[0].prediction == ["a.py"]
 
 
@@ -14902,8 +15110,6 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
     req = experiments.HostedLocalizationRunRequest(
         dataset="d",
         version="v1",
-        dataset_config="c",
-        dataset_split="s",
         session=None,
         max_workers=2,
     )
@@ -14930,8 +15136,6 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
     req = experiments.HostedLocalizationRunRequest(
         dataset="d",
         version="v1",
-        dataset_config="c",
-        dataset_split="s",
         session=None,
         max_workers=2,
     )
@@ -14958,8 +15162,6 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
     req = experiments.HostedLocalizationRunRequest(
         dataset="d",
         version="v1",
-        dataset_config="c",
-        dataset_split="s",
         session=None,
         max_workers=1,
     )
@@ -15020,7 +15222,13 @@ import types
 
 import pytest
 
-from harness.telemetry.hosted.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
+from harness.telemetry.hosted.hf_lca import (
+    HFDatasetLoadError,
+    build_langfuse_items_from_hf_tasks,
+    compute_lca_task_identity,
+    fetch_hf_localization_dataset,
+    sync_hf_localization_dataset_to_langfuse,
+)
 
 
 class _FakeDatasets:
@@ -15116,6 +15324,150 @@ def test_hf_loader_missing_required_fields_raises(monkeypatch):
     with pytest.raises(HFDatasetLoadError) as excinfo:
         fetch_hf_localization_dataset("JetBrains-Research/lca-bug-localization")
     assert excinfo.value.category == "schema"
+
+
+def test_hf_sync_payloads_are_langfuse_items(monkeypatch):
+    rows = [
+        {
+            "repo_owner": "square",
+            "repo_name": "okhttp",
+            "base_sha": "abc123",
+            "issue_title": "t",
+            "issue_body": "b",
+            "changed_files": ["src/Main.kt"],
+        }
+    ]
+
+    fake_module = types.SimpleNamespace(utils=types.SimpleNamespace(AuthenticationError=Exception))
+    monkeypatch.setattr(
+        "harness.telemetry.hosted.hf_lca._require_dependency",
+        lambda: types.SimpleNamespace(load_dataset=_FakeDatasets(rows).load_dataset, utils=fake_module.utils),
+    )
+
+    tasks = fetch_hf_localization_dataset(
+        "JetBrains-Research/lca-bug-localization",
+        dataset_config="py",
+        dataset_split="dev",
+        revision="main",
+    )
+    items = build_langfuse_items_from_hf_tasks(
+        tasks,
+        dataset_name="JetBrains-Research/lca-bug-localization",
+        dataset_config="py",
+        dataset_split="dev",
+        revision="main",
+    )
+
+    assert items[0]["input"]["identity"]["repo_owner"] == "square"
+    assert items[0]["id"] == compute_lca_task_identity(tasks[0])
+    assert items[0]["metadata"]["canonical_task_identity"] == items[0]["id"]
+    assert items[0]["expected_output"] == {"changed_files": ["src/Main.kt"], "changed_files_count": None, "changed_files_exts": None}
+    assert items[0]["metadata"]["source"] == "huggingface"
+    assert items[0]["metadata"]["source_config"] == "py"
+
+
+def test_hf_sync_identity_ignores_source_provenance(monkeypatch):
+    rows = [
+        {
+            "repo_owner": "square",
+            "repo_name": "okhttp",
+            "base_sha": "abc123",
+            "issue_url": "https://example.test/issues/1",
+            "issue_title": "t",
+            "issue_body": "b",
+            "changed_files": ["src/Main.kt"],
+        }
+    ]
+    fake_module = types.SimpleNamespace(utils=types.SimpleNamespace(AuthenticationError=Exception))
+    monkeypatch.setattr(
+        "harness.telemetry.hosted.hf_lca._require_dependency",
+        lambda: types.SimpleNamespace(load_dataset=_FakeDatasets(rows).load_dataset, utils=fake_module.utils),
+    )
+
+    task_py = fetch_hf_localization_dataset("hf", dataset_config="py", dataset_split="dev")[0]
+    task_java = fetch_hf_localization_dataset("hf", dataset_config="java", dataset_split="test")[0]
+
+    assert task_py.identity.dataset_config != task_java.identity.dataset_config
+    assert compute_lca_task_identity(task_py) == compute_lca_task_identity(task_java)
+
+
+def test_hf_sync_upserts_same_logical_item(monkeypatch):
+    rows = [
+        {
+            "repo_owner": "square",
+            "repo_name": "okhttp",
+            "base_sha": "abc123",
+            "issue_url": "https://example.test/issues/1",
+            "issue_title": "t",
+            "issue_body": "b",
+            "changed_files": ["src/Main.kt"],
+        }
+    ]
+    fake_module = types.SimpleNamespace(utils=types.SimpleNamespace(AuthenticationError=Exception))
+    monkeypatch.setattr(
+        "harness.telemetry.hosted.hf_lca._require_dependency",
+        lambda: types.SimpleNamespace(load_dataset=_FakeDatasets(rows).load_dataset, utils=fake_module.utils),
+    )
+
+    class DummyClient:
+        def __init__(self):
+            self.items: dict[str, dict[str, object]] = {}
+
+        def upsert_dataset_item(self, **kwargs):
+            self.items[str(kwargs["id"])] = dict(kwargs)
+
+    client = DummyClient()
+    monkeypatch.setattr("harness.telemetry.hosted.hf_lca.get_langfuse_client", lambda: client)
+
+    first = sync_hf_localization_dataset_to_langfuse(
+        hf_dataset="hf",
+        langfuse_dataset="lca",
+        dataset_config="py",
+        dataset_split="dev",
+    )
+    second = sync_hf_localization_dataset_to_langfuse(
+        hf_dataset="hf",
+        langfuse_dataset="lca",
+        dataset_config="py",
+        dataset_split="dev",
+    )
+
+    assert first[0]["id"] == second[0]["id"]
+    assert list(client.items) == [str(first[0]["id"])]
+    assert client.items[str(first[0]["id"])]["dataset_name"] == "lca"
+
+
+def test_hf_sync_requires_langfuse_upsert(monkeypatch):
+    rows = [
+        {
+            "repo_owner": "square",
+            "repo_name": "okhttp",
+            "base_sha": "abc123",
+            "issue_url": "https://example.test/issues/1",
+            "issue_title": "t",
+            "issue_body": "b",
+            "changed_files": ["src/Main.kt"],
+        }
+    ]
+    fake_module = types.SimpleNamespace(utils=types.SimpleNamespace(AuthenticationError=Exception))
+    monkeypatch.setattr(
+        "harness.telemetry.hosted.hf_lca._require_dependency",
+        lambda: types.SimpleNamespace(load_dataset=_FakeDatasets(rows).load_dataset, utils=fake_module.utils),
+    )
+    monkeypatch.setattr(
+        "harness.telemetry.hosted.hf_lca.get_langfuse_client",
+        lambda: types.SimpleNamespace(create_dataset_item=lambda **_: None),
+    )
+
+    with pytest.raises(HFDatasetLoadError) as excinfo:
+        sync_hf_localization_dataset_to_langfuse(
+            hf_dataset="hf",
+            langfuse_dataset="lca",
+            dataset_config="py",
+            dataset_split="dev",
+        )
+
+    assert excinfo.value.category == "langfuse-client"
 </file>
 
 <file path="tests_harness/test_hf_network_optin.py">
@@ -15211,7 +15563,7 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
+        tasks=[task], dataset_provenance="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is None
     assert result.score_summary is not None
@@ -15238,7 +15590,7 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
+        tasks=[task], dataset_provenance="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.RUNNER
@@ -15260,7 +15612,7 @@ def test_orchestration_evaluation_uses_shared_backend(monkeypatch, tmp_path) -> 
     assert eval_result.control_score == 1.0
 
 
-def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
+def test_backend_accepts_absent_dataset_provenance(monkeypatch, tmp_path) -> None:
     task = _make_task(tmp_path)
     bundle = _bundle()
 
@@ -15270,7 +15622,7 @@ def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="huggingface", worktree_manager=None, parent_trace=None
+        tasks=[task], dataset_provenance=None, worktree_manager=None, parent_trace=None
     )
     assert result.failure is None
     assert result.machine_score == 1.0
@@ -15288,7 +15640,7 @@ def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
+        tasks=[task], dataset_provenance="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING
@@ -15309,7 +15661,7 @@ def test_score_summary_failure_is_typed(monkeypatch, tmp_path) -> None:
         raising=True,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
+        tasks=[task], dataset_provenance="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING
@@ -15661,7 +16013,7 @@ def test_telemetry_builder_is_model_first():
         identity,
         score_summary=score_summary,
         changed_files_count=1,
-        dataset_source="langfuse",
+        dataset_provenance="langfuse",
         repo_language="py",
         repo_license="mit",
         evidence=evidence,
@@ -15675,7 +16027,7 @@ def test_telemetry_builder_is_model_first():
     dumped = envelope.model_dump()
     assert dumped["score_summary"]["composed_score"] == 1.0
     assert dumped["changed_files_count"] == 1
-    assert dumped["dataset_source"] == "langfuse"
+    assert dumped["dataset_provenance"] == "langfuse"
     assert dumped["evidence"]["items"][0]["file"] == "a.py"
     assert dumped["evidence"]["items"][0]["hints"] == ["hint"]
     assert dumped["materialization_events"]["events"] == ["clone", "checkout"]
@@ -16860,7 +17212,7 @@ def test_optimization_completes_and_records_history() -> None:
         task=_task(),
         iterations=1,
         session_id=None,
-        baseline_snapshot=None,
+        baseline_record=None,
         run_trace=RecordingSpan(),
         history=[],
         prepared_tasks=None,
@@ -16881,8 +17233,8 @@ def test_optimization_completes_and_records_history() -> None:
 from __future__ import annotations
 
 from pathlib import Path
-import sys
 import shutil
+import sys
 
 import pytest
 
@@ -16890,7 +17242,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from harness.tools.loop_viz import render_state_machines
+from harness.tools.loop_viz import render_state_machines  # noqa: E402
 
 
 def test_mermaid_render_to_stdout(capsys):
@@ -17671,7 +18023,6 @@ def test_ruff_warning_not_classified_as_failure():
 <file path="tests_harness/test_policy_loader.py">
 from __future__ import annotations
 
-import types
 import pytest
 
 from harness.policy import load as policy_loader
@@ -18218,7 +18569,6 @@ import pytest
 
 from types import SimpleNamespace
 
-from harness.localization.models import LCATask
 import run as run_module
 
 
@@ -18226,7 +18576,7 @@ def test_auto_approve_requires_max_items(monkeypatch, tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     # Stub dataset fetch and projection to reach the yes/max-items validation quickly.
-    monkeypatch.setattr(run_module, "fetch_hf_localization_dataset", lambda *args, **kwargs: [SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))])
+    monkeypatch.setattr(run_module, "fetch_localization_dataset", lambda *args, **kwargs: [SimpleNamespace(task_id="t1", identity=SimpleNamespace(task_id=lambda: "t1"))])
     monkeypatch.setattr(
         run_module,
         "_select_tasks",
@@ -18237,10 +18587,8 @@ def test_auto_approve_requires_max_items(monkeypatch, tmp_path):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     argv = [
         "baseline",
-        "--config",
-        "py",
-        "--split",
-        "dev",
+        "--dataset",
+        "canonical-lca",
         "--yes",
     ]
     with pytest.raises(ValueError):
@@ -18249,8 +18597,6 @@ def test_auto_approve_requires_max_items(monkeypatch, tmp_path):
 
 <file path="tests_harness/test_runner_model.py">
 from __future__ import annotations
-
-import os
 
 from harness.agents.localizer import resolve_runner_model
 
@@ -20251,7 +20597,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     loop_ctx = LoopContext(
         task=task,
         iterations=1,
-        baseline_snapshot=None,
+        baseline_record=None,
         run_trace=_DummySpan(),
     )
     opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
@@ -20336,12 +20682,12 @@ if __name__ == "__main__":
 </file>
 
 <file path="tools/sync_cerebras_models.py">
-from __future__ import annotations
-
 """
 One-off helper to sync Cerebras pricing definitions to Langfuse Cloud Models API.
 Requires LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY (and optional LANGFUSE_BASE_URL) to be set.
 """
+
+from __future__ import annotations
 
 from harness.telemetry.tracing.cerebras_pricing import sync_cerebras_models
 
@@ -21067,15 +21413,17 @@ todo.md
 - Baselines/experiments operate on localization payloads (no symbols); metrics are file-set localization scores.
 
 ## Datasets
-- `fetch_localization_dataset(name, version=None, dataset_config=None, dataset_split=None)` pulls hosted localization tasks.
-- `fetch_localization_dataset_from_source(source, name, version=None, dataset_config=None, dataset_split=None)` supports Langfuse (default) or Hugging Face (`JetBrains-Research/lca-bug-localization`), using typed `LocalizationDatasetSource`. HF loader supports config/split/revision and surfaces failure categories (auth/missing/schema/load).
+- `fetch_localization_dataset(name, version=None)` pulls hosted localization tasks from Langfuse.
+- Langfuse dataset items store the task payload in `input` and `changed_files` gold in `expected_output`.
+- Hugging Face loading is sync-only ingestion tooling used to populate Langfuse datasets. Hosted runtime never loads tasks from Hugging Face.
+- HF sync writes deterministic Langfuse item ids from repo owner/name, `base_sha`, and issue/pull identity; config, split, revision, and dataset name are provenance only.
 - `local_dataset(name, items, ...)` converts local task dicts to `LCATask` instances (normalizes identity/context/gold).
-- Items must include localization identity fields and changed_files; symbol fields are ignored.
+- Items must include localization identity/context fields and `changed_files` gold; symbol fields are ignored.
 
 ## Baselines & Experiments (Localization-first)
-- Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, score summaries, repo metadata, and trace/run ids.
+- Evaluation bundles: derived localization run records keyed by task identity; contain predictions, score summaries, repo metadata, and trace/run ids. Canonical benchmark state remains in Langfuse datasets.
 - Hosted localization baselines/experiments use the documented SDK via `run_hosted_localization_baseline` / `run_hosted_localization_experiment`.
-- Hosted runs accept dataset_source; Langfuse remains default; Hugging Face path uses the HF loader plus `WorktreeManager` for repo@sha checkout caching, emitting dataset source and checkout events in telemetry and stdout summaries.
+- Hosted runs accept Langfuse dataset identity and optional version. `WorktreeManager` resolves repo@sha checkout caching independently from dataset identity.
 - Local runs use `run_localization_task` to resolve a repo checkout, predict, and score; hosted runs emit dataset run ids and telemetry.
 - Cost/usage: Cerebras generations must include `model` and usage (OpenAI-style prompt/completion/total). If the provider omits usage, supply it explicitly; do not emit zeroed usage. Costs are inferred via Langfuse model definitions.
 
@@ -21095,9 +21443,9 @@ Leaf-operation observability remains with:
 - `localization/scoring.py` remains the source of score-context construction; Langfuse stores composed score and named component results.
 
 ## CLI
-- Localization single run: `python run.py --mode localization-single --repo-owner ... --repo-name ... --base-sha ... --issue-title ... --issue-body ... --changed-file path1 --changed-file path2`
-- Localization baseline (hosted dataset): `python run.py --mode localization-baseline --dataset DATASET_NAME [--version v1] [--config py] [--split dev] [--baseline-path bundle.json]`
-- Localization experiment (hosted dataset): `python run.py --mode localization-experiment --dataset DATASET_NAME [--version v1] [--config py] [--split dev]`
+- Localization baseline (hosted Langfuse dataset): `python run.py baseline --dataset DATASET_NAME [--version v1] --max-items 25`
+- Localization experiment (hosted Langfuse dataset): `python run.py experiment --dataset DATASET_NAME [--version v1] --max-items 25`
+- Hugging Face ingestion: `python run.py sync-hf --dataset DATASET_NAME --config py --split dev [--revision REV]`
 - Console output is concise; Langfuse stores detailed traces/scores. `flush_langfuse()` runs on exit.
 - To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.tracing.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/tracing/cerebras_pricing.py`.
 

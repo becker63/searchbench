@@ -103,12 +103,12 @@ def test_resolve_and_bundle_roundtrip(tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     task = _task(str(repo_dir))
-    snap = baselines.compute_baseline_for_task(
+    record = baselines.compute_baseline_for_task(
         task,
         dataset_version="v1",
         runner=lambda task, *_: _runner_result(task, ["a.py"]),
     )
-    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="v1")
+    bundle = baselines.make_baseline_bundle([record], dataset_name=task.identity.dataset_name, dataset_version="v1")
     path = tmp_path / "bundle.json"
     baselines.save_baseline_bundle(bundle, path)
     loaded = baselines.load_baseline_bundle(path)
@@ -140,16 +140,16 @@ def test_baseline_uses_shared_backend(monkeypatch, tmp_path):
         return _eval_result(task)
 
     monkeypatch.setattr(baselines, "evaluate_localization_batch", fake_backend)
-    snap = baselines.compute_baseline_for_task(task, dataset_version="v1", runner=None)
+    record = baselines.compute_baseline_for_task(task, dataset_version="v1", runner=None)
     assert calls
-    assert snap.score_summary.composed_score == 1.0
-    assert snap.prediction.predicted_files == ["a.py"]
+    assert record.score_summary.composed_score == 1.0
+    assert record.prediction.predicted_files == ["a.py"]
 
 
 def test_baseline_dataset_span_gets_aggregates(monkeypatch):
     task = _task()
-    snap_one = _snapshot(task, version="v1")
-    snap_two = _snapshot(task, version="v1", score_hops=1)
+    record_one = _record(task, version="v1")
+    record_two = _record(task, version="v1", score_hops=1)
     emitted: list[dict[str, object]] = []
     updates: list[dict[str, object]] = []
 
@@ -163,7 +163,7 @@ def test_baseline_dataset_span_gets_aggregates(monkeypatch):
         def update(self, **kwargs):
             updates.append(kwargs)
 
-    baselines.emit_baseline_dataset_aggregates(DummySpan(), [snap_one, snap_two])
+    baselines.emit_baseline_dataset_aggregates(DummySpan(), [record_one, record_two])
     names = {item["name"] for item in emitted}
     assert names == {
         "baseline.aggregate_composed_score",
@@ -177,10 +177,10 @@ def test_baseline_dataset_span_gets_aggregates(monkeypatch):
     assert metadata["score_summary"]["aggregate_composed_score"] == 0.75
 
 
-def _snapshot(task: LCATask, version: str = "v1", score_hops: int = 0) -> baselines.BaselineSnapshot:
+def _record(task: LCATask, version: str = "v1", score_hops: int = 0) -> baselines.EvaluationRecord:
     bundle = _score_bundle(score_hops)
     score_summary = summarize_task_score(task.task_id, bundle)
-    return baselines.BaselineSnapshot(
+    return baselines.EvaluationRecord(
         dataset_name=task.identity.dataset_name,
         dataset_config=task.identity.dataset_config,
         dataset_split=task.identity.dataset_split,
@@ -198,19 +198,15 @@ def _snapshot(task: LCATask, version: str = "v1", score_hops: int = 0) -> baseli
 def test_persist_and_load_baseline_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev1")
-    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="rev1")
+    record = _record(task, version="rev1")
+    bundle = baselines.make_baseline_bundle([record], dataset_name=task.identity.dataset_name, dataset_version="rev1")
     path = baselines.persist_baseline_bundle(
         bundle,
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev1",
     )
     expected = baselines.baseline_cache_path(
         task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev1",
         root=tmp_path,
     )
@@ -219,24 +215,20 @@ def test_persist_and_load_baseline_bundle(monkeypatch, tmp_path):
     json.loads(path.read_text())
     loaded = baselines.load_persisted_baseline_bundle(
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev1",
     )
     assert loaded is not None
-    assert loaded.items and loaded.items[0].identity == snap.identity
+    assert loaded.records and loaded.records[0].identity == record.identity
 
 
 def test_run_hosted_localization_baseline_uses_cached_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev2")
-    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="rev2")
+    record = _record(task, version="rev2")
+    bundle = baselines.make_baseline_bundle([record], dataset_name=task.identity.dataset_name, dataset_version="rev2")
     baselines.persist_baseline_bundle(
         bundle,
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev2",
     )
 
@@ -246,23 +238,21 @@ def test_run_hosted_localization_baseline_uses_cached_bundle(monkeypatch, tmp_pa
     def _raise_compute(*args, **kwargs):
         raise AssertionError("compute should not be called")
 
-    monkeypatch.setattr(experiments, "fetch_hf_localization_dataset", _raise_fetch)
+    monkeypatch.setattr(experiments, "fetch_localization_dataset", _raise_fetch)
     monkeypatch.setattr(experiments, "compute_baseline_for_task", _raise_compute)
 
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         version="rev2",
     )
     result = experiments.run_hosted_localization_baseline(req)
-    assert result.items and result.items[0].identity == snap.identity
+    assert result.records and result.records[0].identity == record.identity
 
 
 def test_run_hosted_localization_baseline_persists_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev3")
+    record = _record(task, version="rev3")
     calls = {"compute": 0, "fetch": 0}
 
     def fake_fetch(*args, **kwargs):
@@ -271,51 +261,43 @@ def test_run_hosted_localization_baseline_persists_bundle(monkeypatch, tmp_path)
 
     def fake_compute(*args, **kwargs):
         calls["compute"] += 1
-        return snap
+        return record
 
-    monkeypatch.setattr(experiments, "fetch_hf_localization_dataset", fake_fetch)
+    monkeypatch.setattr(experiments, "fetch_localization_dataset", fake_fetch)
     monkeypatch.setattr(experiments, "compute_baseline_for_task", fake_compute)
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
 
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         version="rev3",
     )
     result = experiments.run_hosted_localization_baseline(req)
     assert calls["fetch"] == 1
     assert calls["compute"] == 1
-    assert result.items and result.items[0].identity == snap.identity
+    assert result.records and result.records[0].identity == record.identity
 
     bundle_path = baselines.baseline_cache_path(
         task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev3",
         root=tmp_path,
     )
     assert bundle_path.exists()
     loaded = baselines.load_persisted_baseline_bundle(
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev3",
     )
     assert loaded is not None
-    assert loaded.items and loaded.items[0].identity == snap.identity
+    assert loaded.records and loaded.records[0].identity == record.identity
 
 
 def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev-hit")
-    bundle = baselines.make_baseline_bundle([snap], dataset_name=task.identity.dataset_name, dataset_version="rev-hit")
+    record = _record(task, version="rev-hit")
+    bundle = baselines.make_baseline_bundle([record], dataset_name=task.identity.dataset_name, dataset_version="rev-hit")
     baselines.persist_baseline_bundle(
         bundle,
         dataset_name=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         dataset_version="rev-hit",
     )
 
@@ -350,17 +332,15 @@ def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(
         experiments,
-        "fetch_hf_localization_dataset",
+        "fetch_localization_dataset",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetch should not run")),
     )
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         version="rev-hit",
     )
     result = experiments.run_hosted_localization_baseline(req)
-    assert result.items and result.items[0].identity == task.task_id
+    assert result.records and result.records[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
     assert names == {
         "baseline.aggregate_composed_score",
@@ -371,13 +351,13 @@ def test_cached_baseline_emits_root_scores(monkeypatch, tmp_path):
     metadata = metadata_updates[-1].get("metadata")
     assert metadata and metadata.get("cache_hit") is True
     assert metadata.get("selected_count") == 1
-    assert metadata["score_summary"]["aggregate_composed_score"] == snap.score_summary.composed_score
+    assert metadata["score_summary"]["aggregate_composed_score"] == record.score_summary.composed_score
 
 
 def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(tmp_path))
     task = _task()
-    snap = _snapshot(task, version="rev-fresh")
+    record = _record(task, version="rev-fresh")
     captured_scores: list[dict[str, object]] = []
     metadata_updates: list[dict[str, object]] = []
 
@@ -409,22 +389,20 @@ def test_fresh_baseline_emits_root_scores(monkeypatch, tmp_path):
     monkeypatch.setattr(experiments, "flush_langfuse", lambda: None)
     monkeypatch.setattr(
         experiments,
-        "fetch_hf_localization_dataset",
+        "fetch_localization_dataset",
         lambda *a, **k: [task],
     )
     monkeypatch.setattr(
         experiments,
         "compute_baseline_for_task",
-        lambda *a, **k: snap,
+        lambda *a, **k: record,
     )
     req = HostedLocalizationBaselineRequest(
         dataset=task.identity.dataset_name,
-        dataset_config=task.identity.dataset_config,
-        dataset_split=task.identity.dataset_split,
         version="rev-fresh",
     )
     result = experiments.run_hosted_localization_baseline(req)
-    assert result.items and result.items[0].identity == task.task_id
+    assert result.records and result.records[0].identity == task.task_id
     names = {item["name"] for item in captured_scores}
     assert names == {
         "baseline.aggregate_composed_score",
@@ -440,7 +418,8 @@ def test_baseline_cache_path_respects_env_and_dataset(monkeypatch, tmp_path):
     cache_root = tmp_path / "baseline_cache"
     monkeypatch.setenv("HARNESS_BASELINE_CACHE_DIR", str(cache_root))
     path = baselines.baseline_cache_path(
-        "JetBrains-Research/lca-bug-localization", dataset_config="py", dataset_split="dev", dataset_version="rev1"
+        "JetBrains-Research/lca-bug-localization",
+        dataset_version="rev1",
     )
-    expected = cache_root / "JetBrains-Research__lca-bug-localization" / "py" / "dev" / "rev1.json"
+    expected = cache_root / "JetBrains-Research__lca-bug-localization" / "rev1.json"
     assert path == expected

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-import sys
 import shutil
+import sys
 
 import pytest
 
@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from harness.tools.loop_viz import render_state_machines
+from harness.tools.loop_viz import render_state_machines  # noqa: E402
 
 
 def test_mermaid_render_to_stdout(capsys):

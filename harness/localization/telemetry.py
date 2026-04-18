@@ -17,7 +17,7 @@ def build_localization_telemetry(
     identity: LCATaskIdentity,
     score_summary: TaskScoreSummary,
     changed_files_count: Optional[int] = None,
-    dataset_source: Optional[str] = None,
+    dataset_provenance: Optional[str] = None,
     repo_language: Optional[str] = None,
     repo_license: Optional[str] = None,
     evidence: Optional[LocalizationEvidence] = None,
@@ -50,7 +50,7 @@ def build_localization_telemetry(
     return LocalizationTelemetryEnvelope(
         identity=identity.task_id(),
         dataset=dataset_block,
-        dataset_source=dataset_source,
+        dataset_provenance=dataset_provenance,
         repo=repo_block,
         score_summary=score_summary,
         changed_files_count=changed_files_count,

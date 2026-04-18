@@ -67,7 +67,7 @@ def prediction_filenames(prediction: LocalizationPrediction) -> list[str]:
 def evaluate_localization_batch(
     tasks: Sequence[LCATask],
     *,
-    dataset_source: str | None = None,
+    dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
@@ -82,7 +82,7 @@ def evaluate_localization_batch(
         try:
             run_result = run_localization_task(
                 task,
-                dataset_source=dataset_source,
+                dataset_provenance=dataset_provenance,
                 worktree_manager=worktree_manager,
                 parent_trace=parent_trace,
                 runner=resolved_runner,

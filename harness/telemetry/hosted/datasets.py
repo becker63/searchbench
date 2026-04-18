@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-import logging
-
-from harness.localization.models import LCATask, normalize_lca_task
-from harness.entrypoints.models.requests import LocalizationDatasetSource
-from harness.telemetry.hosted.hf_lca import HFDatasetLoadError, fetch_hf_localization_dataset
-
+from harness.localization.models import LCAGold, LCATask, normalize_lca_task
 from harness.telemetry.tracing import get_langfuse_client
+
+
+class LocalizationDatasetLoadError(RuntimeError):
+    """Raised when a Langfuse localization dataset item cannot be validated."""
 
 
 class LocalizationDataset(BaseModel):
@@ -24,7 +23,9 @@ class LocalizationDataset(BaseModel):
         return self.items
 
 
-def _defaults(dataset_name: str, dataset_config: str | None, dataset_split: str | None) -> tuple[str, str, str]:
+def _defaults(
+    dataset_name: str, dataset_config: str | None, dataset_split: str | None
+) -> tuple[str, str, str]:
     return (
         dataset_name,
         dataset_config or "unspecified-config",
@@ -49,20 +50,79 @@ def normalize_localization_task(
     return normalize_lca_task(item, defaults=defaults)
 
 
+def _field(raw: object, name: str) -> object:
+    if isinstance(raw, Mapping):
+        return raw.get(name)
+    return getattr(raw, name, None)
+
+
+def _require_mapping(value: object, field_name: str) -> Mapping[str, object]:
+    if isinstance(value, Mapping):
+        return value
+    raise LocalizationDatasetLoadError(
+        f"Langfuse dataset item {field_name} must be an object"
+    )
+
+
+def _expected_gold(expected_output: object) -> LCAGold:
+    expected = _require_mapping(expected_output, "expected_output")
+    try:
+        return LCAGold.model_validate(expected)
+    except Exception as exc:
+        raise LocalizationDatasetLoadError(
+            "Langfuse dataset item expected_output must contain valid changed_files gold"
+        ) from exc
+
+
+def task_from_langfuse_dataset_item(
+    raw: object,
+    *,
+    dataset_name: str,
+) -> LCATask:
+    """
+    Validate one Langfuse dataset item into the canonical localization task model.
+
+    Langfuse owns task payloads in `input` and gold localization data in
+    `expected_output`. Runtime code receives only the reconstructed `LCATask`.
+    """
+
+    input_payload = _require_mapping(_field(raw, "input"), "input")
+    gold = _expected_gold(_field(raw, "expected_output"))
+    task_payload = dict(input_payload)
+    task_payload["gold"] = gold.model_dump()
+    try:
+        return LCATask.model_validate(task_payload)
+    except Exception as exc:
+        raise LocalizationDatasetLoadError(
+            f"Langfuse dataset item input for {dataset_name!r} is not a valid LCATask payload"
+        ) from exc
+
+
+def langfuse_dataset_item_from_task(
+    task: LCATask,
+    *,
+    metadata: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Build the canonical Langfuse dataset item payload for one task."""
+
+    return {
+        "input": task.model_dump(mode="json", exclude={"gold"}),
+        "expected_output": task.gold.model_dump(mode="json"),
+        "metadata": dict(metadata) if metadata else {},
+    }
+
+
 def fetch_localization_dataset(
     name: str,
     version: str | None = None,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
 ) -> list[LCATask]:
     """
     Fetch localization tasks from Langfuse dataset items.
-    Expects each item to include LCA identity fields and changed_files; legacy symbol fields are not used.
     """
     client = get_langfuse_client()
     if not client:
         return []
-    client_any = cast(Any, client)
+    client_any: Any = client
     dataset: Any = None
     try:
         dataset = (
@@ -75,59 +135,21 @@ def fetch_localization_dataset(
     if dataset is None:
         return []
     try:
-        raw_items = dataset.items() if callable(getattr(dataset, "items", None)) else getattr(dataset, "items", [])
+        raw_items = (
+            dataset.items()
+            if callable(getattr(dataset, "items", None))
+            else getattr(dataset, "items", [])
+        )
     except Exception:
         raw_items = []
-    tasks: list[LCATask] = []
-    defaults = _defaults(name, dataset_config, dataset_split)
-    for raw in raw_items:
-        if not isinstance(raw, Mapping):
-            continue
-        # Langfuse typically stores payload under "input"
-        input_section = raw.get("input") if isinstance(raw.get("input"), Mapping) else raw
-        try:
-            tasks.append(normalize_lca_task(cast(Mapping[str, object], input_section), defaults=defaults))
-        except Exception:
-            continue
-    return tasks
 
-
-def fetch_localization_dataset_from_source(
-    source: LocalizationDatasetSource,
-    name: str,
-    version: str | None = None,
-    dataset_config: str | None = None,
-    dataset_split: str | None = None,
-    token: str | None = None,
-) -> list[LCATask]:
-    """
-    Branching loader that supports Langfuse or Hugging Face; retained for internal use.
-    Public CLI should call the HF loader directly.
-    """
-    if source == LocalizationDatasetSource.HUGGINGFACE:
-        try:
-            return fetch_hf_localization_dataset(
-                name,
-                dataset_config=dataset_config,
-                dataset_split=dataset_split,
-                revision=version,
-                token=token,
-            )
-        except HFDatasetLoadError:
-            logging.exception(
-                "HF dataset load failed",
-                extra={
-                    "dataset": name,
-                    "dataset_config": dataset_config,
-                    "dataset_split": dataset_split,
-                    "dataset_version": version,
-                    "dataset_source": source.value,
-                },
-            )
-            raise
-        except Exception as exc:
-            raise HFDatasetLoadError(f"HF dataset load failed unexpectedly: {exc}", category="load") from exc
-    return fetch_localization_dataset(name=name, version=version, dataset_config=dataset_config, dataset_split=dataset_split)
+    return [
+        task_from_langfuse_dataset_item(
+            raw,
+            dataset_name=name,
+        )
+        for raw in raw_items
+    ]
 
 
 def local_dataset(
@@ -138,5 +160,8 @@ def local_dataset(
     dataset_split: str | None = None,
 ) -> LocalizationDataset:
     defaults = _defaults(name, dataset_config, dataset_split)
-    normalized_items = [normalize_lca_task(item, defaults=defaults) for item in items]  # type: ignore[arg-type]
+    normalized_items = [
+        item if isinstance(item, LCATask) else normalize_lca_task(item, defaults=defaults)
+        for item in items
+    ]
     return LocalizationDataset(name=name, version=version, items=normalized_items)

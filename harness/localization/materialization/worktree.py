@@ -96,7 +96,15 @@ class WorktreeManager:
         lock_timeout_seconds: int = 120,
         stale_lock_timeout_seconds: int = 300,
     ) -> None:
-        self.cache_root = cache_root or Path(os.environ.get("HF_LCA_CACHE_DIR", Path.home() / ".cache" / "harness" / "hf_repos"))
+        self.cache_root = cache_root or Path(
+            os.environ.get(
+                "HARNESS_WORKTREE_CACHE_DIR",
+                os.environ.get(
+                    "HF_LCA_CACHE_DIR",
+                    Path.home() / ".cache" / "harness" / "worktrees",
+                ),
+            )
+        )
         self.repo_base_url = repo_base_url or os.environ.get("HF_LCA_REPO_BASE", "https://github.com")
         self.lock_timeout_seconds = lock_timeout_seconds
         self.stale_lock_timeout_seconds = stale_lock_timeout_seconds

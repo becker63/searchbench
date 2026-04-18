@@ -1,12 +1,12 @@
-from __future__ import annotations
-
 """
 Leaf operation: policy pipeline execution (lint/tests/etc.).
 No CLI or session policy; receives normalized inputs only.
 """
 
-from typing import Iterable, List
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Iterable, List
 
 from harness.telemetry.tracing import start_observation
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle

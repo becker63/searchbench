@@ -12,15 +12,17 @@
 - Baselines/experiments operate on localization payloads (no symbols); metrics are file-set localization scores.
 
 ## Datasets
-- `fetch_localization_dataset(name, version=None, dataset_config=None, dataset_split=None)` pulls hosted localization tasks.
-- `fetch_localization_dataset_from_source(source, name, version=None, dataset_config=None, dataset_split=None)` supports Langfuse (default) or Hugging Face (`JetBrains-Research/lca-bug-localization`), using typed `LocalizationDatasetSource`. HF loader supports config/split/revision and surfaces failure categories (auth/missing/schema/load).
+- `fetch_localization_dataset(name, version=None)` pulls hosted localization tasks from Langfuse.
+- Langfuse dataset items store the task payload in `input` and `changed_files` gold in `expected_output`.
+- Hugging Face loading is sync-only ingestion tooling used to populate Langfuse datasets. Hosted runtime never loads tasks from Hugging Face.
+- HF sync writes deterministic Langfuse item ids from repo owner/name, `base_sha`, and issue/pull identity; config, split, revision, and dataset name are provenance only.
 - `local_dataset(name, items, ...)` converts local task dicts to `LCATask` instances (normalizes identity/context/gold).
-- Items must include localization identity fields and changed_files; symbol fields are ignored.
+- Items must include localization identity/context fields and `changed_files` gold; symbol fields are ignored.
 
 ## Baselines & Experiments (Localization-first)
-- Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, score summaries, repo metadata, and trace/run ids.
+- Evaluation bundles: derived localization run records keyed by task identity; contain predictions, score summaries, repo metadata, and trace/run ids. Canonical benchmark state remains in Langfuse datasets.
 - Hosted localization baselines/experiments use the documented SDK via `run_hosted_localization_baseline` / `run_hosted_localization_experiment`.
-- Hosted runs accept dataset_source; Langfuse remains default; Hugging Face path uses the HF loader plus `WorktreeManager` for repo@sha checkout caching, emitting dataset source and checkout events in telemetry and stdout summaries.
+- Hosted runs accept Langfuse dataset identity and optional version. `WorktreeManager` resolves repo@sha checkout caching independently from dataset identity.
 - Local runs use `run_localization_task` to resolve a repo checkout, predict, and score; hosted runs emit dataset run ids and telemetry.
 - Cost/usage: Cerebras generations must include `model` and usage (OpenAI-style prompt/completion/total). If the provider omits usage, supply it explicitly; do not emit zeroed usage. Costs are inferred via Langfuse model definitions.
 
@@ -40,9 +42,9 @@ Leaf-operation observability remains with:
 - `localization/scoring.py` remains the source of score-context construction; Langfuse stores composed score and named component results.
 
 ## CLI
-- Localization single run: `python run.py --mode localization-single --repo-owner ... --repo-name ... --base-sha ... --issue-title ... --issue-body ... --changed-file path1 --changed-file path2`
-- Localization baseline (hosted dataset): `python run.py --mode localization-baseline --dataset DATASET_NAME [--version v1] [--config py] [--split dev] [--baseline-path bundle.json]`
-- Localization experiment (hosted dataset): `python run.py --mode localization-experiment --dataset DATASET_NAME [--version v1] [--config py] [--split dev]`
+- Localization baseline (hosted Langfuse dataset): `python run.py baseline --dataset DATASET_NAME [--version v1] --max-items 25`
+- Localization experiment (hosted Langfuse dataset): `python run.py experiment --dataset DATASET_NAME [--version v1] --max-items 25`
+- Hugging Face ingestion: `python run.py sync-hf --dataset DATASET_NAME --config py --split dev [--revision REV]`
 - Console output is concise; Langfuse stores detailed traces/scores. `flush_langfuse()` runs on exit.
 - To sync Cerebras pricing to Langfuse Cloud Models API: `python -c "from harness.telemetry.tracing.cerebras_pricing import sync_cerebras_models; sync_cerebras_models()"` (requires Langfuse Cloud credentials). Pricing entries live in `telemetry/tracing/cerebras_pricing.py`.
 
