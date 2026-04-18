@@ -9,10 +9,10 @@ from harness.localization.errors import (
 )
 from harness.localization.runtime.records import build_localization_score_eval_record
 from harness.localization.scoring import build_localization_score_context
-from harness.localization.materialization.materialize import (
+from harness.localization.materialization.worktree import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
-    RepoMaterializer,
+    WorktreeManager,
 )
 from harness.localization.models import (
     LCATask,
@@ -43,10 +43,10 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
             pass
 
 
-def _materialize_repo(
-    task: LCATask, materializer: RepoMaterializer | None
+def _get_repo_checkout(
+    task: LCATask, worktree_manager: WorktreeManager | None
 ) -> RepoMaterializationResult | None:
-    if materializer is None:
+    if worktree_manager is None:
         return None
     request = RepoMaterializationRequest(
         dataset_name=task.identity.dataset_name,
@@ -56,21 +56,21 @@ def _materialize_repo(
         repo_name=task.identity.repo_name,
         base_sha=task.identity.base_sha,
     )
-    return materializer.materialize(request)
+    return worktree_manager.get_or_create(request)
 
 
 def _resolve_repo_path(
-    task: LCATask, materialization_result: RepoMaterializationResult | None
+    task: LCATask, checkout_result: RepoMaterializationResult | None
 ) -> Path:
     repo_path: Path | None = (
-        materialization_result.local_path if materialization_result else None
+        checkout_result.local_path if checkout_result else None
     )
     if repo_path is None and task.repo:
         repo_path = Path(task.repo).expanduser()
     if repo_path is None:
         raise LocalizationEvaluationError(
             LocalizationFailureCategory.MATERIALIZATION,
-            "Localization task is missing a repo path; provide a materializer or task.repo",
+            "Localization task is missing a repo path; provide a WorktreeManager or task.repo",
             task_id=task.task_id,
         )
     if not repo_path.exists():
@@ -236,7 +236,7 @@ def _emit_telemetry(
 def run_localization_task(
     task: LCATask,
     dataset_source: str | None = None,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: Callable[
         [LCATask, str, object | None], LocalizationRunResult
@@ -251,11 +251,11 @@ def run_localization_task(
 ]:
     """
     Execute a single localization task end to end (leaf helper):
-    - materialize repo at base_sha (if a materializer is provided)
+    - resolve repo@sha checkout through WorktreeManager when provided
     - run the localization agent/backend to produce predicted_files
     - score using static-graph score bundles
     - emit task-level telemetry
-    Returns prediction, score bundle, optional evidence, materialization details, and token usage.
+    Returns prediction, score bundle, optional evidence, checkout details, and token usage.
     """
 
     with start_observation(
@@ -272,14 +272,14 @@ def run_localization_task(
         },
     ) as trace:
         try:
-            materialization_result = _materialize_repo(task, materializer)
+            checkout_result = _get_repo_checkout(task, worktree_manager)
         except Exception as exc:
             raise LocalizationEvaluationError(
                 LocalizationFailureCategory.MATERIALIZATION,
                 str(exc),
                 task_id=task.task_id,
             ) from exc
-        repo_path = _resolve_repo_path(task, materialization_result)
+        repo_path = _resolve_repo_path(task, checkout_result)
         runner_result = _run_runner(task, repo_path, trace, runner)
         prediction = runner_result.prediction
         usage = extract_token_usage_record(
@@ -291,11 +291,11 @@ def run_localization_task(
             task=task,
             score_bundle=score_bundle,
             evidence=task.evidence,
-            materialization=materialization_result,
+            materialization=checkout_result,
             dataset_source=dataset_source,
             trace=trace,
             predicted_files=prediction.normalized_predicted_files(),
             changed_files=task.gold.normalized_changed_files(),
             score_prefix=_score_prefix_from_runner_result(runner_result),
         )
-        return prediction, score_bundle, task.evidence, materialization_result, usage
+        return prediction, score_bundle, task.evidence, checkout_result, usage

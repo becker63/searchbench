@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from harness.localization.materialization.materialize import RepoMaterializer
+from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationResult,
@@ -52,7 +52,7 @@ class EvaluateLocalizationBatch(Protocol):
         tasks: Sequence[LCATask],
         *,
         dataset_source: str | None = None,
-        materializer: RepoMaterializer | None = None,
+        worktree_manager: WorktreeManager | None = None,
         parent_trace: object | None = None,
         runner: LocalizationRunner | None = None,
     ) -> LocalizationEvaluationResult: ...

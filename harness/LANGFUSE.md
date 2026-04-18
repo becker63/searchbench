@@ -20,8 +20,8 @@
 ## Baselines & Experiments (Localization-first)
 - Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, score summaries, repo metadata, and trace/run ids.
 - Hosted localization baselines/experiments use the documented SDK via `run_hosted_localization_baseline` / `run_hosted_localization_experiment`.
-- Hosted runs accept dataset_source; Langfuse remains default; Hugging Face path uses HF loader and HF repo materializer, emitting dataset source and materialization events in telemetry and stdout summaries.
-- Local runs use `run_localization_task` to materialize, predict, and score; hosted runs emit dataset run ids and telemetry.
+- Hosted runs accept dataset_source; Langfuse remains default; Hugging Face path uses the HF loader plus `WorktreeManager` for repo@sha checkout caching, emitting dataset source and checkout events in telemetry and stdout summaries.
+- Local runs use `run_localization_task` to resolve a repo checkout, predict, and score; hosted runs emit dataset run ids and telemetry.
 - Cost/usage: Cerebras generations must include `model` and usage (OpenAI-style prompt/completion/total). If the provider omits usage, supply it explicitly; do not emit zeroed usage. Costs are inferred via Langfuse model definitions.
 
 ## Tracing & Scoring

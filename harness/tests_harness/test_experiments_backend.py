@@ -87,7 +87,7 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
         dataset_split="s",
         session=None,
     )
-    result = experiments.run_hosted_localization_experiment(req, materializer=None)
+    result = experiments.run_hosted_localization_experiment(req, worktree_manager=None)
     assert calls
     assert isinstance(calls[0]["tasks"][0], LCATask)
     assert result.items[0].prediction == ["a.py"]
@@ -149,7 +149,7 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
         session=None,
         max_workers=2,
     )
-    result = experiments.run_hosted_localization_experiment(req, materializer=None, tasks=tasks)
+    result = experiments.run_hosted_localization_experiment(req, worktree_manager=None, tasks=tasks)
     assert [item.prediction[0] for item in result.items] == [t1.task_id, t2.task_id]
     assert result.failure is None
 
@@ -177,7 +177,7 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
         session=None,
         max_workers=2,
     )
-    result = experiments.run_hosted_localization_experiment(req, materializer=None, tasks=[t1, t2])
+    result = experiments.run_hosted_localization_experiment(req, worktree_manager=None, tasks=[t1, t2])
     assert result.failure is not None
     assert result.failure.task_id == t2.task_id
     # Only the successful task (t1) should be in results, ordered
@@ -205,7 +205,7 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
         session=None,
         max_workers=1,
     )
-    result = experiments.run_hosted_localization_experiment(req, materializer=None, tasks=[t2, t1])
+    result = experiments.run_hosted_localization_experiment(req, worktree_manager=None, tasks=[t2, t1])
     assert calls == [t1.task_id, t2.task_id]
     assert [item.prediction[0] for item in result.items] == [t1.task_id, t2.task_id]
     assert result.failure is None
@@ -216,4 +216,4 @@ def test_missing_parent_trace_guard(monkeypatch, tmp_path):
     repo_root.mkdir()
     task = _task(str(repo_root / "r1"))
     with pytest.raises(experiments._TaskFailure):
-        experiments._run_experiment_task(task=task, parent_trace=None, materializer=None, session_id=None)
+        experiments._run_experiment_task(task=task, parent_trace=None, worktree_manager=None, session_id=None)

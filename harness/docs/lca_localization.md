@@ -18,16 +18,16 @@
 - **Phase B (finalization)**: separate no-tools request with strict JSON schema (`predicted_files`, `reasoning`, optional `evidence`); enforces shape via `response_format: json_schema`.
 - **Evaluation**: score structured prediction against gold `changed_files` through static graph resolution; telemetry emits score bundle results post-run.
 
-## Repo Materialization
-- Inputs: dataset/config/split, repo_owner/name, `base_sha`.
-- HF source: cached bare git mirror + per-task worktree checkout at `base_sha` with per-key lock, completion marker, and cache validation (worktree HEAD is checked against `base_sha` on reuse); stale locks and incomplete caches are pruned under the lock.
+## Repo Checkout Cache
+- Inputs: repo_owner/name and `base_sha`; dataset/config/split are task metadata and do not define checkout cache identity.
+- `WorktreeManager`: cached bare git mirror + repo@sha worktree checkout at `base_sha` with per-key lock, completion marker, and cache validation (worktree HEAD is checked against `base_sha` on reuse); stale locks and incomplete caches are pruned under the lock.
 - Outputs: local path at `base_sha`, cache hit/miss, cache_validated, mirror_fetched, worktree_created, checkout_verified, logs/events.
 - CLI logs: dataset/config/split, dataset source (langfuse|huggingface), cache hit/miss, git fetch/worktree/verification status, checkout `base_sha`, ready path, summary printed to stdout.
-- Telemetry: includes dataset source and materialization events; failure categories surfaced (lock, auth/fetch, checkout verification, cache corruption).
+- Telemetry: Langfuse owns dataset/experiment context; WorktreeManager emits checkout/cache events; runtime execution consumes the local checkout path. Failure categories are surfaced for lock, auth/fetch, checkout verification, and cache corruption.
 
 ## Dataset Source (HF-only public CLI)
 - Public CLI baseline/experiment commands use the Hugging Face LCA dataset (`JetBrains-Research/lca-bug-localization`) directly, resolved via config/split/revision.
-- Repo materialization still locks/cache-validates HF mirrors/worktrees per task (repo + base_sha), and logs materialization events as before.
+- WorktreeManager still locks/cache-validates mirrors/worktrees per repo + base_sha, and logs checkout events as before.
 
 ## CLI Examples (HF-only)
 - Baseline: `python run.py baseline --config py --split dev --max-items 25`
@@ -47,7 +47,7 @@
 
 ## Shared Evaluation Backend (Machine + Hosted)
 - A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.
-- The optimization/repair state machine invokes the backend through the evaluation hook (`evaluate_policy_on_item`) under a machine-owned evaluation span; LCA backend opens child task/materialization spans.
+- The optimization/repair state machine invokes the backend through the evaluation hook (`evaluate_policy_on_item`) under a machine-owned evaluation span; LCA backend opens child task/checkout spans.
 - Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they emit localization-native score bundle summaries and outputs.
 - Machine-facing scores use explicit `machine_score` semantics: `machine_score == score_summary.aggregate_composed_score`. There is no policy selector over file-set fields.
 - Rollback should be treated as an implementation revert/emergency only, not a co-equal path; the shared backend remains the canonical evaluation route.

@@ -13,10 +13,8 @@ from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
 )
-from harness.localization.materialization.materialize import (
-    RepoMaterializationResult,
-    RepoMaterializer,
-)
+from harness.localization.materialization.worktree import RepoMaterializationResult
+from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
@@ -251,7 +249,7 @@ def compute_baseline_for_task(
     ]
     | None = None,
     dataset_source: str | None = None,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
 ) -> BaselineSnapshot:
     with propagate_context(session_id=session_id):
         with start_observation(
@@ -268,7 +266,7 @@ def compute_baseline_for_task(
             eval_result = evaluate_localization_batch(
                 tasks=[task],
                 dataset_source=dataset_source,
-                materializer=materializer,
+                worktree_manager=worktree_manager,
                 parent_trace=trace,
                 runner=runner,
             )

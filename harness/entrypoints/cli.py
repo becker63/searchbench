@@ -25,8 +25,7 @@ from harness.localization.runtime.evaluate import (
     LocalizationRunner,
     evaluate_localization_batch as _evaluate_localization_batch,
 )
-from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
-from harness.localization.materialization.materialize import RepoMaterializer
+from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import LCATask
 from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
 from harness.telemetry.hosted.experiments import (
@@ -136,7 +135,7 @@ def evaluate_localization_batch(
     tasks: Sequence[LCATask],
     *,
     dataset_source: str | None = None,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
 ):
@@ -146,7 +145,7 @@ def evaluate_localization_batch(
     return _evaluate_localization_batch(
         tasks,
         dataset_source=dataset_source,
-        materializer=materializer,
+        worktree_manager=worktree_manager,
         parent_trace=parent_trace,
         runner=runner,
     )
@@ -271,18 +270,13 @@ def _invalidate_baseline_cache(bundle_path: Path) -> None:
     print(f"[CACHE] Baseline cache not found at {cache_path}; nothing to invalidate.")
 
 
-def _invalidate_materialized_repos_for_tasks(
-    tasks: Sequence[LCATask], materializer: RepoMaterializer
+def _invalidate_worktree_checkouts_for_tasks(
+    tasks: Sequence[LCATask], worktree_manager: WorktreeManager
 ) -> list[str]:
     """
     Best-effort targeted invalidation of repo worktree caches for selected tasks.
     """
-    invalidator = getattr(materializer, "invalidate_tasks", None)
-    if not callable(invalidator):
-        print("[CACHE] Repo worktree cache invalidation unavailable for materializer.")
-        return []
-    raw_events = invalidator(tasks)
-    events = [str(event) for event in raw_events] if isinstance(raw_events, list) else []
+    events = [str(event) for event in worktree_manager.invalidate_tasks(tasks)]
     print(
         f"[CACHE] Repo worktree cache invalidated for {len(tasks)} selected task(s)"
     )
@@ -516,7 +510,7 @@ def main(argv: list[str] | None = None) -> None:
     ensure_langfuse_auth()
     if args.max_workers is not None and args.max_workers <= 0:
         raise ValueError("--max-workers must be a positive integer")
-    materializer = HuggingFaceRepoMaterializer()
+    worktree_manager = WorktreeManager()
     session_cfg = _build_session_config(
         args.command or "cli", args.session_id, args.allow_session_fallback
     )
@@ -564,7 +558,7 @@ def main(argv: list[str] | None = None) -> None:
                 return
             if baseline_bundle_path and getattr(args, "invalidate_baseline_cache", False):
                 _invalidate_baseline_cache(baseline_bundle_path)
-                _invalidate_materialized_repos_for_tasks(selected_tasks, materializer)
+                _invalidate_worktree_checkouts_for_tasks(selected_tasks, worktree_manager)
             req = HostedLocalizationBaselineRequest(
                 dataset=HF_DATASET_NAME,
                 version=args.revision,
@@ -578,7 +572,7 @@ def main(argv: list[str] | None = None) -> None:
                 projection=projection,
             )
             bundle = run_hosted_localization_baseline(
-                req, materializer=materializer, tasks=selected_tasks
+                req, worktree_manager=worktree_manager, tasks=selected_tasks
             )
             if bundle is None:
                 print("[RUN] Baseline run returned no bundle; skipping summary.")
@@ -636,7 +630,7 @@ def main(argv: list[str] | None = None) -> None:
                 projection=projection,
             )
             results = run_hosted_localization_experiment(
-                req, materializer=materializer, tasks=selected_tasks
+                req, worktree_manager=worktree_manager, tasks=selected_tasks
             )
             print(f"[RUN] Localization items completed: {len(results.items)}")
             failure = getattr(results, "failure", None)

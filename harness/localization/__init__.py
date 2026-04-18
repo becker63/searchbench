@@ -10,7 +10,8 @@ from .models import (
 )
 from .scoring import build_localization_score_context, score_localization
 from .runtime.records import localization_eval_identity
-from .materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer
+from .materialization.worktree import RepoMaterializationRequest, RepoMaterializationResult
+from .materialization.worktree import WorktreeManager
 from .telemetry import build_localization_telemetry
 from . import static_graph
 
@@ -23,7 +24,7 @@ __all__ = [
     "LocalizationRunResult",
     "RepoMaterializationRequest",
     "RepoMaterializationResult",
-    "RepoMaterializer",
+    "WorktreeManager",
     "build_localization_score_context",
     "build_localization_telemetry",
     "localization_eval_identity",

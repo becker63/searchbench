@@ -8,7 +8,7 @@ import pytest
 
 import run as run_module
 from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest
-from harness.localization.materialization.materialize import RepoMaterializationRequest, describe_repo_mapping
+from harness.localization.materialization.worktree import RepoMaterializationRequest, WorktreeManager
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.telemetry.hosted.baselines import baseline_cache_path
 from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
@@ -61,11 +61,8 @@ def _stub_cli_baseline(monkeypatch, tmp_path, run_stub, cache_root=None, baselin
     return hf_cache_dir, baseline_cache_dir
 
 
-def _cache_key(request: RepoMaterializationRequest) -> str:
-    return describe_repo_mapping(request).replace(":", "__").replace("/", "__")
-
-
 def _worktree_path(cache_root, *, repo_owner: str = "o", repo_name: str = "r", base_sha: str = "b", config: str = "py"):
+    manager = WorktreeManager(cache_root=cache_root)
     request = RepoMaterializationRequest(
         dataset_name=run_module.harness_run.HF_DATASET_NAME,
         dataset_config=config,
@@ -74,7 +71,7 @@ def _worktree_path(cache_root, *, repo_owner: str = "o", repo_name: str = "r", b
         repo_name=repo_name,
         base_sha=base_sha,
     )
-    return cache_root / "worktrees" / _cache_key(request)
+    return manager._worktree_path(manager._cache_key(request))  # pyright: ignore[reportPrivateUsage]
 
 
 def test_parse_defaults():
@@ -268,7 +265,7 @@ def test_max_workers_validation():
 def test_cli_fresh_session_per_invocation(monkeypatch, tmp_path):
     sessions: list[SessionConfig | None] = []
 
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         sessions.append(req.session)
         return SimpleNamespace(items=[], failure=None)
 
@@ -290,7 +287,7 @@ def test_cli_fresh_session_per_invocation(monkeypatch, tmp_path):
 def test_cli_respects_explicit_session_id(monkeypatch, tmp_path):
     sessions: list[SessionConfig | None] = []
 
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         sessions.append(req.session)
         return SimpleNamespace(items=[], failure=None)
 
@@ -317,7 +314,7 @@ def test_cli_respects_explicit_session_id(monkeypatch, tmp_path):
 def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys):
     calls = []
 
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         calls.append(True)
         return SimpleNamespace(items=[], failure=None)
 
@@ -363,7 +360,7 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
 def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys):
     calls = []
 
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         calls.append(True)
         return SimpleNamespace(items=[], failure=None)
 
@@ -405,7 +402,7 @@ def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys
 
 
 def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypatch, tmp_path):
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         return SimpleNamespace(items=[], failure=None)
 
     selected_task = _task(

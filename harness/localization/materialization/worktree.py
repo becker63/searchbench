@@ -6,15 +6,87 @@ import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
+from pydantic import BaseModel, ConfigDict
+
 from harness.localization.models import LCATask
 
-from .materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer, describe_repo_mapping
+__all__ = [
+    "MaterializationError",
+    "RepoMaterializationRequest",
+    "RepoMaterializationResult",
+    "WorktreeManager",
+]
 
 
-class HuggingFaceRepoMaterializer(RepoMaterializer):
+class RepoMaterializationRequest(BaseModel):
     """
-    Repo materializer for HF-backed LCA tasks using a cached bare git mirror + per-task worktree.
-    Concurrency is enforced per cache key via a lock file; partial builds are never reused.
+    Input contract for repo@sha checkout resolution.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dataset_name: str
+    dataset_config: str
+    dataset_split: str
+    repo_owner: str
+    repo_name: str
+    base_sha: str
+    archive_uri: Optional[str] = None
+
+
+class RepoMaterializationResult(BaseModel):
+    """
+    Output contract for repo@sha checkout resolution.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    local_path: Optional[Path] = None
+    cache_hit: Optional[bool] = None
+    cache_validated: Optional[bool] = None
+    mirror_fetched: Optional[bool] = None
+    worktree_created: Optional[bool] = None
+    checkout_verified: Optional[bool] = None
+    logs: list[str] = []
+    events: list[str] = []
+
+    def describe_mapping(self) -> str:
+        """
+        Human-readable description of how the repo@sha checkout was resolved.
+        """
+        return (
+            f"path={self.local_path}, cache_hit={self.cache_hit}, cache_validated={self.cache_validated}, "
+            f"mirror_fetched={self.mirror_fetched}, worktree_created={self.worktree_created}, "
+            f"checkout_verified={self.checkout_verified}"
+        )
+
+    def summary(self) -> str:
+        """
+        Concise human-readable summary for CLI/logs.
+        """
+        path = str(self.local_path) if self.local_path else "unset"
+        status_parts = []
+        if self.cache_hit is not None:
+            status_parts.append(f"cache_hit={self.cache_hit}")
+        if self.cache_validated is not None:
+            status_parts.append(f"cache_validated={self.cache_validated}")
+        if self.mirror_fetched is not None:
+            status_parts.append(f"mirror_fetched={self.mirror_fetched}")
+        if self.worktree_created is not None:
+            status_parts.append(f"worktree_created={self.worktree_created}")
+        if self.checkout_verified is not None:
+            status_parts.append(f"checkout_verified={self.checkout_verified}")
+        status = ", ".join(status_parts) if status_parts else "status=unknown"
+        log_tail = f"; logs={self.logs[-1]}" if self.logs else ""
+        return f"{path} ({status}){log_tail}"
+
+
+class WorktreeManager:
+    """
+    Worktree-backed checkout cache for repo@sha resolution.
+
+    Construction is cheap. The side-effectful mirror fetch, worktree creation,
+    validation, and rebuild flow happens only in get_or_create().
     """
 
     def __init__(
@@ -29,14 +101,14 @@ class HuggingFaceRepoMaterializer(RepoMaterializer):
         self.lock_timeout_seconds = lock_timeout_seconds
         self.stale_lock_timeout_seconds = stale_lock_timeout_seconds
 
-    def materialize(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
-        cache_key = _cache_key_for_request(request)
-        worktree_root = self.cache_root / "worktrees" / cache_key
+    def get_or_create(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
+        cache_key = self._cache_key(request)
+        worktree_root = self._worktree_path(cache_key)
         mirror_root = self.cache_root / "mirrors"
-        lock_path = self.cache_root / "locks" / f"{cache_key}.lock"
+        lock_path = self._lock_path(cache_key)
         completion_marker = worktree_root / ".complete"
-        repo_url = f"{self.repo_base_url.rstrip('/')}/{request.repo_owner}/{request.repo_name}.git"
-        mirror_path = mirror_root / f"{request.repo_owner}__{request.repo_name}.git"
+        repo_url = self._repo_url(request)
+        mirror_path = self._mirror_path(request)
         self.cache_root.mkdir(parents=True, exist_ok=True)
         mirror_root.mkdir(parents=True, exist_ok=True)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,13 +184,13 @@ class HuggingFaceRepoMaterializer(RepoMaterializer):
             events=logs,
         )
 
-    def invalidate_request_cache(self, request: RepoMaterializationRequest) -> list[str]:
-        """Remove the cached worktree for one materialization request, if present."""
+    def invalidate(self, request: RepoMaterializationRequest) -> list[str]:
+        """Remove the cached worktree for one repo@sha checkout, if present."""
 
-        cache_key = _cache_key_for_request(request)
-        worktree_root = self.cache_root / "worktrees" / cache_key
-        mirror_path = self.cache_root / "mirrors" / f"{request.repo_owner}__{request.repo_name}.git"
-        lock_path = self.cache_root / "locks" / f"{cache_key}.lock"
+        cache_key = self._cache_key(request)
+        worktree_root = self._worktree_path(cache_key)
+        mirror_path = self._mirror_path(request)
+        lock_path = self._lock_path(cache_key)
         self.cache_root.mkdir(parents=True, exist_ok=True)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         logs: list[str] = []
@@ -139,20 +211,38 @@ class HuggingFaceRepoMaterializer(RepoMaterializer):
         events: list[str] = []
         seen: set[str] = set()
         for task in tasks:
-            request = RepoMaterializationRequest(
-                dataset_name=task.identity.dataset_name,
-                dataset_config=task.identity.dataset_config,
-                dataset_split=task.identity.dataset_split,
-                repo_owner=task.identity.repo_owner,
-                repo_name=task.identity.repo_name,
-                base_sha=task.identity.base_sha,
-            )
-            cache_key = _cache_key_for_request(request)
+            request = self._request_for_task(task)
+            cache_key = self._cache_key(request)
             if cache_key in seen:
                 continue
             seen.add(cache_key)
-            events.extend(self.invalidate_request_cache(request))
+            events.extend(self.invalidate(request))
         return events
+
+    def _cache_key(self, request: RepoMaterializationRequest) -> str:
+        return _cache_key_for_request(request)
+
+    def _worktree_path(self, cache_key: str) -> Path:
+        return self.cache_root / "worktrees" / cache_key
+
+    def _lock_path(self, cache_key: str) -> Path:
+        return self.cache_root / "locks" / f"{cache_key}.lock"
+
+    def _mirror_path(self, request: RepoMaterializationRequest) -> Path:
+        return self.cache_root / "mirrors" / f"{request.repo_owner}__{request.repo_name}.git"
+
+    def _repo_url(self, request: RepoMaterializationRequest) -> str:
+        return f"{self.repo_base_url.rstrip('/')}/{request.repo_owner}/{request.repo_name}.git"
+
+    def _request_for_task(self, task: LCATask) -> RepoMaterializationRequest:
+        return RepoMaterializationRequest(
+            dataset_name=task.identity.dataset_name,
+            dataset_config=task.identity.dataset_config,
+            dataset_split=task.identity.dataset_split,
+            repo_owner=task.identity.repo_owner,
+            repo_name=task.identity.repo_name,
+            base_sha=task.identity.base_sha,
+        )
 
 
 class MaterializationError(RuntimeError):
@@ -313,7 +403,7 @@ def _remove_cached_worktree(mirror_path: Path, worktree_path: Path, logs: List[s
 
 
 def _cache_key_for_request(request: RepoMaterializationRequest) -> str:
-    return describe_repo_mapping(request).replace(":", "__").replace("/", "__")
+    return f"{request.repo_owner}__{request.repo_name}@{request.base_sha}"
 
 
 def _pid_alive(pid: int) -> bool:

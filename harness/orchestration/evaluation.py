@@ -60,7 +60,7 @@ def evaluate_policy_on_item(
     eval_result = evaluate_localization_batch(
         tasks=[task],
         dataset_source=None,
-        materializer=None,
+        worktree_manager=None,
         parent_trace=iteration_span,
     )
     if eval_result.failure:

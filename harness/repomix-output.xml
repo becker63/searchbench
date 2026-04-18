@@ -64,8 +64,7 @@ entrypoints/
 localization/
   materialization/
     __init__.py
-    hf_materialize.py
-    materialize.py
+    worktree.py
   runtime/
     __init__.py
     evaluate.py
@@ -156,7 +155,6 @@ tests_harness/
   test_failure_context_budget.py
   test_filesystem_guard.py
   test_hf_loader.py
-  test_hf_materializer.py
   test_hf_network_optin.py
   test_localization_evaluation_backend.py
   test_localization_score_models.py
@@ -188,6 +186,7 @@ tests_harness/
   test_token_usage.py
   test_tracing_wrappers.py
   test_type_loader.py
+  test_worktree_manager.py
   test_writer.py
 tools/
   loop_viz.py
@@ -2229,16 +2228,16 @@ def serialize_tool_result_for_model(result: Any) -> str:
 - **Phase B (finalization)**: separate no-tools request with strict JSON schema (`predicted_files`, `reasoning`, optional `evidence`); enforces shape via `response_format: json_schema`.
 - **Evaluation**: score structured prediction against gold `changed_files` through static graph resolution; telemetry emits score bundle results post-run.
 
-## Repo Materialization
-- Inputs: dataset/config/split, repo_owner/name, `base_sha`.
-- HF source: cached bare git mirror + per-task worktree checkout at `base_sha` with per-key lock, completion marker, and cache validation (worktree HEAD is checked against `base_sha` on reuse); stale locks and incomplete caches are pruned under the lock.
+## Repo Checkout Cache
+- Inputs: repo_owner/name and `base_sha`; dataset/config/split are task metadata and do not define checkout cache identity.
+- `WorktreeManager`: cached bare git mirror + repo@sha worktree checkout at `base_sha` with per-key lock, completion marker, and cache validation (worktree HEAD is checked against `base_sha` on reuse); stale locks and incomplete caches are pruned under the lock.
 - Outputs: local path at `base_sha`, cache hit/miss, cache_validated, mirror_fetched, worktree_created, checkout_verified, logs/events.
 - CLI logs: dataset/config/split, dataset source (langfuse|huggingface), cache hit/miss, git fetch/worktree/verification status, checkout `base_sha`, ready path, summary printed to stdout.
-- Telemetry: includes dataset source and materialization events; failure categories surfaced (lock, auth/fetch, checkout verification, cache corruption).
+- Telemetry: Langfuse owns dataset/experiment context; WorktreeManager emits checkout/cache events; runtime execution consumes the local checkout path. Failure categories are surfaced for lock, auth/fetch, checkout verification, and cache corruption.
 
 ## Dataset Source (HF-only public CLI)
 - Public CLI baseline/experiment commands use the Hugging Face LCA dataset (`JetBrains-Research/lca-bug-localization`) directly, resolved via config/split/revision.
-- Repo materialization still locks/cache-validates HF mirrors/worktrees per task (repo + base_sha), and logs materialization events as before.
+- WorktreeManager still locks/cache-validates mirrors/worktrees per repo + base_sha, and logs checkout events as before.
 
 ## CLI Examples (HF-only)
 - Baseline: `python run.py baseline --config py --split dev --max-items 25`
@@ -2258,7 +2257,7 @@ def serialize_tool_result_for_model(result: Any) -> str:
 
 ## Shared Evaluation Backend (Machine + Hosted)
 - A shared localization evaluation backend (`evaluate_localization_batch`) executes per-task localization via `run_localization_task`, aggregates scores, and surfaces typed failures (`materialization`, `runner`, `scoring`, `unknown`) without string matching.
-- The optimization/repair state machine invokes the backend through the evaluation hook (`evaluate_policy_on_item`) under a machine-owned evaluation span; LCA backend opens child task/materialization spans.
+- The optimization/repair state machine invokes the backend through the evaluation hook (`evaluate_policy_on_item`) under a machine-owned evaluation span; LCA backend opens child task/checkout spans.
 - Hosted baseline/experiment wrappers reuse the same backend and remain imperative shells; they emit localization-native score bundle summaries and outputs.
 - Machine-facing scores use explicit `machine_score` semantics: `machine_score == score_summary.aggregate_composed_score`. There is no policy selector over file-set fields.
 - Rollback should be treated as an implementation revert/emergency only, not a co-equal path; the shared backend remains the canonical evaluation route.
@@ -2339,7 +2338,7 @@ By default both machines are rendered; use `--machine optimization` or `--machin
 
 - Run/root spans are created once by `orchestration/machine.py` before state machine execution; entrypoints may nest under an external parent but do not create iteration/repair roots.
 - Iteration/repair spans and high-level metrics are listener/state-machine owned. Dependency wiring lives in `orchestration/dependencies.py`, policy evaluation in `orchestration/evaluation.py`, and repair writer support in `orchestration/writer.py`.
-- Evaluation spans are opened by the machine-owned evaluation hook (state-machine layer) and passed as parents to the shared LCA evaluation backend; LCA opens child dataset/task/materialization spans under that parent.
+- Evaluation spans are opened by the machine-owned evaluation hook (state-machine layer) and passed as parents to the shared LCA evaluation backend; LCA opens child dataset/task/checkout spans under that parent.
 - Leaf modules (`agents/writer.py`, pipeline helpers, baselines) emit child spans only; they require a parent span and must fail/guard rather than create new roots unless an explicit, documented no-op is chosen.
 - Allowed leaf spans: writer attempts, backend/model/tool calls, usage/cost/latency, pipeline steps, baseline items — all attached to provided parents.
 - Disallowed patterns: leaf-created roots, competing iteration/repair spans, split ownership of high-level scores, silent root creation when no parent is provided.
@@ -2446,8 +2445,7 @@ from harness.localization.runtime.evaluate import (
     LocalizationRunner,
     evaluate_localization_batch as _evaluate_localization_batch,
 )
-from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
-from harness.localization.materialization.materialize import RepoMaterializer
+from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import LCATask
 from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
 from harness.telemetry.hosted.experiments import (
@@ -2557,7 +2555,7 @@ def evaluate_localization_batch(
     tasks: Sequence[LCATask],
     *,
     dataset_source: str | None = None,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
 ):
@@ -2567,7 +2565,7 @@ def evaluate_localization_batch(
     return _evaluate_localization_batch(
         tasks,
         dataset_source=dataset_source,
-        materializer=materializer,
+        worktree_manager=worktree_manager,
         parent_trace=parent_trace,
         runner=runner,
     )
@@ -2692,18 +2690,13 @@ def _invalidate_baseline_cache(bundle_path: Path) -> None:
     print(f"[CACHE] Baseline cache not found at {cache_path}; nothing to invalidate.")
 
 
-def _invalidate_materialized_repos_for_tasks(
-    tasks: Sequence[LCATask], materializer: RepoMaterializer
+def _invalidate_worktree_checkouts_for_tasks(
+    tasks: Sequence[LCATask], worktree_manager: WorktreeManager
 ) -> list[str]:
     """
     Best-effort targeted invalidation of repo worktree caches for selected tasks.
     """
-    invalidator = getattr(materializer, "invalidate_tasks", None)
-    if not callable(invalidator):
-        print("[CACHE] Repo worktree cache invalidation unavailable for materializer.")
-        return []
-    raw_events = invalidator(tasks)
-    events = [str(event) for event in raw_events] if isinstance(raw_events, list) else []
+    events = [str(event) for event in worktree_manager.invalidate_tasks(tasks)]
     print(
         f"[CACHE] Repo worktree cache invalidated for {len(tasks)} selected task(s)"
     )
@@ -2937,7 +2930,7 @@ def main(argv: list[str] | None = None) -> None:
     ensure_langfuse_auth()
     if args.max_workers is not None and args.max_workers <= 0:
         raise ValueError("--max-workers must be a positive integer")
-    materializer = HuggingFaceRepoMaterializer()
+    worktree_manager = WorktreeManager()
     session_cfg = _build_session_config(
         args.command or "cli", args.session_id, args.allow_session_fallback
     )
@@ -2985,7 +2978,7 @@ def main(argv: list[str] | None = None) -> None:
                 return
             if baseline_bundle_path and getattr(args, "invalidate_baseline_cache", False):
                 _invalidate_baseline_cache(baseline_bundle_path)
-                _invalidate_materialized_repos_for_tasks(selected_tasks, materializer)
+                _invalidate_worktree_checkouts_for_tasks(selected_tasks, worktree_manager)
             req = HostedLocalizationBaselineRequest(
                 dataset=HF_DATASET_NAME,
                 version=args.revision,
@@ -2999,7 +2992,7 @@ def main(argv: list[str] | None = None) -> None:
                 projection=projection,
             )
             bundle = run_hosted_localization_baseline(
-                req, materializer=materializer, tasks=selected_tasks
+                req, worktree_manager=worktree_manager, tasks=selected_tasks
             )
             if bundle is None:
                 print("[RUN] Baseline run returned no bundle; skipping summary.")
@@ -3057,7 +3050,7 @@ def main(argv: list[str] | None = None) -> None:
                 projection=projection,
             )
             results = run_hosted_localization_experiment(
-                req, materializer=materializer, tasks=selected_tasks
+                req, worktree_manager=worktree_manager, tasks=selected_tasks
             )
             print(f"[RUN] Localization items completed: {len(results.items)}")
             failure = getattr(results, "failure", None)
@@ -3088,10 +3081,19 @@ if __name__ == "__main__":
 </file>
 
 <file path="localization/materialization/__init__.py">
-"""Localization materialization: repo cloning and preparation."""
+"""Worktree-backed repo@sha checkout cache."""
+
+from .worktree import RepoMaterializationRequest, RepoMaterializationResult
+from .worktree import WorktreeManager
+
+__all__ = [
+    "RepoMaterializationRequest",
+    "RepoMaterializationResult",
+    "WorktreeManager",
+]
 </file>
 
-<file path="localization/materialization/hf_materialize.py">
+<file path="localization/materialization/worktree.py">
 from __future__ import annotations
 
 import os
@@ -3100,15 +3102,87 @@ import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
+from pydantic import BaseModel, ConfigDict
+
 from harness.localization.models import LCATask
 
-from .materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer, describe_repo_mapping
+__all__ = [
+    "MaterializationError",
+    "RepoMaterializationRequest",
+    "RepoMaterializationResult",
+    "WorktreeManager",
+]
 
 
-class HuggingFaceRepoMaterializer(RepoMaterializer):
+class RepoMaterializationRequest(BaseModel):
     """
-    Repo materializer for HF-backed LCA tasks using a cached bare git mirror + per-task worktree.
-    Concurrency is enforced per cache key via a lock file; partial builds are never reused.
+    Input contract for repo@sha checkout resolution.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dataset_name: str
+    dataset_config: str
+    dataset_split: str
+    repo_owner: str
+    repo_name: str
+    base_sha: str
+    archive_uri: Optional[str] = None
+
+
+class RepoMaterializationResult(BaseModel):
+    """
+    Output contract for repo@sha checkout resolution.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    local_path: Optional[Path] = None
+    cache_hit: Optional[bool] = None
+    cache_validated: Optional[bool] = None
+    mirror_fetched: Optional[bool] = None
+    worktree_created: Optional[bool] = None
+    checkout_verified: Optional[bool] = None
+    logs: list[str] = []
+    events: list[str] = []
+
+    def describe_mapping(self) -> str:
+        """
+        Human-readable description of how the repo@sha checkout was resolved.
+        """
+        return (
+            f"path={self.local_path}, cache_hit={self.cache_hit}, cache_validated={self.cache_validated}, "
+            f"mirror_fetched={self.mirror_fetched}, worktree_created={self.worktree_created}, "
+            f"checkout_verified={self.checkout_verified}"
+        )
+
+    def summary(self) -> str:
+        """
+        Concise human-readable summary for CLI/logs.
+        """
+        path = str(self.local_path) if self.local_path else "unset"
+        status_parts = []
+        if self.cache_hit is not None:
+            status_parts.append(f"cache_hit={self.cache_hit}")
+        if self.cache_validated is not None:
+            status_parts.append(f"cache_validated={self.cache_validated}")
+        if self.mirror_fetched is not None:
+            status_parts.append(f"mirror_fetched={self.mirror_fetched}")
+        if self.worktree_created is not None:
+            status_parts.append(f"worktree_created={self.worktree_created}")
+        if self.checkout_verified is not None:
+            status_parts.append(f"checkout_verified={self.checkout_verified}")
+        status = ", ".join(status_parts) if status_parts else "status=unknown"
+        log_tail = f"; logs={self.logs[-1]}" if self.logs else ""
+        return f"{path} ({status}){log_tail}"
+
+
+class WorktreeManager:
+    """
+    Worktree-backed checkout cache for repo@sha resolution.
+
+    Construction is cheap. The side-effectful mirror fetch, worktree creation,
+    validation, and rebuild flow happens only in get_or_create().
     """
 
     def __init__(
@@ -3123,14 +3197,14 @@ class HuggingFaceRepoMaterializer(RepoMaterializer):
         self.lock_timeout_seconds = lock_timeout_seconds
         self.stale_lock_timeout_seconds = stale_lock_timeout_seconds
 
-    def materialize(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
-        cache_key = _cache_key_for_request(request)
-        worktree_root = self.cache_root / "worktrees" / cache_key
+    def get_or_create(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
+        cache_key = self._cache_key(request)
+        worktree_root = self._worktree_path(cache_key)
         mirror_root = self.cache_root / "mirrors"
-        lock_path = self.cache_root / "locks" / f"{cache_key}.lock"
+        lock_path = self._lock_path(cache_key)
         completion_marker = worktree_root / ".complete"
-        repo_url = f"{self.repo_base_url.rstrip('/')}/{request.repo_owner}/{request.repo_name}.git"
-        mirror_path = mirror_root / f"{request.repo_owner}__{request.repo_name}.git"
+        repo_url = self._repo_url(request)
+        mirror_path = self._mirror_path(request)
         self.cache_root.mkdir(parents=True, exist_ok=True)
         mirror_root.mkdir(parents=True, exist_ok=True)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3206,13 +3280,13 @@ class HuggingFaceRepoMaterializer(RepoMaterializer):
             events=logs,
         )
 
-    def invalidate_request_cache(self, request: RepoMaterializationRequest) -> list[str]:
-        """Remove the cached worktree for one materialization request, if present."""
+    def invalidate(self, request: RepoMaterializationRequest) -> list[str]:
+        """Remove the cached worktree for one repo@sha checkout, if present."""
 
-        cache_key = _cache_key_for_request(request)
-        worktree_root = self.cache_root / "worktrees" / cache_key
-        mirror_path = self.cache_root / "mirrors" / f"{request.repo_owner}__{request.repo_name}.git"
-        lock_path = self.cache_root / "locks" / f"{cache_key}.lock"
+        cache_key = self._cache_key(request)
+        worktree_root = self._worktree_path(cache_key)
+        mirror_path = self._mirror_path(request)
+        lock_path = self._lock_path(cache_key)
         self.cache_root.mkdir(parents=True, exist_ok=True)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         logs: list[str] = []
@@ -3233,20 +3307,38 @@ class HuggingFaceRepoMaterializer(RepoMaterializer):
         events: list[str] = []
         seen: set[str] = set()
         for task in tasks:
-            request = RepoMaterializationRequest(
-                dataset_name=task.identity.dataset_name,
-                dataset_config=task.identity.dataset_config,
-                dataset_split=task.identity.dataset_split,
-                repo_owner=task.identity.repo_owner,
-                repo_name=task.identity.repo_name,
-                base_sha=task.identity.base_sha,
-            )
-            cache_key = _cache_key_for_request(request)
+            request = self._request_for_task(task)
+            cache_key = self._cache_key(request)
             if cache_key in seen:
                 continue
             seen.add(cache_key)
-            events.extend(self.invalidate_request_cache(request))
+            events.extend(self.invalidate(request))
         return events
+
+    def _cache_key(self, request: RepoMaterializationRequest) -> str:
+        return _cache_key_for_request(request)
+
+    def _worktree_path(self, cache_key: str) -> Path:
+        return self.cache_root / "worktrees" / cache_key
+
+    def _lock_path(self, cache_key: str) -> Path:
+        return self.cache_root / "locks" / f"{cache_key}.lock"
+
+    def _mirror_path(self, request: RepoMaterializationRequest) -> Path:
+        return self.cache_root / "mirrors" / f"{request.repo_owner}__{request.repo_name}.git"
+
+    def _repo_url(self, request: RepoMaterializationRequest) -> str:
+        return f"{self.repo_base_url.rstrip('/')}/{request.repo_owner}/{request.repo_name}.git"
+
+    def _request_for_task(self, task: LCATask) -> RepoMaterializationRequest:
+        return RepoMaterializationRequest(
+            dataset_name=task.identity.dataset_name,
+            dataset_config=task.identity.dataset_config,
+            dataset_split=task.identity.dataset_split,
+            repo_owner=task.identity.repo_owner,
+            repo_name=task.identity.repo_name,
+            base_sha=task.identity.base_sha,
+        )
 
 
 class MaterializationError(RuntimeError):
@@ -3407,7 +3499,7 @@ def _remove_cached_worktree(mirror_path: Path, worktree_path: Path, logs: List[s
 
 
 def _cache_key_for_request(request: RepoMaterializationRequest) -> str:
-    return describe_repo_mapping(request).replace(":", "__").replace("/", "__")
+    return f"{request.repo_owner}__{request.repo_name}@{request.base_sha}"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -3422,104 +3514,6 @@ def _pid_alive(pid: int) -> bool:
     return True
 </file>
 
-<file path="localization/materialization/materialize.py">
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
-
-from pydantic import BaseModel, ConfigDict
-
-
-class RepoMaterializationRequest(BaseModel):
-    """
-    Input contract for repo materialization/resolution.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    dataset_name: str
-    dataset_config: str
-    dataset_split: str
-    repo_owner: str
-    repo_name: str
-    base_sha: str
-    archive_uri: Optional[str] = None  # e.g., HF path or local cache key
-
-
-class RepoMaterializationResult(BaseModel):
-    """
-    Output contract for repo materialization/resolution.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    local_path: Optional[Path] = None
-    cache_hit: Optional[bool] = None
-    cache_validated: Optional[bool] = None
-    mirror_fetched: Optional[bool] = None
-    worktree_created: Optional[bool] = None
-    checkout_verified: Optional[bool] = None
-    logs: list[str] = []
-    events: list[str] = []
-
-    def describe_mapping(self) -> str:
-        """
-        Human-readable description of how the repo was mapped/materialized.
-        """
-        return (
-            f"path={self.local_path}, cache_hit={self.cache_hit}, cache_validated={self.cache_validated}, "
-            f"mirror_fetched={self.mirror_fetched}, worktree_created={self.worktree_created}, "
-            f"checkout_verified={self.checkout_verified}"
-        )
-
-    def summary(self) -> str:
-        """
-        Concise human-readable summary for CLI/logs.
-        """
-        path = str(self.local_path) if self.local_path else "unset"
-        status_parts = []
-        if self.cache_hit is not None:
-            status_parts.append(f"cache_hit={self.cache_hit}")
-        if self.cache_validated is not None:
-            status_parts.append(f"cache_validated={self.cache_validated}")
-        if self.mirror_fetched is not None:
-            status_parts.append(f"mirror_fetched={self.mirror_fetched}")
-        if self.worktree_created is not None:
-            status_parts.append(f"worktree_created={self.worktree_created}")
-        if self.checkout_verified is not None:
-            status_parts.append(f"checkout_verified={self.checkout_verified}")
-        status = ", ".join(status_parts) if status_parts else "status=unknown"
-        log_tail = f"; logs={self.logs[-1]}" if self.logs else ""
-        return f"{path} ({status}){log_tail}"
-
-
-@runtime_checkable
-class RepoMaterializer(Protocol):
-    """
-    Abstract interface for materializing a repository at base_sha.
-    Implementations are deferred to phase 2.
-    """
-
-    def materialize(self, request: RepoMaterializationRequest) -> RepoMaterializationResult:
-        ...
-
-
-def describe_repo_mapping(request: RepoMaterializationRequest) -> str:
-    """
-    Documented mapping rule: dataset/config/split + repo_owner/name + base_sha drive cache key and checkout target.
-    Implementations SHOULD:
-    - derive cache key from dataset/config/split + repo_owner/name + base_sha
-    - download/extract archive if cache miss
-    - checkout base_sha
-    - return local path and status flags
-    """
-    return (
-        f"cache_key={request.dataset_name}:{request.dataset_config}:{request.dataset_split}:"
-        f"{request.repo_owner}/{request.repo_name}@{request.base_sha}"
-    )
-</file>
-
 <file path="localization/runtime/__init__.py">
 """Localization runtime: evaluation, execution, and agent iteration."""
 </file>
@@ -3532,7 +3526,8 @@ from typing import Callable, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
 from harness.localization.errors import LocalizationEvaluationError, LocalizationFailureCategory
-from harness.localization.materialization.materialize import RepoMaterializer, RepoMaterializationResult
+from harness.localization.materialization.worktree import RepoMaterializationResult
+from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
@@ -3594,7 +3589,7 @@ def evaluate_localization_batch(
     tasks: Sequence[LCATask],
     *,
     dataset_source: str | None = None,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: LocalizationRunner | None = None,
 ) -> LocalizationEvaluationResult:
@@ -3609,7 +3604,7 @@ def evaluate_localization_batch(
             run_result = run_localization_task(
                 task,
                 dataset_source=dataset_source,
-                materializer=materializer,
+                worktree_manager=worktree_manager,
                 parent_trace=parent_trace,
                 runner=resolved_runner,
             )
@@ -3665,10 +3660,10 @@ from harness.localization.errors import (
 )
 from harness.localization.runtime.records import build_localization_score_eval_record
 from harness.localization.scoring import build_localization_score_context
-from harness.localization.materialization.materialize import (
+from harness.localization.materialization.worktree import (
     RepoMaterializationRequest,
     RepoMaterializationResult,
-    RepoMaterializer,
+    WorktreeManager,
 )
 from harness.localization.models import (
     LCATask,
@@ -3699,10 +3694,10 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
             pass
 
 
-def _materialize_repo(
-    task: LCATask, materializer: RepoMaterializer | None
+def _get_repo_checkout(
+    task: LCATask, worktree_manager: WorktreeManager | None
 ) -> RepoMaterializationResult | None:
-    if materializer is None:
+    if worktree_manager is None:
         return None
     request = RepoMaterializationRequest(
         dataset_name=task.identity.dataset_name,
@@ -3712,21 +3707,21 @@ def _materialize_repo(
         repo_name=task.identity.repo_name,
         base_sha=task.identity.base_sha,
     )
-    return materializer.materialize(request)
+    return worktree_manager.get_or_create(request)
 
 
 def _resolve_repo_path(
-    task: LCATask, materialization_result: RepoMaterializationResult | None
+    task: LCATask, checkout_result: RepoMaterializationResult | None
 ) -> Path:
     repo_path: Path | None = (
-        materialization_result.local_path if materialization_result else None
+        checkout_result.local_path if checkout_result else None
     )
     if repo_path is None and task.repo:
         repo_path = Path(task.repo).expanduser()
     if repo_path is None:
         raise LocalizationEvaluationError(
             LocalizationFailureCategory.MATERIALIZATION,
-            "Localization task is missing a repo path; provide a materializer or task.repo",
+            "Localization task is missing a repo path; provide a WorktreeManager or task.repo",
             task_id=task.task_id,
         )
     if not repo_path.exists():
@@ -3892,7 +3887,7 @@ def _emit_telemetry(
 def run_localization_task(
     task: LCATask,
     dataset_source: str | None = None,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
     parent_trace: object | None = None,
     runner: Callable[
         [LCATask, str, object | None], LocalizationRunResult
@@ -3907,11 +3902,11 @@ def run_localization_task(
 ]:
     """
     Execute a single localization task end to end (leaf helper):
-    - materialize repo at base_sha (if a materializer is provided)
+    - resolve repo@sha checkout through WorktreeManager when provided
     - run the localization agent/backend to produce predicted_files
     - score using static-graph score bundles
     - emit task-level telemetry
-    Returns prediction, score bundle, optional evidence, materialization details, and token usage.
+    Returns prediction, score bundle, optional evidence, checkout details, and token usage.
     """
 
     with start_observation(
@@ -3928,14 +3923,14 @@ def run_localization_task(
         },
     ) as trace:
         try:
-            materialization_result = _materialize_repo(task, materializer)
+            checkout_result = _get_repo_checkout(task, worktree_manager)
         except Exception as exc:
             raise LocalizationEvaluationError(
                 LocalizationFailureCategory.MATERIALIZATION,
                 str(exc),
                 task_id=task.task_id,
             ) from exc
-        repo_path = _resolve_repo_path(task, materialization_result)
+        repo_path = _resolve_repo_path(task, checkout_result)
         runner_result = _run_runner(task, repo_path, trace, runner)
         prediction = runner_result.prediction
         usage = extract_token_usage_record(
@@ -3947,14 +3942,14 @@ def run_localization_task(
             task=task,
             score_bundle=score_bundle,
             evidence=task.evidence,
-            materialization=materialization_result,
+            materialization=checkout_result,
             dataset_source=dataset_source,
             trace=trace,
             predicted_files=prediction.normalized_predicted_files(),
             changed_files=task.gold.normalized_changed_files(),
             score_prefix=_score_prefix_from_runner_result(runner_result),
         )
-        return prediction, score_bundle, task.evidence, materialization_result, usage
+        return prediction, score_bundle, task.evidence, checkout_result, usage
 </file>
 
 <file path="localization/runtime/records.py">
@@ -4824,7 +4819,8 @@ from .models import (
 )
 from .scoring import build_localization_score_context, score_localization
 from .runtime.records import localization_eval_identity
-from .materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, RepoMaterializer
+from .materialization.worktree import RepoMaterializationRequest, RepoMaterializationResult
+from .materialization.worktree import WorktreeManager
 from .telemetry import build_localization_telemetry
 from . import static_graph
 
@@ -4837,7 +4833,7 @@ __all__ = [
     "LocalizationRunResult",
     "RepoMaterializationRequest",
     "RepoMaterializationResult",
-    "RepoMaterializer",
+    "WorktreeManager",
     "build_localization_score_context",
     "build_localization_telemetry",
     "localization_eval_identity",
@@ -5628,7 +5624,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from harness.localization.materialization.materialize import RepoMaterializer
+from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationResult,
@@ -5675,7 +5671,7 @@ class EvaluateLocalizationBatch(Protocol):
         tasks: Sequence[LCATask],
         *,
         dataset_source: str | None = None,
-        materializer: RepoMaterializer | None = None,
+        worktree_manager: WorktreeManager | None = None,
         parent_trace: object | None = None,
         runner: LocalizationRunner | None = None,
     ) -> LocalizationEvaluationResult: ...
@@ -6075,7 +6071,7 @@ def evaluate_policy_on_item(
     eval_result = evaluate_localization_batch(
         tasks=[task],
         dataset_source=None,
-        materializer=None,
+        worktree_manager=None,
         parent_trace=iteration_span,
     )
     if eval_result.failure:
@@ -10142,10 +10138,8 @@ from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
 )
-from harness.localization.materialization.materialize import (
-    RepoMaterializationResult,
-    RepoMaterializer,
-)
+from harness.localization.materialization.worktree import RepoMaterializationResult
+from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import (
     LCATask,
     LocalizationEvidence,
@@ -10380,7 +10374,7 @@ def compute_baseline_for_task(
     ]
     | None = None,
     dataset_source: str | None = None,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
 ) -> BaselineSnapshot:
     with propagate_context(session_id=session_id):
         with start_observation(
@@ -10397,7 +10391,7 @@ def compute_baseline_for_task(
             eval_result = evaluate_localization_batch(
                 tasks=[task],
                 dataset_source=dataset_source,
-                materializer=materializer,
+                worktree_manager=worktree_manager,
                 parent_trace=trace,
                 runner=runner,
             )
@@ -10685,10 +10679,8 @@ from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
 )
-from harness.localization.materialization.materialize import (
-    RepoMaterializationResult,
-    RepoMaterializer,
-)
+from harness.localization.materialization.worktree import RepoMaterializationResult
+from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
@@ -10823,7 +10815,7 @@ def _normalize_failure_category(
 
 def run_hosted_localization_baseline(
     req: HostedLocalizationBaselineRequest,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
     tasks: list[LCATask] | None = None,
 ) -> BaselineBundle:
     run_session_id = resolve_session_id(req.session, run_id=req.dataset)
@@ -10904,7 +10896,7 @@ def run_hosted_localization_baseline(
                                 dataset_version=req.version,
                                 parent_trace=parent_trace,
                                 dataset_source="huggingface",
-                                materializer=materializer,
+                                worktree_manager=worktree_manager,
                             )
                         )
                 else:
@@ -10912,7 +10904,7 @@ def run_hosted_localization_baseline(
                         selected_tasks,
                         effective_workers,
                         parent_trace,
-                        materializer,
+                        worktree_manager,
                         req.version,
                         run_session_id,
                     )
@@ -10953,7 +10945,7 @@ def _baseline_worker(
     index: int,
     task: LCATask,
     parent_trace: object,
-    materializer: RepoMaterializer | None,
+    worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
 ) -> BaselineSnapshot:
@@ -10971,7 +10963,7 @@ def _baseline_worker(
             dataset_version=dataset_version,
             parent_trace=parent_trace,
             dataset_source="huggingface",
-            materializer=materializer,
+            worktree_manager=worktree_manager,
         )
     except LocalizationEvaluationError as exc:
         category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
@@ -10991,7 +10983,7 @@ def _run_baseline_parallel(
     tasks: list[LCATask],
     effective_workers: int,
     parent_trace: object,
-    materializer: RepoMaterializer | None,
+    worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
 ) -> tuple[list[BaselineSnapshot], LocalizationEvaluationFailure | None]:
@@ -11010,7 +11002,7 @@ def _run_baseline_parallel(
                 idx,
                 tasks[idx],
                 parent_trace,
-                materializer,
+                worktree_manager,
                 dataset_version,
                 session_id,
             )
@@ -11089,7 +11081,7 @@ def _emit_experiment_dataset_aggregates(
 def _run_experiment_task(
     task: LCATask,
     parent_trace: object,
-    materializer: RepoMaterializer | None,
+    worktree_manager: WorktreeManager | None,
     session_id: str | None,
 ) -> LocalizationRunItemResult:
     if parent_trace is None:
@@ -11104,7 +11096,7 @@ def _run_experiment_task(
             eval_result = evaluate_localization_batch(
                 tasks=[task],
                 dataset_source="huggingface",
-                materializer=materializer,
+                worktree_manager=worktree_manager,
                 parent_trace=parent_trace,
             )
         if eval_result.failure or not eval_result.items:
@@ -11146,7 +11138,7 @@ def _run_experiment_parallel(
     tasks: list[LCATask],
     effective_workers: int,
     parent_trace: object,
-    materializer: RepoMaterializer | None,
+    worktree_manager: WorktreeManager | None,
     session_id: str | None,
 ) -> tuple[list[LocalizationRunItemResult], LocalizationEvaluationFailure | None]:
     results: list[LocalizationRunItemResult | None] = [None] * len(tasks)
@@ -11163,7 +11155,7 @@ def _run_experiment_parallel(
                 _run_experiment_task,
                 tasks[idx],
                 parent_trace,
-                materializer,
+                worktree_manager,
                 session_id,
             )
             inflight[future] = idx
@@ -11212,7 +11204,7 @@ def _run_experiment_parallel(
 
 def run_hosted_localization_experiment(
     req: HostedLocalizationRunRequest,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
     tasks: list[LCATask] | None = None,
 ) -> HostedLocalizationRunResult:
     tasks = tasks or _resolve_items(req)
@@ -11267,7 +11259,7 @@ def run_hosted_localization_experiment(
                         _run_experiment_task(
                             task=task,
                             parent_trace=parent_trace,
-                            materializer=materializer,
+                            worktree_manager=worktree_manager,
                             session_id=run_session_id,
                         )
                     )
@@ -11276,7 +11268,7 @@ def run_hosted_localization_experiment(
                     selected_tasks,
                     effective_workers,
                     parent_trace,
-                    materializer,
+                    worktree_manager,
                     run_session_id,
                 )
             _emit_experiment_dataset_aggregates(
@@ -14204,7 +14196,7 @@ import pytest
 
 import run as run_module
 from harness.entrypoints.models.requests import HostedLocalizationBaselineRequest
-from harness.localization.materialization.materialize import RepoMaterializationRequest, describe_repo_mapping
+from harness.localization.materialization.worktree import RepoMaterializationRequest, WorktreeManager
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.telemetry.hosted.baselines import baseline_cache_path
 from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
@@ -14257,11 +14249,8 @@ def _stub_cli_baseline(monkeypatch, tmp_path, run_stub, cache_root=None, baselin
     return hf_cache_dir, baseline_cache_dir
 
 
-def _cache_key(request: RepoMaterializationRequest) -> str:
-    return describe_repo_mapping(request).replace(":", "__").replace("/", "__")
-
-
 def _worktree_path(cache_root, *, repo_owner: str = "o", repo_name: str = "r", base_sha: str = "b", config: str = "py"):
+    manager = WorktreeManager(cache_root=cache_root)
     request = RepoMaterializationRequest(
         dataset_name=run_module.harness_run.HF_DATASET_NAME,
         dataset_config=config,
@@ -14270,7 +14259,7 @@ def _worktree_path(cache_root, *, repo_owner: str = "o", repo_name: str = "r", b
         repo_name=repo_name,
         base_sha=base_sha,
     )
-    return cache_root / "worktrees" / _cache_key(request)
+    return manager._worktree_path(manager._cache_key(request))  # pyright: ignore[reportPrivateUsage]
 
 
 def test_parse_defaults():
@@ -14464,7 +14453,7 @@ def test_max_workers_validation():
 def test_cli_fresh_session_per_invocation(monkeypatch, tmp_path):
     sessions: list[SessionConfig | None] = []
 
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         sessions.append(req.session)
         return SimpleNamespace(items=[], failure=None)
 
@@ -14486,7 +14475,7 @@ def test_cli_fresh_session_per_invocation(monkeypatch, tmp_path):
 def test_cli_respects_explicit_session_id(monkeypatch, tmp_path):
     sessions: list[SessionConfig | None] = []
 
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         sessions.append(req.session)
         return SimpleNamespace(items=[], failure=None)
 
@@ -14513,7 +14502,7 @@ def test_cli_respects_explicit_session_id(monkeypatch, tmp_path):
 def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys):
     calls = []
 
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         calls.append(True)
         return SimpleNamespace(items=[], failure=None)
 
@@ -14559,7 +14548,7 @@ def test_invalidate_baseline_cache_removes_bundle(monkeypatch, tmp_path, capsys)
 def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys):
     calls = []
 
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         calls.append(True)
         return SimpleNamespace(items=[], failure=None)
 
@@ -14601,7 +14590,7 @@ def test_invalidate_baseline_cache_missing_is_noop(monkeypatch, tmp_path, capsys
 
 
 def test_invalidate_baseline_cache_only_removes_selected_repo_worktree(monkeypatch, tmp_path):
-    def fake_run(req, materializer=None, tasks=None):
+    def fake_run(req, worktree_manager=None, tasks=None):
         return SimpleNamespace(items=[], failure=None)
 
     selected_task = _task(
@@ -14856,7 +14845,7 @@ def test_experiment_uses_shared_backend(monkeypatch, tmp_path) -> None:
         dataset_split="s",
         session=None,
     )
-    result = experiments.run_hosted_localization_experiment(req, materializer=None)
+    result = experiments.run_hosted_localization_experiment(req, worktree_manager=None)
     assert calls
     assert isinstance(calls[0]["tasks"][0], LCATask)
     assert result.items[0].prediction == ["a.py"]
@@ -14918,7 +14907,7 @@ def test_experiment_parallel_preserves_order(monkeypatch, tmp_path):
         session=None,
         max_workers=2,
     )
-    result = experiments.run_hosted_localization_experiment(req, materializer=None, tasks=tasks)
+    result = experiments.run_hosted_localization_experiment(req, worktree_manager=None, tasks=tasks)
     assert [item.prediction[0] for item in result.items] == [t1.task_id, t2.task_id]
     assert result.failure is None
 
@@ -14946,7 +14935,7 @@ def test_experiment_failure_is_deterministic(monkeypatch, tmp_path):
         session=None,
         max_workers=2,
     )
-    result = experiments.run_hosted_localization_experiment(req, materializer=None, tasks=[t1, t2])
+    result = experiments.run_hosted_localization_experiment(req, worktree_manager=None, tasks=[t1, t2])
     assert result.failure is not None
     assert result.failure.task_id == t2.task_id
     # Only the successful task (t1) should be in results, ordered
@@ -14974,7 +14963,7 @@ def test_experiment_serial_worker_count_one(monkeypatch, tmp_path):
         session=None,
         max_workers=1,
     )
-    result = experiments.run_hosted_localization_experiment(req, materializer=None, tasks=[t2, t1])
+    result = experiments.run_hosted_localization_experiment(req, worktree_manager=None, tasks=[t2, t1])
     assert calls == [t1.task_id, t2.task_id]
     assert [item.prediction[0] for item in result.items] == [t1.task_id, t2.task_id]
     assert result.failure is None
@@ -14985,7 +14974,7 @@ def test_missing_parent_trace_guard(monkeypatch, tmp_path):
     repo_root.mkdir()
     task = _task(str(repo_root / "r1"))
     with pytest.raises(experiments._TaskFailure):
-        experiments._run_experiment_task(task=task, parent_trace=None, materializer=None, session_id=None)
+        experiments._run_experiment_task(task=task, parent_trace=None, worktree_manager=None, session_id=None)
 </file>
 
 <file path="tests_harness/test_failure_context_budget.py">
@@ -15129,314 +15118,6 @@ def test_hf_loader_missing_required_fields_raises(monkeypatch):
     assert excinfo.value.category == "schema"
 </file>
 
-<file path="tests_harness/test_hf_materializer.py">
-from __future__ import annotations
-import concurrent.futures
-import shutil
-import subprocess
-from pathlib import Path
-
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
-from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
-from harness.localization.materialization.materialize import RepoMaterializationRequest, RepoMaterializationResult, describe_repo_mapping
-
-
-def _run_git(args: list[str], cwd: Path | None = None) -> str:
-    completed = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {completed.stderr}")
-    return completed.stdout.strip()
-
-
-def _make_local_bare_repo(tmp_path: Path) -> tuple[Path, str]:
-    owner = "example"
-    repo_name = "repo"
-    workdir = tmp_path / "work"
-    workdir.mkdir(parents=True, exist_ok=True)
-    repo_path = workdir / repo_name
-    repo_path.mkdir()
-    _run_git(["init"], cwd=repo_path)
-    _run_git(["config", "user.email", "test@example.com"], cwd=repo_path)
-    _run_git(["config", "user.name", "Test User"], cwd=repo_path)
-    (repo_path / "README.md").write_text("hello\n")
-    _run_git(["add", "README.md"], cwd=repo_path)
-    _run_git(["commit", "-m", "init"], cwd=repo_path)
-    base_sha = _run_git(["rev-parse", "HEAD"], cwd=repo_path)
-
-    origin_root = tmp_path / "origin"
-    origin_repo_dir = origin_root / owner
-    origin_repo_dir.mkdir(parents=True, exist_ok=True)
-    origin_bare = origin_repo_dir / f"{repo_name}.git"
-    _run_git(["clone", "--bare", str(repo_path), str(origin_bare)])
-    return origin_root, base_sha
-
-
-def _task(repo_owner: str, repo_name: str, base_sha: str, config: str = "py") -> LCATask:
-    identity = LCATaskIdentity(
-        dataset_name="hf",
-        dataset_config=config,
-        dataset_split="dev",
-        repo_owner=repo_owner,
-        repo_name=repo_name,
-        base_sha=base_sha,
-    )
-    return LCATask(
-        identity=identity,
-        context=LCAContext(issue_title="t", issue_body="b"),
-        gold=LCAGold(changed_files=["README.md"]),
-    )
-
-
-def _cache_key(request: RepoMaterializationRequest) -> str:
-    return describe_repo_mapping(request).replace(":", "__").replace("/", "__")
-
-
-def test_materializer_creates_and_reuses_cache(tmp_path):
-    origin_root, base_sha = _make_local_bare_repo(tmp_path)
-    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
-    request = RepoMaterializationRequest(
-        dataset_name="hf",
-        dataset_config="py",
-        dataset_split="dev",
-        repo_owner="example",
-        repo_name="repo",
-        base_sha=base_sha,
-    )
-
-    first = materializer.materialize(request)
-    assert first.local_path and first.local_path.exists()
-    assert first.cache_hit is False
-    assert first.worktree_created is True
-    assert first.checkout_verified is True
-    assert first.mirror_fetched is True
-    assert (first.local_path / ".complete").exists()
-
-    second = materializer.materialize(request)
-    assert second.cache_hit is True
-    assert second.local_path == first.local_path
-    assert second.checkout_verified is True
-    assert second.worktree_created is False
-    assert second.cache_validated is True
-    assert second.mirror_fetched is False
-
-
-def test_materializer_rebuilds_incomplete(tmp_path):
-    origin_root, base_sha = _make_local_bare_repo(tmp_path)
-    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
-    request = RepoMaterializationRequest(
-        dataset_name="hf",
-        dataset_config="py",
-        dataset_split="dev",
-        repo_owner="example",
-        repo_name="repo",
-        base_sha=base_sha,
-    )
-
-    result = materializer.materialize(request)
-    marker = result.local_path / ".complete" if result.local_path else None
-    if marker and marker.exists():
-        marker.unlink()
-    # simulate partial build by removing marker and wiping contents
-    if result.local_path:
-        shutil.rmtree(result.local_path / ".git", ignore_errors=True)
-
-    rebuilt = materializer.materialize(request)
-    assert rebuilt.local_path and rebuilt.local_path.exists()
-    assert rebuilt.cache_hit is False  # incomplete cache forces rebuild
-    assert (rebuilt.local_path / ".complete").exists()
-    assert rebuilt.checkout_verified is True
-    assert rebuilt.cache_validated is False
-
-
-def test_materializer_reuses_after_multiple_runs(tmp_path):
-    origin_root, base_sha = _make_local_bare_repo(tmp_path)
-    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
-    request = RepoMaterializationRequest(
-        dataset_name="hf",
-        dataset_config="py",
-        dataset_split="dev",
-        repo_owner="example",
-        repo_name="repo",
-        base_sha=base_sha,
-    )
-    first = materializer.materialize(request)
-    second = materializer.materialize(request)
-    third = materializer.materialize(request)
-    assert first.local_path == second.local_path == third.local_path
-    assert [first.cache_hit, second.cache_hit, third.cache_hit] == [False, True, True]
-    assert third.checkout_verified is True
-    assert third.cache_validated is True
-
-
-def test_stale_lock_is_broken(tmp_path, monkeypatch):
-    origin_root, base_sha = _make_local_bare_repo(tmp_path)
-    materializer = HuggingFaceRepoMaterializer(
-        cache_root=tmp_path / "cache",
-        repo_base_url=origin_root.as_uri(),
-        lock_timeout_seconds=2,
-        stale_lock_timeout_seconds=0,  # break immediately
-    )
-    request = RepoMaterializationRequest(
-        dataset_name="hf",
-        dataset_config="py",
-        dataset_split="dev",
-        repo_owner="example",
-        repo_name="repo",
-        base_sha=base_sha,
-    )
-    cache_key = describe_repo_mapping(request).replace(":", "__").replace("/", "__")
-    lock_path = materializer.cache_root / "locks" / f"{cache_key}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.write_text("99999:0")
-
-    result = materializer.materialize(request)
-    assert result.cache_hit is False
-    assert any("stale lock" in log for log in result.logs)
-    assert result.cache_validated is False
-
-
-def test_invalid_cached_head_triggers_rebuild(tmp_path):
-    origin_root, base_sha = _make_local_bare_repo(tmp_path)
-    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
-    request = RepoMaterializationRequest(
-        dataset_name="hf",
-        dataset_config="py",
-        dataset_split="dev",
-        repo_owner="example",
-        repo_name="repo",
-        base_sha=base_sha,
-    )
-    first = materializer.materialize(request)
-    assert first.cache_hit is False
-    # mutate worktree HEAD to wrong commit by creating a new commit
-    assert first.local_path
-    (first.local_path / "mutate.txt").write_text("mutate\n")
-    _run_git(["add", "mutate.txt"], cwd=first.local_path)
-    _run_git(["commit", "-m", "mutate"], cwd=first.local_path)
-
-    second = materializer.materialize(request)
-    assert second.cache_hit is False  # cache invalid -> rebuild
-    assert second.checkout_verified is True
-    assert second.cache_validated is False
-
-
-def test_materialization_summary_mentions_git_states(tmp_path):
-    dummy = RepoMaterializationResult(
-        local_path=tmp_path,
-        cache_hit=True,
-        mirror_fetched=False,
-        worktree_created=True,
-        checkout_verified=True,
-        logs=["log entry"],
-    )
-    summary_text = dummy.summary()
-    assert "mirror_fetched" in summary_text
-    assert "worktree_created" in summary_text
-    assert "checkout_verified" in summary_text
-
-
-def test_materializer_parallel_calls_share_cache(tmp_path):
-    origin_root, base_sha = _make_local_bare_repo(tmp_path)
-    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
-    request = RepoMaterializationRequest(
-        dataset_name="hf",
-        dataset_config="py",
-        dataset_split="dev",
-        repo_owner="example",
-        repo_name="repo",
-        base_sha=base_sha,
-    )
-
-    def _materialize():
-        return materializer.materialize(request)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(lambda _: _materialize(), range(2)))
-
-    assert len(results) == 2
-    assert results[0].local_path == results[1].local_path
-    assert (results[0].local_path / ".complete").exists()
-
-
-def test_materializer_targeted_invalidation_only_removes_selected_worktree(tmp_path):
-    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache")
-    selected_request = RepoMaterializationRequest(
-        dataset_name="hf",
-        dataset_config="py",
-        dataset_split="dev",
-        repo_owner="example",
-        repo_name="repo",
-        base_sha="a" * 40,
-    )
-    other_request = selected_request.model_copy(
-        update={"dataset_config": "java", "base_sha": "b" * 40}
-    )
-    selected_path = materializer.cache_root / "worktrees" / _cache_key(selected_request)
-    other_path = materializer.cache_root / "worktrees" / _cache_key(other_request)
-    selected_path.mkdir(parents=True)
-    other_path.mkdir(parents=True)
-    (selected_path / ".complete").write_text("")
-    (other_path / ".complete").write_text("")
-
-    events = materializer.invalidate_tasks([
-        _task("example", "repo", "a" * 40, config="py")
-    ])
-
-    assert any("removed cached worktree" in event for event in events)
-    assert not selected_path.exists()
-    assert other_path.exists()
-    assert (other_path / ".complete").exists()
-
-
-def test_materializer_invalidation_forces_next_materialization_fresh(tmp_path):
-    origin_root, base_sha = _make_local_bare_repo(tmp_path)
-    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
-    request = RepoMaterializationRequest(
-        dataset_name="hf",
-        dataset_config="py",
-        dataset_split="dev",
-        repo_owner="example",
-        repo_name="repo",
-        base_sha=base_sha,
-    )
-
-    first = materializer.materialize(request)
-    assert first.cache_hit is False
-    assert first.worktree_created is True
-    second = materializer.materialize(request)
-    assert second.cache_hit is True
-    assert second.worktree_created is False
-
-    materializer.invalidate_request_cache(request)
-    fresh = materializer.materialize(request)
-
-    assert fresh.cache_hit is False
-    assert fresh.worktree_created is True
-    assert fresh.local_path == first.local_path
-    assert fresh.local_path and (fresh.local_path / ".complete").exists()
-
-
-def test_materializer_invalidation_is_idempotent_for_missing_or_corrupt_worktree(tmp_path):
-    materializer = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache")
-    request = RepoMaterializationRequest(
-        dataset_name="hf",
-        dataset_config="py",
-        dataset_split="dev",
-        repo_owner="example",
-        repo_name="repo",
-        base_sha="a" * 40,
-    )
-    worktree_path = materializer.cache_root / "worktrees" / _cache_key(request)
-    worktree_path.mkdir(parents=True)
-
-    first_events = materializer.invalidate_request_cache(request)
-    second_events = materializer.invalidate_request_cache(request)
-
-    assert not worktree_path.exists()
-    assert any("removed cached worktree" in event for event in first_events)
-    assert any("no cached worktree found" in event for event in second_events)
-</file>
-
 <file path="tests_harness/test_hf_network_optin.py">
 from __future__ import annotations
 
@@ -15445,15 +15126,15 @@ from pathlib import Path
 
 import pytest
 
-from harness.localization.materialization.hf_materialize import HuggingFaceRepoMaterializer
-from harness.localization.materialization.materialize import RepoMaterializationRequest
+from harness.localization.materialization.worktree import WorktreeManager
+from harness.localization.materialization.worktree import RepoMaterializationRequest
 from harness.telemetry.hosted.hf_lca import fetch_hf_localization_dataset
 
 
 @pytest.mark.skipif(not os.environ.get("HF_NETWORK_TESTS"), reason="HF network tests are opt-in via HF_NETWORK_TESTS env")
 def test_hf_network_smoke_end_to_end(tmp_path):
     """
-    Opt-in network smoke: fetch one HF task (py/dev) and materialize its repo at base_sha.
+    Opt-in network smoke: fetch one HF task (py/dev) and resolve its repo@sha checkout.
     Skipped by default/CI unless HF_NETWORK_TESTS=1 is set.
     """
     tasks = fetch_hf_localization_dataset(
@@ -15465,7 +15146,7 @@ def test_hf_network_smoke_end_to_end(tmp_path):
     )
     assert tasks, "Expected at least one HF task"
     task = tasks[0]
-    mat = HuggingFaceRepoMaterializer(cache_root=tmp_path / "cache")
+    mat = WorktreeManager(cache_root=tmp_path / "cache")
     req = RepoMaterializationRequest(
         dataset_name=task.identity.dataset_name,
         dataset_config=task.identity.dataset_config,
@@ -15474,7 +15155,7 @@ def test_hf_network_smoke_end_to_end(tmp_path):
         repo_name=task.identity.repo_name,
         base_sha=task.identity.base_sha,
     )
-    result = mat.materialize(req)
+    result = mat.get_or_create(req)
     assert result.local_path and Path(result.local_path).exists()
     assert result.checkout_verified is True
 </file>
@@ -15530,7 +15211,7 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is None
     assert result.score_summary is not None
@@ -15557,7 +15238,7 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.RUNNER
@@ -15589,7 +15270,7 @@ def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="huggingface", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="huggingface", worktree_manager=None, parent_trace=None
     )
     assert result.failure is None
     assert result.machine_score == 1.0
@@ -15607,7 +15288,7 @@ def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING
@@ -15628,7 +15309,7 @@ def test_score_summary_failure_is_typed(monkeypatch, tmp_path) -> None:
         raising=True,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING
@@ -19813,6 +19494,357 @@ def test_load_frontier_examples_uses_local_file(tmp_path):
     assert "frontier_priority(node: GraphNode, graph: Graph, step: int)" in loaded
 </file>
 
+<file path="tests_harness/test_worktree_manager.py">
+from __future__ import annotations
+import concurrent.futures
+import shutil
+import subprocess
+from pathlib import Path
+
+from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.materialization.worktree import (
+    RepoMaterializationRequest,
+    RepoMaterializationResult,
+    WorktreeManager,
+)
+
+
+def _run_git(args: list[str], cwd: Path | None = None) -> str:
+    completed = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {completed.stderr}")
+    return completed.stdout.strip()
+
+
+def _make_local_bare_repo(tmp_path: Path) -> tuple[Path, str]:
+    owner = "example"
+    repo_name = "repo"
+    workdir = tmp_path / "work"
+    workdir.mkdir(parents=True, exist_ok=True)
+    repo_path = workdir / repo_name
+    repo_path.mkdir()
+    _run_git(["init"], cwd=repo_path)
+    _run_git(["config", "user.email", "test@example.com"], cwd=repo_path)
+    _run_git(["config", "user.name", "Test User"], cwd=repo_path)
+    (repo_path / "README.md").write_text("hello\n")
+    _run_git(["add", "README.md"], cwd=repo_path)
+    _run_git(["commit", "-m", "init"], cwd=repo_path)
+    base_sha = _run_git(["rev-parse", "HEAD"], cwd=repo_path)
+
+    origin_root = tmp_path / "origin"
+    origin_repo_dir = origin_root / owner
+    origin_repo_dir.mkdir(parents=True, exist_ok=True)
+    origin_bare = origin_repo_dir / f"{repo_name}.git"
+    _run_git(["clone", "--bare", str(repo_path), str(origin_bare)])
+    return origin_root, base_sha
+
+
+def _task(repo_owner: str, repo_name: str, base_sha: str, config: str = "py") -> LCATask:
+    identity = LCATaskIdentity(
+        dataset_name="hf",
+        dataset_config=config,
+        dataset_split="dev",
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        base_sha=base_sha,
+    )
+    return LCATask(
+        identity=identity,
+        context=LCAContext(issue_title="t", issue_body="b"),
+        gold=LCAGold(changed_files=["README.md"]),
+    )
+
+
+def _worktree_path(manager: WorktreeManager, request: RepoMaterializationRequest) -> Path:
+    return manager._worktree_path(manager._cache_key(request))  # pyright: ignore[reportPrivateUsage]
+
+
+def test_worktree_manager_creates_and_reuses_cache(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    manager = WorktreeManager(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+
+    first = manager.get_or_create(request)
+    assert first.local_path and first.local_path.exists()
+    assert first.cache_hit is False
+    assert first.worktree_created is True
+    assert first.checkout_verified is True
+    assert first.mirror_fetched is True
+    assert (first.local_path / ".complete").exists()
+
+    second = manager.get_or_create(request)
+    assert second.cache_hit is True
+    assert second.local_path == first.local_path
+    assert second.checkout_verified is True
+    assert second.worktree_created is False
+    assert second.cache_validated is True
+    assert second.mirror_fetched is False
+
+
+def test_worktree_manager_rebuilds_incomplete(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    manager = WorktreeManager(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+
+    result = manager.get_or_create(request)
+    marker = result.local_path / ".complete" if result.local_path else None
+    if marker and marker.exists():
+        marker.unlink()
+    # simulate partial build by removing marker and wiping contents
+    if result.local_path:
+        shutil.rmtree(result.local_path / ".git", ignore_errors=True)
+
+    rebuilt = manager.get_or_create(request)
+    assert rebuilt.local_path and rebuilt.local_path.exists()
+    assert rebuilt.cache_hit is False  # incomplete cache forces rebuild
+    assert (rebuilt.local_path / ".complete").exists()
+    assert rebuilt.checkout_verified is True
+    assert rebuilt.cache_validated is False
+
+
+def test_worktree_manager_reuses_after_multiple_runs(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    manager = WorktreeManager(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+    first = manager.get_or_create(request)
+    second = manager.get_or_create(request)
+    third = manager.get_or_create(request)
+    assert first.local_path == second.local_path == third.local_path
+    assert [first.cache_hit, second.cache_hit, third.cache_hit] == [False, True, True]
+    assert third.checkout_verified is True
+    assert third.cache_validated is True
+
+
+def test_worktree_manager_cache_identity_ignores_dataset_metadata(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    manager = WorktreeManager(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+    same_checkout_request = request.model_copy(
+        update={
+            "dataset_name": "other-dataset",
+            "dataset_config": "java",
+            "dataset_split": "test",
+        }
+    )
+
+    first = manager.get_or_create(request)
+    second = manager.get_or_create(same_checkout_request)
+
+    assert second.cache_hit is True
+    assert second.local_path == first.local_path
+
+
+def test_worktree_manager_cache_identity_changes_with_sha(tmp_path):
+    manager = WorktreeManager(cache_root=tmp_path / "cache")
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha="a" * 40,
+    )
+    other_sha_request = request.model_copy(update={"base_sha": "b" * 40})
+
+    assert _worktree_path(manager, request) != _worktree_path(manager, other_sha_request)
+
+
+def test_stale_lock_is_broken(tmp_path, monkeypatch):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    manager = WorktreeManager(
+        cache_root=tmp_path / "cache",
+        repo_base_url=origin_root.as_uri(),
+        lock_timeout_seconds=2,
+        stale_lock_timeout_seconds=0,  # break immediately
+    )
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+    lock_path = manager._lock_path(manager._cache_key(request))  # pyright: ignore[reportPrivateUsage]
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("99999:0")
+
+    result = manager.get_or_create(request)
+    assert result.cache_hit is False
+    assert any("stale lock" in log for log in result.logs)
+    assert result.cache_validated is False
+
+
+def test_invalid_cached_head_triggers_rebuild(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    manager = WorktreeManager(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+    first = manager.get_or_create(request)
+    assert first.cache_hit is False
+    # mutate worktree HEAD to wrong commit by creating a new commit
+    assert first.local_path
+    (first.local_path / "mutate.txt").write_text("mutate\n")
+    _run_git(["add", "mutate.txt"], cwd=first.local_path)
+    _run_git(["commit", "-m", "mutate"], cwd=first.local_path)
+
+    second = manager.get_or_create(request)
+    assert second.cache_hit is False  # cache invalid -> rebuild
+    assert second.checkout_verified is True
+    assert second.cache_validated is False
+
+
+def test_checkout_summary_mentions_git_states(tmp_path):
+    dummy = RepoMaterializationResult(
+        local_path=tmp_path,
+        cache_hit=True,
+        mirror_fetched=False,
+        worktree_created=True,
+        checkout_verified=True,
+        logs=["log entry"],
+    )
+    summary_text = dummy.summary()
+    assert "mirror_fetched" in summary_text
+    assert "worktree_created" in summary_text
+    assert "checkout_verified" in summary_text
+
+
+def test_worktree_manager_parallel_calls_share_cache(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    manager = WorktreeManager(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+
+    def _get_or_create():
+        return manager.get_or_create(request)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: _get_or_create(), range(2)))
+
+    assert len(results) == 2
+    assert results[0].local_path == results[1].local_path
+    assert (results[0].local_path / ".complete").exists()
+
+
+def test_worktree_manager_targeted_invalidation_only_removes_selected_worktree(tmp_path):
+    manager = WorktreeManager(cache_root=tmp_path / "cache")
+    selected_request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha="a" * 40,
+    )
+    other_request = selected_request.model_copy(
+        update={"dataset_config": "java", "base_sha": "b" * 40}
+    )
+    selected_path = _worktree_path(manager, selected_request)
+    other_path = _worktree_path(manager, other_request)
+    selected_path.mkdir(parents=True)
+    other_path.mkdir(parents=True)
+    (selected_path / ".complete").write_text("")
+    (other_path / ".complete").write_text("")
+
+    events = manager.invalidate_tasks([
+        _task("example", "repo", "a" * 40, config="py")
+    ])
+
+    assert any("removed cached worktree" in event for event in events)
+    assert not selected_path.exists()
+    assert other_path.exists()
+    assert (other_path / ".complete").exists()
+
+
+def test_worktree_manager_invalidation_forces_next_materialization_fresh(tmp_path):
+    origin_root, base_sha = _make_local_bare_repo(tmp_path)
+    manager = WorktreeManager(cache_root=tmp_path / "cache", repo_base_url=origin_root.as_uri())
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha=base_sha,
+    )
+
+    first = manager.get_or_create(request)
+    assert first.cache_hit is False
+    assert first.worktree_created is True
+    second = manager.get_or_create(request)
+    assert second.cache_hit is True
+    assert second.worktree_created is False
+
+    manager.invalidate(request)
+    fresh = manager.get_or_create(request)
+
+    assert fresh.cache_hit is False
+    assert fresh.worktree_created is True
+    assert fresh.local_path == first.local_path
+    assert fresh.local_path and (fresh.local_path / ".complete").exists()
+
+
+def test_worktree_manager_invalidation_is_idempotent_for_missing_or_corrupt_worktree(tmp_path):
+    manager = WorktreeManager(cache_root=tmp_path / "cache")
+    request = RepoMaterializationRequest(
+        dataset_name="hf",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="example",
+        repo_name="repo",
+        base_sha="a" * 40,
+    )
+    worktree_path = _worktree_path(manager, request)
+    worktree_path.mkdir(parents=True)
+
+    first_events = manager.invalidate(request)
+    second_events = manager.invalidate(request)
+
+    assert not worktree_path.exists()
+    assert any("removed cached worktree" in event for event in first_events)
+    assert any("no cached worktree found" in event for event in second_events)
+</file>
+
 <file path="tests_harness/test_writer.py">
 from __future__ import annotations
 
@@ -21043,8 +21075,8 @@ todo.md
 ## Baselines & Experiments (Localization-first)
 - Baseline bundle: reusable localization snapshots keyed by localization identity; contains predictions, score summaries, repo metadata, and trace/run ids.
 - Hosted localization baselines/experiments use the documented SDK via `run_hosted_localization_baseline` / `run_hosted_localization_experiment`.
-- Hosted runs accept dataset_source; Langfuse remains default; Hugging Face path uses HF loader and HF repo materializer, emitting dataset source and materialization events in telemetry and stdout summaries.
-- Local runs use `run_localization_task` to materialize, predict, and score; hosted runs emit dataset run ids and telemetry.
+- Hosted runs accept dataset_source; Langfuse remains default; Hugging Face path uses the HF loader plus `WorktreeManager` for repo@sha checkout caching, emitting dataset source and checkout events in telemetry and stdout summaries.
+- Local runs use `run_localization_task` to resolve a repo checkout, predict, and score; hosted runs emit dataset run ids and telemetry.
 - Cost/usage: Cerebras generations must include `model` and usage (OpenAI-style prompt/completion/total). If the provider omits usage, supply it explicitly; do not emit zeroed usage. Costs are inferred via Langfuse model definitions.
 
 ## Tracing & Scoring

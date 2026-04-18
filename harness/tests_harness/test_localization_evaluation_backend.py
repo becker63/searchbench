@@ -48,7 +48,7 @@ def test_evaluation_backend_success(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is None
     assert result.score_summary is not None
@@ -75,7 +75,7 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.RUNNER
@@ -107,7 +107,7 @@ def test_backend_accepts_hf_dataset_source(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="huggingface", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="huggingface", worktree_manager=None, parent_trace=None
     )
     assert result.failure is None
     assert result.machine_score == 1.0
@@ -125,7 +125,7 @@ def test_typed_failure_propagates(monkeypatch, tmp_path) -> None:
         raising=False,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING
@@ -146,7 +146,7 @@ def test_score_summary_failure_is_typed(monkeypatch, tmp_path) -> None:
         raising=True,
     )
     result = evaluate_localization_batch(
-        tasks=[task], dataset_source="test", materializer=None, parent_trace=None
+        tasks=[task], dataset_source="test", worktree_manager=None, parent_trace=None
     )
     assert result.failure is not None
     assert result.failure.category == LocalizationFailureCategory.SCORING

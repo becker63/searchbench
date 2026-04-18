@@ -15,10 +15,8 @@ from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
 )
-from harness.localization.materialization.materialize import (
-    RepoMaterializationResult,
-    RepoMaterializer,
-)
+from harness.localization.materialization.worktree import RepoMaterializationResult
+from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
@@ -153,7 +151,7 @@ def _normalize_failure_category(
 
 def run_hosted_localization_baseline(
     req: HostedLocalizationBaselineRequest,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
     tasks: list[LCATask] | None = None,
 ) -> BaselineBundle:
     run_session_id = resolve_session_id(req.session, run_id=req.dataset)
@@ -234,7 +232,7 @@ def run_hosted_localization_baseline(
                                 dataset_version=req.version,
                                 parent_trace=parent_trace,
                                 dataset_source="huggingface",
-                                materializer=materializer,
+                                worktree_manager=worktree_manager,
                             )
                         )
                 else:
@@ -242,7 +240,7 @@ def run_hosted_localization_baseline(
                         selected_tasks,
                         effective_workers,
                         parent_trace,
-                        materializer,
+                        worktree_manager,
                         req.version,
                         run_session_id,
                     )
@@ -283,7 +281,7 @@ def _baseline_worker(
     index: int,
     task: LCATask,
     parent_trace: object,
-    materializer: RepoMaterializer | None,
+    worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
 ) -> BaselineSnapshot:
@@ -301,7 +299,7 @@ def _baseline_worker(
             dataset_version=dataset_version,
             parent_trace=parent_trace,
             dataset_source="huggingface",
-            materializer=materializer,
+            worktree_manager=worktree_manager,
         )
     except LocalizationEvaluationError as exc:
         category = getattr(exc, "category", LocalizationFailureCategory.UNKNOWN)
@@ -321,7 +319,7 @@ def _run_baseline_parallel(
     tasks: list[LCATask],
     effective_workers: int,
     parent_trace: object,
-    materializer: RepoMaterializer | None,
+    worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
 ) -> tuple[list[BaselineSnapshot], LocalizationEvaluationFailure | None]:
@@ -340,7 +338,7 @@ def _run_baseline_parallel(
                 idx,
                 tasks[idx],
                 parent_trace,
-                materializer,
+                worktree_manager,
                 dataset_version,
                 session_id,
             )
@@ -419,7 +417,7 @@ def _emit_experiment_dataset_aggregates(
 def _run_experiment_task(
     task: LCATask,
     parent_trace: object,
-    materializer: RepoMaterializer | None,
+    worktree_manager: WorktreeManager | None,
     session_id: str | None,
 ) -> LocalizationRunItemResult:
     if parent_trace is None:
@@ -434,7 +432,7 @@ def _run_experiment_task(
             eval_result = evaluate_localization_batch(
                 tasks=[task],
                 dataset_source="huggingface",
-                materializer=materializer,
+                worktree_manager=worktree_manager,
                 parent_trace=parent_trace,
             )
         if eval_result.failure or not eval_result.items:
@@ -476,7 +474,7 @@ def _run_experiment_parallel(
     tasks: list[LCATask],
     effective_workers: int,
     parent_trace: object,
-    materializer: RepoMaterializer | None,
+    worktree_manager: WorktreeManager | None,
     session_id: str | None,
 ) -> tuple[list[LocalizationRunItemResult], LocalizationEvaluationFailure | None]:
     results: list[LocalizationRunItemResult | None] = [None] * len(tasks)
@@ -493,7 +491,7 @@ def _run_experiment_parallel(
                 _run_experiment_task,
                 tasks[idx],
                 parent_trace,
-                materializer,
+                worktree_manager,
                 session_id,
             )
             inflight[future] = idx
@@ -542,7 +540,7 @@ def _run_experiment_parallel(
 
 def run_hosted_localization_experiment(
     req: HostedLocalizationRunRequest,
-    materializer: RepoMaterializer | None = None,
+    worktree_manager: WorktreeManager | None = None,
     tasks: list[LCATask] | None = None,
 ) -> HostedLocalizationRunResult:
     tasks = tasks or _resolve_items(req)
@@ -597,7 +595,7 @@ def run_hosted_localization_experiment(
                         _run_experiment_task(
                             task=task,
                             parent_trace=parent_trace,
-                            materializer=materializer,
+                            worktree_manager=worktree_manager,
                             session_id=run_session_id,
                         )
                     )
@@ -606,7 +604,7 @@ def run_hosted_localization_experiment(
                     selected_tasks,
                     effective_workers,
                     parent_trace,
-                    materializer,
+                    worktree_manager,
                     run_session_id,
                 )
             _emit_experiment_dataset_aggregates(
