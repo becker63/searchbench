@@ -28,8 +28,10 @@
 
 Orchestration-scoped tracing is owned by the state machines and their listeners:
 - `orchestration/machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
+- `orchestration/dependencies.py`: typed dependency wiring for concrete collaborators used by the machines.
+- `orchestration/evaluation.py`: policy-on-item evaluation against the shared localization backend.
+- `orchestration/writer.py`: repair writer support, candidate cleanup, and policy file writes.
 - `orchestration/listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, score recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration scoring records the composed score bundle output.
-- `orchestration/runtime.py`: thin bootstrap/wiring layer — constructs context, dependencies, and the optimization machine; converts iteration records to public output shape. Not responsible for tracing or orchestration.
 
 Leaf-operation observability remains with:
 - `runner.py`: model calls and MCP tool invocations traced via Langfuse spans.

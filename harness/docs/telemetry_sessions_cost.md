@@ -30,8 +30,8 @@
 
 ## Tracing ownership (listener-owned)
 
-- Run/root spans are created once by orchestration bootstrap/listener layers before state machine execution; entrypoints may nest under an external parent but do not create iteration/repair roots.
-- Iteration/repair spans and high-level metrics are listener/state-machine owned; `orchestration/runtime.py` remains wiring-only and does not create tracing policy or roots.
+- Run/root spans are created once by `orchestration/machine.py` before state machine execution; entrypoints may nest under an external parent but do not create iteration/repair roots.
+- Iteration/repair spans and high-level metrics are listener/state-machine owned. Dependency wiring lives in `orchestration/dependencies.py`, policy evaluation in `orchestration/evaluation.py`, and repair writer support in `orchestration/writer.py`.
 - Evaluation spans are opened by the machine-owned evaluation hook (state-machine layer) and passed as parents to the shared LCA evaluation backend; LCA opens child dataset/task/materialization spans under that parent.
 - Leaf modules (`agents/writer.py`, pipeline helpers, baselines) emit child spans only; they require a parent span and must fail/guard rather than create new roots unless an explicit, documented no-op is chosen.
 - Allowed leaf spans: writer attempts, backend/model/tool calls, usage/cost/latency, pipeline steps, baseline items — all attached to provided parents.

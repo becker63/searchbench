@@ -33,19 +33,18 @@ class DummySpan:
 
 
 class _DummyMessage:
-    def __init__(self, content, parsed=None):
+    def __init__(self, content):
         self.content = content
-        self.parsed = parsed
 
 
 class _DummyChoice:
-    def __init__(self, content, parsed=None):
-        self.message = _DummyMessage(content, parsed)
+    def __init__(self, content):
+        self.message = _DummyMessage(content)
 
 
 class _DummyResponse:
-    def __init__(self, content, parsed=None):
-        self.choices = [_DummyChoice(content, parsed)]
+    def __init__(self, content):
+        self.choices = [_DummyChoice(content)]
         self.usage = type(
             "U",
             (),
@@ -59,11 +58,11 @@ class _DummyResponse:
         )()
 
 
-def _make_client(content, capture, parsed=None):
+def _make_client(content, capture):
     class DummyCompletions:
         def create(self, **kwargs):
             capture.append(kwargs)
-            return _DummyResponse(content, parsed)
+            return _DummyResponse(content)
 
     class DummyChat:
         def __init__(self):
@@ -180,14 +179,13 @@ def test_generate_policy_rejects_invalid_json(monkeypatch):
         writer.generate_policy(**_base_inputs())
 
 
-def test_generate_policy_accepts_parsed_fallback(monkeypatch):
+def test_generate_policy_rejects_missing_content(monkeypatch):
     calls: list[dict[str, object]] = []
-    parsed = {"code": "def frontier_priority(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 2.0\n"}
-    monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(None, calls, parsed=parsed), "model"))
+    monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(None, calls), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
-    code = writer.generate_policy(**_base_inputs())
-    assert "return 2.0" in code
+    with pytest.raises(ValueError, match="missing content"):
+        writer.generate_policy(**_base_inputs())
 
 
 def test_frontier_context_is_derived_from_structured_context(monkeypatch):

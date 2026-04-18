@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.orchestration import _write_policy
+from harness.orchestration.writer import _write_policy
 
 
 def test_only_policy_file_can_be_written(tmp_path: Path):

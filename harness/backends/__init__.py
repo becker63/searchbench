@@ -1,4 +1,4 @@
-"""Backend dispatch: IC, JCodeMunch, and MCP adapters."""
+"""Concrete backend implementations over the shared MCP utility layer."""
 
 from .ic import IterativeContextBackend
 from .jc import JCodeMunchBackend

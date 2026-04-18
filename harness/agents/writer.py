@@ -78,7 +78,6 @@ def _extract_policy_code(response: Any) -> str:
     Supports:
     - response.choices[0].message.content as JSON string (primary)
     - response.choices[0].message.content as mapping
-    - response.choices[0].message.parsed (mapping with "code") as compatibility fallback
     """
     choices = getattr(response, "choices", None)
     if not choices:
@@ -112,12 +111,6 @@ def _extract_policy_code(response: Any) -> str:
         raise ValueError("Writer response missing code field")
     if content is not None:
         raise ValueError("Writer response content is not supported")
-
-    parsed = getattr(msg, "parsed", None)
-    if isinstance(parsed, Mapping):
-        code_val = _mapping_code(parsed)
-        if code_val is not None:
-            return code_val
 
     raise ValueError("Writer response missing content")
 

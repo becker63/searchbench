@@ -8,8 +8,8 @@ from harness.localization.runtime.evaluate import (
     LocalizationEvaluationTaskResult,
     evaluate_localization_batch,
 )
+from harness.orchestration.evaluation import evaluate_policy_on_item
 from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine
-from harness.orchestration.runtime import evaluate_policy_on_item
 
 
 def _make_task(tmp_path: Path) -> LCATask:
@@ -81,7 +81,7 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
     assert result.failure.category == LocalizationFailureCategory.RUNNER
 
 
-def test_orchestration_runtime_uses_shared_backend(monkeypatch, tmp_path) -> None:
+def test_orchestration_evaluation_uses_shared_backend(monkeypatch, tmp_path) -> None:
     bundle = _bundle()
     task = _make_task(tmp_path)
 
@@ -90,7 +90,7 @@ def test_orchestration_runtime_uses_shared_backend(monkeypatch, tmp_path) -> Non
         lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
-    monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda: "policy", raising=False)
+    monkeypatch.setattr("harness.orchestration.evaluation._read_policy", lambda: "policy", raising=False)
     eval_result = evaluate_policy_on_item(task, None, None, 0)
     assert eval_result.metrics.get("score") == 1.0
     assert eval_result.ic_result.get("predicted_files") == ["a.py"]

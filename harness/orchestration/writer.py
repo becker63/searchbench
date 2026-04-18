@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from harness.agents.writer import generate_policy
 from harness.pipeline.types import PipelineClassification
 from harness.prompts import WriterOptimizationBrief
 from harness.utils.type_loader import FrontierContext
+
+_POLICY_PATH = Path(__file__).resolve().parent.parent / "policy" / "current.py"
+
+
+def _write_policy(code: str, path: Path = _POLICY_PATH) -> None:
+    if path.name not in ("policy.py", "current.py"):
+        raise RuntimeError("Unauthorized write attempt")
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(code, encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def clean_policy_code(code: str) -> str:

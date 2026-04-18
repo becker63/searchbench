@@ -5,12 +5,31 @@ Holds state transitions and callbacks; no CLI or entrypoint concerns.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import TYPE_CHECKING, Any, Sequence, cast
 
 from statemachine import State, StateChart
 from statemachine.event import BoundEvent
 
+import jcodemunch_mcp.tools.index_folder as index_folder_tool
+
+from harness import pipeline as pipeline_module
+from harness.agents import writer as agent_writer
+from harness.localization.models import LCATask
+from harness.pipeline.types import PipelineClassification, StepResult
+from harness.prompts import WriterGuidance
+from harness.telemetry import tracing
+from harness.telemetry.tracing import score_emitter
+from harness.utils import diff as diff_utils
+from harness.utils import env as env_utils
+from harness.utils import repo_root as repo_root_utils
+from harness.utils import test_loader
+from harness.utils import type_loader
+from . import dependencies as dependency_wiring
+from . import evaluation as policy_evaluation
+from . import feedback as feedback_wiring
+from . import writer as policy_writer
 from .listeners import OptimizationTracingListener, RepairTracingListener
 from .types import (
     AcceptedPolicy,
@@ -25,17 +44,20 @@ from .types import (
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
+    RunMetadata,
     SpanHandle,
 )
-from harness.pipeline.types import PipelineClassification, StepResult
-from harness.prompts import WriterGuidance
+
+if TYPE_CHECKING:
+    from harness.telemetry.hosted.baselines import BaselineSnapshot
 
 _BOUND_EVENT = cast(Any, BoundEvent)
+_MAX_POLICY_REPAIRS = 3
 
-# python-statemachine 3.x uses ``name`` on events while older callback dispatchers
-# expect ``key``. Patch in a lightweight compatibility property so callbacks work
-# uniformly without scattering conditionals.
-if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
+# The installed python-statemachine release still reads ``BoundEvent.key``
+# internally while dispatching callbacks. Keep the patch isolated here; harness
+# callbacks and listeners use state hooks and EventData instead.
+if not hasattr(BoundEvent, "key"):  # pragma: no cover - depends on library release
     setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
 
@@ -540,3 +562,130 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             if step.exit_code != 0:
                 return step
         return None
+
+
+def _runtime_collaborators() -> dependency_wiring.RuntimeCollaborators:
+    return dependency_wiring.RuntimeCollaborators(
+        index_folder=index_folder_tool.index_folder,
+        evaluate_localization_batch=policy_evaluation.evaluate_localization_batch,
+        load_tests=test_loader.load_tests,
+        format_tests_for_prompt=test_loader.format_tests_for_prompt,
+        build_frontier_context=type_loader.build_frontier_context,
+        format_frontier_context=type_loader.format_frontier_context,
+        compute_diff=diff_utils.compute_diff,
+        format_diff=diff_utils.format_diff,
+        interpret_diff=diff_utils.interpret_diff,
+        generate_policy=agent_writer.generate_policy,
+        emit_score=score_emitter.emit_score,
+        classify_results=pipeline_module.classify_results,
+        read_policy=policy_evaluation._read_policy,
+        write_policy=policy_writer._write_policy,
+        get_writer_model=env_utils.get_writer_model,
+        start_observation=tracing.start_observation,
+        find_repo_root=repo_root_utils.find_repo_root,
+        default_pipeline=pipeline_module.default_pipeline,
+    )
+
+
+def build_loop_dependencies() -> LoopDependencies:
+    return dependency_wiring.build_loop_dependencies(
+        _runtime_collaborators(),
+        evaluate_policy_on_item=policy_evaluation.evaluate_policy_on_item,
+        build_iteration_feedback=feedback_wiring.build_iteration_feedback,
+        attempt_policy_generation=policy_writer.attempt_policy_generation,
+    )
+
+
+def _fallback_history(
+    opt_model: OptimizationMachineModel,
+    parent_trace: SpanHandle | None,
+) -> list[IterationRecord]:
+    repo_root = repo_root_utils.find_repo_root()
+    pipeline = pipeline_module.default_pipeline()
+    fallback_parent = opt_model.context.run_trace or parent_trace
+    pipeline_results, pipeline_success = dependency_wiring.run_policy_pipeline(
+        pipeline,
+        repo_root,
+        repair_obs=fallback_parent,
+        allow_no_parent=fallback_parent is None,
+        emit_score=score_emitter.emit_score,
+    )
+    classified = pipeline_module.classify_results(pipeline_results)
+    failed_step = dependency_wiring.first_failed_step(pipeline_results)
+    metrics_map: dict[str, float | int | bool | None] = {}
+    return [
+        IterationRecord(
+            iteration=0,
+            metrics=EvaluationMetrics.model_validate(metrics_map),
+            pipeline_passed=pipeline_success,
+            pipeline_feedback=classified,
+            failed_step=failed_step.name if failed_step else "pipeline_failed",
+            failed_exit_code=failed_step.exit_code if failed_step else None,
+            failed_summary=(failed_step.stderr or failed_step.stdout)
+            if failed_step
+            else None,
+            repair_attempts=_MAX_POLICY_REPAIRS,
+            max_policy_repairs=_MAX_POLICY_REPAIRS,
+            writer_error="writer_failed" if not pipeline_success else None,
+        )
+    ]
+
+
+def _baseline_snapshot_model(
+    baseline_snapshot: "BaselineSnapshot | Mapping[str, object] | None",
+) -> "BaselineSnapshot | None":
+    if isinstance(baseline_snapshot, Mapping):
+        from harness.telemetry.hosted.baselines import (
+            BaselineSnapshot as BaselineSnapshotModel,
+        )
+
+        return BaselineSnapshotModel.model_validate(baseline_snapshot)
+    return baseline_snapshot
+
+
+def run_loop(
+    task: LCATask,
+    iterations: int = 5,
+    parent_trace: SpanHandle | None = None,
+    baseline_snapshot: "BaselineSnapshot | Mapping[str, object] | None" = None,
+    session_id: str | None = None,
+) -> list[IterationRecord]:
+    """
+    Closed-loop optimizer: execute, score, rewrite policy, repeat.
+    """
+    root_meta = RunMetadata(task=task, iterations=iterations, session_id=session_id)
+    opt_model: OptimizationMachineModel | None = None
+    history: list[IterationRecord] = []
+    with tracing.start_observation(
+        name="run_loop",
+        parent=parent_trace,
+        input=task.model_dump(),
+        metadata=root_meta.model_dump(),
+    ) as run_span:
+        with tracing.propagate_context(
+            trace_name="run_loop",
+            session_id=session_id,
+            metadata={"iterations": iterations, "session_id": session_id},
+        ):
+            context = LoopContext(
+                task=task,
+                iterations=iterations,
+                session_id=session_id,
+                parent_trace=parent_trace,
+                run_metadata=root_meta,
+                baseline_snapshot=_baseline_snapshot_model(baseline_snapshot),
+                run_trace=run_span,
+            )
+            opt_model = OptimizationMachineModel(
+                context=context,
+                deps=build_loop_dependencies(),
+                max_policy_repairs=_MAX_POLICY_REPAIRS,
+            )
+            machine = OptimizationStateMachine(opt_model)
+            try:
+                history = machine.run()
+            finally:
+                tracing.flush_langfuse()
+    if not history and opt_model is not None:
+        history = _fallback_history(opt_model, parent_trace)
+    return history

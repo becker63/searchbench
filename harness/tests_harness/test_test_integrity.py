@@ -1,6 +1,17 @@
+import hashlib
 from pathlib import Path
 
-from harness.orchestration import _hash_tests_dir, _write_policy, _read_policy
+from harness.orchestration.evaluation import _read_policy
+from harness.orchestration.writer import _write_policy
+
+
+def _hash_tests_dir(repo_root: Path) -> str:
+    digest = hashlib.sha256()
+    tests_dir = repo_root / "iterative-context" / "tests"
+    for path in sorted(p for p in tests_dir.rglob("*") if p.is_file()):
+        digest.update(str(path.relative_to(tests_dir)).encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def test_test_directory_integrity(tmp_path: Path):

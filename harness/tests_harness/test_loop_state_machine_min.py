@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any, Iterator, List
 
 import pytest
+from statemachine.event import BoundEvent
 
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.orchestration import feedback as feedback_module
-from harness.orchestration import runtime as runtime_module
 from harness.orchestration.machine import OptimizationStateMachine, RepairStateMachine
 from harness.orchestration.types import (
     AcceptedPolicyMeta,
@@ -126,7 +126,7 @@ def test_build_iteration_feedback_produces_typed_writer_brief(monkeypatch: pytes
         success=False,
     )
 
-    feedback = runtime_module.build_iteration_feedback(evaluation, None, None, tmp_path)
+    feedback = feedback_module.build_iteration_feedback(evaluation, None, None, tmp_path)
 
     assert feedback.tests == "tests"
     assert feedback.frontier_context == "frontier"
@@ -291,6 +291,31 @@ def test_pipeline_failure_propagates_failure_details() -> None:
     assert len(seen_parent) == 1
     assert seen_parent[0] is spans[0]
     assert any(meta.get("status") == "failed" for span in spans for meta in span.ended)
+    assert events[0][0] == "span_open"
+    assert events[1][0] == "writer"
+    assert events[0][1] is events[1][1]
+
+
+def test_repair_listener_uses_event_data_without_direct_event_key_inspection() -> None:
+    assert "key" in vars(BoundEvent)
+    root = Path(__file__).resolve().parents[1]
+    assert "event.key" not in (root / "orchestration" / "listeners.py").read_text(encoding="utf-8")
+    deps, spans, seen_parent, events = _repair_deps(writer_ok_sequence=[True], pipeline_ok_sequence=[True])
+    ctx = RepairContext(
+        repo_root=Path("."),
+        evaluation=_make_eval(),
+        feedback=_make_feedback(),
+        max_repair_attempts=1,
+        parent_trace=None,
+        writer_model="model",
+    )
+    model = RepairMachineModel(context=ctx, deps=deps)
+
+    outcome = RepairStateMachine(model).run()
+
+    assert outcome.success is True
+    assert len(spans) == 1
+    assert seen_parent == spans
     assert events[0][0] == "span_open"
     assert events[1][0] == "writer"
     assert events[0][1] is events[1][1]

@@ -93,7 +93,6 @@ orchestration/
   feedback.py
   listeners.py
   machine.py
-  runtime.py
   types.py
   writer.py
 pipeline/
@@ -1664,7 +1663,6 @@ def _extract_policy_code(response: Any) -> str:
     Supports:
     - response.choices[0].message.content as JSON string (primary)
     - response.choices[0].message.content as mapping
-    - response.choices[0].message.parsed (mapping with "code") as compatibility fallback
     """
     choices = getattr(response, "choices", None)
     if not choices:
@@ -1698,12 +1696,6 @@ def _extract_policy_code(response: Any) -> str:
         raise ValueError("Writer response missing code field")
     if content is not None:
         raise ValueError("Writer response content is not supported")
-
-    parsed = getattr(msg, "parsed", None)
-    if isinstance(parsed, Mapping):
-        code_val = _mapping_code(parsed)
-        if code_val is not None:
-            return code_val
 
     raise ValueError("Writer response missing content")
 
@@ -1873,7 +1865,7 @@ def generate_policy(
 </file>
 
 <file path="backends/__init__.py">
-"""Backend dispatch: IC, JCodeMunch, and MCP adapters."""
+"""Concrete backend implementations over the shared MCP utility layer."""
 
 from .ic import IterativeContextBackend
 from .jc import JCodeMunchBackend
@@ -2345,8 +2337,8 @@ By default both machines are rendered; use `--machine optimization` or `--machin
 
 ## Tracing ownership (listener-owned)
 
-- Run/root spans are created once by orchestration bootstrap/listener layers before state machine execution; entrypoints may nest under an external parent but do not create iteration/repair roots.
-- Iteration/repair spans and high-level metrics are listener/state-machine owned; `orchestration/runtime.py` remains wiring-only and does not create tracing policy or roots.
+- Run/root spans are created once by `orchestration/machine.py` before state machine execution; entrypoints may nest under an external parent but do not create iteration/repair roots.
+- Iteration/repair spans and high-level metrics are listener/state-machine owned. Dependency wiring lives in `orchestration/dependencies.py`, policy evaluation in `orchestration/evaluation.py`, and repair writer support in `orchestration/writer.py`.
 - Evaluation spans are opened by the machine-owned evaluation hook (state-machine layer) and passed as parents to the shared LCA evaluation backend; LCA opens child dataset/task/materialization spans under that parent.
 - Leaf modules (`agents/writer.py`, pipeline helpers, baselines) emit child spans only; they require a parent span and must fail/guard rather than create new roots unless an explicit, documented no-op is chosen.
 - Allowed leaf spans: writer attempts, backend/model/tool calls, usage/cost/latency, pipeline steps, baseline items — all attached to provided parents.
@@ -5582,25 +5574,10 @@ def build_localization_telemetry(
 </file>
 
 <file path="orchestration/__init__.py">
-"""Orchestration: state machines, listeners, and runtime coordination."""
+"""Orchestration: state machines, listeners, and loop coordination."""
 # pyright: reportImportCycles=false
 
-from .runtime import (  # pyright: ignore[reportPrivateUsage,reportUnusedImport]
-    _clean_policy_code,  # pyright: ignore[reportPrivateUsage]
-    _hash_tests_dir,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]
-    _read_policy,  # pyright: ignore[reportPrivateUsage]
-    _write_policy,  # pyright: ignore[reportPrivateUsage]
-    emit_score,
-    evaluate_policy_on_item,
-    index_folder,
-    load_frontier_policy,
-    build_frontier_context,
-    load_graph_models,
-    prepare_iteration_tasks,
-    run_loop,
-    run_policy_pipeline,
-)
-from .machine import OptimizationStateMachine, RepairStateMachine
+from .machine import OptimizationStateMachine, RepairStateMachine, run_loop
 from .types import (
     AcceptedPolicy,
     AcceptedPolicyMeta,
@@ -5622,18 +5599,6 @@ from .types import (
 
 __all__ = [
     "run_loop",
-    "prepare_iteration_tasks",
-    "evaluate_policy_on_item",
-    "_read_policy",
-    "_write_policy",
-    "_clean_policy_code",
-    "_hash_tests_dir",
-    "index_folder",
-    "emit_score",
-    "load_frontier_policy",
-    "load_graph_models",
-    "build_frontier_context",
-    "run_policy_pipeline",
     "OptimizationStateMachine",
     "RepairStateMachine",
     "AcceptedPolicy",
@@ -6517,12 +6482,31 @@ Holds state transitions and callbacks; no CLI or entrypoint concerns.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import TYPE_CHECKING, Any, Sequence, cast
 
 from statemachine import State, StateChart
 from statemachine.event import BoundEvent
 
+import jcodemunch_mcp.tools.index_folder as index_folder_tool
+
+from harness import pipeline as pipeline_module
+from harness.agents import writer as agent_writer
+from harness.localization.models import LCATask
+from harness.pipeline.types import PipelineClassification, StepResult
+from harness.prompts import WriterGuidance
+from harness.telemetry import tracing
+from harness.telemetry.tracing import score_emitter
+from harness.utils import diff as diff_utils
+from harness.utils import env as env_utils
+from harness.utils import repo_root as repo_root_utils
+from harness.utils import test_loader
+from harness.utils import type_loader
+from . import dependencies as dependency_wiring
+from . import evaluation as policy_evaluation
+from . import feedback as feedback_wiring
+from . import writer as policy_writer
 from .listeners import OptimizationTracingListener, RepairTracingListener
 from .types import (
     AcceptedPolicy,
@@ -6537,17 +6521,20 @@ from .types import (
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
+    RunMetadata,
     SpanHandle,
 )
-from harness.pipeline.types import PipelineClassification, StepResult
-from harness.prompts import WriterGuidance
+
+if TYPE_CHECKING:
+    from harness.telemetry.hosted.baselines import BaselineSnapshot
 
 _BOUND_EVENT = cast(Any, BoundEvent)
+_MAX_POLICY_REPAIRS = 3
 
-# python-statemachine 3.x uses ``name`` on events while older callback dispatchers
-# expect ``key``. Patch in a lightweight compatibility property so callbacks work
-# uniformly without scattering conditionals.
-if not hasattr(BoundEvent, "key"):  # pragma: no cover - defensive shim
+# The installed python-statemachine release still reads ``BoundEvent.key``
+# internally while dispatching callbacks. Keep the patch isolated here; harness
+# callbacks and listeners use state hooks and EventData instead.
+if not hasattr(BoundEvent, "key"):  # pragma: no cover - depends on library release
     setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
 
@@ -7052,251 +7039,37 @@ class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
             if step.exit_code != 0:
                 return step
         return None
-</file>
-
-<file path="orchestration/runtime.py">
-"""
-Single-run optimizer coordinator.
-
-This module owns the public loop entrypoint, dependency assembly, state-machine
-startup, fallback record construction, and compatibility patch points.
-"""
-
-from __future__ import annotations
-
-import hashlib
-from collections.abc import Mapping, Sequence
-from pathlib import Path
-from typing import TYPE_CHECKING
-
-from jcodemunch_mcp.tools.index_folder import index_folder
-
-from harness.agents.localizer import run_ic_iteration
-from harness.agents.writer import generate_policy
-from harness.localization.materialization.materialize import RepoMaterializer
-from harness.localization.models import LCATask
-from harness.localization.runtime.evaluate import (
-    LocalizationEvaluationResult,
-    LocalizationRunner,
-)
-from harness.pipeline import PipelineClassification, classify_results, default_pipeline
-from harness.pipeline.types import StepResult
-from harness.policy.load import load_frontier_policy
-from harness.telemetry.tracing import flush_langfuse, propagate_context, start_observation
-from harness.telemetry.tracing.score_emitter import emit_score
-from harness.utils.diff import compute_diff, format_diff, interpret_diff
-from harness.utils.env import get_writer_model
-from harness.utils.repo_root import find_repo_root
-from harness.utils.test_loader import format_tests_for_prompt, load_tests
-from harness.utils.type_loader import (
-    build_frontier_context,
-    format_frontier_context,
-    load_frontier_examples,
-    load_frontier_types,
-    load_graph_models,
-)
-
-from . import dependencies as dependency_wiring
-from .evaluation import evaluate_policy_on_item
-from .feedback import build_iteration_feedback
-from .machine import OptimizationStateMachine
-from .types import (
-    AcceptedPolicyMeta,
-    EvaluationMetrics,
-    FailedRepairDetails,
-    IterationRecord,
-    LoopContext,
-    LoopDependencies,
-    OptimizationMachineModel,
-    PreparedTasks,
-    RunMetadata,
-    SpanHandle,
-    SupportsPipelineRun,
-)
-from .writer import attempt_policy_generation, clean_policy_code
-
-if TYPE_CHECKING:
-    from harness.telemetry.hosted.baselines import BaselineSnapshot
-    from iterative_context.graph_models import Graph, GraphNode
-
-
-_POLICY_PATH = Path(__file__).resolve().parent.parent / "policy" / "current.py"
-_MAX_POLICY_REPAIRS = 3
-
-
-# Compatibility exports used by tests and legacy monkeypatch call sites.
-_COMPATIBILITY_EXPORTS = (
-    index_folder,
-    load_frontier_policy,
-    load_graph_models,
-    load_frontier_examples,
-    load_frontier_types,
-    run_ic_iteration,
-    compute_diff,
-    format_diff,
-    interpret_diff,
-    get_writer_model,
-    find_repo_root,
-    format_tests_for_prompt,
-    load_tests,
-    build_frontier_context,
-    format_frontier_context,
-    generate_policy,
-    classify_results,
-    default_pipeline,
-    flush_langfuse,
-    emit_score,
-)
-
-
-def evaluate_localization_batch(
-    tasks: Sequence[LCATask],
-    *,
-    dataset_source: str | None = None,
-    materializer: RepoMaterializer | None = None,
-    parent_trace: object | None = None,
-    runner: LocalizationRunner | None = None,
-) -> LocalizationEvaluationResult:
-    """
-    Stable wrapper for tests and callers that patch runtime-level evaluation.
-    """
-    from harness.localization.runtime.evaluate import evaluate_localization_batch as _evaluate_localization_batch
-
-    return _evaluate_localization_batch(
-        tasks,
-        dataset_source=dataset_source,
-        materializer=materializer,
-        parent_trace=parent_trace,
-        runner=runner,
-    )
-
-
-def frontier_priority(node: "GraphNode", graph: "Graph", step: int) -> float:
-    """
-    Stable wrapper around the active policy function.
-    """
-    from harness.policy import frontier_priority as _frontier_priority
-
-    return _frontier_priority(node, graph, step)
-
-
-def _read_policy(path: Path = _POLICY_PATH) -> str:
-    return path.read_text(encoding="utf-8")
-
-
-def _write_policy(code: str, path: Path = _POLICY_PATH) -> None:
-    if path.name not in ("policy.py", "current.py"):
-        raise RuntimeError("Unauthorized write attempt")
-    tmp_path = path.with_suffix(".tmp")
-    tmp_path.write_text(code, encoding="utf-8")
-    tmp_path.replace(path)
-
-
-def _clean_policy_code(code: str) -> str:
-    return clean_policy_code(code)
-
-
-def _hash_tests_dir(repo_root: Path) -> str:
-    tests_path = repo_root / "iterative-context" / "tests"
-    hasher = hashlib.sha256()
-    if not tests_path.exists():
-        return hasher.hexdigest()
-    for file in sorted(tests_path.rglob("*.py")):
-        hasher.update(str(file.relative_to(repo_root)).encode())
-        hasher.update(file.read_bytes())
-    return hasher.hexdigest()
-
-
-def prepare_iteration_tasks(
-    task: LCATask,
-    parent_trace: SpanHandle | None = None,
-) -> PreparedTasks:
-    return dependency_wiring.prepare_iteration_tasks(
-        task,
-        parent_trace,
-        start_observation=start_observation,
-        index_folder=index_folder,
-    )
-
-
-def run_policy_pipeline(
-    pipeline: SupportsPipelineRun,
-    repo_root: Path,
-    repair_obs: SpanHandle | None = None,
-    allow_no_parent: bool = False,
-) -> tuple[list[StepResult], bool]:
-    return dependency_wiring.run_policy_pipeline(
-        pipeline,
-        repo_root,
-        repair_obs=repair_obs,
-        allow_no_parent=allow_no_parent,
-        emit_score=emit_score,
-    )
-
-
-def finalize_successful_policy(
-    *,
-    new_code: str,
-    attempts_used: int,
-    max_repair_attempts: int,
-    repair_obs: object | None = None,
-) -> tuple[str, AcceptedPolicyMeta]:
-    return dependency_wiring.finalize_successful_policy(
-        new_code=new_code,
-        attempts_used=attempts_used,
-        max_repair_attempts=max_repair_attempts,
-        repair_obs=repair_obs,
-        read_policy=_read_policy,
-    )
-
-
-def finalize_failed_repair(
-    *,
-    pipeline_results: list[StepResult],
-    classified: PipelineClassification,
-    writer_model: str | None,
-    attempts_used: int,
-    writer_error: str | None,
-) -> FailedRepairDetails:
-    return dependency_wiring.finalize_failed_repair(
-        pipeline_results=pipeline_results,
-        classified=classified,
-        writer_model=writer_model,
-        attempts_used=attempts_used,
-        writer_error=writer_error,
-        read_policy=_read_policy,
-    )
 
 
 def _runtime_collaborators() -> dependency_wiring.RuntimeCollaborators:
     return dependency_wiring.RuntimeCollaborators(
-        index_folder=index_folder,
-        evaluate_localization_batch=evaluate_localization_batch,
-        load_tests=load_tests,
-        format_tests_for_prompt=format_tests_for_prompt,
-        build_frontier_context=build_frontier_context,
-        format_frontier_context=format_frontier_context,
-        compute_diff=compute_diff,
-        format_diff=format_diff,
-        interpret_diff=interpret_diff,
-        generate_policy=generate_policy,
-        emit_score=emit_score,
-        classify_results=classify_results,
-        read_policy=_read_policy,
-        write_policy=_write_policy,
-        get_writer_model=get_writer_model,
-        start_observation=start_observation,
-        find_repo_root=find_repo_root,
-        default_pipeline=default_pipeline,
+        index_folder=index_folder_tool.index_folder,
+        evaluate_localization_batch=policy_evaluation.evaluate_localization_batch,
+        load_tests=test_loader.load_tests,
+        format_tests_for_prompt=test_loader.format_tests_for_prompt,
+        build_frontier_context=type_loader.build_frontier_context,
+        format_frontier_context=type_loader.format_frontier_context,
+        compute_diff=diff_utils.compute_diff,
+        format_diff=diff_utils.format_diff,
+        interpret_diff=diff_utils.interpret_diff,
+        generate_policy=agent_writer.generate_policy,
+        emit_score=score_emitter.emit_score,
+        classify_results=pipeline_module.classify_results,
+        read_policy=policy_evaluation._read_policy,
+        write_policy=policy_writer._write_policy,
+        get_writer_model=env_utils.get_writer_model,
+        start_observation=tracing.start_observation,
+        find_repo_root=repo_root_utils.find_repo_root,
+        default_pipeline=pipeline_module.default_pipeline,
     )
 
 
-def _build_dependencies() -> LoopDependencies:
+def build_loop_dependencies() -> LoopDependencies:
     return dependency_wiring.build_loop_dependencies(
         _runtime_collaborators(),
-        evaluate_policy_on_item=evaluate_policy_on_item,
-        build_iteration_feedback=build_iteration_feedback,
-        attempt_policy_generation=attempt_policy_generation,
+        evaluate_policy_on_item=policy_evaluation.evaluate_policy_on_item,
+        build_iteration_feedback=feedback_wiring.build_iteration_feedback,
+        attempt_policy_generation=policy_writer.attempt_policy_generation,
     )
 
 
@@ -7304,16 +7077,17 @@ def _fallback_history(
     opt_model: OptimizationMachineModel,
     parent_trace: SpanHandle | None,
 ) -> list[IterationRecord]:
-    repo_root = find_repo_root()
-    pipeline = default_pipeline()
+    repo_root = repo_root_utils.find_repo_root()
+    pipeline = pipeline_module.default_pipeline()
     fallback_parent = opt_model.context.run_trace or parent_trace
-    pipeline_results, pipeline_success = run_policy_pipeline(
+    pipeline_results, pipeline_success = dependency_wiring.run_policy_pipeline(
         pipeline,
         repo_root,
         repair_obs=fallback_parent,
         allow_no_parent=fallback_parent is None,
+        emit_score=score_emitter.emit_score,
     )
-    classified = classify_results(pipeline_results)
+    classified = pipeline_module.classify_results(pipeline_results)
     failed_step = dependency_wiring.first_failed_step(pipeline_results)
     metrics_map: dict[str, float | int | bool | None] = {}
     return [
@@ -7338,7 +7112,9 @@ def _baseline_snapshot_model(
     baseline_snapshot: "BaselineSnapshot | Mapping[str, object] | None",
 ) -> "BaselineSnapshot | None":
     if isinstance(baseline_snapshot, Mapping):
-        from harness.telemetry.hosted.baselines import BaselineSnapshot as BaselineSnapshotModel
+        from harness.telemetry.hosted.baselines import (
+            BaselineSnapshot as BaselineSnapshotModel,
+        )
 
         return BaselineSnapshotModel.model_validate(baseline_snapshot)
     return baseline_snapshot
@@ -7357,13 +7133,13 @@ def run_loop(
     root_meta = RunMetadata(task=task, iterations=iterations, session_id=session_id)
     opt_model: OptimizationMachineModel | None = None
     history: list[IterationRecord] = []
-    with start_observation(
+    with tracing.start_observation(
         name="run_loop",
         parent=parent_trace,
         input=task.model_dump(),
         metadata=root_meta.model_dump(),
     ) as run_span:
-        with propagate_context(
+        with tracing.propagate_context(
             trace_name="run_loop",
             session_id=session_id,
             metadata={"iterations": iterations, "session_id": session_id},
@@ -7379,14 +7155,14 @@ def run_loop(
             )
             opt_model = OptimizationMachineModel(
                 context=context,
-                deps=_build_dependencies(),
+                deps=build_loop_dependencies(),
                 max_policy_repairs=_MAX_POLICY_REPAIRS,
             )
             machine = OptimizationStateMachine(opt_model)
             try:
                 history = machine.run()
             finally:
-                flush_langfuse()
+                tracing.flush_langfuse()
     if not history and opt_model is not None:
         history = _fallback_history(opt_model, parent_trace)
     return history
@@ -7929,10 +7705,22 @@ _rebuild_forward_refs()
 <file path="orchestration/writer.py">
 from __future__ import annotations
 
+from pathlib import Path
+
 from harness.agents.writer import generate_policy
 from harness.pipeline.types import PipelineClassification
 from harness.prompts import WriterOptimizationBrief
 from harness.utils.type_loader import FrontierContext
+
+_POLICY_PATH = Path(__file__).resolve().parent.parent / "policy" / "current.py"
+
+
+def _write_policy(code: str, path: Path = _POLICY_PATH) -> None:
+    if path.name not in ("policy.py", "current.py"):
+        raise RuntimeError("Unauthorized write attempt")
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(code, encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def clean_policy_code(code: str) -> str:
@@ -14291,7 +14079,8 @@ from harness.localization.models import (
 )
 from harness import orchestration
 from harness.orchestration import dependencies as orchestration_dependencies
-from harness.orchestration import runtime
+from harness.orchestration import evaluation as orchestration_evaluation
+from harness.orchestration import machine as orchestration_machine
 from harness.orchestration import types as orchestration_types
 
 DELETED_TASK_WRAPPERS = (
@@ -14336,8 +14125,8 @@ def test_orchestration_records_reference_lca_task_directly() -> None:
     assert orchestration_types.IterationTasks.model_fields["task"].annotation is LCATask
     assert orchestration_types.LoopContext.model_fields["task"].annotation is LCATask
     assert inspect.signature(orchestration_dependencies.prepare_iteration_tasks).parameters["task"].annotation in {LCATask, "LCATask"}
-    assert inspect.signature(runtime.evaluate_policy_on_item).parameters["task"].annotation in {LCATask, "LCATask"}
-    assert inspect.signature(runtime.run_loop).parameters["task"].annotation in {LCATask, "LCATask"}
+    assert inspect.signature(orchestration_evaluation.evaluate_policy_on_item).parameters["task"].annotation in {LCATask, "LCATask"}
+    assert inspect.signature(orchestration_machine.run_loop).parameters["task"].annotation in {LCATask, "LCATask"}
 
 
 def test_ic_and_jc_share_lca_task_input_type() -> None:
@@ -15227,7 +15016,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.orchestration import _write_policy
+from harness.orchestration.writer import _write_policy
 
 
 def test_only_policy_file_can_be_written(tmp_path: Path):
@@ -15701,8 +15490,8 @@ from harness.localization.runtime.evaluate import (
     LocalizationEvaluationTaskResult,
     evaluate_localization_batch,
 )
+from harness.orchestration.evaluation import evaluate_policy_on_item
 from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine
-from harness.orchestration.runtime import evaluate_policy_on_item
 
 
 def _make_task(tmp_path: Path) -> LCATask:
@@ -15774,7 +15563,7 @@ def test_evaluation_backend_failure_maps_category(monkeypatch, tmp_path) -> None
     assert result.failure.category == LocalizationFailureCategory.RUNNER
 
 
-def test_orchestration_runtime_uses_shared_backend(monkeypatch, tmp_path) -> None:
+def test_orchestration_evaluation_uses_shared_backend(monkeypatch, tmp_path) -> None:
     bundle = _bundle()
     task = _make_task(tmp_path)
 
@@ -15783,7 +15572,7 @@ def test_orchestration_runtime_uses_shared_backend(monkeypatch, tmp_path) -> Non
         lambda *a, **k: (LocalizationPrediction(predicted_files=["a.py"]), bundle, None, None),
         raising=False,
     )
-    monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda: "policy", raising=False)
+    monkeypatch.setattr("harness.orchestration.evaluation._read_policy", lambda: "policy", raising=False)
     eval_result = evaluate_policy_on_item(task, None, None, 0)
     assert eval_result.metrics.get("score") == 1.0
     assert eval_result.ic_result.get("predicted_files") == ["a.py"]
@@ -16892,8 +16681,8 @@ from harness.localization.models import (
     LocalizationPrediction,
 )
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+from harness.orchestration.evaluation import evaluate_policy_on_item
 from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine, summarize_batch_scores
-from harness.orchestration.runtime import evaluate_policy_on_item
 
 
 def _identity() -> LCATaskIdentity:
@@ -16998,10 +16787,10 @@ from pathlib import Path
 from typing import Any, Iterator, List
 
 import pytest
+from statemachine.event import BoundEvent
 
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.orchestration import feedback as feedback_module
-from harness.orchestration import runtime as runtime_module
 from harness.orchestration.machine import OptimizationStateMachine, RepairStateMachine
 from harness.orchestration.types import (
     AcceptedPolicyMeta,
@@ -17119,7 +16908,7 @@ def test_build_iteration_feedback_produces_typed_writer_brief(monkeypatch: pytes
         success=False,
     )
 
-    feedback = runtime_module.build_iteration_feedback(evaluation, None, None, tmp_path)
+    feedback = feedback_module.build_iteration_feedback(evaluation, None, None, tmp_path)
 
     assert feedback.tests == "tests"
     assert feedback.frontier_context == "frontier"
@@ -17284,6 +17073,31 @@ def test_pipeline_failure_propagates_failure_details() -> None:
     assert len(seen_parent) == 1
     assert seen_parent[0] is spans[0]
     assert any(meta.get("status") == "failed" for span in spans for meta in span.ended)
+    assert events[0][0] == "span_open"
+    assert events[1][0] == "writer"
+    assert events[0][1] is events[1][1]
+
+
+def test_repair_listener_uses_event_data_without_direct_event_key_inspection() -> None:
+    assert "key" in vars(BoundEvent)
+    root = Path(__file__).resolve().parents[1]
+    assert "event.key" not in (root / "orchestration" / "listeners.py").read_text(encoding="utf-8")
+    deps, spans, seen_parent, events = _repair_deps(writer_ok_sequence=[True], pipeline_ok_sequence=[True])
+    ctx = RepairContext(
+        repo_root=Path("."),
+        evaluation=_make_eval(),
+        feedback=_make_feedback(),
+        max_repair_attempts=1,
+        parent_trace=None,
+        writer_model="model",
+    )
+    model = RepairMachineModel(context=ctx, deps=deps)
+
+    outcome = RepairStateMachine(model).run()
+
+    assert outcome.success is True
+    assert len(spans) == 1
+    assert seen_parent == spans
     assert events[0][0] == "span_open"
     assert events[1][0] == "writer"
     assert events[0][1] is events[1][1]
@@ -17834,8 +17648,8 @@ def test_build_loop_dependencies_wires_explicit_collaborators(tmp_path: Path) ->
 
 def test_refactored_orchestration_surface_has_no_cast_usage() -> None:
     root = Path(__file__).resolve().parents[1]
+    assert not (root / "orchestration" / "runtime.py").exists()
     paths = [
-        root / "orchestration" / "runtime.py",
         root / "orchestration" / "dependencies.py",
     ]
 
@@ -18636,36 +18450,33 @@ def test_run_loop_keeps_filesystem_repo_for_ic(monkeypatch, tmp_path):
     repo_dir = tmp_path / "ic_repo"
     repo_dir.mkdir()
 
-    monkeypatch.setattr("harness.orchestration.runtime.index_folder", lambda repo: {"repo": "local/fake-repo-id"})
-    monkeypatch.setattr("harness.orchestration.runtime.load_frontier_policy", lambda: lambda *_: 1.0)
+    monkeypatch.setattr("jcodemunch_mcp.tools.index_folder.index_folder", lambda repo: {"repo": "local/fake-repo-id"})
 
     def fake_run_ic_iteration(task: LCATask, *args, **kwargs):
         ic_repos.append(task.repo)
         return {"observations": [{"tool": "x"}], "node_count": 1}
 
     monkeypatch.setattr("harness.agents.localizer.run_ic_iteration", fake_run_ic_iteration)
-    monkeypatch.setattr("harness.orchestration.runtime.frontier_priority", lambda *args, **kwargs: 1.0)
-    monkeypatch.setattr("harness.orchestration.runtime.load_tests", lambda repo: [])
-    monkeypatch.setattr("harness.orchestration.runtime.format_tests_for_prompt", lambda tests: "")
+    monkeypatch.setattr("harness.utils.test_loader.load_tests", lambda repo: [])
+    monkeypatch.setattr("harness.utils.test_loader.format_tests_for_prompt", lambda tests: "")
     from harness.utils.type_loader import FrontierContext
 
     dummy_ctx = FrontierContext(signature="", graph_models="", types="", examples="", notes="")
-    monkeypatch.setattr("harness.orchestration.runtime.build_frontier_context", lambda repo: dummy_ctx)
-    monkeypatch.setattr("harness.orchestration.runtime.format_frontier_context", lambda *a, **k: "")
-    monkeypatch.setattr("harness.orchestration.runtime._read_policy", lambda *a, **k: "def frontier_priority(node, graph, step):\n    return 0.0\n")
-    monkeypatch.setattr("harness.orchestration.runtime._write_policy", lambda *a, **k: None)
-    monkeypatch.setattr("harness.orchestration.runtime._hash_tests_dir", lambda *a, **k: "hash")
-    monkeypatch.setattr("harness.orchestration.runtime.generate_policy", lambda **kwargs: "def frontier_priority(node, graph, step):\n    return 1.0\n")
+    monkeypatch.setattr("harness.utils.type_loader.build_frontier_context", lambda repo: dummy_ctx)
+    monkeypatch.setattr("harness.utils.type_loader.format_frontier_context", lambda *a, **k: "")
+    monkeypatch.setattr("harness.orchestration.evaluation._read_policy", lambda *a, **k: "def frontier_priority(node, graph, step):\n    return 0.0\n")
+    monkeypatch.setattr("harness.orchestration.writer._write_policy", lambda *a, **k: None)
+    monkeypatch.setattr("harness.orchestration.writer.generate_policy", lambda **kwargs: "def frontier_priority(node, graph, step):\n    return 1.0\n")
 
     class DummyPipeline:
         def run(self, repo_root, observation=None, allow_no_parent=False):
             return []
 
-    monkeypatch.setattr("harness.orchestration.runtime.default_pipeline", lambda: DummyPipeline())
-    monkeypatch.setattr("harness.orchestration.runtime.find_repo_root", lambda: tmp_path)
-    monkeypatch.setattr("harness.orchestration.runtime.start_observation", lambda *a, **k: DummySpan("span"))
-    monkeypatch.setattr("harness.orchestration.runtime.emit_score", lambda *a, **k: None)
-    monkeypatch.setattr("harness.orchestration.runtime.flush_langfuse", lambda: None)
+    monkeypatch.setattr("harness.pipeline.default_pipeline", lambda: DummyPipeline())
+    monkeypatch.setattr("harness.utils.repo_root.find_repo_root", lambda: tmp_path)
+    monkeypatch.setattr("harness.telemetry.tracing.start_observation", lambda *a, **k: DummySpan("span"))
+    monkeypatch.setattr("harness.telemetry.tracing.score_emitter.emit_score", lambda *a, **k: None)
+    monkeypatch.setattr("harness.telemetry.tracing.flush_langfuse", lambda: None)
 
     task = _task(str(repo_dir))
     run_loop(task, iterations=1)
@@ -19447,9 +19258,20 @@ def test_disallowed_command_rejected():
 </file>
 
 <file path="tests_harness/test_test_integrity.py">
+import hashlib
 from pathlib import Path
 
-from harness.orchestration import _hash_tests_dir, _write_policy, _read_policy
+from harness.orchestration.evaluation import _read_policy
+from harness.orchestration.writer import _write_policy
+
+
+def _hash_tests_dir(repo_root: Path) -> str:
+    digest = hashlib.sha256()
+    tests_dir = repo_root / "iterative-context" / "tests"
+    for path in sorted(p for p in tests_dir.rglob("*") if p.is_file()):
+        digest.update(str(path.relative_to(tests_dir)).encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def test_test_directory_integrity(tmp_path: Path):
@@ -20027,19 +19849,18 @@ class DummySpan:
 
 
 class _DummyMessage:
-    def __init__(self, content, parsed=None):
+    def __init__(self, content):
         self.content = content
-        self.parsed = parsed
 
 
 class _DummyChoice:
-    def __init__(self, content, parsed=None):
-        self.message = _DummyMessage(content, parsed)
+    def __init__(self, content):
+        self.message = _DummyMessage(content)
 
 
 class _DummyResponse:
-    def __init__(self, content, parsed=None):
-        self.choices = [_DummyChoice(content, parsed)]
+    def __init__(self, content):
+        self.choices = [_DummyChoice(content)]
         self.usage = type(
             "U",
             (),
@@ -20053,11 +19874,11 @@ class _DummyResponse:
         )()
 
 
-def _make_client(content, capture, parsed=None):
+def _make_client(content, capture):
     class DummyCompletions:
         def create(self, **kwargs):
             capture.append(kwargs)
-            return _DummyResponse(content, parsed)
+            return _DummyResponse(content)
 
     class DummyChat:
         def __init__(self):
@@ -20174,14 +19995,13 @@ def test_generate_policy_rejects_invalid_json(monkeypatch):
         writer.generate_policy(**_base_inputs())
 
 
-def test_generate_policy_accepts_parsed_fallback(monkeypatch):
+def test_generate_policy_rejects_missing_content(monkeypatch):
     calls: list[dict[str, object]] = []
-    parsed = {"code": "def frontier_priority(node: \"GraphNode\", graph: \"Graph\", step: int):\n    return 2.0\n"}
-    monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(None, calls, parsed=parsed), "model"))
+    monkeypatch.setattr(writer, "_get_client", lambda: (_make_client(None, calls), "model"))
     monkeypatch.setattr(writer, "start_observation", lambda *a, **k: DummySpan())
     monkeypatch.setattr(writer, "emit_score_for_handle", lambda *a, **k: None)
-    code = writer.generate_policy(**_base_inputs())
-    assert "return 2.0" in code
+    with pytest.raises(ValueError, match="missing content"):
+        writer.generate_policy(**_base_inputs())
 
 
 def test_frontier_context_is_derived_from_structured_context(monkeypatch):
@@ -21231,8 +21051,10 @@ todo.md
 
 Orchestration-scoped tracing is owned by the state machines and their listeners:
 - `orchestration/machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
+- `orchestration/dependencies.py`: typed dependency wiring for concrete collaborators used by the machines.
+- `orchestration/evaluation.py`: policy-on-item evaluation against the shared localization backend.
+- `orchestration/writer.py`: repair writer support, candidate cleanup, and policy file writes.
 - `orchestration/listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, score recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration scoring records the composed score bundle output.
-- `orchestration/runtime.py`: thin bootstrap/wiring layer — constructs context, dependencies, and the optimization machine; converts iteration records to public output shape. Not responsible for tracing or orchestration.
 
 Leaf-operation observability remains with:
 - `runner.py`: model calls and MCP tool invocations traced via Langfuse spans.

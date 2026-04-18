@@ -182,8 +182,8 @@ def test_build_loop_dependencies_wires_explicit_collaborators(tmp_path: Path) ->
 
 def test_refactored_orchestration_surface_has_no_cast_usage() -> None:
     root = Path(__file__).resolve().parents[1]
+    assert not (root / "orchestration" / "runtime.py").exists()
     paths = [
-        root / "orchestration" / "runtime.py",
         root / "orchestration" / "dependencies.py",
     ]
 

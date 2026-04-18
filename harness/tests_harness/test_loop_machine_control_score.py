@@ -10,8 +10,8 @@ from harness.localization.models import (
     LocalizationPrediction,
 )
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult, LocalizationEvaluationTaskResult
+from harness.orchestration.evaluation import evaluate_policy_on_item
 from harness.scoring import ScoreBundle, ScoreContext, ScoreEngine, summarize_batch_scores
-from harness.orchestration.runtime import evaluate_policy_on_item
 
 
 def _identity() -> LCATaskIdentity:
