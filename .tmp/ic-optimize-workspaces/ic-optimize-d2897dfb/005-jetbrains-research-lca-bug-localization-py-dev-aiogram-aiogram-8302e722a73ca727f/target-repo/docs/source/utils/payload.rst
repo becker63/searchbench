@@ -1,4 +1,0 @@
-=======
-Payload
-=======
-Coming soon...

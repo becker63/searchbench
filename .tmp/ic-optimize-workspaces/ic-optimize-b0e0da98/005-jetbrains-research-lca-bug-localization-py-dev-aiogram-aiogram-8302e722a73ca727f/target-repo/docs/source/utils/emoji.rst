@@ -1,4 +1,0 @@
-=====
-Emoji
-=====
-Coming soon...
