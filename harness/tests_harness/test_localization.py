@@ -22,6 +22,7 @@ from harness.localization.runtime.records import build_localization_score_eval_r
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.runtime.execute import run_localization_task
 from harness.localization.errors import LocalizationEvaluationError
+from harness.scoring.helpers import tokens_to_score
 import harness.localization.runtime.execute as executor_module
 import harness.agents.localizer as runner
 
@@ -206,7 +207,7 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
         yield type("S", (), {"id": "span", "metadata": {}, "end": lambda self, **kw: None})()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    prediction, score_bundle, _evidence, _mat, _usage = run_localization_task(
+    prediction, score_bundle, _evidence, _mat, _usage, _run_result = run_localization_task(
         lca_task,
         runner=lambda task, *_args: _runner_result(task, ["predicted.py"], source="runner"),
     )
@@ -374,7 +375,7 @@ def test_localization_task_scores_runner_usage_as_visible_component(monkeypatch,
         lambda handle, **kwargs: emitted.append(kwargs),
     )
 
-    _prediction, score_bundle, _evidence, _mat, usage = run_localization_task(
+    _prediction, score_bundle, _evidence, _mat, usage, _run_result = run_localization_task(
         lca_task,
         runner=lambda task, *_args: LocalizationRunResult(
             task=task,
@@ -389,6 +390,75 @@ def test_localization_task_scores_runner_usage_as_visible_component(monkeypatch,
     assert score_bundle.results["token_efficiency"].value is not None
     names = {item["name"] for item in emitted}
     assert "ic.token_efficiency" in names
+
+
+def test_localization_task_scores_full_run_usage_not_finalization_only(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    (repo_dir / "src").mkdir(parents=True)
+    (repo_dir / "src" / "app.py").write_text("def app():\n    return 1\n")
+    identity = LCATaskIdentity(
+        dataset_name="lca",
+        dataset_config="py",
+        dataset_split="dev",
+        repo_owner="o",
+        repo_name="r",
+        base_sha="abc",
+    )
+    lca_task = executor_module.LCATask.model_validate(
+        {
+            "identity": identity.model_dump(),
+            "context": LCAContext(issue_title="app bug", issue_body="src app").model_dump(),
+            "gold": LCAGold(changed_files=["src/app.py"]).model_dump(),
+            "repo": str(repo_dir),
+        }
+    )
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def span_cm():
+        span = type(
+            "S",
+            (),
+            {
+                "id": "span",
+                "metadata": {},
+                "update": lambda self, **kw: None,
+                "end": lambda self, **kw: None,
+            },
+        )()
+        yield span
+
+    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(executor_module, "emit_score_for_handle", lambda *a, **k: None)
+
+    _prediction, score_bundle, _evidence, _mat, usage, _run_result = run_localization_task(
+        lca_task,
+        runner=lambda task, *_args: LocalizationRunResult(
+            task=task,
+            prediction=LocalizationPrediction(predicted_files=["src/app.py"]),
+            backend="ic",
+            observations=[
+                {"usage_details": {"input": 1000, "output": 100, "total": 1100}},
+            ],
+            raw={
+                "final": {"predicted_files": ["src/app.py"]},
+                "usage_details": {"input": 10, "output": 2, "total": 12},
+                "raw": {
+                    "usage_details": {"input": 1000, "output": 100, "total": 1100},
+                    "observations": [
+                        {"usage_details": {"input": 1000, "output": 100, "total": 1100}},
+                    ],
+                },
+            },
+        ),
+    )
+
+    assert usage.normalized_total() == 1112
+    token_score = score_bundle.results["token_efficiency"]
+    assert token_score.available is True
+    assert token_score.value == pytest.approx(tokens_to_score(1112))
+    assert token_score.value != pytest.approx(tokens_to_score(12))
 
 
 def test_localization_langfuse_boundary_node_count_visible_without_malformed_bundle_fallback(

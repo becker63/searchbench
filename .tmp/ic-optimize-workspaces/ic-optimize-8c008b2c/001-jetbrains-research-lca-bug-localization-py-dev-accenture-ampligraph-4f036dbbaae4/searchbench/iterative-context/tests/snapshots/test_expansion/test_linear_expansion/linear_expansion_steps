@@ -1,0 +1,535 @@
+[
+  {
+    "event": null,
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "nodes": [
+        "A_child"
+      ],
+      "type": "addNodes"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        }
+      ],
+      "type": "addEdges"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "id": "A",
+      "patch": {
+        "state": "resolved",
+        "tokens": 1
+      },
+      "type": "updateNode"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "nodes": [
+        "A_child_child"
+      ],
+      "type": "addNodes"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        }
+      ],
+      "type": "addEdges"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "id": "A_child",
+      "patch": {
+        "state": "resolved",
+        "tokens": 1
+      },
+      "type": "updateNode"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "nodes": [
+        "A_child_child_child"
+      ],
+      "type": "addNodes"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "type": "addEdges"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "id": "A_child_child",
+      "patch": {
+        "state": "resolved",
+        "tokens": 1
+      },
+      "type": "updateNode"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "A",
+          "target": "A_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child",
+          "target": "A_child_child"
+        },
+        {
+          "kind": "calls",
+          "source": "A_child_child",
+          "target": "A_child_child_child"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "A",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 1
+        },
+        {
+          "id": "A_child_child_child",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  }
+]

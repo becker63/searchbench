@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/scoring.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.1, 0.5, 5.0, 10.0, 1000, 'anchor', 'pending', 'score_degree', 'score_random', 'score_v1', 'tokens']

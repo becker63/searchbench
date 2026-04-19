@@ -1,0 +1,16 @@
+{
+  "edges": [],
+  "nodes": [
+    {
+      "id": "A",
+      "kind": "symbol",
+      "state": "resolved",
+      "tokens": 1
+    },
+    {
+      "id": "A_child",
+      "kind": "symbol",
+      "state": "pending"
+    }
+  ]
+}

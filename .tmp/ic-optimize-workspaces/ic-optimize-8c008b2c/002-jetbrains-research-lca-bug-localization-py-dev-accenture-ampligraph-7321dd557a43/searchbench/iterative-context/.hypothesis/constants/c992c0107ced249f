@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/injest/llm_tldr_adapter.py
+# hypothesis_version: 6.151.9
+
+['*.py', '.venv', '__pycache__', 'functions', 'module', 'name', 'python']

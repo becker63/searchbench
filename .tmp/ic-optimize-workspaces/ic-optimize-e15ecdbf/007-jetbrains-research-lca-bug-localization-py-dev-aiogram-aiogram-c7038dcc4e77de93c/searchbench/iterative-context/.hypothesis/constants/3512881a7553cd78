@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/exploration.py
+# hypothesis_version: 6.151.9
+
+['*.py', '.venv', '__pycache__', 'calls', 'data', 'depth', 'edges', 'expanded_from', 'file', 'function', 'imports', 'kind', 'metadata', 'nodes', 'references', 'symbol', 'type']

@@ -24,7 +24,7 @@ from harness.scoring import ScoreBundle, ScoreEngine, summarize_task_score
 from harness.localization.telemetry import build_localization_telemetry
 from harness.scoring.token_usage import (
     TokenUsageRecord,
-    extract_token_usage_record,
+    aggregate_token_usage_record,
 )
 from harness.telemetry.tracing import start_observation
 from harness.telemetry.tracing.score_emitter import (
@@ -142,16 +142,22 @@ def _default_runner(
             raw = result.raw
             error = raw.get("error") if isinstance(raw, Mapping) else None
             detail = f": {error}" if isinstance(error, str) and error else ""
-            raise RuntimeError(
-                f"Localization runner failed before producing observations{detail}"
+            raise LocalizationEvaluationError(
+                LocalizationFailureCategory.RUNNER,
+                f"Localization runner failed before producing observations{detail}",
+                task_id=lca_task.task_id,
+                observability_summary=result.observability_summary,
             )
         detail = (
             " after finalization and fallback recovery"
             if source == "fallback_empty"
             else ""
         )
-        raise RuntimeError(
-            f"Localization runner produced an empty predicted_files list{detail}"
+        raise LocalizationEvaluationError(
+            LocalizationFailureCategory.RUNNER,
+            f"Localization runner produced an empty predicted_files list{detail}",
+            task_id=lca_task.task_id,
+            observability_summary=result.observability_summary,
         )
     return result
 
@@ -248,6 +254,7 @@ def run_localization_task(
     LocalizationEvidence | None,
     RepoMaterializationResult | None,
     TokenUsageRecord,
+    LocalizationRunResult,
 ]:
     """
     Execute a single localization task end to end (leaf helper):
@@ -282,11 +289,24 @@ def run_localization_task(
         repo_path = _resolve_repo_path(task, checkout_result)
         runner_result = _run_runner(task, repo_path, trace, runner)
         prediction = runner_result.prediction
-        usage = extract_token_usage_record(
+        usage = aggregate_token_usage_record(
             runner_result.model_dump(),
             source="runner",
         )
         score_bundle = _score_task(task, prediction, repo_path, usage)
+        if runner_result.observability_summary is not None:
+            predicted_set = set(prediction.normalized_predicted_files())
+            gold_set = set(task.gold.normalized_changed_files())
+            overlap = len(predicted_set & gold_set)
+            precision = overlap / len(predicted_set) if predicted_set else 0.0
+            recall = overlap / len(gold_set) if gold_set else 0.0
+            runner_result.observability_summary.evaluation.update(
+                {
+                    "gold_overlap_count": float(overlap),
+                    "file_precision": precision,
+                    "file_recall": recall,
+                }
+            )
         _emit_telemetry(
             task=task,
             score_bundle=score_bundle,
@@ -298,4 +318,16 @@ def run_localization_task(
             changed_files=task.gold.normalized_changed_files(),
             score_prefix=_score_prefix_from_runner_result(runner_result),
         )
-        return prediction, score_bundle, task.evidence, checkout_result, usage
+        if runner_result.observability_summary is not None:
+            try:
+                _safe_update_metadata(
+                    trace,
+                    {
+                        "task_summary": runner_result.observability_summary.model_dump(
+                            mode="json"
+                        )
+                    },
+                )
+            except Exception:
+                pass
+        return prediction, score_bundle, task.evidence, checkout_result, usage, runner_result

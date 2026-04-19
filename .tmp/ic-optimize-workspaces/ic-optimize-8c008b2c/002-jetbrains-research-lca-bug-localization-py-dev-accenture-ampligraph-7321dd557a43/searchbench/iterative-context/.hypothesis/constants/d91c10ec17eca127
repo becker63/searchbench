@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/server.py
+# hypothesis_version: 6.151.9
+
+['call_tool', 'data', 'depth', 'description', 'edges', 'error', 'expand', 'graph', 'id', 'integer', 'iterative-context', 'list_tools', 'metadata', 'minimum', 'node', 'node_id', 'nodes', 'object', 'properties', 'required', 'resolve', 'resolve_and_expand', 'server', 'string', 'symbol', 'text', 'type']

@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/store.py
+# hypothesis_version: 6.151.9
+
+['calls', 'edges', 'file', 'id', 'imports', 'kind', 'nodes', 'primary', 'references', 'symbol']

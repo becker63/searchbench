@@ -1,0 +1,138 @@
+:::writing{variant=“chat_message” id=“42854”}
+Nice first pass. Do a second, narrower cleanup pass focused only on the remaining legibility issues.
+
+This is not a redesign and not a backend refactor.
+
+Scope for this pass
+
+Only work on:
+	1.	localization evaluation API simplification
+	2.	docs/comment cleanup
+	3.	small import / naming cleanup caused by the first reorg
+	4.	tests needed to keep the repo green
+
+Explicit non-goals
+
+Do not touch:
+	•	harness/backends/*
+	•	backend payload models
+	•	backend dispatch semantics
+	•	MCP adapter behavior
+	•	tracing ownership model
+	•	scoring semantics
+	•	state machine behavior
+	•	business logic
+
+Leave backends alone for this pass.
+
+Main task
+
+A. Simplify the localization evaluation entrypoint
+
+Right now the reorg improved structure, but the localization evaluation path still has more wrapper ceremony than needed.
+
+Focus on harness/localization/evaluate.py and its callers.
+
+Goal:
+	•	either remove LocalizationEvaluationRequest entirely and replace it with a normal function signature using explicit keyword args
+	•	or, if removal is too invasive, make it clearly internal/private and stop making the rest of the code revolve around it
+
+Preferred end state:
+
+def evaluate_localization_batch(
+    tasks,
+    *,
+    dataset_source=None,
+    materializer=None,
+    parent_trace=None,
+    runner=None,
+    machine_score_policy=MachineScorePolicy.AGGREGATE,
+):
+    ...
+
+Requirements:
+	•	preserve behavior
+	•	preserve typing as much as practical
+	•	preserve result models
+	•	preserve tracing semantics
+	•	preserve all evaluation/scoring semantics
+	•	update callers conservatively
+
+The point is to make the evaluation path easier to read, not to redesign it.
+
+B. Clean up docs and comments after the reorg
+
+Update stale references to old module/package names.
+
+Look for docs/comments mentioning old paths like:
+	•	loop/
+	•	loop_machine.py
+	•	loop_listeners.py
+	•	loop.py
+	•	runner_agent.py
+	•	root writer.py
+	•	observability/ if the package was renamed to telemetry/
+
+Update them to match the new structure.
+
+Prioritize:
+	•	architecture docs
+	•	loop/orchestration docs
+	•	localization docs
+	•	telemetry docs
+	•	comments near public entrypoints
+
+Do not do a giant docs rewrite. Just make the docs stop lying.
+
+C. Small cleanup only where directly justified
+
+You may do small follow-on cleanups if they are directly caused by the first reorg, such as:
+	•	import cleanup
+	•	clearer symbol names
+	•	removing tiny compatibility shims that are no longer needed
+	•	tightening __init__.py exports
+
+But do not expand scope.
+
+Execution plan
+
+Phase 1
+
+Inspect current localization evaluation flow and identify:
+	•	where LocalizationEvaluationRequest is defined
+	•	where it is constructed
+	•	where it is consumed
+	•	what tests cover it
+
+Phase 2
+
+Simplify that API conservatively.
+
+Phase 3
+
+Update docs/comments to the new module layout.
+
+Phase 4
+
+Run targeted tests and repair only what this cleanup breaks.
+
+Required tests
+
+Run the most relevant tests for:
+	•	localization
+	•	orchestration
+	•	tracing wrappers
+	•	CLI guardrails
+	•	policy loader / writer if touched by imports
+
+Deliverables
+
+At the end, provide:
+	1.	what changed in localization evaluation API shape
+	2.	which callers were updated
+	3.	which stale docs/comments were fixed
+	4.	any shims removed
+	5.	tests run and status
+
+Stay conservative. This pass is about finishing the legibility cleanup, not reopening architecture decisions.
+:::

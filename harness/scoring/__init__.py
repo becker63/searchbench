@@ -28,7 +28,12 @@ from .summaries import (
     summarize_score_summaries,
     summarize_task_score,
 )
-from .token_usage import TokenUsage, TokenUsageRecord, extract_token_usage_record
+from .token_usage import (
+    TokenUsage,
+    TokenUsageRecord,
+    aggregate_token_usage_record,
+    extract_token_usage_record,
+)
 
 __all__ = [
     "AggregateComponentScore",
@@ -50,6 +55,7 @@ __all__ = [
     "TokenEfficiencyScore",
     "TokenUsage",
     "TokenUsageRecord",
+    "aggregate_token_usage_record",
     "clamp_01",
     "extract_token_usage_record",
     "hop_to_score",

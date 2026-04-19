@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/selection_policy.py
+# hypothesis_version: 6.151.9
+
+['SelectionPolicy', 'invalid score', 'load_policy_module', 'policy.py', 'score']

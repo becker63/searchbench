@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/serialization.py
+# hypothesis_version: 6.151.9
+
+['data', 'edges', 'file', 'id', 'kind', 'metadata', 'nodes', 'references', 'serialize_graph', 'serialize_node', 'source', 'state', 'symbol', 'target', 'tokens', 'type']
