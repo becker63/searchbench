@@ -15,7 +15,7 @@ from harness.localization.models import (
 from harness import orchestration
 from harness.orchestration import dependencies as orchestration_dependencies
 from harness.orchestration import evaluation as orchestration_evaluation
-from harness.orchestration import machine as orchestration_machine
+from harness.orchestration import optimize_loop as orchestration_optimize_loop
 from harness.orchestration import types as orchestration_types
 
 DELETED_TASK_WRAPPERS = (
@@ -61,7 +61,7 @@ def test_orchestration_records_reference_lca_task_directly() -> None:
     assert orchestration_types.LoopContext.model_fields["task"].annotation is LCATask
     assert inspect.signature(orchestration_dependencies.prepare_iteration_tasks).parameters["task"].annotation in {LCATask, "LCATask"}
     assert inspect.signature(orchestration_evaluation.evaluate_policy_on_item).parameters["task"].annotation in {LCATask, "LCATask"}
-    assert inspect.signature(orchestration_machine.run_loop).parameters["task"].annotation in {LCATask, "LCATask"}
+    assert inspect.signature(orchestration_optimize_loop.run_loop).parameters["task"].annotation in {LCATask, "LCATask"}
 
 
 def test_ic_and_jc_share_lca_task_input_type() -> None:

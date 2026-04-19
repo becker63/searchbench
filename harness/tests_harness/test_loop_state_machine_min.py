@@ -9,23 +9,26 @@ from statemachine.event import BoundEvent
 
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.orchestration import feedback as feedback_module
-from harness.orchestration.machine import OptimizationStateMachine, RepairStateMachine
+from harness.orchestration.machine import RepairStateMachine
+from harness.orchestration.optimize_loop import DEFAULT_OPTIMIZATION_ITERATIONS, OptimizeTaskLoop
 from harness.orchestration.types import (
     AcceptedPolicyMeta,
     EvaluationMetrics,
+    EvaluationPhaseResult,
     EvaluationResult,
     FailedRepairDetails,
     FeedbackPackage,
     IterationTasks,
     ICResult,
-    IterationRecord,
     JCResult,
     LoopContext,
     LoopDependencies,
-    OptimizationMachineModel,
+    OptimizationIterationState,
     PreparedTasks,
+    ReducerSummary,
     RepairContext,
     RepairMachineModel,
+    WriterInputContext,
 )
 from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
@@ -33,7 +36,9 @@ from harness.utils.type_loader import FrontierContext
 
 
 class RecordingSpan:
-    def __init__(self) -> None:
+    def __init__(self, name: str | None = None, metadata: dict[str, object] | None = None) -> None:
+        self.name = name
+        self.metadata = metadata or {}
         self.ended: list[dict[str, Any]] = []
 
     def end(self, **kwargs: Any) -> None:
@@ -183,7 +188,10 @@ def _repair_deps(
 
     @contextmanager
     def start_observation(**kwargs: Any) -> Iterator[RecordingSpan]:
-        span = RecordingSpan()
+        span = RecordingSpan(
+            name=kwargs.get("name") if isinstance(kwargs.get("name"), str) else None,
+            metadata=kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else None,
+        )
         spans.append(span)
         events.append(("span_open", span))
         yield span
@@ -212,6 +220,10 @@ def _repair_deps(
     return deps, spans, seen_parent, events
 
 
+def _repair_spans(spans: list[RecordingSpan]) -> list[RecordingSpan]:
+    return [span for span in spans if (span.name or "").startswith("policy_repair_attempt_")]
+
+
 def test_repair_exhausts_after_failures() -> None:
     deps, spans, seen_parent, events = _repair_deps(writer_ok_sequence=[False, False], pipeline_ok_sequence=[])
     ctx = RepairContext(
@@ -229,16 +241,16 @@ def test_repair_exhausts_after_failures() -> None:
     assert outcome.success is False
     assert outcome.attempts_used == 2
     assert outcome.error in {"writer_failed", "pipeline_failed"}
-    assert len(spans) == 2
+    repair_spans = _repair_spans(spans)
+    assert len(repair_spans) == 2
     assert len(seen_parent) == 2
-    assert all(seen_parent[i] is spans[i] for i in range(2))
+    assert all(getattr(seen_parent[i], "name", None) == "writer_generation" for i in range(2))
     # Span should be ended with failed status
-    assert all(span.ended for span in spans)
-    assert any(meta.get("status") == "failed" for span in spans for meta in span.ended)
+    assert all(span.ended for span in repair_spans)
+    assert any(meta.get("status") == "failed" for span in repair_spans for meta in span.ended)
     # Ordering: span_open precedes writer per attempt
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
 
 
 def test_repair_succeeds_on_second_attempt() -> None:
@@ -259,14 +271,58 @@ def test_repair_succeeds_on_second_attempt() -> None:
     assert outcome.attempts_used == 2
     assert outcome.accepted_policy_source == "post_pipeline_disk"
     assert outcome.failed_step is None
-    assert len(spans) == 2
+    repair_spans = _repair_spans(spans)
+    assert len(repair_spans) == 2
     assert len(seen_parent) == 2
-    assert all(seen_parent[i] is spans[i] for i in range(2))
-    assert any(meta.get("status") == "passed" for span in spans for meta in span.ended)
+    assert all(getattr(seen_parent[i], "name", None) == "writer_generation" for i in range(2))
+    assert any(meta.get("status") == "passed" for span in repair_spans for meta in span.ended)
     # Ordering: first attempt failed, second passed; each writer sees its own span
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
+
+
+def test_repair_writer_loop_uses_writer_session_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    import harness.orchestration.machine as machine_module
+
+    propagated: list[dict[str, object]] = []
+
+    @contextmanager
+    def propagate_cm(**kwargs: object):
+        propagated.append(dict(kwargs))
+        yield
+
+    monkeypatch.setattr(machine_module.tracing, "propagate_context", propagate_cm)
+    deps, spans, _seen_parent, _events = _repair_deps(
+        writer_ok_sequence=[True],
+        pipeline_ok_sequence=[True],
+    )
+    ctx = RepairContext(
+        repo_root=Path("."),
+        evaluation=_make_eval(),
+        feedback=_make_feedback(),
+        max_repair_attempts=1,
+        parent_trace=None,
+        writer_model="model",
+        optimize_run_id="opt-run-1",
+        writer_session_id="writer:opt-run-1:1:abc",
+        task_identity="task-1",
+        task_ordinal=1,
+        task_total=2,
+    )
+    model = RepairMachineModel(context=ctx, deps=deps)
+
+    outcome = RepairStateMachine(model).run()
+
+    assert outcome.success is True
+    assert propagated
+    assert all(call.get("session_id") == "writer:opt-run-1:1:abc" for call in propagated)
+    repair_span = _repair_spans(spans)[0]
+    assert repair_span.metadata["writer_session_id"] == "writer:opt-run-1:1:abc"
+    assert repair_span.metadata["optimize_run_id"] == "opt-run-1"
+    writer_span = next(span for span in spans if span.name == "writer_generation")
+    assert writer_span.metadata["session_id"] == "writer:opt-run-1:1:abc"
+    pipeline_span = next(span for span in spans if span.name == "pipeline_check")
+    assert pipeline_span.metadata["session_id"] == "writer:opt-run-1:1:abc"
 
 
 def test_pipeline_failure_propagates_failure_details() -> None:
@@ -287,13 +343,13 @@ def test_pipeline_failure_propagates_failure_details() -> None:
     assert outcome.failed_step == "step"
     assert outcome.failed_exit_code == 1
     assert outcome.failed_summary == "failed"
-    assert len(spans) == 1
+    repair_spans = _repair_spans(spans)
+    assert len(repair_spans) == 1
     assert len(seen_parent) == 1
-    assert seen_parent[0] is spans[0]
-    assert any(meta.get("status") == "failed" for span in spans for meta in span.ended)
+    assert getattr(seen_parent[0], "name", None) == "writer_generation"
+    assert any(meta.get("status") == "failed" for span in repair_spans for meta in span.ended)
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
 
 
 def test_repair_listener_uses_event_data_without_direct_event_key_inspection() -> None:
@@ -314,11 +370,11 @@ def test_repair_listener_uses_event_data_without_direct_event_key_inspection() -
     outcome = RepairStateMachine(model).run()
 
     assert outcome.success is True
-    assert len(spans) == 1
-    assert seen_parent == spans
+    repair_spans = _repair_spans(spans)
+    assert len(repair_spans) == 1
+    assert all(getattr(parent, "name", None) == "writer_generation" for parent in seen_parent)
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
 
 
 def test_failed_candidate_not_marked_accepted() -> None:
@@ -338,16 +394,17 @@ def test_failed_candidate_not_marked_accepted() -> None:
     assert outcome.success is False
     assert outcome.accepted_policy_source is None
     assert outcome.accepted_policy_changed_by_pipeline is None
-    assert any(meta.get("status") == "failed" for span in spans for meta in span.ended)
+    assert any(meta.get("status") == "failed" for span in _repair_spans(spans) for meta in span.ended)
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
 
 
-def _opt_deps(ctx: LoopContext) -> LoopDependencies:
+def _opt_deps(events: list[str] | None = None) -> LoopDependencies:
     span = RecordingSpan()
 
     def prepare_iteration_tasks(task: LCATask, trace: object | None = None) -> PreparedTasks:
+        if events is not None:
+            events.append("prepare")
         return PreparedTasks(
             task=task.with_repo("."),
             resolved_repo_path=".",
@@ -360,9 +417,16 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
         iteration_span: object | None = None,
         iteration_index: int | None = None,
     ) -> EvaluationResult:
-        metrics = EvaluationMetrics.model_validate({"score": 1.0})
-        record = IterationRecord(iteration=iteration_index or 0, metrics=metrics, pipeline_passed=True)
-        ctx.history.append(record)
+        if events is not None:
+            events.append(f"evaluate:{iteration_index}")
+        metrics = EvaluationMetrics.model_validate(
+            {
+                "score": 1.0,
+                "additional_metrics": [
+                    {"name": "token_efficiency", "value": 0.25},
+                ],
+            }
+        )
         return EvaluationResult(
             metrics=metrics,
             ic_result=ICResult(),
@@ -372,12 +436,32 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
             policy_code="policy",
         )
 
+    def build_iteration_feedback(*args: Any, **kwargs: Any) -> FeedbackPackage:
+        if events is not None:
+            events.append("feedback")
+        return _make_feedback()
+
+    def attempt_policy_generation(**kwargs: Any) -> tuple[str | None, str | None]:
+        if events is not None:
+            brief = kwargs["optimization_brief"]
+            reducer_findings = [
+                finding for finding in brief.findings
+                if finding.kind == "global_reducer_summary"
+            ]
+            events.append(f"writer:reducer={bool(reducer_findings)}")
+        return "policy", None
+
+    def run_policy_pipeline(*args: Any, **kwargs: Any) -> tuple[list[StepResult], bool]:
+        if events is not None:
+            events.append("pipeline")
+        return [StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")], True
+
     deps = LoopDependencies(
         prepare_iteration_tasks=prepare_iteration_tasks,
         evaluate_policy_on_item=evaluate_policy_on_item,
-        build_iteration_feedback=lambda *a, **k: _make_feedback(),
-        attempt_policy_generation=lambda **k: ("policy", None),
-        run_policy_pipeline=lambda *a, **k: ([StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")], True),
+        build_iteration_feedback=build_iteration_feedback,
+        attempt_policy_generation=attempt_policy_generation,
+        run_policy_pipeline=run_policy_pipeline,
         finalize_successful_policy=lambda **k: ("policy", AcceptedPolicyMeta(accepted_policy_source="disk", accepted_policy_changed_by_pipeline=False, repair_attempts=0, max_policy_repairs=0)),
         finalize_failed_repair=lambda **k: FailedRepairDetails(failure_context="", policy_code="policy", failed_step=None, failed_exit_code=None, failed_summary=None, error=""),
         classify_results=lambda results: PipelineClassification(),
@@ -392,7 +476,8 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
     return deps
 
 
-def test_optimization_completes_and_records_history() -> None:
+def test_optimize_task_loop_completes_and_records_history() -> None:
+    events: list[str] = []
     ctx = LoopContext(
         task=_task(),
         iterations=1,
@@ -402,13 +487,57 @@ def test_optimization_completes_and_records_history() -> None:
         history=[],
         prepared_tasks=None,
     )
-    deps = _opt_deps(ctx)
-    model = OptimizationMachineModel(context=ctx, deps=deps, max_policy_repairs=1)
-    sm = OptimizationStateMachine(model)
-    sm.model.prep_ok = True  # bypass prep guard
+    deps = _opt_deps(events)
 
-    sm.run()
+    OptimizeTaskLoop(context=ctx, deps=deps, max_policy_repairs=1).run()
 
     assert ctx.history, "history should be recorded"
     assert ctx.history[0].metrics.get("score") == 1.0
-    assert sm.current_state.id == "completed"
+    assert ctx.history[0].metrics.get("token_efficiency") == 0.25
+    assert events[:4] == ["prepare", "evaluate:0", "feedback", "writer:reducer=True"]
+
+
+def test_optimize_loop_default_iterations_is_five() -> None:
+    assert DEFAULT_OPTIMIZATION_ITERATIONS == 5
+
+
+def test_optimizer_loop_types_are_explicit() -> None:
+    state = OptimizationIterationState(
+        iteration=0,
+        iterations=5,
+        task_identity="task-1",
+    )
+    reducer = ReducerSummary(
+        iteration=0,
+        task_identity="task-1",
+        current_score=1.0,
+        previous_score=None,
+        evaluation_success=True,
+    )
+    phase = EvaluationPhaseResult(
+        state=state,
+        prepared_tasks=PreparedTasks(task=_task(), resolved_repo_path=".", jc_repo_id=None),
+        evaluation=_make_eval(),
+        success=True,
+    )
+    writer_input = WriterInputContext(
+        state=state,
+        evaluation=phase.evaluation,
+        reducer_summary=reducer,
+        feedback=_make_feedback(),
+    )
+
+    assert phase.state is state
+    assert writer_input.reducer_summary.compact_message()
+
+
+def test_optimizer_loop_production_entrypoints_do_not_use_optimizer_machine() -> None:
+    root = Path(__file__).resolve().parents[1]
+    production_paths = [
+        root / "entrypoints" / "cli.py",
+        root / "orchestration" / "optimize_loop.py",
+        root / "orchestration" / "__init__.py",
+    ]
+    for path in production_paths:
+        text = path.read_text(encoding="utf-8")
+        assert "OptimizationStateMachine" not in text

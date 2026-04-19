@@ -34,14 +34,16 @@ def test_png_writes_file(tmp_path: Path):
     assert out_path.stat().st_size > 0
 
 
-def test_png_writes_both_files(tmp_path: Path):
+def test_png_both_writes_repair_file_only(tmp_path: Path):
     if shutil.which("dot") is None:
         pytest.skip("Graphviz 'dot' binary not installed")
     base = tmp_path / "chart.png"
     render_state_machines(fmt="png", machine="both", output=base)
-    first = base
-    second = tmp_path / "chart_OptimizationStateMachine.png"
-    assert first.exists()
-    assert second.exists()
-    assert first.stat().st_size > 0
-    assert second.stat().st_size > 0
+    assert base.exists()
+    assert base.stat().st_size > 0
+    assert not (tmp_path / "chart_OptimizationStateMachine.png").exists()
+
+
+def test_optimization_machine_render_is_removed():
+    with pytest.raises(ValueError, match="explicit optimize loop"):
+        render_state_machines(fmt="mermaid", machine="optimization", output=None)

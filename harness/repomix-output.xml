@@ -93,6 +93,7 @@ orchestration/
   feedback.py
   listeners.py
   machine.py
+  optimize_loop.py
   runtime_context.py
   types.py
   writer.py
@@ -2049,6 +2050,11 @@ def generate_policy(
     client, model = _get_client()
     if client is None or not hasattr(client, "chat"):
         raise RuntimeError("Writer client is not available")
+    writer_session_id = getattr(parent_span, "session_id", None)
+    parent_metadata = getattr(parent_span, "metadata", None)
+    if writer_session_id is None and isinstance(parent_metadata, Mapping):
+        raw_session = parent_metadata.get("writer_session_id") or parent_metadata.get("session_id")
+        writer_session_id = raw_session if isinstance(raw_session, str) else None
     model_budget = get_model_budget(model)
     failure_context_budget = compute_prompt_char_budget(model, repair_attempt=repair_attempt)
     failure_context = failure_context or ""
@@ -2066,15 +2072,22 @@ def generate_policy(
     with start_observation(
         name="policy_writer",
         parent=parent_span,
-        metadata={"model": model},
+        metadata={
+            "model": model,
+            "writer_session_id": writer_session_id,
+            "session_id": writer_session_id,
+        }
+        if writer_session_id
+        else {"model": model},
     ) as writer_obs:
         response = None
         _LOGGER.info(
-            "[OPTIMIZE] writer model=%s completion_budget=%s failure_context_budget=%s prompt_chars=%s",
+            "[OPTIMIZE] writer model=%s completion_budget=%s failure_context_budget=%s prompt_chars=%s writer_session_id=%s",
             model,
             completion_tokens,
             failure_context_budget,
             len(rendered_prompt.system) + len(rendered_prompt.user),
+            writer_session_id or "none",
         )
         emit_score_for_handle(writer_obs, name="writer.policy_generated", value=False, data_type="BOOLEAN")
         emit_score_for_handle(writer_obs, name="writer.policy_compiled", value=False, data_type="BOOLEAN")
@@ -2086,7 +2099,14 @@ def generate_policy(
                 parent=writer_obs,
                 as_type="generation",
                 model=model,
-                metadata={"attempt": attempt, "model": model},
+                metadata={
+                    "attempt": attempt,
+                    "model": model,
+                    "writer_session_id": writer_session_id,
+                    "session_id": writer_session_id,
+                }
+                if writer_session_id
+                else {"attempt": attempt, "model": model},
             ) as attempt_obs:
                 try:
                     messages = [
@@ -2794,7 +2814,7 @@ from harness.localization.runtime.evaluate import (
 from harness.localization.runtime.evaluate import (
     evaluate_localization_batch as _evaluate_localization_batch,
 )
-from harness.orchestration.machine import run_loop
+from harness.orchestration.optimize_loop import DEFAULT_OPTIMIZATION_ITERATIONS, run_loop
 from harness.orchestration.runtime_context import isolated_optimization_workspace
 from harness.orchestration import writer as policy_writer
 from harness.telemetry.hosted.datasets import fetch_localization_dataset
@@ -2810,7 +2830,10 @@ from harness.telemetry.tracing import (
     start_observation,
 )
 from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
-from harness.telemetry.tracing.session_policy import SessionConfig
+from harness.telemetry.tracing.session_policy import (
+    SessionConfig,
+    derive_optimize_writer_session_id,
+)
 
 WARNING_THRESHOLD = 50
 HF_DATASET_NAME = "JetBrains-Research/lca-bug-localization"
@@ -2844,7 +2867,6 @@ REMOVED_FLAGS = {
 REMOVED_FRESHNESS_FLAGS = {"--invalidate-baseline-cache"}
 
 # Runner shape and iteration bounds
-DEFAULT_OPTIMIZATION_ITERATIONS = 5
 MAX_POLICY_REPAIRS_PER_ITERATION = 3
 WRITER_INTERNAL_ATTEMPTS_PER_REPAIR = 3
 
@@ -2915,6 +2937,14 @@ OptimizeMaxWorkersOption = Annotated[
         help="Maximum parallel per-task optimization workers; each worker uses an isolated workspace and policy file (>=1)",
     ),
 ]
+OptimizeIterationsOption = Annotated[
+    int,
+    typer.Option(
+        "--iterations",
+        min=1,
+        help="Optimizer iterations per selected task",
+    ),
+]
 ProjectionOnlyOption = Annotated[
     bool,
     typer.Option(
@@ -2931,6 +2961,13 @@ YesOption = Annotated[
 SessionIdOption = Annotated[
     str | None,
     typer.Option("--session-id", help="Optional explicit session id"),
+]
+OptimizeSessionIdOption = Annotated[
+    str | None,
+    typer.Option(
+        "--session-id",
+        help="Optional explicit optimize run id; writer replay sessions are derived per task",
+    ),
 ]
 FreshWorktreesOption = Annotated[
     bool,
@@ -3687,6 +3724,7 @@ def _run_ic_optimize_command(
     max_items: int | None,
     offset: int,
     max_workers: int,
+    iterations: int,
     projection_only: bool,
     yes: bool,
     session_id: str | None,
@@ -3695,7 +3733,7 @@ def _run_ic_optimize_command(
     def _action() -> None:
         print("[RUN] ic optimize")
         print(
-            "[FLOW] evaluate current IC behavior -> build writer feedback -> generate candidate policy update in isolated workspaces -> run pipeline correctness checks -> accept or reject the best update"
+            "[FLOW] evaluate current IC behavior -> refresh global reducer summary -> build writer input -> generate candidate policy update in isolated workspaces -> run pipeline correctness checks -> accept or reject the best update"
         )
         (
             project_dataset,
@@ -3720,15 +3758,16 @@ def _run_ic_optimize_command(
         materialized_tasks = _materialize_tasks_for_optimization(selected_tasks, worktree_manager)
         total = len(materialized_tasks)
         effective_workers = max(1, min(max_workers, total or 1))
-        session_id_value = session_cfg.session_id or "ic-optimize"
-        workspace_base = _optimize_workspace_base(session_id_value)
+        optimize_run_id = session_cfg.session_id or "ic-optimize"
+        workspace_base = _optimize_workspace_base(optimize_run_id)
         workspace_base.mkdir(parents=True, exist_ok=True)
         print(
-            "[RUN] ic optimize session=%s dataset=%s selected=%s execution=parallel effective_workers=%s isolation=per-task-workspace workspace_base=%s"
+            "[RUN] ic optimize optimize_run_id=%s dataset=%s selected=%s iterations=%s execution=parallel effective_workers=%s isolation=per-task-workspace workspace_base=%s"
             % (
-                session_id_value,
+                optimize_run_id,
                 project_dataset.name,
                 total,
+                iterations,
                 effective_workers,
                 workspace_base,
             )
@@ -3765,6 +3804,11 @@ def _run_ic_optimize_command(
             )
             workspace_root: Path | None = None
             isolated_task = task
+            writer_session_id = derive_optimize_writer_session_id(
+                optimize_run_id=optimize_run_id,
+                task_identity=task.task_id,
+                ordinal=ordinal,
+            )
             try:
                 workspace_root, isolated_task = _prepare_isolated_optimization_workspace(
                     task,
@@ -3783,7 +3827,7 @@ def _run_ic_optimize_command(
                 )
                 task_metadata = {
                     "command": "ic optimize",
-                    "optimize_run_id": session_id_value,
+                    "optimize_run_id": optimize_run_id,
                     "identity": task.task_id,
                     "ordinal": ordinal,
                     "total": total,
@@ -3792,10 +3836,12 @@ def _run_ic_optimize_command(
                     "workspace_root": str(workspace_root),
                     "execution": "parallel",
                     "effective_workers": effective_workers,
+                    "iterations": iterations,
+                    "writer_session_id": writer_session_id,
+                    "session_policy": "writer_loop_only",
                 }
                 with propagate_context(
                     trace_name="ic_optimize_task",
-                    session_id=session_id_value,
                     metadata=task_metadata,
                 ):
                     with start_observation(
@@ -3803,14 +3849,18 @@ def _run_ic_optimize_command(
                         metadata=task_metadata,
                     ) as task_span:
                         log(
-                            "[TASK] ic optimize phase=evaluate_policy task=%s/%s identity=%s"
-                            % (ordinal, total, task.task_id)
+                            "[TASK] ic optimize phase=evaluate_policy task=%s/%s identity=%s optimize_run_id=%s writer_session_id=%s"
+                            % (ordinal, total, task.task_id, optimize_run_id, writer_session_id)
                         )
                         with isolated_optimization_workspace(workspace_root):
                             history = run_loop(
                                 isolated_task,
+                                iterations=iterations,
                                 parent_trace=task_span,
-                                session_id=session_id_value,
+                                session_id=writer_session_id,
+                                optimize_run_id=optimize_run_id,
+                                task_ordinal=ordinal,
+                                task_total=total,
                                 flush_tracing=False,
                             )
                         duration = time.perf_counter() - started_at
@@ -3858,7 +3908,7 @@ def _run_ic_optimize_command(
                 duration = time.perf_counter() - started_at
                 failure_metadata = {
                     "command": "ic optimize",
-                    "optimize_run_id": session_id_value,
+                    "optimize_run_id": optimize_run_id,
                     "identity": task.task_id,
                     "ordinal": ordinal,
                     "total": total,
@@ -3868,10 +3918,11 @@ def _run_ic_optimize_command(
                     "status": "failure",
                     "error": str(exc),
                     "duration_seconds": duration,
+                    "writer_session_id": writer_session_id,
+                    "session_policy": "writer_loop_only",
                 }
                 with propagate_context(
                     trace_name="ic_optimize_task",
-                    session_id=session_id_value,
                     metadata=failure_metadata,
                 ):
                     with start_observation(
@@ -3908,27 +3959,30 @@ def _run_ic_optimize_command(
 
         with propagate_context(
             trace_name="ic_optimize",
-            session_id=session_id_value,
             metadata={
                 "command": "ic optimize",
+                "optimize_run_id": optimize_run_id,
                 "dataset": project_dataset.name,
                 "dataset_version": project_dataset.version,
                 "selection": selection_info,
                 "projection": projection,
-                "execution": "parallel",
-                "effective_workers": effective_workers,
-                "isolation": "per-task-workspace",
-            },
+                    "execution": "parallel",
+                    "effective_workers": effective_workers,
+                    "iterations": iterations,
+                    "isolation": "per-task-workspace",
+                },
         ):
             with start_observation(
                 name="ic_optimize_dataset",
                 metadata={
                     "command": "ic optimize",
+                    "optimize_run_id": optimize_run_id,
                     "dataset": project_dataset.name,
                     "dataset_version": project_dataset.version,
                     "selected_count": total,
                     "execution": "parallel",
                     "effective_workers": effective_workers,
+                    "iterations": iterations,
                     "workspace_base": str(workspace_base),
                 },
             ) as dataset_span:
@@ -4069,15 +4123,17 @@ def ic_optimize(
     max_items: MaxItemsOption = None,
     offset: OffsetOption = 0,
     max_workers: OptimizeMaxWorkersOption = 1,
+    iterations: OptimizeIterationsOption = DEFAULT_OPTIMIZATION_ITERATIONS,
     projection_only: ProjectionOnlyOption = False,
     yes: YesOption = False,
-    session_id: SessionIdOption = None,
+    session_id: OptimizeSessionIdOption = None,
     fresh_worktrees: FreshWorktreesOption = False,
 ) -> None:
     _run_ic_optimize_command(
         max_items=max_items,
         offset=offset,
         max_workers=max_workers,
+        iterations=iterations,
         projection_only=projection_only,
         yes=yes,
         session_id=session_id,
@@ -4207,16 +4263,19 @@ IC_OPTIMIZE_NARRATIVE = FlowNarrative(
         "fixed project dataset",
         "selection window",
         "optional worktree refresh",
-        "run session",
+        "optimize run id",
     ),
     steps=(
-        "create session",
+        "create optimize run id",
         "load fixed task set",
         "optionally refresh worktrees",
         "run selected optimization tasks in isolated workspaces up to the worker limit",
+        "run 5 default iterations per task unless overridden",
         "evaluate current IC behavior",
-        "build writer feedback from evaluation",
+        "refresh global reducer summary",
+        "build writer input from evaluation plus reducer output",
         "generate candidate policy update",
+        "derive writer replay session for the task",
         "run pipeline correctness checks",
         "accept or reject the update",
         "report iteration outcome",
@@ -6823,10 +6882,11 @@ def build_localization_telemetry(
 </file>
 
 <file path="orchestration/__init__.py">
-"""Orchestration: state machines, listeners, and loop coordination."""
+"""Orchestration: explicit optimize loops, repair state, and typed contracts."""
 # pyright: reportImportCycles=false
 
-from .machine import OptimizationStateMachine, RepairStateMachine, run_loop
+from .machine import RepairStateMachine
+from .optimize_loop import DEFAULT_OPTIMIZATION_ITERATIONS, OptimizeTaskLoop, run_loop
 from .types import (
     AcceptedPolicy,
     AcceptedPolicyMeta,
@@ -6837,7 +6897,11 @@ from .types import (
     IterationTasks,
     LoopContext,
     LoopDependencies,
-    OptimizationMachineModel,
+    OptimizationIterationState,
+    EvaluationPhaseResult,
+    ReducerSummary,
+    WriterInputContext,
+    IterationOutcome,
     PreparedTasks,
     RepairContext,
     RepairMachineModel,
@@ -6848,7 +6912,8 @@ from .types import (
 
 __all__ = [
     "run_loop",
-    "OptimizationStateMachine",
+    "DEFAULT_OPTIMIZATION_ITERATIONS",
+    "OptimizeTaskLoop",
     "RepairStateMachine",
     "AcceptedPolicy",
     "AcceptedPolicyMeta",
@@ -6859,7 +6924,11 @@ __all__ = [
     "IterationRecord",
     "LoopContext",
     "LoopDependencies",
-    "OptimizationMachineModel",
+    "OptimizationIterationState",
+    "EvaluationPhaseResult",
+    "ReducerSummary",
+    "WriterInputContext",
+    "IterationOutcome",
     "PreparedTasks",
     "RepairContext",
     "RepairMachineModel",
@@ -7522,14 +7591,11 @@ No session creation; reacts to machine events only.
 
 from __future__ import annotations
 
-import json
 from typing import Any, ContextManager, Protocol
 
 from statemachine import State
 
-from harness.telemetry.tracing.score_emitter import emit_score_for_handle
-
-from .types import IterationRecord, OptimizationMachineModel, RepairMachineModel
+from .types import RepairMachineModel
 
 
 class SpanHandle(Protocol):
@@ -7545,9 +7611,6 @@ class _EventTarget(Protocol):
 class _RepairEventData(Protocol):
     target: _EventTarget | None
 
-
-class _OptEventData(Protocol):
-    target: _EventTarget | None
 
 class RepairTracingListener:
     """Listener that owns the full repair attempt span lifecycle.
@@ -7567,10 +7630,25 @@ class RepairTracingListener:
         repair_model: RepairMachineModel = model
         ctx = repair_model.context
         if ctx.repair_observation is None:
+            metadata: dict[str, object] = {
+                "attempt": ctx.attempts_used,
+                "phase": "policy_repair_attempt",
+            }
+            if ctx.optimize_run_id:
+                metadata["optimize_run_id"] = ctx.optimize_run_id
+            if ctx.writer_session_id:
+                metadata["writer_session_id"] = ctx.writer_session_id
+                metadata["session_id"] = ctx.writer_session_id
+            if ctx.task_identity:
+                metadata["task_identity"] = ctx.task_identity
+            if ctx.task_ordinal is not None:
+                metadata["ordinal"] = ctx.task_ordinal
+            if ctx.task_total is not None:
+                metadata["total"] = ctx.task_total
             cm: ContextManager[SpanHandle] = repair_model.deps.start_observation(
                 name=f"policy_repair_attempt_{ctx.attempts_used}",
                 parent=ctx.parent_trace,
-                metadata={"attempt": ctx.attempts_used},
+                metadata=metadata,
             )
             ctx.repair_observation = cm.__enter__()
             ctx.repair_observation_cm = cm
@@ -7609,122 +7687,6 @@ class RepairTracingListener:
                 pass
         ctx.repair_observation = None
         ctx.repair_observation_cm = None
-
-
-class OptimizationTracingListener:
-    """Listener that owns iteration spans and summary metrics."""
-
-    def __init__(self) -> None:
-        self._last_recorded_iteration: int | None = None
-
-    def on_enter_evaluating(self, event: object, state: State, event_data: _OptEventData, model: Any = None, **kwargs: object) -> None:
-        if model is None:
-            return
-        opt_model: OptimizationMachineModel = model
-        ctx = opt_model.context
-        if ctx.prepared_tasks is None:
-            opt_model.current_iteration_span = None
-            opt_model.current_iteration_cm = None
-            return
-        iteration_tasks = ctx.prepared_tasks.build_iteration_tasks()
-        cm: ContextManager[SpanHandle] = opt_model.deps.start_observation(
-            name=f"iteration_{ctx.current_iteration}",
-            parent=ctx.run_trace,
-            metadata={
-                "iteration": ctx.current_iteration,
-                "iterations": ctx.iterations,
-                "task": iteration_tasks.task.model_dump(),
-                "jc_repo": iteration_tasks.jc_repo_id,
-            },
-        )
-        opt_model.current_iteration_span = cm.__enter__()
-        opt_model.current_iteration_cm = cm
-
-    def on_exit_accepted_round(self, event: object, state: State, event_data: _OptEventData, model: Any = None, **kwargs: object) -> None:
-        if model is not None:
-            self._finalize_iteration(model, status="complete")
-
-    def on_enter_completed(self, event: object, state: State, event_data: _OptEventData, model: Any = None, **kwargs: object) -> None:
-        if model is not None:
-            self._finalize_iteration(model, status="completed")
-
-    def on_enter_failed(self, event: object, state: State, event_data: _OptEventData, model: Any = None, **kwargs: object) -> None:
-        if model is not None:
-            self._finalize_iteration(model, status="failed")
-
-    def _finalize_iteration(self, model: OptimizationMachineModel, status: str) -> None:
-        ctx = model.context
-        span = model.current_iteration_span
-        record = ctx.history[-1] if ctx.history else None
-        if record is not None and self._last_recorded_iteration == record.iteration:
-            model.current_iteration_span = None
-            model.current_iteration_cm = None
-            return
-
-        handle_obj: SpanHandle | None = span
-        if handle_obj is None and ctx.run_trace is not None:
-            handle_obj = ctx.run_trace
-        if record is not None:
-            self._record_iteration_scores(model, handle_obj, record)
-            self._last_recorded_iteration = record.iteration
-
-        if handle_obj is not None and span is not None:
-            status_val = status
-            if record and (record.error or record.writer_error or record.pipeline_passed is False):
-                status_val = "failed"
-            metadata: dict[str, object] = {
-                "status": status_val,
-                "iteration": record.iteration if record else ctx.current_iteration,
-            }
-            if record and record.pipeline_passed is not None:
-                metadata["pipeline_passed"] = record.pipeline_passed
-            failure_val = record.error if record else None
-            failure_val = failure_val or (record.writer_error if record else None)
-            if failure_val:
-                metadata["error"] = failure_val
-            try:
-                handle_obj.update(metadata=metadata)
-            except Exception:
-                pass
-        cm = model.current_iteration_cm
-        if cm is not None:
-            try:
-                cm.__exit__(None, None, None)
-            except Exception:
-                pass
-        model.current_iteration_span = None
-        model.current_iteration_cm = None
-
-    def _record_iteration_scores(
-        self,
-        model: OptimizationMachineModel,
-        handle: SpanHandle | None,
-        record: IterationRecord,
-    ) -> None:
-        score_meta: dict[str, object] = {"iteration": record.iteration}
-        comment: str | None = None
-        try:
-            comment = json.dumps(score_meta)
-        except Exception:
-            comment = str(score_meta)
-        if record.pipeline_passed is not None:
-            emit_score_for_handle(
-                handle,
-                name="pipeline_passed",
-                value=bool(record.pipeline_passed),
-                data_type="BOOLEAN",
-                comment=comment,
-            )
-        for key in ("score",):
-            value = record.metrics.get(key)
-            if isinstance(value, (int, float, bool)):
-                emit_score_for_handle(
-                    handle,
-                    name=f"metrics.{key}",
-                    value=float(value),
-                    data_type="NUMERIC" if not isinstance(value, bool) else "BOOLEAN",
-                    comment=comment,
-                )
 </file>
 
 <file path="orchestration/machine.py">
@@ -7736,9 +7698,8 @@ Holds state transitions and callbacks; no CLI or entrypoint concerns.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence, cast
+from typing import Any, cast
 
 from statemachine import State, StateChart
 from statemachine.event import BoundEvent
@@ -7747,8 +7708,7 @@ import jcodemunch_mcp.tools.index_folder as index_folder_tool
 
 from harness import pipeline as pipeline_module
 from harness.agents import writer as agent_writer
-from harness.localization.models import LCATask
-from harness.pipeline.types import PipelineClassification, StepResult
+from harness.pipeline.types import StepResult
 from harness.prompts import WriterGuidance
 from harness.telemetry import tracing
 from harness.telemetry.tracing import score_emitter
@@ -7762,26 +7722,13 @@ from . import evaluation as policy_evaluation
 from . import feedback as feedback_wiring
 from . import writer as policy_writer
 from .runtime_context import optimization_repo_root
-from .listeners import OptimizationTracingListener, RepairTracingListener
+from .listeners import RepairTracingListener
 from .types import (
-    AcceptedPolicy,
-    EvaluationMetrics,
-    EvaluationResult,
-    FeedbackPackage,
-    IterationRecord,
-    LoopContext,
     LoopDependencies,
-    OptimizationMachineModel,
-    PreparedTasks,
     RepairContext,
     RepairMachineModel,
     RepairOutcome,
-    RunMetadata,
-    SpanHandle,
 )
-
-if TYPE_CHECKING:
-    from harness.telemetry.hosted.baselines import EvaluationRecord
 
 _BOUND_EVENT = cast(Any, BoundEvent)
 _MAX_POLICY_REPAIRS = 3
@@ -7884,6 +7831,28 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
     def _attempts_remaining(self) -> bool:
         return self.context.attempts_used < self.context.max_repair_attempts
 
+    def _writer_correlation_metadata(self, *, phase: str) -> dict[str, object]:
+        ctx = self.context
+        metadata: dict[str, object] = {
+            "phase": phase,
+            "attempt": ctx.attempts_used,
+        }
+        if ctx.optimize_run_id:
+            metadata["optimize_run_id"] = ctx.optimize_run_id
+        if ctx.writer_session_id:
+            metadata["writer_session_id"] = ctx.writer_session_id
+            # Kept on writer-loop spans only so child score emission and tests
+            # can correlate with the Langfuse session without putting evaluator
+            # work into the same replay surface.
+            metadata["session_id"] = ctx.writer_session_id
+        if ctx.task_identity:
+            metadata["task_identity"] = ctx.task_identity
+        if ctx.task_ordinal is not None:
+            metadata["ordinal"] = ctx.task_ordinal
+        if ctx.task_total is not None:
+            metadata["total"] = ctx.task_total
+        return metadata
+
     def _run_writer(self) -> None:
         ctx = self.context
         deps = self.deps
@@ -7907,36 +7876,42 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             ctx.writer_model or "unknown",
             len(ctx.failure_context or ""),
         )
-        with deps.start_observation(
-            name="writer_generation",
-            parent=ctx.repair_observation,
-            metadata={
-                "attempt": ctx.attempts_used,
-                "writer_model": ctx.writer_model,
-                "failure_context_chars": len(ctx.failure_context or ""),
-            },
-        ) as writer_span:
-            new_code, writer_error = deps.attempt_policy_generation(
-                initial_policy=ctx.evaluation.policy_code,
-                tests=ctx.feedback.tests,
-                frontier_context=ctx.feedback.frontier_context,
-                frontier_context_details=ctx.feedback.frontier_context_details,
-                optimization_brief=optimization_brief,
-                failure_context_str=ctx.failure_context,
-                repair_attempt=ctx.attempts_used,
-                parent_trace=writer_span,
-                pipeline_feedback=ctx.last_classified,
-            )
-            try:
-                writer_span.update(
-                    metadata={
-                        "attempt": ctx.attempts_used,
-                        "code_returned": new_code is not None,
-                        "writer_error": writer_error,
-                    }
+        writer_metadata = {
+            **self._writer_correlation_metadata(phase="writer_generation"),
+            "writer_model": ctx.writer_model,
+            "failure_context_chars": len(ctx.failure_context or ""),
+        }
+        with tracing.propagate_context(
+            session_id=ctx.writer_session_id,
+            metadata=writer_metadata,
+        ):
+            with deps.start_observation(
+                name="writer_generation",
+                parent=ctx.repair_observation,
+                metadata=writer_metadata,
+            ) as writer_span:
+                new_code, writer_error = deps.attempt_policy_generation(
+                    initial_policy=ctx.evaluation.policy_code,
+                    tests=ctx.feedback.tests,
+                    frontier_context=ctx.feedback.frontier_context,
+                    frontier_context_details=ctx.feedback.frontier_context_details,
+                    optimization_brief=optimization_brief,
+                    failure_context_str=ctx.failure_context,
+                    repair_attempt=ctx.attempts_used,
+                    parent_trace=writer_span,
+                    pipeline_feedback=ctx.last_classified,
                 )
-            except Exception:
-                pass
+                try:
+                    writer_span.update(
+                        metadata={
+                            "attempt": ctx.attempts_used,
+                            "code_returned": new_code is not None,
+                            "writer_error": writer_error,
+                            "writer_session_id": ctx.writer_session_id,
+                        }
+                    )
+                except Exception:
+                    pass
 
         if new_code is None:
             _LOGGER.info(
@@ -7959,9 +7934,10 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         deps.write_policy(new_code)
         ctx.candidate_code = new_code
         _LOGGER.info(
-            "[OPTIMIZE] writer_generation complete attempt=%s code_returned=true code_chars=%s",
+            "[OPTIMIZE] writer_generation complete attempt=%s code_returned=true code_chars=%s writer_session_id=%s",
             ctx.attempts_used,
             len(new_code),
+            ctx.writer_session_id or "none",
         )
         self.raise_("writer_generated")  # type: ignore[call-arg]
         self._run_pipeline()
@@ -7972,34 +7948,41 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         pipeline = ctx.pipeline or deps.default_pipeline()
         check_names = [getattr(step, "name", "unknown") for step in getattr(pipeline, "steps", [])]
         _LOGGER.info(
-            "[OPTIMIZE] pipeline_check start attempt=%s checks=%s repo_root=%s",
+            "[OPTIMIZE] pipeline_check start attempt=%s checks=%s repo_root=%s writer_session_id=%s",
             ctx.attempts_used,
             ",".join(check_names) if check_names else "unknown",
             ctx.repo_root,
+            ctx.writer_session_id or "none",
         )
-        with deps.start_observation(
-            name="pipeline_check",
-            parent=ctx.repair_observation,
-            metadata={
-                "attempt": ctx.attempts_used,
-                "checks": check_names,
-                "repo_root": str(ctx.repo_root),
-            },
-        ) as pipeline_span:
-            pipeline_results, pipeline_success = deps.run_policy_pipeline(
-                pipeline,
-                ctx.repo_root,
-                repair_obs=pipeline_span,
-            )
-            try:
-                pipeline_span.update(
-                    metadata={
-                        "pipeline_passed": pipeline_success,
-                        "checks_run": [step.name for step in pipeline_results],
-                    }
+        pipeline_metadata = {
+            **self._writer_correlation_metadata(phase="pipeline_check"),
+            "checks": check_names,
+            "repo_root": str(ctx.repo_root),
+        }
+        with tracing.propagate_context(
+            session_id=ctx.writer_session_id,
+            metadata=pipeline_metadata,
+        ):
+            with deps.start_observation(
+                name="pipeline_check",
+                parent=ctx.repair_observation,
+                metadata=pipeline_metadata,
+            ) as pipeline_span:
+                pipeline_results, pipeline_success = deps.run_policy_pipeline(
+                    pipeline,
+                    ctx.repo_root,
+                    repair_obs=pipeline_span,
                 )
-            except Exception:
-                pass
+                try:
+                    pipeline_span.update(
+                        metadata={
+                            "pipeline_passed": pipeline_success,
+                            "checks_run": [step.name for step in pipeline_results],
+                            "writer_session_id": ctx.writer_session_id,
+                        }
+                    )
+                except Exception:
+                    pass
         # Enforce canonical step result shape at the boundary.
         ctx.pipeline_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in pipeline_results]
         ctx.pipeline_passed = pipeline_success
@@ -8012,23 +7995,35 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         )
 
         if pipeline_success:
-            with deps.start_observation(
-                name="policy_acceptance",
-                parent=ctx.repair_observation,
-                metadata={"attempts_used": ctx.attempts_used, "status": "accepted"},
-            ) as acceptance_span:
-                final_policy, success_meta = deps.finalize_successful_policy(
-                    new_code=ctx.candidate_code or deps.read_policy(),
-                    attempts_used=ctx.attempts_used,
-                    max_repair_attempts=ctx.max_repair_attempts,
-                    repair_obs=acceptance_span,
-                )
-                try:
-                    acceptance_span.update(
-                        metadata=success_meta.model_dump(mode="json")
+            acceptance_metadata = {
+                **self._writer_correlation_metadata(phase="policy_acceptance"),
+                "attempts_used": ctx.attempts_used,
+                "status": "accepted",
+            }
+            with tracing.propagate_context(
+                session_id=ctx.writer_session_id,
+                metadata=acceptance_metadata,
+            ):
+                with deps.start_observation(
+                    name="policy_acceptance",
+                    parent=ctx.repair_observation,
+                    metadata=acceptance_metadata,
+                ) as acceptance_span:
+                    final_policy, success_meta = deps.finalize_successful_policy(
+                        new_code=ctx.candidate_code or deps.read_policy(),
+                        attempts_used=ctx.attempts_used,
+                        max_repair_attempts=ctx.max_repair_attempts,
+                        repair_obs=acceptance_span,
                     )
-                except Exception:
-                    pass
+                    try:
+                        acceptance_span.update(
+                            metadata={
+                                **success_meta.model_dump(mode="json"),
+                                "writer_session_id": ctx.writer_session_id,
+                            }
+                        )
+                    except Exception:
+                        pass
             ctx.candidate_code = final_policy
             ctx.accepted_policy_source = success_meta.accepted_policy_source
             ctx.accepted_policy_changed_by_pipeline = success_meta.accepted_policy_changed_by_pipeline
@@ -8079,399 +8074,6 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         )
 
 
-class OptimizationStateMachine(StateChart[OptimizationMachineModel]):
-    """Top-level orchestrator for a full loop run driven by state callbacks."""
-
-    preparing = State(initial=True)
-    evaluating = State()
-    repairing = State()
-    accepted_round = State()
-    completed = State(final=True)
-    failed = State(final=True)
-
-    prepare = preparing.to(evaluating, cond="prep_ready") | preparing.to(failed)
-    evaluation_done = evaluating.to(
-        repairing, cond="evaluation_successful"
-    ) | evaluating.to(accepted_round, unless="evaluation_successful")
-    repair_done = repairing.to(accepted_round)
-    advance = accepted_round.to(
-        evaluating, cond="has_more_iterations"
-    ) | accepted_round.to(completed)
-
-    @property
-    def context(self) -> LoopContext:
-        return self.model.context
-
-    @property
-    def deps(self) -> LoopDependencies:
-        return self.model.deps
-
-    @property
-    def max_policy_repairs(self) -> int:
-        return self.model.max_policy_repairs
-
-    def __init__(self, model: OptimizationMachineModel):
-        self._ensure_run_trace(model)
-        super().__init__(
-            model=model,
-            listeners=[
-                OptimizationTracingListener(),
-            ],
-        )
-
-    # Entry point ---------------------------------------------------------
-    def run(self) -> list[IterationRecord]:
-        status: str | None = None
-        try:
-            _LOGGER.info(
-                "[OPTIMIZE] run_loop start task=%s iterations=%s repo=%s",
-                self.context.task.task_id,
-                self.context.iterations,
-                self.context.task.repo,
-            )
-            self._prepare_context()
-            self.raise_("prepare")  # type: ignore[call-arg]
-            status = getattr(self.current_state, "id", None)
-            return self.context.history
-        finally:
-            self._finalize_run_trace(status=status)
-            _LOGGER.info(
-                "[OPTIMIZE] run_loop complete task=%s status=%s iterations_completed=%s",
-                self.context.task.task_id,
-                status or "unknown",
-                len(self.context.history),
-            )
-
-    # Guards --------------------------------------------------------------
-    def prep_ready(self) -> bool:
-        return self.model.prep_ok
-
-    def evaluation_successful(self) -> bool:
-        return bool(self.model.current_evaluation and self.model.current_evaluation.success)
-
-    def has_more_iterations(self) -> bool:
-        return self.context.current_iteration + 1 < self.context.iterations
-
-    # Run root ------------------------------------------------------------
-    def _ensure_run_trace(self, model: OptimizationMachineModel) -> None:
-        ctx = model.context
-        if ctx.run_trace is None:
-            raise RuntimeError("run_trace is required before starting the optimization state machine")
-
-    def _finalize_run_trace(self, status: str | None) -> None:
-        span = self.context.run_trace
-        try:
-            if span is None:
-                return
-            metadata: dict[str, object] = {"iterations_completed": len(self.context.history)}
-            if status:
-                metadata["status"] = status
-            updater = getattr(span, "update", None)
-            if callable(updater):
-                try:
-                    updater(metadata=metadata)
-                except Exception:
-                    pass
-        finally:
-            cm = self.model.current_iteration_cm
-            if cm is not None:
-                try:
-                    cm.__exit__(None, None, None)
-                except Exception:
-                    pass
-            self.model.current_iteration_span = None
-            self.model.current_iteration_cm = None
-
-    # Preparation ---------------------------------------------------------
-    def _prepare_context(self) -> None:
-        try:
-            _LOGGER.info(
-                "[OPTIMIZE] backend_init start task=%s repo=%s",
-                self.context.task.task_id,
-                self.context.task.repo,
-            )
-            self.context.prepared_tasks = self.deps.prepare_iteration_tasks(
-                self.context.task, self.context.run_trace
-            )
-            self.model.prep_ok = self.context.prepared_tasks is not None
-        except Exception:
-            self.context.prepared_tasks = None
-            self.model.prep_ok = False
-        if self.context.prepared_tasks is None:
-            self.context.prepared_tasks = PreparedTasks(
-                task=self.context.task,
-                resolved_repo_path=self.context.task.repo,
-                jc_repo_id=None,
-            )
-            self.model.prep_ok = True
-        _LOGGER.info(
-            "[OPTIMIZE] backend_init complete task=%s resolved_repo=%s",
-            self.context.task.task_id,
-            self.context.prepared_tasks.resolved_repo_path if self.context.prepared_tasks else None,
-        )
-
-    # Evaluation ----------------------------------------------------------
-    def on_enter_evaluating(self, event: object, state: State) -> None:
-        self.model.current_evaluation = None
-        self.model.current_repair_outcome = None
-        prepared_tasks = getattr(self.context, "prepared_tasks", None)
-        if prepared_tasks is None:
-            self.model.current_evaluation = None
-            self.raise_("evaluation_done")  # type: ignore[call-arg]
-            return
-
-        iteration_tasks = prepared_tasks.build_iteration_tasks()
-        eval_metadata = {
-            "iteration": self.context.current_iteration,
-            "task": iteration_tasks.task.identity.task_id(),
-        }
-        _LOGGER.info(
-            "[OPTIMIZE] evaluate_policy start iteration=%s task=%s",
-            self.context.current_iteration,
-            iteration_tasks.task.identity.task_id(),
-        )
-        with self.deps.start_observation(
-            name="evaluate_policy",
-            parent=self.model.current_iteration_span,
-            metadata=eval_metadata,
-        ) as eval_span:
-            self.model.current_evaluation = self.deps.evaluate_policy_on_item(
-                iteration_tasks.task,
-                self.context.baseline_record,
-                eval_span,
-                self.context.current_iteration,
-            )
-            if hasattr(eval_span, "update"):
-                try:
-                    eval_span.update(
-                        metadata={
-                            "status": "ok",
-                            "success": self.model.current_evaluation.success
-                            if self.model.current_evaluation
-                            else False,
-                        }
-                    )  # type: ignore[call-arg]
-                except Exception:
-                    pass
-        predicted_files_obj = (
-            self.model.current_evaluation.ic_result.as_map().get("predicted_files")
-            if self.model.current_evaluation
-            else []
-        )
-        predicted_files_count = (
-            len(predicted_files_obj) if isinstance(predicted_files_obj, list) else 0
-        )
-        _LOGGER.info(
-            "[OPTIMIZE] evaluate_policy complete iteration=%s success=%s score=%s predicted_files=%s",
-            self.context.current_iteration,
-            self.model.current_evaluation.success if self.model.current_evaluation else False,
-            self.model.current_evaluation.metrics.score if self.model.current_evaluation else None,
-            predicted_files_count,
-        )
-        self.raise_("evaluation_done")  # type: ignore[call-arg]
-
-    # Repair --------------------------------------------------------------
-    def on_enter_repairing(self, event: object, state: State) -> None:
-        evaluation = self.model.current_evaluation
-        if evaluation is None:
-            self.model.current_repair_outcome = None
-            self.raise_("repair_done")  # type: ignore[call-arg]
-            return
-
-        repo_root = self.deps.find_repo_root()
-        _LOGGER.info(
-            "[OPTIMIZE] build_feedback start iteration=%s prev_score=%s",
-            self.context.current_iteration,
-            self.context.prev_score,
-        )
-        with self.deps.start_observation(
-            name="build_feedback",
-            parent=self.model.current_iteration_span,
-            metadata={
-                "iteration": self.context.current_iteration,
-                "prev_score": self.context.prev_score,
-            },
-        ) as feedback_span:
-            feedback = self.deps.build_iteration_feedback(
-                evaluation,
-                self.context.prev_score,
-                self.context.prev_classified,
-                repo_root,
-            )
-            try:
-                feedback_span.update(
-                    metadata={
-                        "tests_chars": len(feedback.tests),
-                        "frontier_context_chars": len(feedback.frontier_context),
-                    }
-                )
-            except Exception:
-                pass
-        _LOGGER.info(
-            "[OPTIMIZE] build_feedback complete iteration=%s tests_chars=%s frontier_context_chars=%s",
-            self.context.current_iteration,
-            len(feedback.tests),
-            len(feedback.frontier_context),
-        )
-        repair_outcome = self._run_repair_phase(
-            repo_root, evaluation, feedback, self.model.current_iteration_span
-        )
-        self.model.current_repair_outcome = repair_outcome
-        self.raise_("repair_done")  # type: ignore[call-arg]
-
-    # Acceptance / recording ---------------------------------------------
-    def on_enter_accepted_round(self, event: object, state: State) -> None:
-        evaluation = self.model.current_evaluation
-        repair_outcome = self.model.current_repair_outcome
-
-        if evaluation is None:
-            self.raise_("advance")  # type: ignore[call-arg]
-            return
-
-        record = self._build_iteration_record(
-            iteration=self.context.current_iteration,
-            evaluation=evaluation,
-            repair_outcome=repair_outcome,
-        )
-        self._record_iteration(
-            record,
-            pipeline_passed=repair_outcome.success if repair_outcome else None,
-        )
-        if repair_outcome and repair_outcome.success:
-            score_val = record.metrics.get("score")
-            self.context.prev_score = (
-                float(score_val) if isinstance(score_val, (int, float)) else None
-            )
-            self.context.prev_classified = PipelineClassification()
-
-        self.context.current_iteration += 1
-        self.raise_("advance")  # type: ignore[call-arg]
-
-    def _run_repair_phase(
-        self,
-        repo_root: Path,
-        evaluation: EvaluationResult,
-        feedback: FeedbackPackage,
-        iteration_span: SpanHandle | None,
-    ) -> RepairOutcome:
-        repair_ctx = RepairContext(
-            repo_root=repo_root,
-            evaluation=evaluation,
-            feedback=feedback,
-            max_repair_attempts=self.max_policy_repairs,
-            parent_trace=iteration_span,
-            writer_model=self.deps.get_writer_model(),
-            pipeline=self.deps.default_pipeline(),
-        )
-        repair_model = RepairMachineModel(
-            context=repair_ctx,
-            deps=self.deps,
-        )
-        repair_machine = RepairStateMachine(repair_model)
-        return repair_machine.run()
-
-    def _build_iteration_record(
-        self,
-        iteration: int,
-        evaluation: EvaluationResult,
-        repair_outcome: RepairOutcome | None,
-    ) -> IterationRecord:
-        metrics_map = evaluation.metrics.as_map()
-        pipeline_feedback = (
-            repair_outcome.pipeline_feedback if repair_outcome else self.context.last_classified
-        )
-        repair_attempts_val = (
-            repair_outcome.repair_attempts_reported if repair_outcome else None
-        )
-        max_repairs_val = (
-            repair_outcome.max_policy_repairs if repair_outcome else self.max_policy_repairs
-        )
-        error_val = repair_outcome.error if repair_outcome else None
-        writer_err_val = repair_outcome.writer_error if repair_outcome else None
-        record = IterationRecord(
-            iteration=iteration,
-            metrics=EvaluationMetrics.model_validate(metrics_map),
-            pipeline_passed=repair_outcome.success if repair_outcome else None,
-            pipeline_feedback=pipeline_feedback,
-            repair_attempts=repair_attempts_val
-            if isinstance(repair_attempts_val, int)
-            else (repair_outcome.attempts_used if repair_outcome else None),
-            max_policy_repairs=max_repairs_val if isinstance(max_repairs_val, int) else self.max_policy_repairs,
-            error=error_val if isinstance(error_val, str) else None,
-            writer_error=writer_err_val if isinstance(writer_err_val, str) else None,
-            failed_step=repair_outcome.failed_step if repair_outcome else None,
-            failed_exit_code=repair_outcome.failed_exit_code if repair_outcome else None,
-            failed_summary=repair_outcome.failed_summary if repair_outcome else None,
-        )
-        failed_step = (
-            self._first_failed_step(repair_outcome.pipeline_results)
-            if repair_outcome
-            else None
-        )
-        if failed_step:
-            record.failed_step = failed_step.name
-            record.failed_exit_code = failed_step.exit_code
-            record.failed_summary = failed_step.stderr or failed_step.stdout
-        if repair_outcome and repair_outcome.success:
-            record.accepted_policy = AcceptedPolicy(
-                code=repair_outcome.policy,
-                source=repair_outcome.accepted_policy_source,
-                changed_by_pipeline=repair_outcome.accepted_policy_changed_by_pipeline,
-                repair_attempts=record.repair_attempts or repair_outcome.attempts_used,
-                max_policy_repairs=record.max_policy_repairs or self.max_policy_repairs,
-            )
-        return record
-
-    def _record_iteration(
-        self,
-        record: IterationRecord,
-        pipeline_passed: bool | None = None,
-    ) -> None:
-        pipeline_val = (
-            record.pipeline_passed if pipeline_passed is None else pipeline_passed
-        )
-        record.pipeline_passed = pipeline_val
-        outcome = getattr(self.model, "current_repair_outcome", None)
-        if outcome and pipeline_val is False:
-            if getattr(outcome, "pipeline_results", None):
-                classified = outcome.pipeline_feedback or self.deps.classify_results(outcome.pipeline_results)
-                record.pipeline_feedback = record.pipeline_feedback or classified
-                failed_step = self._first_failed_step(outcome.pipeline_results)
-                if failed_step:
-                    record.failed_step = record.failed_step or failed_step.name
-                    record.failed_exit_code = record.failed_exit_code or failed_step.exit_code
-                    record.failed_summary = record.failed_summary or failed_step.stderr or failed_step.stdout
-        if pipeline_val is False:
-            if outcome and getattr(outcome, "pipeline_results", None):
-                classified = outcome.pipeline_feedback or self.deps.classify_results(outcome.pipeline_results)
-                record.pipeline_feedback = classified
-            if record.failed_step is None:
-                if outcome and getattr(outcome, "pipeline_results", None):
-                    failed_step = self._first_failed_step(outcome.pipeline_results)
-                    if failed_step:
-                        record.failed_step = failed_step.name
-                        record.failed_exit_code = failed_step.exit_code
-                        record.failed_summary = failed_step.stderr or failed_step.stdout
-                if record.failed_step is None:
-                    record.failed_step = "pipeline_failed"
-        if record.pipeline_feedback is None and outcome and getattr(outcome, "pipeline_results", None):
-            record.pipeline_feedback = self.deps.classify_results(outcome.pipeline_results)
-        if record.writer_error is None and outcome:
-            if isinstance(outcome.writer_error, str):
-                record.writer_error = outcome.writer_error
-            elif getattr(outcome, "success", None) is False:
-                record.writer_error = "writer_failed"
-        self.context.history.append(record)
-
-    def _first_failed_step(
-        self, steps: Sequence[StepResult]
-    ) -> StepResult | None:
-        for step in steps:
-            if step.exit_code != 0:
-                return step
-        return None
-
-
 def _runtime_collaborators() -> dependency_wiring.RuntimeCollaborators:
     def find_runtime_repo_root() -> Path:
         return optimization_repo_root() or repo_root_utils.find_repo_root()
@@ -8505,41 +8107,62 @@ def build_loop_dependencies() -> LoopDependencies:
         build_iteration_feedback=feedback_wiring.build_iteration_feedback,
         attempt_policy_generation=policy_writer.attempt_policy_generation,
     )
+</file>
+
+<file path="orchestration/optimize_loop.py">
+"""Explicit optimizer loop orchestration.
+
+This module owns the top-level IC optimize control flow.  The repair state
+machine remains the inner writer/pipeline retry engine.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from harness.localization.models import LCATask
+from harness.pipeline.types import PipelineClassification, StepResult
+from harness.prompts import WriterFeedbackFinding
+from harness.telemetry import tracing
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
+
+from .machine import (
+    RepairStateMachine,
+    _MAX_POLICY_REPAIRS,
+    build_loop_dependencies,
+)
+from .types import (
+    AcceptedPolicy,
+    EvaluationMetrics,
+    EvaluationPhaseResult,
+    EvaluationResult,
+    FeedbackPackage,
+    IterationOutcome,
+    IterationRecord,
+    LoopContext,
+    LoopDependencies,
+    OptimizationIterationState,
+    PreparedTasks,
+    ReducerSummary,
+    RepairContext,
+    RepairMachineModel,
+    RepairOutcome,
+    RunMetadata,
+    SpanHandle,
+    WriterInputContext,
+)
+
+if TYPE_CHECKING:
+    from harness.telemetry.hosted.baselines import EvaluationRecord
 
 
-def _fallback_history(
-    opt_model: OptimizationMachineModel,
-    parent_trace: SpanHandle | None,
-) -> list[IterationRecord]:
-    repo_root = repo_root_utils.find_repo_root()
-    pipeline = pipeline_module.default_pipeline()
-    fallback_parent = opt_model.context.run_trace or parent_trace
-    pipeline_results, pipeline_success = dependency_wiring.run_policy_pipeline(
-        pipeline,
-        repo_root,
-        repair_obs=fallback_parent,
-        allow_no_parent=fallback_parent is None,
-        emit_score=score_emitter.emit_score,
-    )
-    classified = pipeline_module.classify_results(pipeline_results)
-    failed_step = dependency_wiring.first_failed_step(pipeline_results)
-    metrics_map: dict[str, float | int | bool | None] = {}
-    return [
-        IterationRecord(
-            iteration=0,
-            metrics=EvaluationMetrics.model_validate(metrics_map),
-            pipeline_passed=pipeline_success,
-            pipeline_feedback=classified,
-            failed_step=failed_step.name if failed_step else "pipeline_failed",
-            failed_exit_code=failed_step.exit_code if failed_step else None,
-            failed_summary=(failed_step.stderr or failed_step.stdout)
-            if failed_step
-            else None,
-            repair_attempts=_MAX_POLICY_REPAIRS,
-            max_policy_repairs=_MAX_POLICY_REPAIRS,
-            writer_error="writer_failed" if not pipeline_success else None,
-        )
-    ]
+DEFAULT_OPTIMIZATION_ITERATIONS = 5
+_LOGGER = logging.getLogger(__name__)
 
 
 def _baseline_record_model(
@@ -8554,19 +8177,665 @@ def _baseline_record_model(
     return baseline_record
 
 
+class OptimizeTaskLoop:
+    """Readable per-task optimizer: evaluate -> reduce -> write -> validate."""
+
+    def __init__(
+        self,
+        *,
+        context: LoopContext,
+        deps: LoopDependencies,
+        max_policy_repairs: int = _MAX_POLICY_REPAIRS,
+    ) -> None:
+        self.context = context
+        self.deps = deps
+        self.max_policy_repairs = max_policy_repairs
+        self._current_iteration_span: SpanHandle | None = None
+
+    def run(self) -> list[IterationRecord]:
+        status = "running"
+        try:
+            _LOGGER.info(
+                "[OPTIMIZE] run_loop start task=%s iterations=%s repo=%s",
+                self.context.task.task_id,
+                self.context.iterations,
+                self.context.task.repo,
+            )
+            prepared_tasks = self._prepare_context()
+            while self.context.current_iteration < self.context.iterations:
+                outcome = self._run_iteration(prepared_tasks)
+                if outcome.failed_phase:
+                    status = "failed"
+                    break
+                if not outcome.continue_next:
+                    status = "completed"
+                    break
+            else:
+                status = "completed"
+            return self.context.history
+        finally:
+            self._finalize_run_trace(status=status)
+            _LOGGER.info(
+                "[OPTIMIZE] run_loop complete task=%s status=%s iterations_completed=%s",
+                self.context.task.task_id,
+                status,
+                len(self.context.history),
+            )
+
+    def _prepare_context(self) -> PreparedTasks:
+        _LOGGER.info(
+            "[OPTIMIZE] backend_init start task=%s repo=%s",
+            self.context.task.task_id,
+            self.context.task.repo,
+        )
+        try:
+            prepared = self.deps.prepare_iteration_tasks(
+                self.context.task, self.context.run_trace
+            )
+        except Exception:
+            prepared = PreparedTasks(
+                task=self.context.task,
+                resolved_repo_path=self.context.task.repo,
+                jc_repo_id=None,
+            )
+        self.context.prepared_tasks = prepared
+        _LOGGER.info(
+            "[OPTIMIZE] backend_init complete task=%s resolved_repo=%s",
+            self.context.task.task_id,
+            prepared.resolved_repo_path,
+        )
+        return prepared
+
+    def _run_iteration(self, prepared_tasks: PreparedTasks) -> IterationOutcome:
+        started_at = time.perf_counter()
+        state = OptimizationIterationState(
+            iteration=self.context.current_iteration,
+            iterations=self.context.iterations,
+            task_identity=self.context.task.task_id,
+            optimize_run_id=self.context.optimize_run_id,
+            writer_session_id=self.context.writer_session_id,
+            task_ordinal=self.context.task_ordinal,
+            task_total=self.context.task_total,
+        )
+        metadata = self._iteration_metadata(state)
+        _LOGGER.info(
+            "[OPTIMIZE] optimize_iteration start iteration=%s/%s task=%s",
+            state.iteration + 1,
+            state.iterations,
+            state.task_identity,
+        )
+        with self.deps.start_observation(
+            name="optimize_iteration",
+            parent=self.context.run_trace,
+            metadata=metadata,
+        ) as iteration_span:
+            self._current_iteration_span = iteration_span
+            eval_result = self._evaluate_iteration(state, prepared_tasks, iteration_span)
+            reducer_summary = self._reduce_iteration(state, eval_result, iteration_span)
+            if eval_result.evaluation is None or not eval_result.success:
+                record = self._build_failed_evaluation_record(
+                    state, eval_result, reducer_summary
+                )
+                self._record_iteration(record, repair_outcome=None)
+                outcome = IterationOutcome(
+                    state=state,
+                    record=record,
+                    status="evaluation_failed",
+                    duration_seconds=time.perf_counter() - started_at,
+                    continue_next=self._advance_iteration(),
+                    failed_phase="evaluate",
+                )
+                self._finalize_iteration_span(iteration_span, outcome)
+                return outcome
+
+            writer_input = self._build_writer_input(
+                state, eval_result.evaluation, reducer_summary, iteration_span
+            )
+            repair_outcome = self._writer_iteration(writer_input, iteration_span)
+            record = self._build_iteration_record(
+                iteration=state.iteration,
+                evaluation=writer_input.evaluation,
+                repair_outcome=repair_outcome,
+            )
+            self._record_iteration(record, repair_outcome=repair_outcome)
+            if repair_outcome and repair_outcome.success:
+                score_val = record.metrics.get("score")
+                self.context.prev_score = (
+                    float(score_val) if isinstance(score_val, (int, float)) else None
+                )
+                self.context.prev_classified = PipelineClassification()
+            outcome = IterationOutcome(
+                state=state,
+                record=record,
+                repair_outcome=repair_outcome,
+                status="success" if repair_outcome and repair_outcome.success else "rejected",
+                duration_seconds=time.perf_counter() - started_at,
+                continue_next=self._advance_iteration(),
+            )
+            self._finalize_iteration_span(iteration_span, outcome)
+            _LOGGER.info(
+                "[OPTIMIZE] optimize_iteration complete iteration=%s/%s status=%s pipeline_passed=%s continue=%s",
+                state.iteration + 1,
+                state.iterations,
+                outcome.status,
+                record.pipeline_passed,
+                outcome.continue_next,
+            )
+            return outcome
+
+    def _evaluate_iteration(
+        self,
+        state: OptimizationIterationState,
+        prepared_tasks: PreparedTasks,
+        iteration_span: SpanHandle,
+    ) -> EvaluationPhaseResult:
+        iteration_tasks = prepared_tasks.build_iteration_tasks()
+        metadata = {
+            **self._iteration_metadata(state),
+            "phase": "evaluate_iteration",
+            "task": iteration_tasks.task.identity.task_id(),
+            "session_policy": "metadata_only",
+        }
+        _LOGGER.info(
+            "[OPTIMIZE] evaluate_iteration start iteration=%s/%s task=%s",
+            state.iteration + 1,
+            state.iterations,
+            iteration_tasks.task.identity.task_id(),
+        )
+        evaluation: EvaluationResult | None = None
+        error: str | None = None
+        with self.deps.start_observation(
+            name="evaluate_iteration",
+            parent=iteration_span,
+            metadata=metadata,
+        ) as eval_span:
+            try:
+                evaluation = self.deps.evaluate_policy_on_item(
+                    iteration_tasks.task,
+                    self.context.baseline_record,
+                    eval_span,
+                    state.iteration,
+                )
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+            try:
+                eval_span.update(
+                    metadata={
+                        "status": "ok" if evaluation and evaluation.success else "failed",
+                        "success": evaluation.success if evaluation else False,
+                        "error": error,
+                    }
+                )
+            except Exception:
+                pass
+        predicted_files_obj = (
+            evaluation.ic_result.as_map().get("predicted_files") if evaluation else []
+        )
+        predicted_files_count = (
+            len(predicted_files_obj) if isinstance(predicted_files_obj, list) else 0
+        )
+        _LOGGER.info(
+            "[OPTIMIZE] evaluate_iteration complete iteration=%s/%s success=%s score=%s predicted_files=%s",
+            state.iteration + 1,
+            state.iterations,
+            evaluation.success if evaluation else False,
+            evaluation.metrics.score if evaluation else None,
+            predicted_files_count,
+        )
+        return EvaluationPhaseResult(
+            state=state,
+            prepared_tasks=prepared_tasks,
+            evaluation=evaluation,
+            predicted_files_count=predicted_files_count,
+            success=bool(evaluation and evaluation.success),
+            error=error or (evaluation.error if evaluation else None),
+        )
+
+    def _reduce_iteration(
+        self,
+        state: OptimizationIterationState,
+        evaluation_phase: EvaluationPhaseResult,
+        iteration_span: SpanHandle,
+    ) -> ReducerSummary:
+        _LOGGER.info(
+            "[OPTIMIZE] reduce_iteration start iteration=%s/%s task=%s",
+            state.iteration + 1,
+            state.iterations,
+            state.task_identity,
+        )
+        evaluation = evaluation_phase.evaluation
+        current_score = self._score_from_evaluation(evaluation)
+        previous_score = self.context.prev_score
+        score_delta = (
+            current_score - previous_score
+            if current_score is not None and previous_score is not None
+            else None
+        )
+        regression_raw = evaluation.metrics.get("iteration_regression") if evaluation else None
+        summary = ReducerSummary(
+            iteration=state.iteration,
+            task_identity=state.task_identity,
+            current_score=current_score,
+            previous_score=previous_score,
+            score_delta=score_delta,
+            regression=regression_raw if isinstance(regression_raw, bool) else None,
+            evaluation_success=evaluation_phase.success,
+            pipeline_feedback_available=self.context.prev_classified is not None,
+            comparison_summary=evaluation.comparison_summary if evaluation else None,
+        )
+        with self.deps.start_observation(
+            name="reduce_iteration",
+            parent=iteration_span,
+            metadata={
+                **self._iteration_metadata(state),
+                "phase": "reduce_iteration",
+                "current_score": summary.current_score,
+                "previous_score": summary.previous_score,
+                "score_delta": summary.score_delta,
+                "evaluation_success": summary.evaluation_success,
+            },
+        ):
+            pass
+        _LOGGER.info(
+            "[OPTIMIZE] reduce_iteration complete iteration=%s/%s current_score=%s previous_score=%s delta=%s",
+            state.iteration + 1,
+            state.iterations,
+            summary.current_score,
+            summary.previous_score,
+            summary.score_delta,
+        )
+        return summary
+
+    def _build_writer_input(
+        self,
+        state: OptimizationIterationState,
+        evaluation: EvaluationResult,
+        reducer_summary: ReducerSummary,
+        iteration_span: SpanHandle,
+    ) -> WriterInputContext:
+        repo_root = self.deps.find_repo_root()
+        _LOGGER.info(
+            "[OPTIMIZE] build_writer_input start iteration=%s/%s prev_score=%s",
+            state.iteration + 1,
+            state.iterations,
+            self.context.prev_score,
+        )
+        with self.deps.start_observation(
+            name="build_writer_input",
+            parent=iteration_span,
+            metadata={
+                **self._iteration_metadata(state),
+                "phase": "build_writer_input",
+                "previous_score": self.context.prev_score,
+            },
+        ) as feedback_span:
+            feedback = self.deps.build_iteration_feedback(
+                evaluation,
+                self.context.prev_score,
+                self.context.prev_classified,
+                repo_root,
+            )
+            feedback = self._attach_reducer_summary(feedback, reducer_summary)
+            try:
+                feedback_span.update(
+                    metadata={
+                        "tests_chars": len(feedback.tests),
+                        "frontier_context_chars": len(feedback.frontier_context),
+                        "reducer_summary": reducer_summary.model_dump(mode="json"),
+                    }
+                )
+            except Exception:
+                pass
+        _LOGGER.info(
+            "[OPTIMIZE] build_writer_input complete iteration=%s/%s tests_chars=%s frontier_context_chars=%s reducer_available=true",
+            state.iteration + 1,
+            state.iterations,
+            len(feedback.tests),
+            len(feedback.frontier_context),
+        )
+        return WriterInputContext(
+            state=state,
+            evaluation=evaluation,
+            reducer_summary=reducer_summary,
+            feedback=feedback,
+        )
+
+    def _writer_iteration(
+        self,
+        writer_input: WriterInputContext,
+        iteration_span: SpanHandle,
+    ) -> RepairOutcome:
+        state = writer_input.state
+        _LOGGER.info(
+            "[OPTIMIZE] writer_iteration start iteration=%s/%s task=%s writer_session_id=%s",
+            state.iteration + 1,
+            state.iterations,
+            state.task_identity,
+            state.writer_session_id or "none",
+        )
+        with self.deps.start_observation(
+            name="writer_iteration",
+            parent=iteration_span,
+            metadata={
+                **self._iteration_metadata(state),
+                "phase": "writer_iteration",
+                "writer_session_id": state.writer_session_id,
+            },
+        ) as writer_span:
+            repair_outcome = self._run_repair_phase(
+                self.deps.find_repo_root(),
+                writer_input.evaluation,
+                writer_input.feedback,
+                writer_span,
+            )
+            try:
+                writer_span.update(
+                    metadata={
+                        "pipeline_passed": repair_outcome.success,
+                        "attempts_used": repair_outcome.attempts_used,
+                        "writer_error": repair_outcome.writer_error,
+                        "error": repair_outcome.error,
+                    }
+                )
+            except Exception:
+                pass
+        _LOGGER.info(
+            "[OPTIMIZE] writer_iteration complete iteration=%s/%s pipeline_passed=%s attempts=%s",
+            state.iteration + 1,
+            state.iterations,
+            repair_outcome.success,
+            repair_outcome.attempts_used,
+        )
+        return repair_outcome
+
+    def _run_repair_phase(
+        self,
+        repo_root: Path,
+        evaluation: EvaluationResult,
+        feedback: FeedbackPackage,
+        iteration_span: SpanHandle | None,
+    ) -> RepairOutcome:
+        repair_ctx = RepairContext(
+            repo_root=repo_root,
+            evaluation=evaluation,
+            feedback=feedback,
+            max_repair_attempts=self.max_policy_repairs,
+            parent_trace=iteration_span,
+            writer_model=self.deps.get_writer_model(),
+            optimize_run_id=self.context.optimize_run_id,
+            writer_session_id=self.context.writer_session_id,
+            task_identity=self.context.task.task_id,
+            task_ordinal=self.context.task_ordinal,
+            task_total=self.context.task_total,
+            pipeline=self.deps.default_pipeline(),
+        )
+        repair_model = RepairMachineModel(
+            context=repair_ctx,
+            deps=self.deps,
+        )
+        return RepairStateMachine(repair_model).run()
+
+    def _build_iteration_record(
+        self,
+        iteration: int,
+        evaluation: EvaluationResult,
+        repair_outcome: RepairOutcome | None,
+    ) -> IterationRecord:
+        pipeline_feedback = (
+            repair_outcome.pipeline_feedback if repair_outcome else self.context.last_classified
+        )
+        repair_attempts_val = (
+            repair_outcome.repair_attempts_reported if repair_outcome else None
+        )
+        max_repairs_val = (
+            repair_outcome.max_policy_repairs if repair_outcome else self.max_policy_repairs
+        )
+        error_val = repair_outcome.error if repair_outcome else None
+        writer_err_val = repair_outcome.writer_error if repair_outcome else None
+        record = IterationRecord(
+            iteration=iteration,
+            metrics=evaluation.metrics,
+            pipeline_passed=repair_outcome.success if repair_outcome else None,
+            pipeline_feedback=pipeline_feedback,
+            repair_attempts=repair_attempts_val
+            if isinstance(repair_attempts_val, int)
+            else (repair_outcome.attempts_used if repair_outcome else None),
+            max_policy_repairs=max_repairs_val
+            if isinstance(max_repairs_val, int)
+            else self.max_policy_repairs,
+            error=error_val if isinstance(error_val, str) else None,
+            writer_error=writer_err_val if isinstance(writer_err_val, str) else None,
+            failed_step=repair_outcome.failed_step if repair_outcome else None,
+            failed_exit_code=repair_outcome.failed_exit_code if repair_outcome else None,
+            failed_summary=repair_outcome.failed_summary if repair_outcome else None,
+        )
+        failed_step = (
+            self._first_failed_step(repair_outcome.pipeline_results)
+            if repair_outcome
+            else None
+        )
+        if failed_step:
+            record.failed_step = failed_step.name
+            record.failed_exit_code = failed_step.exit_code
+            record.failed_summary = failed_step.stderr or failed_step.stdout
+        if repair_outcome and repair_outcome.success:
+            record.accepted_policy = AcceptedPolicy(
+                code=repair_outcome.policy,
+                source=repair_outcome.accepted_policy_source,
+                changed_by_pipeline=repair_outcome.accepted_policy_changed_by_pipeline,
+                repair_attempts=record.repair_attempts or repair_outcome.attempts_used,
+                max_policy_repairs=record.max_policy_repairs or self.max_policy_repairs,
+            )
+        return record
+
+    def _build_failed_evaluation_record(
+        self,
+        state: OptimizationIterationState,
+        evaluation_phase: EvaluationPhaseResult,
+        reducer_summary: ReducerSummary,
+    ) -> IterationRecord:
+        del reducer_summary
+        evaluation = evaluation_phase.evaluation
+        metrics = evaluation.metrics if evaluation else EvaluationMetrics()
+        return IterationRecord(
+            iteration=state.iteration,
+            metrics=metrics,
+            pipeline_passed=None,
+            error=evaluation_phase.error or "evaluation_failed",
+        )
+
+    def _record_iteration(
+        self,
+        record: IterationRecord,
+        repair_outcome: RepairOutcome | None,
+    ) -> None:
+        outcome = repair_outcome
+        pipeline_val = record.pipeline_passed
+        if outcome and pipeline_val is False:
+            if outcome.pipeline_results:
+                classified = outcome.pipeline_feedback or self.deps.classify_results(
+                    outcome.pipeline_results
+                )
+                record.pipeline_feedback = record.pipeline_feedback or classified
+                failed_step = self._first_failed_step(outcome.pipeline_results)
+                if failed_step:
+                    record.failed_step = record.failed_step or failed_step.name
+                    record.failed_exit_code = record.failed_exit_code or failed_step.exit_code
+                    record.failed_summary = (
+                        record.failed_summary or failed_step.stderr or failed_step.stdout
+                    )
+        if pipeline_val is False:
+            if outcome and outcome.pipeline_results:
+                classified = outcome.pipeline_feedback or self.deps.classify_results(
+                    outcome.pipeline_results
+                )
+                record.pipeline_feedback = classified
+            if record.failed_step is None:
+                if outcome and outcome.pipeline_results:
+                    failed_step = self._first_failed_step(outcome.pipeline_results)
+                    if failed_step:
+                        record.failed_step = failed_step.name
+                        record.failed_exit_code = failed_step.exit_code
+                        record.failed_summary = failed_step.stderr or failed_step.stdout
+                if record.failed_step is None:
+                    record.failed_step = "pipeline_failed"
+        if record.pipeline_feedback is None and outcome and outcome.pipeline_results:
+            record.pipeline_feedback = self.deps.classify_results(outcome.pipeline_results)
+        if record.writer_error is None and outcome:
+            if isinstance(outcome.writer_error, str):
+                record.writer_error = outcome.writer_error
+            elif outcome.success is False:
+                record.writer_error = "writer_failed"
+        self.context.history.append(record)
+        self._record_iteration_scores(self._current_iteration_span, record)
+
+    def _record_iteration_scores(
+        self,
+        handle: SpanHandle | None,
+        record: IterationRecord,
+    ) -> None:
+        score_meta = {"iteration": record.iteration}
+        try:
+            comment = json.dumps(score_meta)
+        except Exception:
+            comment = str(score_meta)
+        if record.pipeline_passed is not None:
+            emit_score_for_handle(
+                handle,
+                name="pipeline_passed",
+                value=bool(record.pipeline_passed),
+                data_type="BOOLEAN",
+                comment=comment,
+            )
+        value = record.metrics.get("score")
+        if isinstance(value, (int, float, bool)):
+            emit_score_for_handle(
+                handle,
+                name="metrics.score",
+                value=float(value),
+                data_type="NUMERIC" if not isinstance(value, bool) else "BOOLEAN",
+                comment=comment,
+            )
+
+    def _advance_iteration(self) -> bool:
+        self.context.current_iteration += 1
+        return self.context.current_iteration < self.context.iterations
+
+    def _finalize_iteration_span(
+        self,
+        span: SpanHandle,
+        outcome: IterationOutcome,
+    ) -> None:
+        metadata: dict[str, object] = {
+            "status": outcome.status,
+            "iteration": outcome.state.iteration,
+            "continue_next": outcome.continue_next,
+        }
+        if outcome.record.pipeline_passed is not None:
+            metadata["pipeline_passed"] = outcome.record.pipeline_passed
+        if outcome.failed_phase:
+            metadata["failed_phase"] = outcome.failed_phase
+        failure_val = outcome.record.error or outcome.record.writer_error
+        if failure_val:
+            metadata["error"] = failure_val
+        if outcome.duration_seconds is not None:
+            metadata["duration_seconds"] = outcome.duration_seconds
+        try:
+            span.update(metadata=metadata)
+        except Exception:
+            pass
+        self._current_iteration_span = None
+
+    def _finalize_run_trace(self, status: str | None) -> None:
+        span = self.context.run_trace
+        if span is None:
+            return
+        metadata: dict[str, object] = {
+            "iterations_completed": len(self.context.history),
+        }
+        if status:
+            metadata["status"] = status
+        try:
+            span.update(metadata=metadata)
+        except Exception:
+            pass
+
+    def _iteration_metadata(self, state: OptimizationIterationState) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "iteration": state.iteration,
+            "iteration_ordinal": state.iteration + 1,
+            "iterations": state.iterations,
+            "task_identity": state.task_identity,
+        }
+        if state.optimize_run_id:
+            metadata["optimize_run_id"] = state.optimize_run_id
+        if state.writer_session_id:
+            metadata["writer_session_id"] = state.writer_session_id
+        if state.task_ordinal is not None:
+            metadata["ordinal"] = state.task_ordinal
+        if state.task_total is not None:
+            metadata["total"] = state.task_total
+        return metadata
+
+    def _attach_reducer_summary(
+        self,
+        feedback: FeedbackPackage,
+        reducer_summary: ReducerSummary,
+    ) -> FeedbackPackage:
+        finding = WriterFeedbackFinding(
+            kind="global_reducer_summary",
+            message=reducer_summary.compact_message(),
+            severity="info",
+            source="optimizer.reducer",
+        )
+        brief = feedback.optimization_brief.model_copy(
+            update={
+                "findings": [
+                    *feedback.optimization_brief.findings,
+                    finding,
+                ]
+            }
+        )
+        return feedback.model_copy(update={"optimization_brief": brief})
+
+    def _score_from_evaluation(self, evaluation: EvaluationResult | None) -> float | None:
+        if evaluation is None:
+            return None
+        score = evaluation.metrics.get("score")
+        if isinstance(score, (int, float)):
+            return float(score)
+        return None
+
+    def _first_failed_step(self, steps: Sequence[StepResult]) -> StepResult | None:
+        for step in steps:
+            if step.exit_code != 0:
+                return step
+        return None
+
+
 def run_loop(
     task: LCATask,
-    iterations: int = 5,
+    iterations: int = DEFAULT_OPTIMIZATION_ITERATIONS,
     parent_trace: SpanHandle | None = None,
     baseline_record: "EvaluationRecord | Mapping[str, object] | None" = None,
     session_id: str | None = None,
+    optimize_run_id: str | None = None,
+    task_ordinal: int | None = None,
+    task_total: int | None = None,
     flush_tracing: bool = True,
 ) -> list[IterationRecord]:
-    """
-    Closed-loop optimizer: execute, score, rewrite policy, repeat.
-    """
-    root_meta = RunMetadata(task=task, iterations=iterations, session_id=session_id)
-    opt_model: OptimizationMachineModel | None = None
+    """Closed-loop optimizer: evaluate, reduce, write, validate, repeat."""
+    writer_session_id = session_id
+    root_meta = RunMetadata(
+        task=task,
+        iterations=iterations,
+        optimize_run_id=optimize_run_id,
+        writer_session_id=writer_session_id,
+        task_ordinal=task_ordinal,
+        task_total=task_total,
+    )
+    context: LoopContext | None = None
+    deps: LoopDependencies | None = None
     history: list[IterationRecord] = []
     with tracing.start_observation(
         name="run_loop",
@@ -8576,32 +8845,75 @@ def run_loop(
     ) as run_span:
         with tracing.propagate_context(
             trace_name="run_loop",
-            session_id=session_id,
-            metadata={"iterations": iterations, "session_id": session_id},
+            metadata={
+                "iterations": iterations,
+                "optimize_run_id": optimize_run_id,
+                "writer_session_id": writer_session_id,
+                "task_ordinal": task_ordinal,
+                "task_total": task_total,
+                "session_policy": "writer_loop_only",
+            },
         ):
             context = LoopContext(
                 task=task,
                 iterations=iterations,
-                session_id=session_id,
+                session_id=writer_session_id,
+                optimize_run_id=optimize_run_id,
+                writer_session_id=writer_session_id,
+                task_ordinal=task_ordinal,
+                task_total=task_total,
                 parent_trace=parent_trace,
                 run_metadata=root_meta,
                 baseline_record=_baseline_record_model(baseline_record),
                 run_trace=run_span,
             )
-            opt_model = OptimizationMachineModel(
-                context=context,
-                deps=build_loop_dependencies(),
-                max_policy_repairs=_MAX_POLICY_REPAIRS,
-            )
-            machine = OptimizationStateMachine(opt_model)
+            deps = build_loop_dependencies()
             try:
-                history = machine.run()
+                history = OptimizeTaskLoop(
+                    context=context,
+                    deps=deps,
+                    max_policy_repairs=_MAX_POLICY_REPAIRS,
+                ).run()
             finally:
                 if flush_tracing:
                     tracing.flush_langfuse()
-    if not history and opt_model is not None:
-        history = _fallback_history(opt_model, parent_trace)
+    if not history and context is not None and deps is not None:
+        history = _fallback_history_from_context(context, deps, parent_trace)
     return history
+
+
+def _fallback_history_from_context(
+    context: LoopContext,
+    deps: LoopDependencies,
+    parent_trace: SpanHandle | None,
+) -> list[IterationRecord]:
+    repo_root = deps.find_repo_root()
+    pipeline = deps.default_pipeline()
+    fallback_parent = context.run_trace or parent_trace
+    pipeline_results, pipeline_success = deps.run_policy_pipeline(
+        pipeline,
+        repo_root,
+        repair_obs=fallback_parent,
+        allow_no_parent=fallback_parent is None,
+    )
+    classified = deps.classify_results(pipeline_results)
+    failed_step = next((step for step in pipeline_results if step.exit_code != 0), None)
+    return [
+        IterationRecord(
+            iteration=0,
+            metrics=EvaluationMetrics.model_validate({}),
+            pipeline_passed=pipeline_success,
+            pipeline_feedback=classified,
+            failed_step=failed_step.name if failed_step else "pipeline_failed",
+            failed_exit_code=failed_step.exit_code if failed_step else None,
+            failed_summary=(failed_step.stderr or failed_step.stdout)
+            if failed_step
+            else None,
+            repair_attempts=_MAX_POLICY_REPAIRS,
+            max_policy_repairs=_MAX_POLICY_REPAIRS,
+            writer_error="writer_failed" if not pipeline_success else None,
+        )
+    ]
 </file>
 
 <file path="orchestration/runtime_context.py">
@@ -8871,6 +9183,10 @@ class RunMetadata(BaseModel):
     iterations: int
     task: LCATask
     session_id: str | None = None
+    optimize_run_id: str | None = None
+    writer_session_id: str | None = None
+    task_ordinal: int | None = None
+    task_total: int | None = None
 
 class PreparedTasks(BaseModel):
     """Canonical task plus execution metadata resolved once for the loop."""
@@ -8992,12 +9308,100 @@ class IterationRecord(BaseModel):
     max_policy_repairs: int | None = None
 
 
+class OptimizationIterationState(BaseModel):
+    """Immutable context for one explicit optimizer iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    iteration: int
+    iterations: int
+    task_identity: str
+    optimize_run_id: str | None = None
+    writer_session_id: str | None = None
+    task_ordinal: int | None = None
+    task_total: int | None = None
+
+
+class EvaluationPhaseResult(BaseModel):
+    """Evaluation phase output used by reducer and writer stages."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: OptimizationIterationState
+    prepared_tasks: PreparedTasks
+    evaluation: EvaluationResult | None = None
+    predicted_files_count: int = 0
+    success: bool = False
+    error: str | None = None
+
+
+class ReducerSummary(BaseModel):
+    """Compact writer-facing reducer output for the current iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    iteration: int
+    task_identity: str
+    current_score: float | None = None
+    previous_score: float | None = None
+    score_delta: float | None = None
+    regression: bool | None = None
+    evaluation_success: bool
+    pipeline_feedback_available: bool = False
+    comparison_summary: str | None = None
+
+    def compact_message(self) -> str:
+        parts = [
+            f"iteration={self.iteration}",
+            f"evaluation_success={self.evaluation_success}",
+        ]
+        if self.current_score is not None:
+            parts.append(f"current_score={self.current_score}")
+        if self.previous_score is not None:
+            parts.append(f"previous_score={self.previous_score}")
+        if self.score_delta is not None:
+            parts.append(f"score_delta={self.score_delta}")
+        if self.regression is not None:
+            parts.append(f"regression={self.regression}")
+        parts.append(f"pipeline_feedback_available={self.pipeline_feedback_available}")
+        return "; ".join(parts)
+
+
+class WriterInputContext(BaseModel):
+    """Explicit writer input boundary for one optimizer iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: OptimizationIterationState
+    evaluation: EvaluationResult
+    reducer_summary: ReducerSummary
+    feedback: FeedbackPackage
+
+
+class IterationOutcome(BaseModel):
+    """Recorded result of one explicit optimizer iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: OptimizationIterationState
+    record: IterationRecord
+    repair_outcome: RepairOutcome | None = None
+    status: str
+    duration_seconds: float | None = None
+    continue_next: bool = False
+    failed_phase: str | None = None
+
+
 class LoopContext(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     task: LCATask
     iterations: int
     session_id: str | None = None
+    optimize_run_id: str | None = None
+    writer_session_id: str | None = None
+    task_ordinal: int | None = None
+    task_total: int | None = None
     parent_trace: SpanHandle | None = None
     run_metadata: RunMetadata | None = None
     baseline_record: "EvaluationRecord | None" = None
@@ -9041,6 +9445,11 @@ class RepairContext(BaseModel):
     max_repair_attempts: int
     parent_trace: SpanHandle | None
     writer_model: str | None
+    optimize_run_id: str | None = None
+    writer_session_id: str | None = None
+    task_identity: str | None = None
+    task_ordinal: int | None = None
+    task_total: int | None = None
     failure_context: str | None = None
     last_classified: PipelineClassification | None = None
     attempts_used: int = 0
@@ -9146,22 +9555,6 @@ class RepairMachineModel(BaseModel):
     state: str | None = None
 
 
-class OptimizationMachineModel(BaseModel):
-    """Mutable state model for the optimization state machine."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    context: LoopContext
-    deps: "LoopDependencies"
-    max_policy_repairs: int
-    state: str | None = None
-    prep_ok: bool = False
-    current_iteration_span: SpanHandle | None = None
-    current_iteration_cm: ContextManager[SpanHandle] | None = None
-    current_evaluation: EvaluationResult | None = None
-    current_repair_outcome: RepairOutcome | None = None
-
-
 def _rebuild_forward_refs() -> None:
     try:
         from harness.telemetry.hosted.baselines import EvaluationRecord  # local import to avoid cycles
@@ -9171,7 +9564,6 @@ def _rebuild_forward_refs() -> None:
     LoopDependencies.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord})
     RepairContext.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord})
     RepairMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
-    OptimizationMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
 
 
 _rebuild_forward_refs()
@@ -10093,17 +10485,26 @@ __all__ = [
 
 <file path="prompts/ic_system.jinja">
 You are localizing a bug by exploring a codebase with graph tools and proposing the most likely files needing changes.
+
 Available tools:
 {{ available_tools }}
 
 Guidelines:
 - Use tools first to navigate the repository; ground decisions in the issue/diff context from the task payload.
-- IC workflow: use `resolve` to find the most relevant starting symbol, file, or entry-point anchor.
-- After you have an anchor, prefer `expand` as the primary exploration primitive to inspect nearby callers, callees, dependencies, and graph neighborhoods.
-- If a candidate anchor is plausible but dependencies, side effects, or changed-file evidence are still unclear, call `expand` again with a targeted depth instead of repeatedly resolving adjacent guesses.
-- Final file predictions should be grounded in `expand` exploration results, not just the first `resolve` lookup.
+- Primary optimization target: use `expand` as the main reasoning primitive.
+- You should almost never call `resolve`.
+- Prefer `expand` immediately whenever you have any plausible anchor from the task payload, issue text, stack trace, error message, file hint, symbol hint, prior tool result, or previously explored graph node.
+- Treat `resolve` as a last resort only when you genuinely have no usable anchor for `expand`.
+- If you ever call `resolve`, it is only to obtain an anchor for a follow-up `expand`.
+- A `resolve` call is not useful by itself; after `resolve`, you should almost always call `expand` next.
+- Do not chain multiple `resolve` calls together.
+- Do not use `resolve` to browse adjacent guesses, similar names, or nearby symbols. Use `expand` on the best current anchor instead.
+- Prefer repeated targeted `expand` calls over repeated `resolve` calls.
+- Use `expand` to inspect callers, callees, imports, dependencies, surrounding graph neighborhoods, and likely change surfaces.
+- If the current anchor is only partially convincing, call `expand` again with a targeted depth rather than resolving a different nearby guess.
+- Final file predictions must be grounded primarily in `expand` exploration results, not in anchor lookup alone.
 - Tool arguments must match the schema exactly; use valid JSON, keep integers as numbers (never strings), and respect required fields.
-- If a tool returns an error, fix the arguments or pick a better tool on the next call—do not repeat the same invalid request.
+- If a tool returns an error, fix the arguments or choose a better tool on the next call—do not repeat the same invalid request.
 - Keep candidate files repo-relative, deduplicated, lowercase.
 - Exploration phase only: respond with tool calls and minimal/no prose unless a tool truly cannot be used (then give a brief rationale and follow with a tool call).
 </file>
@@ -11548,8 +11949,16 @@ def _usage_from_mapping(data: Mapping[str, object]) -> TokenUsageRecord:
     cached_raw = data.get("cached_input_tokens")
     cached_raw = cached_raw if isinstance(cached_raw, (int, float)) else data.get("input_cached_tokens")
     total_input_raw = data.get("total_input_tokens")
+    if not isinstance(total_input_raw, (int, float)) and any(
+        isinstance(value, (int, float)) for value in (prompt_raw, cached_raw)
+    ):
+        total_input_raw = (float(prompt_raw) if isinstance(prompt_raw, (int, float)) else 0.0) + (
+            float(cached_raw) if isinstance(cached_raw, (int, float)) else 0.0
+        )
     if not isinstance(total_raw, (int, float)) and isinstance(total_input_raw, (int, float)):
-        total_raw = float(total_input_raw) + (float(completion_raw) if isinstance(completion_raw, (int, float)) else 0.0)
+        total_raw = float(total_input_raw) + (
+            float(completion_raw) if isinstance(completion_raw, (int, float)) else 0.0
+        )
 
     has_numeric = any(
         isinstance(val, (int, float))
@@ -14557,6 +14966,7 @@ __all__ = [
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -14578,6 +14988,29 @@ def _derive_id(*parts: str) -> str:
     joined = "::".join(p for p in parts if p)
     digest = hashlib.sha256(joined.encode()).hexdigest()[:12]
     return f"session-{digest}"
+
+
+def _slug(value: str, *, limit: int) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+    return slug[:limit].strip("-") or "item"
+
+
+def derive_optimize_writer_session_id(
+    *,
+    optimize_run_id: str,
+    task_identity: str,
+    ordinal: int,
+) -> str:
+    """
+    Build the replay session id for one optimize writer loop.
+
+    Optimize run correlation is metadata-only. This id is intentionally scoped
+    to the writer/pipeline loop for one task so Langfuse session replay tells
+    the policy-writing story instead of absorbing evaluator/localizer traces.
+    """
+    digest = hashlib.sha256(f"{optimize_run_id}::{task_identity}::{ordinal}".encode()).hexdigest()[:10]
+    run_slug = _slug(optimize_run_id, limit=32)
+    return f"writer:{run_slug}:{ordinal}:{digest}"
 
 
 def resolve_session_id(
@@ -14607,7 +15040,12 @@ def resolve_session_id(
     return None
 
 
-__all__ = ["SessionScope", "SessionConfig", "resolve_session_id"]
+__all__ = [
+    "SessionScope",
+    "SessionConfig",
+    "derive_optimize_writer_session_id",
+    "resolve_session_id",
+]
 </file>
 
 <file path="telemetry/__init__.py">
@@ -16712,7 +17150,7 @@ from harness.localization.models import (
 from harness import orchestration
 from harness.orchestration import dependencies as orchestration_dependencies
 from harness.orchestration import evaluation as orchestration_evaluation
-from harness.orchestration import machine as orchestration_machine
+from harness.orchestration import optimize_loop as orchestration_optimize_loop
 from harness.orchestration import types as orchestration_types
 
 DELETED_TASK_WRAPPERS = (
@@ -16758,7 +17196,7 @@ def test_orchestration_records_reference_lca_task_directly() -> None:
     assert orchestration_types.LoopContext.model_fields["task"].annotation is LCATask
     assert inspect.signature(orchestration_dependencies.prepare_iteration_tasks).parameters["task"].annotation in {LCATask, "LCATask"}
     assert inspect.signature(orchestration_evaluation.evaluate_policy_on_item).parameters["task"].annotation in {LCATask, "LCATask"}
-    assert inspect.signature(orchestration_machine.run_loop).parameters["task"].annotation in {LCATask, "LCATask"}
+    assert inspect.signature(orchestration_optimize_loop.run_loop).parameters["task"].annotation in {LCATask, "LCATask"}
 
 
 def test_ic_and_jc_share_lca_task_input_type() -> None:
@@ -16987,7 +17425,8 @@ def test_flow_narratives_align_with_commands():
     optimize_steps = " ".join(IC_OPTIMIZE_NARRATIVE.steps)
     for expected in (
         "evaluate current IC behavior",
-        "build writer feedback",
+        "refresh global reducer summary",
+        "build writer input",
         "generate candidate policy",
         "pipeline correctness checks",
         "accept or reject",
@@ -17040,10 +17479,13 @@ def test_ic_optimize_help_narrates_evaluator_writer_pipeline_flow():
     result = RUNNER.invoke(run_module.app, ["ic", "optimize", "--help"])
     assert result.exit_code == 0
     assert "--max-workers" in result.output
+    assert "--iterations" in result.output
+    assert "5" in result.output
     assert "isolated" in result.output
     assert "evaluate current IC behavior" in result.output
-    assert "build writer feedback" in result.output
-    assert "pipeline correctness checks" in result.output
+    assert "refresh global reducer summary" in result.output
+    assert "reducer output" in result.output
+    assert "correctness" in result.output
     assert "accept" in result.output
     assert "reject" in result.output
 
@@ -17330,6 +17772,7 @@ def test_cli_respects_explicit_session_id(monkeypatch, tmp_path, capsys):
 
 def test_ic_optimize_delegates_to_run_loop(monkeypatch, tmp_path):
     calls: list[LCATask] = []
+    run_loop_kwargs: list[dict[str, object]] = []
     task = _task()
     _stub_flow(monkeypatch, tmp_path, tasks=[task])
     monkeypatch.setattr(
@@ -17348,7 +17791,12 @@ def test_ic_optimize_delegates_to_run_loop(monkeypatch, tmp_path):
 
     def fake_run_loop(task_arg, **kwargs):
         calls.append(task_arg)
+        run_loop_kwargs.append(dict(kwargs))
         assert kwargs["session_id"]
+        assert kwargs["optimize_run_id"]
+        assert kwargs["iterations"] == 5
+        assert kwargs["task_ordinal"] == 1
+        assert kwargs["task_total"] == 1
         assert kwargs["flush_tracing"] is False
         return [SimpleNamespace(iteration=0)]
 
@@ -17358,6 +17806,10 @@ def test_ic_optimize_delegates_to_run_loop(monkeypatch, tmp_path):
 
     assert len(calls) == 1
     assert calls[0].repo == str(tmp_path / "repo-1")
+    writer_session = run_loop_kwargs[0]["session_id"]
+    assert isinstance(writer_session, str)
+    assert writer_session.startswith("writer:")
+    assert len(writer_session) < 200
 
 
 def test_ic_optimize_honors_max_workers_with_isolated_workspaces(monkeypatch, tmp_path, capsys):
@@ -17409,6 +17861,7 @@ def test_ic_optimize_traces_parent_and_task_spans(monkeypatch, tmp_path):
     task = _task()
     starts: list[dict[str, object]] = []
     run_loop_parents: list[object | None] = []
+    propagated: list[dict[str, object]] = []
     _stub_flow(monkeypatch, tmp_path, tasks=[task])
     monkeypatch.setattr(
         run_module.harness_run,
@@ -17449,6 +17902,13 @@ def test_ic_optimize_traces_parent_and_task_spans(monkeypatch, tmp_path):
 
     monkeypatch.setattr(run_module.harness_run, "start_observation", span_cm)
 
+    @contextmanager
+    def propagate_cm(**kwargs):
+        propagated.append(dict(kwargs))
+        yield
+
+    monkeypatch.setattr(run_module.harness_run, "propagate_context", propagate_cm)
+
     def fake_run_loop(*args, **kwargs):
         run_loop_parents.append(kwargs.get("parent_trace"))
         return [SimpleNamespace(iteration=0)]
@@ -17463,6 +17923,12 @@ def test_ic_optimize_traces_parent_and_task_spans(monkeypatch, tmp_path):
     assert task_start["parent"] is None
     assert run_loop_parents == [task_start["span"]]
     assert task_start["span"] is not coordinator["span"]
+    assert all(call.get("session_id") is None for call in propagated)
+    task_metadata = task_start["metadata"]
+    assert isinstance(task_metadata, dict)
+    assert task_metadata["optimize_run_id"]
+    assert str(task_metadata["writer_session_id"]).startswith("writer:")
+    assert task_metadata["session_policy"] == "writer_loop_only"
 
 
 def test_select_tasks_is_deterministic_and_offsets():
@@ -19767,23 +20233,26 @@ from statemachine.event import BoundEvent
 
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.orchestration import feedback as feedback_module
-from harness.orchestration.machine import OptimizationStateMachine, RepairStateMachine
+from harness.orchestration.machine import RepairStateMachine
+from harness.orchestration.optimize_loop import DEFAULT_OPTIMIZATION_ITERATIONS, OptimizeTaskLoop
 from harness.orchestration.types import (
     AcceptedPolicyMeta,
     EvaluationMetrics,
+    EvaluationPhaseResult,
     EvaluationResult,
     FailedRepairDetails,
     FeedbackPackage,
     IterationTasks,
     ICResult,
-    IterationRecord,
     JCResult,
     LoopContext,
     LoopDependencies,
-    OptimizationMachineModel,
+    OptimizationIterationState,
     PreparedTasks,
+    ReducerSummary,
     RepairContext,
     RepairMachineModel,
+    WriterInputContext,
 )
 from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
@@ -19791,7 +20260,9 @@ from harness.utils.type_loader import FrontierContext
 
 
 class RecordingSpan:
-    def __init__(self) -> None:
+    def __init__(self, name: str | None = None, metadata: dict[str, object] | None = None) -> None:
+        self.name = name
+        self.metadata = metadata or {}
         self.ended: list[dict[str, Any]] = []
 
     def end(self, **kwargs: Any) -> None:
@@ -19941,7 +20412,10 @@ def _repair_deps(
 
     @contextmanager
     def start_observation(**kwargs: Any) -> Iterator[RecordingSpan]:
-        span = RecordingSpan()
+        span = RecordingSpan(
+            name=kwargs.get("name") if isinstance(kwargs.get("name"), str) else None,
+            metadata=kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else None,
+        )
         spans.append(span)
         events.append(("span_open", span))
         yield span
@@ -19970,6 +20444,10 @@ def _repair_deps(
     return deps, spans, seen_parent, events
 
 
+def _repair_spans(spans: list[RecordingSpan]) -> list[RecordingSpan]:
+    return [span for span in spans if (span.name or "").startswith("policy_repair_attempt_")]
+
+
 def test_repair_exhausts_after_failures() -> None:
     deps, spans, seen_parent, events = _repair_deps(writer_ok_sequence=[False, False], pipeline_ok_sequence=[])
     ctx = RepairContext(
@@ -19987,16 +20465,16 @@ def test_repair_exhausts_after_failures() -> None:
     assert outcome.success is False
     assert outcome.attempts_used == 2
     assert outcome.error in {"writer_failed", "pipeline_failed"}
-    assert len(spans) == 2
+    repair_spans = _repair_spans(spans)
+    assert len(repair_spans) == 2
     assert len(seen_parent) == 2
-    assert all(seen_parent[i] is spans[i] for i in range(2))
+    assert all(getattr(seen_parent[i], "name", None) == "writer_generation" for i in range(2))
     # Span should be ended with failed status
-    assert all(span.ended for span in spans)
-    assert any(meta.get("status") == "failed" for span in spans for meta in span.ended)
+    assert all(span.ended for span in repair_spans)
+    assert any(meta.get("status") == "failed" for span in repair_spans for meta in span.ended)
     # Ordering: span_open precedes writer per attempt
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
 
 
 def test_repair_succeeds_on_second_attempt() -> None:
@@ -20017,14 +20495,58 @@ def test_repair_succeeds_on_second_attempt() -> None:
     assert outcome.attempts_used == 2
     assert outcome.accepted_policy_source == "post_pipeline_disk"
     assert outcome.failed_step is None
-    assert len(spans) == 2
+    repair_spans = _repair_spans(spans)
+    assert len(repair_spans) == 2
     assert len(seen_parent) == 2
-    assert all(seen_parent[i] is spans[i] for i in range(2))
-    assert any(meta.get("status") == "passed" for span in spans for meta in span.ended)
+    assert all(getattr(seen_parent[i], "name", None) == "writer_generation" for i in range(2))
+    assert any(meta.get("status") == "passed" for span in repair_spans for meta in span.ended)
     # Ordering: first attempt failed, second passed; each writer sees its own span
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
+
+
+def test_repair_writer_loop_uses_writer_session_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    import harness.orchestration.machine as machine_module
+
+    propagated: list[dict[str, object]] = []
+
+    @contextmanager
+    def propagate_cm(**kwargs: object):
+        propagated.append(dict(kwargs))
+        yield
+
+    monkeypatch.setattr(machine_module.tracing, "propagate_context", propagate_cm)
+    deps, spans, _seen_parent, _events = _repair_deps(
+        writer_ok_sequence=[True],
+        pipeline_ok_sequence=[True],
+    )
+    ctx = RepairContext(
+        repo_root=Path("."),
+        evaluation=_make_eval(),
+        feedback=_make_feedback(),
+        max_repair_attempts=1,
+        parent_trace=None,
+        writer_model="model",
+        optimize_run_id="opt-run-1",
+        writer_session_id="writer:opt-run-1:1:abc",
+        task_identity="task-1",
+        task_ordinal=1,
+        task_total=2,
+    )
+    model = RepairMachineModel(context=ctx, deps=deps)
+
+    outcome = RepairStateMachine(model).run()
+
+    assert outcome.success is True
+    assert propagated
+    assert all(call.get("session_id") == "writer:opt-run-1:1:abc" for call in propagated)
+    repair_span = _repair_spans(spans)[0]
+    assert repair_span.metadata["writer_session_id"] == "writer:opt-run-1:1:abc"
+    assert repair_span.metadata["optimize_run_id"] == "opt-run-1"
+    writer_span = next(span for span in spans if span.name == "writer_generation")
+    assert writer_span.metadata["session_id"] == "writer:opt-run-1:1:abc"
+    pipeline_span = next(span for span in spans if span.name == "pipeline_check")
+    assert pipeline_span.metadata["session_id"] == "writer:opt-run-1:1:abc"
 
 
 def test_pipeline_failure_propagates_failure_details() -> None:
@@ -20045,13 +20567,13 @@ def test_pipeline_failure_propagates_failure_details() -> None:
     assert outcome.failed_step == "step"
     assert outcome.failed_exit_code == 1
     assert outcome.failed_summary == "failed"
-    assert len(spans) == 1
+    repair_spans = _repair_spans(spans)
+    assert len(repair_spans) == 1
     assert len(seen_parent) == 1
-    assert seen_parent[0] is spans[0]
-    assert any(meta.get("status") == "failed" for span in spans for meta in span.ended)
+    assert getattr(seen_parent[0], "name", None) == "writer_generation"
+    assert any(meta.get("status") == "failed" for span in repair_spans for meta in span.ended)
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
 
 
 def test_repair_listener_uses_event_data_without_direct_event_key_inspection() -> None:
@@ -20072,11 +20594,11 @@ def test_repair_listener_uses_event_data_without_direct_event_key_inspection() -
     outcome = RepairStateMachine(model).run()
 
     assert outcome.success is True
-    assert len(spans) == 1
-    assert seen_parent == spans
+    repair_spans = _repair_spans(spans)
+    assert len(repair_spans) == 1
+    assert all(getattr(parent, "name", None) == "writer_generation" for parent in seen_parent)
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
 
 
 def test_failed_candidate_not_marked_accepted() -> None:
@@ -20096,16 +20618,17 @@ def test_failed_candidate_not_marked_accepted() -> None:
     assert outcome.success is False
     assert outcome.accepted_policy_source is None
     assert outcome.accepted_policy_changed_by_pipeline is None
-    assert any(meta.get("status") == "failed" for span in spans for meta in span.ended)
+    assert any(meta.get("status") == "failed" for span in _repair_spans(spans) for meta in span.ended)
     assert events[0][0] == "span_open"
-    assert events[1][0] == "writer"
-    assert events[0][1] is events[1][1]
+    assert any(event[0] == "writer" for event in events[1:])
 
 
-def _opt_deps(ctx: LoopContext) -> LoopDependencies:
+def _opt_deps(events: list[str] | None = None) -> LoopDependencies:
     span = RecordingSpan()
 
     def prepare_iteration_tasks(task: LCATask, trace: object | None = None) -> PreparedTasks:
+        if events is not None:
+            events.append("prepare")
         return PreparedTasks(
             task=task.with_repo("."),
             resolved_repo_path=".",
@@ -20118,9 +20641,16 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
         iteration_span: object | None = None,
         iteration_index: int | None = None,
     ) -> EvaluationResult:
-        metrics = EvaluationMetrics.model_validate({"score": 1.0})
-        record = IterationRecord(iteration=iteration_index or 0, metrics=metrics, pipeline_passed=True)
-        ctx.history.append(record)
+        if events is not None:
+            events.append(f"evaluate:{iteration_index}")
+        metrics = EvaluationMetrics.model_validate(
+            {
+                "score": 1.0,
+                "additional_metrics": [
+                    {"name": "token_efficiency", "value": 0.25},
+                ],
+            }
+        )
         return EvaluationResult(
             metrics=metrics,
             ic_result=ICResult(),
@@ -20130,12 +20660,32 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
             policy_code="policy",
         )
 
+    def build_iteration_feedback(*args: Any, **kwargs: Any) -> FeedbackPackage:
+        if events is not None:
+            events.append("feedback")
+        return _make_feedback()
+
+    def attempt_policy_generation(**kwargs: Any) -> tuple[str | None, str | None]:
+        if events is not None:
+            brief = kwargs["optimization_brief"]
+            reducer_findings = [
+                finding for finding in brief.findings
+                if finding.kind == "global_reducer_summary"
+            ]
+            events.append(f"writer:reducer={bool(reducer_findings)}")
+        return "policy", None
+
+    def run_policy_pipeline(*args: Any, **kwargs: Any) -> tuple[list[StepResult], bool]:
+        if events is not None:
+            events.append("pipeline")
+        return [StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")], True
+
     deps = LoopDependencies(
         prepare_iteration_tasks=prepare_iteration_tasks,
         evaluate_policy_on_item=evaluate_policy_on_item,
-        build_iteration_feedback=lambda *a, **k: _make_feedback(),
-        attempt_policy_generation=lambda **k: ("policy", None),
-        run_policy_pipeline=lambda *a, **k: ([StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")], True),
+        build_iteration_feedback=build_iteration_feedback,
+        attempt_policy_generation=attempt_policy_generation,
+        run_policy_pipeline=run_policy_pipeline,
         finalize_successful_policy=lambda **k: ("policy", AcceptedPolicyMeta(accepted_policy_source="disk", accepted_policy_changed_by_pipeline=False, repair_attempts=0, max_policy_repairs=0)),
         finalize_failed_repair=lambda **k: FailedRepairDetails(failure_context="", policy_code="policy", failed_step=None, failed_exit_code=None, failed_summary=None, error=""),
         classify_results=lambda results: PipelineClassification(),
@@ -20150,7 +20700,8 @@ def _opt_deps(ctx: LoopContext) -> LoopDependencies:
     return deps
 
 
-def test_optimization_completes_and_records_history() -> None:
+def test_optimize_task_loop_completes_and_records_history() -> None:
+    events: list[str] = []
     ctx = LoopContext(
         task=_task(),
         iterations=1,
@@ -20160,16 +20711,60 @@ def test_optimization_completes_and_records_history() -> None:
         history=[],
         prepared_tasks=None,
     )
-    deps = _opt_deps(ctx)
-    model = OptimizationMachineModel(context=ctx, deps=deps, max_policy_repairs=1)
-    sm = OptimizationStateMachine(model)
-    sm.model.prep_ok = True  # bypass prep guard
+    deps = _opt_deps(events)
 
-    sm.run()
+    OptimizeTaskLoop(context=ctx, deps=deps, max_policy_repairs=1).run()
 
     assert ctx.history, "history should be recorded"
     assert ctx.history[0].metrics.get("score") == 1.0
-    assert sm.current_state.id == "completed"
+    assert ctx.history[0].metrics.get("token_efficiency") == 0.25
+    assert events[:4] == ["prepare", "evaluate:0", "feedback", "writer:reducer=True"]
+
+
+def test_optimize_loop_default_iterations_is_five() -> None:
+    assert DEFAULT_OPTIMIZATION_ITERATIONS == 5
+
+
+def test_optimizer_loop_types_are_explicit() -> None:
+    state = OptimizationIterationState(
+        iteration=0,
+        iterations=5,
+        task_identity="task-1",
+    )
+    reducer = ReducerSummary(
+        iteration=0,
+        task_identity="task-1",
+        current_score=1.0,
+        previous_score=None,
+        evaluation_success=True,
+    )
+    phase = EvaluationPhaseResult(
+        state=state,
+        prepared_tasks=PreparedTasks(task=_task(), resolved_repo_path=".", jc_repo_id=None),
+        evaluation=_make_eval(),
+        success=True,
+    )
+    writer_input = WriterInputContext(
+        state=state,
+        evaluation=phase.evaluation,
+        reducer_summary=reducer,
+        feedback=_make_feedback(),
+    )
+
+    assert phase.state is state
+    assert writer_input.reducer_summary.compact_message()
+
+
+def test_optimizer_loop_production_entrypoints_do_not_use_optimizer_machine() -> None:
+    root = Path(__file__).resolve().parents[1]
+    production_paths = [
+        root / "entrypoints" / "cli.py",
+        root / "orchestration" / "optimize_loop.py",
+        root / "orchestration" / "__init__.py",
+    ]
+    for path in production_paths:
+        text = path.read_text(encoding="utf-8")
+        assert "OptimizationStateMachine" not in text
 </file>
 
 <file path="tests_harness/test_loop_viz.py">
@@ -20209,17 +20804,19 @@ def test_png_writes_file(tmp_path: Path):
     assert out_path.stat().st_size > 0
 
 
-def test_png_writes_both_files(tmp_path: Path):
+def test_png_both_writes_repair_file_only(tmp_path: Path):
     if shutil.which("dot") is None:
         pytest.skip("Graphviz 'dot' binary not installed")
     base = tmp_path / "chart.png"
     render_state_machines(fmt="png", machine="both", output=base)
-    first = base
-    second = tmp_path / "chart_OptimizationStateMachine.png"
-    assert first.exists()
-    assert second.exists()
-    assert first.stat().st_size > 0
-    assert second.stat().st_size > 0
+    assert base.exists()
+    assert base.stat().st_size > 0
+    assert not (tmp_path / "chart_OptimizationStateMachine.png").exists()
+
+
+def test_optimization_machine_render_is_removed():
+    with pytest.raises(ValueError, match="explicit optimize loop"):
+        render_state_machines(fmt="mermaid", machine="optimization", output=None)
 </file>
 
 <file path="tests_harness/test_model_strictness.py">
@@ -21969,7 +22566,11 @@ from typing import Any
 
 from harness.telemetry.tracing import start_observation
 from harness.telemetry.tracing.score_emitter import emit_score
-from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
+from harness.telemetry.tracing.session_policy import (
+    SessionConfig,
+    derive_optimize_writer_session_id,
+    resolve_session_id,
+)
 
 
 @contextmanager
@@ -22041,6 +22642,29 @@ def test_resolve_session_defaults():
     assert sess is not None
     none_cfg = SessionConfig(session_scope="run", allow_generated_fallback=False)
     assert resolve_session_id(none_cfg, run_id="run") is None
+
+
+def test_optimize_writer_session_id_is_short_stable_and_writer_scoped():
+    first = derive_optimize_writer_session_id(
+        optimize_run_id="ic-optimize-abcdef12",
+        task_identity="lca/py/dev/owner/repo/abc123",
+        ordinal=3,
+    )
+    second = derive_optimize_writer_session_id(
+        optimize_run_id="ic-optimize-abcdef12",
+        task_identity="lca/py/dev/owner/repo/abc123",
+        ordinal=3,
+    )
+    other = derive_optimize_writer_session_id(
+        optimize_run_id="ic-optimize-abcdef12",
+        task_identity="lca/py/dev/owner/repo/abc123",
+        ordinal=4,
+    )
+
+    assert first == second
+    assert first != other
+    assert first.startswith("writer:ic-optimize-abcdef12:3:")
+    assert len(first) < 200
 </file>
 
 <file path="tests_harness/test_static_graph_ingest_filter.py">
@@ -22462,6 +23086,23 @@ def test_extracts_from_top_level_usage():
     record = extract_token_usage_record(payload, source="test")
     assert record.available is True
     assert record.usage.total_tokens == 10
+
+
+def test_extract_preserves_cached_token_breakdown_fields():
+    payload = {
+        "usage_details": {
+            "input": 4,
+            "input_cached_tokens": 6,
+            "output": 2,
+        }
+    }
+    record = extract_token_usage_record(payload, source="test")
+    assert record.available is True
+    assert record.usage.fresh_input_tokens == 4
+    assert record.usage.cached_input_tokens == 6
+    assert record.usage.total_input_tokens == 10
+    assert record.usage.output_tokens == 2
+    assert record.usage.total_tokens == 12
 
 
 def test_missing_usage_remains_unavailable():
@@ -23617,14 +24258,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from harness.orchestration import (
-    OptimizationStateMachine,
     RepairStateMachine,
     AcceptedPolicyMeta,
     FailedRepairDetails,
     FeedbackPackage,
-    LoopContext,
     LoopDependencies,
-    OptimizationMachineModel,
     PreparedTasks,
     RepairContext,
     RepairMachineModel,
@@ -23635,7 +24273,7 @@ from harness.orchestration.types import (
     ICResult,
     JCResult,
 )
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.models import LCATask
 from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import FrontierContext
@@ -23746,7 +24384,7 @@ def _stub_deps() -> LoopDependencies:
     )
 
 
-def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
+def _build_charts() -> RepairStateMachine:
     deps = _stub_deps()
     repair_ctx = RepairContext(
         repo_root=Path("."),
@@ -23771,30 +24409,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
     repair_chart = RepairStateMachine(repair_model)
 
-    identity = LCATaskIdentity(
-        dataset_name="demo",
-        dataset_config="cfg",
-        dataset_split="dev",
-        repo_owner="owner",
-        repo_name="repo",
-        base_sha="base",
-    )
-    context = LCAContext(issue_title="demo", issue_body="details")
-    task = LCATask(
-        identity=identity,
-        context=context,
-        gold=LCAGold(changed_files=[]),
-        repo="repo",
-    )
-    loop_ctx = LoopContext(
-        task=task,
-        iterations=1,
-        baseline_record=None,
-        run_trace=_DummySpan(),
-    )
-    opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
-    opt_chart = OptimizationStateMachine(opt_model)
-    return repair_chart, opt_chart
+    return repair_chart
 
 
 def _render(machine: Any, fmt: str) -> str:
@@ -23823,12 +24438,12 @@ def _render(machine: Any, fmt: str) -> str:
 
 
 def render_state_machines(fmt: str = "mermaid", machine: str = "both", output: Path | None = None) -> None:
-    repair_chart, opt_chart = _build_charts()
+    repair_chart = _build_charts()
     targets = []
     if machine in ("both", "repair"):
         targets.append(("RepairStateMachine", repair_chart))
-    if machine in ("both", "optimization"):
-        targets.append(("OptimizationStateMachine", opt_chart))
+    if machine == "optimization":
+        raise ValueError("OptimizationStateMachine was replaced by the explicit optimize loop")
 
     if fmt == "png":
         if output is None:
@@ -23860,9 +24475,9 @@ def main() -> None:
     parser.add_argument("--format", choices=["mermaid", "dot", "md", "png"], default="mermaid", help="Output format")
     parser.add_argument(
         "--machine",
-        choices=["optimization", "repair", "both"],
-        default="both",
-        help="Which machine to render",
+        choices=["repair", "both"],
+        default="repair",
+        help="Which machine to render; optimizer orchestration is no longer a state machine",
     )
     parser.add_argument("--output", type=Path, help="Output file path. Required for png, optional otherwise.")
     args = parser.parse_args()

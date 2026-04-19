@@ -14,14 +14,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from harness.orchestration import (
-    OptimizationStateMachine,
     RepairStateMachine,
     AcceptedPolicyMeta,
     FailedRepairDetails,
     FeedbackPackage,
-    LoopContext,
     LoopDependencies,
-    OptimizationMachineModel,
     PreparedTasks,
     RepairContext,
     RepairMachineModel,
@@ -32,7 +29,7 @@ from harness.orchestration.types import (
     ICResult,
     JCResult,
 )
-from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.localization.models import LCATask
 from harness.prompts import build_writer_optimization_brief
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import FrontierContext
@@ -143,7 +140,7 @@ def _stub_deps() -> LoopDependencies:
     )
 
 
-def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
+def _build_charts() -> RepairStateMachine:
     deps = _stub_deps()
     repair_ctx = RepairContext(
         repo_root=Path("."),
@@ -168,30 +165,7 @@ def _build_charts() -> tuple[RepairStateMachine, OptimizationStateMachine]:
     repair_model = RepairMachineModel(context=repair_ctx, deps=deps)
     repair_chart = RepairStateMachine(repair_model)
 
-    identity = LCATaskIdentity(
-        dataset_name="demo",
-        dataset_config="cfg",
-        dataset_split="dev",
-        repo_owner="owner",
-        repo_name="repo",
-        base_sha="base",
-    )
-    context = LCAContext(issue_title="demo", issue_body="details")
-    task = LCATask(
-        identity=identity,
-        context=context,
-        gold=LCAGold(changed_files=[]),
-        repo="repo",
-    )
-    loop_ctx = LoopContext(
-        task=task,
-        iterations=1,
-        baseline_record=None,
-        run_trace=_DummySpan(),
-    )
-    opt_model = OptimizationMachineModel(context=loop_ctx, deps=deps, max_policy_repairs=1)
-    opt_chart = OptimizationStateMachine(opt_model)
-    return repair_chart, opt_chart
+    return repair_chart
 
 
 def _render(machine: Any, fmt: str) -> str:
@@ -220,12 +194,12 @@ def _render(machine: Any, fmt: str) -> str:
 
 
 def render_state_machines(fmt: str = "mermaid", machine: str = "both", output: Path | None = None) -> None:
-    repair_chart, opt_chart = _build_charts()
+    repair_chart = _build_charts()
     targets = []
     if machine in ("both", "repair"):
         targets.append(("RepairStateMachine", repair_chart))
-    if machine in ("both", "optimization"):
-        targets.append(("OptimizationStateMachine", opt_chart))
+    if machine == "optimization":
+        raise ValueError("OptimizationStateMachine was replaced by the explicit optimize loop")
 
     if fmt == "png":
         if output is None:
@@ -257,9 +231,9 @@ def main() -> None:
     parser.add_argument("--format", choices=["mermaid", "dot", "md", "png"], default="mermaid", help="Output format")
     parser.add_argument(
         "--machine",
-        choices=["optimization", "repair", "both"],
-        default="both",
-        help="Which machine to render",
+        choices=["repair", "both"],
+        default="repair",
+        help="Which machine to render; optimizer orchestration is no longer a state machine",
     )
     parser.add_argument("--output", type=Path, help="Output file path. Required for png, optional otherwise.")
     args = parser.parse_args()

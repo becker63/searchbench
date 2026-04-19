@@ -164,6 +164,11 @@ def generate_policy(
     client, model = _get_client()
     if client is None or not hasattr(client, "chat"):
         raise RuntimeError("Writer client is not available")
+    writer_session_id = getattr(parent_span, "session_id", None)
+    parent_metadata = getattr(parent_span, "metadata", None)
+    if writer_session_id is None and isinstance(parent_metadata, Mapping):
+        raw_session = parent_metadata.get("writer_session_id") or parent_metadata.get("session_id")
+        writer_session_id = raw_session if isinstance(raw_session, str) else None
     model_budget = get_model_budget(model)
     failure_context_budget = compute_prompt_char_budget(model, repair_attempt=repair_attempt)
     failure_context = failure_context or ""
@@ -181,15 +186,22 @@ def generate_policy(
     with start_observation(
         name="policy_writer",
         parent=parent_span,
-        metadata={"model": model},
+        metadata={
+            "model": model,
+            "writer_session_id": writer_session_id,
+            "session_id": writer_session_id,
+        }
+        if writer_session_id
+        else {"model": model},
     ) as writer_obs:
         response = None
         _LOGGER.info(
-            "[OPTIMIZE] writer model=%s completion_budget=%s failure_context_budget=%s prompt_chars=%s",
+            "[OPTIMIZE] writer model=%s completion_budget=%s failure_context_budget=%s prompt_chars=%s writer_session_id=%s",
             model,
             completion_tokens,
             failure_context_budget,
             len(rendered_prompt.system) + len(rendered_prompt.user),
+            writer_session_id or "none",
         )
         emit_score_for_handle(writer_obs, name="writer.policy_generated", value=False, data_type="BOOLEAN")
         emit_score_for_handle(writer_obs, name="writer.policy_compiled", value=False, data_type="BOOLEAN")
@@ -201,7 +213,14 @@ def generate_policy(
                 parent=writer_obs,
                 as_type="generation",
                 model=model,
-                metadata={"attempt": attempt, "model": model},
+                metadata={
+                    "attempt": attempt,
+                    "model": model,
+                    "writer_session_id": writer_session_id,
+                    "session_id": writer_session_id,
+                }
+                if writer_session_id
+                else {"attempt": attempt, "model": model},
             ) as attempt_obs:
                 try:
                     messages = [

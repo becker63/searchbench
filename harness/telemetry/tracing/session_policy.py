@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -22,6 +23,29 @@ def _derive_id(*parts: str) -> str:
     joined = "::".join(p for p in parts if p)
     digest = hashlib.sha256(joined.encode()).hexdigest()[:12]
     return f"session-{digest}"
+
+
+def _slug(value: str, *, limit: int) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+    return slug[:limit].strip("-") or "item"
+
+
+def derive_optimize_writer_session_id(
+    *,
+    optimize_run_id: str,
+    task_identity: str,
+    ordinal: int,
+) -> str:
+    """
+    Build the replay session id for one optimize writer loop.
+
+    Optimize run correlation is metadata-only. This id is intentionally scoped
+    to the writer/pipeline loop for one task so Langfuse session replay tells
+    the policy-writing story instead of absorbing evaluator/localizer traces.
+    """
+    digest = hashlib.sha256(f"{optimize_run_id}::{task_identity}::{ordinal}".encode()).hexdigest()[:10]
+    run_slug = _slug(optimize_run_id, limit=32)
+    return f"writer:{run_slug}:{ordinal}:{digest}"
 
 
 def resolve_session_id(
@@ -51,4 +75,9 @@ def resolve_session_id(
     return None
 
 
-__all__ = ["SessionScope", "SessionConfig", "resolve_session_id"]
+__all__ = [
+    "SessionScope",
+    "SessionConfig",
+    "derive_optimize_writer_session_id",
+    "resolve_session_id",
+]

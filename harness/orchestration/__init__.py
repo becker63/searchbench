@@ -1,7 +1,8 @@
-"""Orchestration: state machines, listeners, and loop coordination."""
+"""Orchestration: explicit optimize loops, repair state, and typed contracts."""
 # pyright: reportImportCycles=false
 
-from .machine import OptimizationStateMachine, RepairStateMachine, run_loop
+from .machine import RepairStateMachine
+from .optimize_loop import DEFAULT_OPTIMIZATION_ITERATIONS, OptimizeTaskLoop, run_loop
 from .types import (
     AcceptedPolicy,
     AcceptedPolicyMeta,
@@ -12,7 +13,11 @@ from .types import (
     IterationTasks,
     LoopContext,
     LoopDependencies,
-    OptimizationMachineModel,
+    OptimizationIterationState,
+    EvaluationPhaseResult,
+    ReducerSummary,
+    WriterInputContext,
+    IterationOutcome,
     PreparedTasks,
     RepairContext,
     RepairMachineModel,
@@ -23,7 +28,8 @@ from .types import (
 
 __all__ = [
     "run_loop",
-    "OptimizationStateMachine",
+    "DEFAULT_OPTIMIZATION_ITERATIONS",
+    "OptimizeTaskLoop",
     "RepairStateMachine",
     "AcceptedPolicy",
     "AcceptedPolicyMeta",
@@ -34,7 +40,11 @@ __all__ = [
     "IterationRecord",
     "LoopContext",
     "LoopDependencies",
-    "OptimizationMachineModel",
+    "OptimizationIterationState",
+    "EvaluationPhaseResult",
+    "ReducerSummary",
+    "WriterInputContext",
+    "IterationOutcome",
     "PreparedTasks",
     "RepairContext",
     "RepairMachineModel",

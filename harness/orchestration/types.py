@@ -225,6 +225,10 @@ class RunMetadata(BaseModel):
     iterations: int
     task: LCATask
     session_id: str | None = None
+    optimize_run_id: str | None = None
+    writer_session_id: str | None = None
+    task_ordinal: int | None = None
+    task_total: int | None = None
 
 class PreparedTasks(BaseModel):
     """Canonical task plus execution metadata resolved once for the loop."""
@@ -346,12 +350,100 @@ class IterationRecord(BaseModel):
     max_policy_repairs: int | None = None
 
 
+class OptimizationIterationState(BaseModel):
+    """Immutable context for one explicit optimizer iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    iteration: int
+    iterations: int
+    task_identity: str
+    optimize_run_id: str | None = None
+    writer_session_id: str | None = None
+    task_ordinal: int | None = None
+    task_total: int | None = None
+
+
+class EvaluationPhaseResult(BaseModel):
+    """Evaluation phase output used by reducer and writer stages."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: OptimizationIterationState
+    prepared_tasks: PreparedTasks
+    evaluation: EvaluationResult | None = None
+    predicted_files_count: int = 0
+    success: bool = False
+    error: str | None = None
+
+
+class ReducerSummary(BaseModel):
+    """Compact writer-facing reducer output for the current iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    iteration: int
+    task_identity: str
+    current_score: float | None = None
+    previous_score: float | None = None
+    score_delta: float | None = None
+    regression: bool | None = None
+    evaluation_success: bool
+    pipeline_feedback_available: bool = False
+    comparison_summary: str | None = None
+
+    def compact_message(self) -> str:
+        parts = [
+            f"iteration={self.iteration}",
+            f"evaluation_success={self.evaluation_success}",
+        ]
+        if self.current_score is not None:
+            parts.append(f"current_score={self.current_score}")
+        if self.previous_score is not None:
+            parts.append(f"previous_score={self.previous_score}")
+        if self.score_delta is not None:
+            parts.append(f"score_delta={self.score_delta}")
+        if self.regression is not None:
+            parts.append(f"regression={self.regression}")
+        parts.append(f"pipeline_feedback_available={self.pipeline_feedback_available}")
+        return "; ".join(parts)
+
+
+class WriterInputContext(BaseModel):
+    """Explicit writer input boundary for one optimizer iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: OptimizationIterationState
+    evaluation: EvaluationResult
+    reducer_summary: ReducerSummary
+    feedback: FeedbackPackage
+
+
+class IterationOutcome(BaseModel):
+    """Recorded result of one explicit optimizer iteration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: OptimizationIterationState
+    record: IterationRecord
+    repair_outcome: RepairOutcome | None = None
+    status: str
+    duration_seconds: float | None = None
+    continue_next: bool = False
+    failed_phase: str | None = None
+
+
 class LoopContext(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     task: LCATask
     iterations: int
     session_id: str | None = None
+    optimize_run_id: str | None = None
+    writer_session_id: str | None = None
+    task_ordinal: int | None = None
+    task_total: int | None = None
     parent_trace: SpanHandle | None = None
     run_metadata: RunMetadata | None = None
     baseline_record: "EvaluationRecord | None" = None
@@ -395,6 +487,11 @@ class RepairContext(BaseModel):
     max_repair_attempts: int
     parent_trace: SpanHandle | None
     writer_model: str | None
+    optimize_run_id: str | None = None
+    writer_session_id: str | None = None
+    task_identity: str | None = None
+    task_ordinal: int | None = None
+    task_total: int | None = None
     failure_context: str | None = None
     last_classified: PipelineClassification | None = None
     attempts_used: int = 0
@@ -500,22 +597,6 @@ class RepairMachineModel(BaseModel):
     state: str | None = None
 
 
-class OptimizationMachineModel(BaseModel):
-    """Mutable state model for the optimization state machine."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    context: LoopContext
-    deps: "LoopDependencies"
-    max_policy_repairs: int
-    state: str | None = None
-    prep_ok: bool = False
-    current_iteration_span: SpanHandle | None = None
-    current_iteration_cm: ContextManager[SpanHandle] | None = None
-    current_evaluation: EvaluationResult | None = None
-    current_repair_outcome: RepairOutcome | None = None
-
-
 def _rebuild_forward_refs() -> None:
     try:
         from harness.telemetry.hosted.baselines import EvaluationRecord  # local import to avoid cycles
@@ -525,7 +606,6 @@ def _rebuild_forward_refs() -> None:
     LoopDependencies.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord})
     RepairContext.model_rebuild(_types_namespace={"EvaluationRecord": EvaluationRecord})
     RepairMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
-    OptimizationMachineModel.model_rebuild(_types_namespace={"LoopDependencies": LoopDependencies})
 
 
 _rebuild_forward_refs()

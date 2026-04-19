@@ -7,7 +7,11 @@ from typing import Any
 
 from harness.telemetry.tracing import start_observation
 from harness.telemetry.tracing.score_emitter import emit_score
-from harness.telemetry.tracing.session_policy import SessionConfig, resolve_session_id
+from harness.telemetry.tracing.session_policy import (
+    SessionConfig,
+    derive_optimize_writer_session_id,
+    resolve_session_id,
+)
 
 
 @contextmanager
@@ -79,3 +83,26 @@ def test_resolve_session_defaults():
     assert sess is not None
     none_cfg = SessionConfig(session_scope="run", allow_generated_fallback=False)
     assert resolve_session_id(none_cfg, run_id="run") is None
+
+
+def test_optimize_writer_session_id_is_short_stable_and_writer_scoped():
+    first = derive_optimize_writer_session_id(
+        optimize_run_id="ic-optimize-abcdef12",
+        task_identity="lca/py/dev/owner/repo/abc123",
+        ordinal=3,
+    )
+    second = derive_optimize_writer_session_id(
+        optimize_run_id="ic-optimize-abcdef12",
+        task_identity="lca/py/dev/owner/repo/abc123",
+        ordinal=3,
+    )
+    other = derive_optimize_writer_session_id(
+        optimize_run_id="ic-optimize-abcdef12",
+        task_identity="lca/py/dev/owner/repo/abc123",
+        ordinal=4,
+    )
+
+    assert first == second
+    assert first != other
+    assert first.startswith("writer:ic-optimize-abcdef12:3:")
+    assert len(first) < 200

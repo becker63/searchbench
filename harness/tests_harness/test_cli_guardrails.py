@@ -159,7 +159,8 @@ def test_flow_narratives_align_with_commands():
     optimize_steps = " ".join(IC_OPTIMIZE_NARRATIVE.steps)
     for expected in (
         "evaluate current IC behavior",
-        "build writer feedback",
+        "refresh global reducer summary",
+        "build writer input",
         "generate candidate policy",
         "pipeline correctness checks",
         "accept or reject",
@@ -212,10 +213,13 @@ def test_ic_optimize_help_narrates_evaluator_writer_pipeline_flow():
     result = RUNNER.invoke(run_module.app, ["ic", "optimize", "--help"])
     assert result.exit_code == 0
     assert "--max-workers" in result.output
+    assert "--iterations" in result.output
+    assert "5" in result.output
     assert "isolated" in result.output
     assert "evaluate current IC behavior" in result.output
-    assert "build writer feedback" in result.output
-    assert "pipeline correctness checks" in result.output
+    assert "refresh global reducer summary" in result.output
+    assert "reducer output" in result.output
+    assert "correctness" in result.output
     assert "accept" in result.output
     assert "reject" in result.output
 
@@ -502,6 +506,7 @@ def test_cli_respects_explicit_session_id(monkeypatch, tmp_path, capsys):
 
 def test_ic_optimize_delegates_to_run_loop(monkeypatch, tmp_path):
     calls: list[LCATask] = []
+    run_loop_kwargs: list[dict[str, object]] = []
     task = _task()
     _stub_flow(monkeypatch, tmp_path, tasks=[task])
     monkeypatch.setattr(
@@ -520,7 +525,12 @@ def test_ic_optimize_delegates_to_run_loop(monkeypatch, tmp_path):
 
     def fake_run_loop(task_arg, **kwargs):
         calls.append(task_arg)
+        run_loop_kwargs.append(dict(kwargs))
         assert kwargs["session_id"]
+        assert kwargs["optimize_run_id"]
+        assert kwargs["iterations"] == 5
+        assert kwargs["task_ordinal"] == 1
+        assert kwargs["task_total"] == 1
         assert kwargs["flush_tracing"] is False
         return [SimpleNamespace(iteration=0)]
 
@@ -530,6 +540,10 @@ def test_ic_optimize_delegates_to_run_loop(monkeypatch, tmp_path):
 
     assert len(calls) == 1
     assert calls[0].repo == str(tmp_path / "repo-1")
+    writer_session = run_loop_kwargs[0]["session_id"]
+    assert isinstance(writer_session, str)
+    assert writer_session.startswith("writer:")
+    assert len(writer_session) < 200
 
 
 def test_ic_optimize_honors_max_workers_with_isolated_workspaces(monkeypatch, tmp_path, capsys):
@@ -581,6 +595,7 @@ def test_ic_optimize_traces_parent_and_task_spans(monkeypatch, tmp_path):
     task = _task()
     starts: list[dict[str, object]] = []
     run_loop_parents: list[object | None] = []
+    propagated: list[dict[str, object]] = []
     _stub_flow(monkeypatch, tmp_path, tasks=[task])
     monkeypatch.setattr(
         run_module.harness_run,
@@ -621,6 +636,13 @@ def test_ic_optimize_traces_parent_and_task_spans(monkeypatch, tmp_path):
 
     monkeypatch.setattr(run_module.harness_run, "start_observation", span_cm)
 
+    @contextmanager
+    def propagate_cm(**kwargs):
+        propagated.append(dict(kwargs))
+        yield
+
+    monkeypatch.setattr(run_module.harness_run, "propagate_context", propagate_cm)
+
     def fake_run_loop(*args, **kwargs):
         run_loop_parents.append(kwargs.get("parent_trace"))
         return [SimpleNamespace(iteration=0)]
@@ -635,6 +657,12 @@ def test_ic_optimize_traces_parent_and_task_spans(monkeypatch, tmp_path):
     assert task_start["parent"] is None
     assert run_loop_parents == [task_start["span"]]
     assert task_start["span"] is not coordinator["span"]
+    assert all(call.get("session_id") is None for call in propagated)
+    task_metadata = task_start["metadata"]
+    assert isinstance(task_metadata, dict)
+    assert task_metadata["optimize_run_id"]
+    assert str(task_metadata["writer_session_id"]).startswith("writer:")
+    assert task_metadata["session_policy"] == "writer_loop_only"
 
 
 def test_select_tasks_is_deterministic_and_offsets():

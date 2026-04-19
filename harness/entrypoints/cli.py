@@ -44,7 +44,7 @@ from harness.localization.runtime.evaluate import (
 from harness.localization.runtime.evaluate import (
     evaluate_localization_batch as _evaluate_localization_batch,
 )
-from harness.orchestration.machine import run_loop
+from harness.orchestration.optimize_loop import DEFAULT_OPTIMIZATION_ITERATIONS, run_loop
 from harness.orchestration.runtime_context import isolated_optimization_workspace
 from harness.orchestration import writer as policy_writer
 from harness.telemetry.hosted.datasets import fetch_localization_dataset
@@ -60,7 +60,10 @@ from harness.telemetry.tracing import (
     start_observation,
 )
 from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
-from harness.telemetry.tracing.session_policy import SessionConfig
+from harness.telemetry.tracing.session_policy import (
+    SessionConfig,
+    derive_optimize_writer_session_id,
+)
 
 WARNING_THRESHOLD = 50
 HF_DATASET_NAME = "JetBrains-Research/lca-bug-localization"
@@ -94,7 +97,6 @@ REMOVED_FLAGS = {
 REMOVED_FRESHNESS_FLAGS = {"--invalidate-baseline-cache"}
 
 # Runner shape and iteration bounds
-DEFAULT_OPTIMIZATION_ITERATIONS = 5
 MAX_POLICY_REPAIRS_PER_ITERATION = 3
 WRITER_INTERNAL_ATTEMPTS_PER_REPAIR = 3
 
@@ -165,6 +167,14 @@ OptimizeMaxWorkersOption = Annotated[
         help="Maximum parallel per-task optimization workers; each worker uses an isolated workspace and policy file (>=1)",
     ),
 ]
+OptimizeIterationsOption = Annotated[
+    int,
+    typer.Option(
+        "--iterations",
+        min=1,
+        help="Optimizer iterations per selected task",
+    ),
+]
 ProjectionOnlyOption = Annotated[
     bool,
     typer.Option(
@@ -181,6 +191,13 @@ YesOption = Annotated[
 SessionIdOption = Annotated[
     str | None,
     typer.Option("--session-id", help="Optional explicit session id"),
+]
+OptimizeSessionIdOption = Annotated[
+    str | None,
+    typer.Option(
+        "--session-id",
+        help="Optional explicit optimize run id; writer replay sessions are derived per task",
+    ),
 ]
 FreshWorktreesOption = Annotated[
     bool,
@@ -937,6 +954,7 @@ def _run_ic_optimize_command(
     max_items: int | None,
     offset: int,
     max_workers: int,
+    iterations: int,
     projection_only: bool,
     yes: bool,
     session_id: str | None,
@@ -945,7 +963,7 @@ def _run_ic_optimize_command(
     def _action() -> None:
         print("[RUN] ic optimize")
         print(
-            "[FLOW] evaluate current IC behavior -> build writer feedback -> generate candidate policy update in isolated workspaces -> run pipeline correctness checks -> accept or reject the best update"
+            "[FLOW] evaluate current IC behavior -> refresh global reducer summary -> build writer input -> generate candidate policy update in isolated workspaces -> run pipeline correctness checks -> accept or reject the best update"
         )
         (
             project_dataset,
@@ -970,15 +988,16 @@ def _run_ic_optimize_command(
         materialized_tasks = _materialize_tasks_for_optimization(selected_tasks, worktree_manager)
         total = len(materialized_tasks)
         effective_workers = max(1, min(max_workers, total or 1))
-        session_id_value = session_cfg.session_id or "ic-optimize"
-        workspace_base = _optimize_workspace_base(session_id_value)
+        optimize_run_id = session_cfg.session_id or "ic-optimize"
+        workspace_base = _optimize_workspace_base(optimize_run_id)
         workspace_base.mkdir(parents=True, exist_ok=True)
         print(
-            "[RUN] ic optimize session=%s dataset=%s selected=%s execution=parallel effective_workers=%s isolation=per-task-workspace workspace_base=%s"
+            "[RUN] ic optimize optimize_run_id=%s dataset=%s selected=%s iterations=%s execution=parallel effective_workers=%s isolation=per-task-workspace workspace_base=%s"
             % (
-                session_id_value,
+                optimize_run_id,
                 project_dataset.name,
                 total,
+                iterations,
                 effective_workers,
                 workspace_base,
             )
@@ -1015,6 +1034,11 @@ def _run_ic_optimize_command(
             )
             workspace_root: Path | None = None
             isolated_task = task
+            writer_session_id = derive_optimize_writer_session_id(
+                optimize_run_id=optimize_run_id,
+                task_identity=task.task_id,
+                ordinal=ordinal,
+            )
             try:
                 workspace_root, isolated_task = _prepare_isolated_optimization_workspace(
                     task,
@@ -1033,7 +1057,7 @@ def _run_ic_optimize_command(
                 )
                 task_metadata = {
                     "command": "ic optimize",
-                    "optimize_run_id": session_id_value,
+                    "optimize_run_id": optimize_run_id,
                     "identity": task.task_id,
                     "ordinal": ordinal,
                     "total": total,
@@ -1042,10 +1066,12 @@ def _run_ic_optimize_command(
                     "workspace_root": str(workspace_root),
                     "execution": "parallel",
                     "effective_workers": effective_workers,
+                    "iterations": iterations,
+                    "writer_session_id": writer_session_id,
+                    "session_policy": "writer_loop_only",
                 }
                 with propagate_context(
                     trace_name="ic_optimize_task",
-                    session_id=session_id_value,
                     metadata=task_metadata,
                 ):
                     with start_observation(
@@ -1053,14 +1079,18 @@ def _run_ic_optimize_command(
                         metadata=task_metadata,
                     ) as task_span:
                         log(
-                            "[TASK] ic optimize phase=evaluate_policy task=%s/%s identity=%s"
-                            % (ordinal, total, task.task_id)
+                            "[TASK] ic optimize phase=evaluate_policy task=%s/%s identity=%s optimize_run_id=%s writer_session_id=%s"
+                            % (ordinal, total, task.task_id, optimize_run_id, writer_session_id)
                         )
                         with isolated_optimization_workspace(workspace_root):
                             history = run_loop(
                                 isolated_task,
+                                iterations=iterations,
                                 parent_trace=task_span,
-                                session_id=session_id_value,
+                                session_id=writer_session_id,
+                                optimize_run_id=optimize_run_id,
+                                task_ordinal=ordinal,
+                                task_total=total,
                                 flush_tracing=False,
                             )
                         duration = time.perf_counter() - started_at
@@ -1108,7 +1138,7 @@ def _run_ic_optimize_command(
                 duration = time.perf_counter() - started_at
                 failure_metadata = {
                     "command": "ic optimize",
-                    "optimize_run_id": session_id_value,
+                    "optimize_run_id": optimize_run_id,
                     "identity": task.task_id,
                     "ordinal": ordinal,
                     "total": total,
@@ -1118,10 +1148,11 @@ def _run_ic_optimize_command(
                     "status": "failure",
                     "error": str(exc),
                     "duration_seconds": duration,
+                    "writer_session_id": writer_session_id,
+                    "session_policy": "writer_loop_only",
                 }
                 with propagate_context(
                     trace_name="ic_optimize_task",
-                    session_id=session_id_value,
                     metadata=failure_metadata,
                 ):
                     with start_observation(
@@ -1158,27 +1189,30 @@ def _run_ic_optimize_command(
 
         with propagate_context(
             trace_name="ic_optimize",
-            session_id=session_id_value,
             metadata={
                 "command": "ic optimize",
+                "optimize_run_id": optimize_run_id,
                 "dataset": project_dataset.name,
                 "dataset_version": project_dataset.version,
                 "selection": selection_info,
                 "projection": projection,
-                "execution": "parallel",
-                "effective_workers": effective_workers,
-                "isolation": "per-task-workspace",
-            },
+                    "execution": "parallel",
+                    "effective_workers": effective_workers,
+                    "iterations": iterations,
+                    "isolation": "per-task-workspace",
+                },
         ):
             with start_observation(
                 name="ic_optimize_dataset",
                 metadata={
                     "command": "ic optimize",
+                    "optimize_run_id": optimize_run_id,
                     "dataset": project_dataset.name,
                     "dataset_version": project_dataset.version,
                     "selected_count": total,
                     "execution": "parallel",
                     "effective_workers": effective_workers,
+                    "iterations": iterations,
                     "workspace_base": str(workspace_base),
                 },
             ) as dataset_span:
@@ -1319,15 +1353,17 @@ def ic_optimize(
     max_items: MaxItemsOption = None,
     offset: OffsetOption = 0,
     max_workers: OptimizeMaxWorkersOption = 1,
+    iterations: OptimizeIterationsOption = DEFAULT_OPTIMIZATION_ITERATIONS,
     projection_only: ProjectionOnlyOption = False,
     yes: YesOption = False,
-    session_id: SessionIdOption = None,
+    session_id: OptimizeSessionIdOption = None,
     fresh_worktrees: FreshWorktreesOption = False,
 ) -> None:
     _run_ic_optimize_command(
         max_items=max_items,
         offset=offset,
         max_workers=max_workers,
+        iterations=iterations,
         projection_only=projection_only,
         yes=yes,
         session_id=session_id,
