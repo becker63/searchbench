@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Mapping
-from typing import TypeAlias
+from collections.abc import Callable
 
+from langfuse import LangfuseGeneration, LangfuseSpan
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from harness.scoring import BatchScoreSummary, ScoreBundle
+from harness.scoring import BatchScoreSummary
 
 _STRICT_DEBUG = bool(os.getenv("LANGFUSE_STRICT_DEBUG"))
-ScoreEmitFn: TypeAlias = Callable[..., None]
 
 
 class ScorePayload(BaseModel):
@@ -57,13 +56,17 @@ def _normalize_score_value(
     return value, resolved_type
 
 
-def _handle_trace_id(handle: object | None) -> str | None:
-    trace_id = getattr(handle, "trace_id", None) if handle is not None else None
+def _handle_trace_id(handle: LangfuseSpan | LangfuseGeneration | None) -> str | None:
+    if handle is None:
+        return None
+    trace_id = handle.trace_id
     return trace_id if isinstance(trace_id, str) and trace_id else None
 
 
-def _handle_observation_id(handle: object | None) -> str | None:
-    observation_id = getattr(handle, "id", None) if handle is not None else None
+def _handle_observation_id(handle: LangfuseSpan | LangfuseGeneration | None) -> str | None:
+    if handle is None:
+        return None
+    observation_id = handle.id
     return observation_id if isinstance(observation_id, str) and observation_id else None
 
 
@@ -88,14 +91,14 @@ def emit_score(
         client = get_langfuse_client()
         ensure_langfuse_auth()
     except Exception as exc:  # noqa: BLE001
-        logging.debug("Langfuse score emission skipped: %s", exc)
+        logging.warning("Langfuse score emission skipped score=%s error=%s", name, exc)
         return
     try:
         create_fn = client.create_score
     except AttributeError as exc:
         if _STRICT_DEBUG:
             raise RuntimeError("Langfuse client missing create_score API") from exc
-        logging.debug("Langfuse score emission unavailable: missing create_score API")
+        logging.warning("Langfuse score emission unavailable score=%s error=missing_create_score_api", name)
         return
     try:
         payload = ScorePayload(
@@ -112,7 +115,7 @@ def emit_score(
     except Exception as exc:  # noqa: BLE001
         if _STRICT_DEBUG:
             raise
-        logging.debug("Langfuse score payload invalid; skipping score %s: %s", name, exc)
+        logging.warning("Langfuse score payload invalid score=%s error=%s", name, exc)
         return
     cleaned = payload.model_dump(exclude_none=True)
     try:
@@ -120,12 +123,12 @@ def emit_score(
     except Exception as exc:  # noqa: BLE001
         if _STRICT_DEBUG:
             raise
-        logging.debug("Langfuse score emission failed for %s: %s", name, exc)
+        logging.warning("Langfuse score emission failed score=%s error=%s", name, exc)
         return
 
 
 def emit_score_for_handle(
-    handle: object | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     *,
     name: str,
     value: float | int | bool | str,
@@ -141,21 +144,24 @@ def emit_score_for_handle(
     # SDK docs show score_id only on create_score(), so use the low-level path
     # when callers need idempotency.
     if handle is not None and score_id is None:
-        score_fn = getattr(handle, "score", None)
-        if callable(score_fn):
-            try:
-                score_fn(  # type: ignore[call-arg]
-                    name=name,
-                    value=normalized_value,
-                    data_type=resolved_type,
-                    comment=comment,
-                    config_id=config_id,
-                )
-                return
-            except Exception as exc:  # noqa: BLE001
-                if _STRICT_DEBUG:
-                    raise
-                logging.debug("Langfuse handle.score failed for %s: %s", name, exc)
+        try:
+            handle.score(
+                name=name,
+                value=normalized_value,
+                data_type=resolved_type,
+                comment=comment,
+                config_id=config_id,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            if _STRICT_DEBUG:
+                raise
+            logging.warning(
+                "Langfuse handle.score failed observation=%s score=%s error=%s",
+                _handle_observation_id(handle) or type(handle).__name__,
+                name,
+                exc,
+            )
     # Fall back to explicit identifier-based emission only when the handle
     # exposes the real trace id. Langfuse requires trace_id for trace and
     # observation scores; handle.id is an observation id and must not be reused
@@ -182,7 +188,7 @@ def emit_score_for_handle(
 
 
 def emit_trace_score_for_handle(
-    handle: object | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     *,
     name: str,
     value: float | int | bool | str,
@@ -195,21 +201,24 @@ def emit_trace_score_for_handle(
     """Emit a trace-level score using the v4 score API."""
     normalized_value, resolved_type = _normalize_score_value(value, data_type)
     if handle is not None and score_id is None:
-        score_trace_fn = getattr(handle, "score_trace", None)
-        if callable(score_trace_fn):
-            try:
-                score_trace_fn(  # type: ignore[call-arg]
-                    name=name,
-                    value=normalized_value,
-                    data_type=resolved_type,
-                    comment=comment,
-                    config_id=config_id,
-                )
-                return
-            except Exception as exc:  # noqa: BLE001
-                if _STRICT_DEBUG:
-                    raise
-                logging.debug("Langfuse handle.score_trace failed for %s: %s", name, exc)
+        try:
+            handle.score_trace(
+                name=name,
+                value=normalized_value,
+                data_type=resolved_type,
+                comment=comment,
+                config_id=config_id,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            if _STRICT_DEBUG:
+                raise
+            logging.warning(
+                "Langfuse handle.score_trace failed observation=%s score=%s error=%s",
+                _handle_observation_id(handle) or type(handle).__name__,
+                name,
+                exc,
+            )
     trace_id = _handle_trace_id(handle)
     if trace_id is None and session_id is None:
         logging.debug(
@@ -231,11 +240,11 @@ def emit_trace_score_for_handle(
 
 
 def _emit_numeric_score(
-    handle: object | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     *,
     name: str,
     value: float,
-    emit_fn: ScoreEmitFn | None,
+    emit_fn: Callable[..., None] | None,
 ) -> None:
     emitter = emit_fn or emit_score_for_handle
     emitter(
@@ -246,97 +255,20 @@ def _emit_numeric_score(
     )
 
 
-def _safe_update_metadata(handle: object | None, metadata: Mapping[str, object]) -> None:
-    updater = getattr(handle, "update", None)
-    if callable(updater):
-        try:
-            updater(metadata=dict(metadata))
-        except Exception:
-            if _STRICT_DEBUG:
-                raise
-            logging.debug("Langfuse score metadata update skipped", exc_info=True)
-
-
-def score_bundle_metadata(
-    bundle: ScoreBundle,
-    *,
-    metadata_key: str = "score_bundle",
-) -> dict[str, object]:
-    hidden_components: list[str] = []
-    unavailable_components: dict[str, object] = {}
-    for component_name, result in bundle.results.items():
-        stable_name = result.name or component_name
-        if not result.visible_to_agent:
-            hidden_components.append(stable_name)
-            continue
-        if not result.available or not isinstance(result.value, (int, float)):
-            unavailable_components[stable_name] = result.reason or "unavailable"
-    return {
-        metadata_key: bundle.model_dump(mode="json"),
-        f"{metadata_key}_diagnostics": {
-            "hidden_components": hidden_components,
-            "unavailable_components": unavailable_components,
-            "available": bundle.available,
-        },
-    }
-
-
-def emit_score_bundle(
-    handle: object | None,
-    bundle: ScoreBundle,
-    *,
-    prefix: str,
-    metadata_key: str = "score_bundle",
-    emit_fn: ScoreEmitFn | None = None,
-) -> None:
-    """
-    Emit the canonical per-item scoring surface.
-
-    Ownership convention: callers attach score bundles to the evaluated task span,
-    not raw backend spans. Backend spans may still emit auxiliary diagnostics such
-    as node counts, but only the evaluated task span has the gold-aware
-    `ScoreBundle` needed for composed and component scores.
-    """
-    if bundle.composed_score is not None:
-        _emit_numeric_score(
-            handle,
-            name=f"{prefix}.composed_score",
-            value=float(bundle.composed_score),
-            emit_fn=emit_fn,
+def _safe_update_metadata(handle: LangfuseSpan | LangfuseGeneration | None, metadata: dict[str, object]) -> None:
+    if handle is None:
+        return
+    try:
+        handle.update(metadata=dict(metadata))
+    except Exception as exc:  # noqa: BLE001
+        if _STRICT_DEBUG:
+            raise
+        logging.warning(
+            "Langfuse batch score metadata update failed observation=%s keys=%s error=%s",
+            _handle_observation_id(handle) or type(handle).__name__,
+            sorted(str(key) for key in metadata),
+            exc,
         )
-
-    for component_name, result in bundle.results.items():
-        stable_name = result.name or component_name
-        if not result.visible_to_agent:
-            continue
-        if not result.available or not isinstance(result.value, (int, float)):
-            continue
-        _emit_numeric_score(
-            handle,
-            name=f"{prefix}.{stable_name}",
-            value=float(result.value),
-            emit_fn=emit_fn,
-        )
-
-    _safe_update_metadata(handle, score_bundle_metadata(bundle, metadata_key=metadata_key))
-
-
-def emit_task_score_summary(
-    handle: object | None,
-    summary: ScoreBundle,
-    *,
-    prefix: str,
-    metadata_key: str = "score_summary",
-    emit_fn: ScoreEmitFn | None = None,
-) -> None:
-    """Emit a task score summary using the same names as a concrete score bundle."""
-    emit_score_bundle(
-        handle,
-        summary,
-        prefix=prefix,
-        metadata_key=metadata_key,
-        emit_fn=emit_fn,
-    )
 
 
 def batch_score_summary_metadata(
@@ -369,7 +301,7 @@ def emit_batch_score_summary(
     *,
     prefix: str,
     metadata_key: str = "score_summary",
-    emit_fn: ScoreEmitFn | None = None,
+    emit_fn: Callable[..., None] | None = None,
 ) -> None:
     """Emit the canonical dataset/root scoring surface for an aggregate summary."""
     score_fn = emit_fn or emit_trace_score_for_handle
@@ -405,9 +337,6 @@ __all__ = [
     "batch_score_summary_metadata",
     "emit_batch_score_summary",
     "emit_score",
-    "emit_score_bundle",
     "emit_score_for_handle",
-    "emit_task_score_summary",
     "emit_trace_score_for_handle",
-    "score_bundle_metadata",
 ]

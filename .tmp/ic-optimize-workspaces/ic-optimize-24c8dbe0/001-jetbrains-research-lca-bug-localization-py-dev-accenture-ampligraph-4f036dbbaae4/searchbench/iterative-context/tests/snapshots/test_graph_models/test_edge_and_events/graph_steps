@@ -1,0 +1,122 @@
+[
+  {
+    "edges": [],
+    "nodes": [
+      {
+        "id": "n1",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n2",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n5",
+        "kind": "symbol",
+        "state": "pending"
+      }
+    ]
+  },
+  {
+    "edges": [],
+    "nodes": [
+      {
+        "id": "n1",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n2",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n5",
+        "kind": "symbol",
+        "state": "pending"
+      }
+    ]
+  },
+  {
+    "edges": [
+      {
+        "kind": "calls",
+        "source": "n1",
+        "target": "n2"
+      }
+    ],
+    "nodes": [
+      {
+        "id": "n1",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n2",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n5",
+        "kind": "symbol",
+        "state": "pending"
+      }
+    ]
+  },
+  {
+    "edges": [
+      {
+        "kind": "calls",
+        "source": "n1",
+        "target": "n2"
+      }
+    ],
+    "nodes": [
+      {
+        "id": "n1",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n2",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n5",
+        "kind": "symbol",
+        "state": "resolved",
+        "tokens": 3
+      }
+    ]
+  },
+  {
+    "edges": [
+      {
+        "kind": "calls",
+        "source": "n1",
+        "target": "n2"
+      }
+    ],
+    "nodes": [
+      {
+        "id": "n1",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n2",
+        "kind": "symbol",
+        "state": "pending"
+      },
+      {
+        "id": "n5",
+        "kind": "symbol",
+        "state": "resolved",
+        "tokens": 3
+      }
+    ]
+  }
+]

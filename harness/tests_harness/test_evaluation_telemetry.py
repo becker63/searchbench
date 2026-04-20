@@ -1,0 +1,243 @@
+from __future__ import annotations
+
+import pytest
+
+from harness.orchestration.types import EvaluationMetrics
+from harness.scoring import ComposeMode, Goal, ScoreBundle, ScoreContext, ScoreResult
+from harness.telemetry import evaluation_emitters
+from harness.telemetry.observability_models import (
+    EvaluationTelemetryArtifact,
+    evaluation_metrics_map,
+)
+
+
+def _bundle() -> ScoreBundle:
+    return ScoreBundle(
+        results={
+            "gold_hop": ScoreResult(
+                name="gold_hop",
+                value=1.0,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            ),
+            "issue_hop": ScoreResult(
+                name="issue_hop",
+                value=0.5,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            ),
+            "token_efficiency": ScoreResult(
+                name="token_efficiency",
+                value=0.25,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            ),
+        },
+        composed_score=0.75,
+        compose_mode=ComposeMode.WEIGHTED_SUM,
+        compose_weights={"gold_hop": 0.75, "issue_hop": 0.25},
+        available=True,
+    )
+
+
+def _context() -> ScoreContext:
+    return ScoreContext(
+        predicted_files=("a.py", "missing.py"),
+        gold_files=("a.py",),
+        gold_min_hops=0,
+        issue_min_hops=2,
+        previous_total_token_count=123.0,
+        resolved_prediction_nodes={"a.py": ("file:a.py",), "missing.py": ()},
+        resolved_gold_nodes={"a.py": ("file:a.py",)},
+        unresolved_predictions=("missing.py",),
+        unresolved_gold_files=(),
+        diagnostics={
+            "static_graph_available": True,
+            "token_usage_available": True,
+            "gold_min_hops_available": True,
+            "issue_min_hops_available": True,
+            "issue_anchor_count": 3,
+            "gold_anchor_count": 1,
+        },
+    )
+
+
+def test_evaluation_telemetry_artifact_contains_compact_score_context():
+    artifact = EvaluationTelemetryArtifact.from_scoring(
+        score_bundle=_bundle(),
+        score_context=_context(),
+    )
+
+    assert artifact.metric_map == {
+        "composed_score": 0.75,
+        "gold_hop": 1.0,
+        "issue_hop": 0.5,
+        "token_efficiency": 0.25,
+    }
+    compact = artifact.compact_score_context.model_dump(mode="json", exclude_none=True)
+    assert compact["gold_min_hops"] == 0
+    assert compact["issue_min_hops"] == 2
+    assert compact["previous_total_token_count"] == 123.0
+    assert compact["static_graph_available"] is True
+    assert compact["token_usage_available"] is True
+    assert compact["unresolved_prediction_count"] == 1
+
+
+def test_localization_task_emitter_scores_and_metadata(monkeypatch: pytest.MonkeyPatch):
+    scores: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    class Span:
+        id = "localization-task"
+        name = "localization_task"
+
+        def update(self, **kwargs: object) -> None:
+            updates.append(kwargs)
+
+    monkeypatch.setattr(
+        evaluation_emitters,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: scores.append(kwargs),
+    )
+    artifact = EvaluationTelemetryArtifact.from_scoring(
+        score_bundle=_bundle(),
+        score_context=_context(),
+    )
+
+    evaluation_emitters.emit_localization_task_telemetry(
+        Span(),
+        artifact,
+        score_prefix="ic",
+        telemetry_payload={"identity": {"task_id": "task"}},
+        predicted_files=["a.py", "missing.py"],
+        changed_files=["a.py"],
+    )
+
+    assert [score["name"] for score in scores] == [
+        "ic.composed_score",
+        "ic.gold_hop",
+        "ic.issue_hop",
+        "ic.token_efficiency",
+    ]
+    metadata = updates[-1]["metadata"]
+    assert metadata["score_context"]["gold_min_hops"] == 0
+    assert metadata["score_context"]["previous_total_token_count"] == 123.0
+    assert metadata["predicted_files"] == ["a.py", "missing.py"]
+
+
+def test_optimize_iteration_emits_all_numeric_boolean_metrics(monkeypatch: pytest.MonkeyPatch):
+    scores: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    class Span:
+        id = "optimize-iteration"
+        name = "optimize_iteration"
+
+        def update(self, **kwargs: object) -> None:
+            updates.append(kwargs)
+
+    monkeypatch.setattr(
+        evaluation_emitters,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: scores.append(kwargs),
+    )
+    metrics = EvaluationMetrics.model_validate(
+        {
+            "score": 0.4,
+            "additional_metrics": [
+                {"name": "gold_hop", "value": 1.0},
+                {"name": "issue_hop", "value": 0.5},
+                {"name": "token_efficiency", "value": 0.25},
+                {"name": "component_passed", "value": True},
+                {"name": "ignored", "value": None},
+            ],
+        }
+    )
+
+    evaluation_emitters.emit_optimize_iteration_telemetry(
+        Span(),
+        metrics=metrics,
+        iteration=2,
+        status="success",
+        pipeline_passed=False,
+        score_context_summary={"gold_hop": 1.0},
+    )
+
+    emitted_names = [score["name"] for score in scores]
+    assert emitted_names == [
+        "metrics.score",
+        "gold_hop",
+        "issue_hop",
+        "token_efficiency",
+        "component_passed",
+        "pipeline_passed",
+    ]
+    assert {score["name"]: score["data_type"] for score in scores}["component_passed"] == "BOOLEAN"
+    assert updates[-1]["metadata"]["score_context_summary"] == {"gold_hop": 1.0}
+
+
+def test_evaluation_metrics_map_ignores_non_numeric_or_boolean_entries():
+    metrics = EvaluationMetrics.model_validate(
+        {
+            "score": 1.0,
+            "additional_metrics": [
+                {"name": "numeric", "value": 2},
+                {"name": "boolean", "value": False},
+                {"name": "missing", "value": None},
+            ],
+        }
+    )
+
+    assert evaluation_metrics_map(metrics) == {
+        "metrics.score": 1.0,
+        "numeric": 2.0,
+        "boolean": False,
+    }
+
+
+def test_metadata_update_failures_are_logged(caplog: pytest.LogCaptureFixture):
+    class BrokenSpan:
+        id = "broken"
+
+        def update(self, **kwargs: object) -> None:
+            raise RuntimeError("metadata down")
+
+    caplog.set_level("WARNING")
+    evaluation_emitters.safe_update_observation_metadata(
+        BrokenSpan(),
+        {"score_context": {"gold_min_hops": 0}},
+        operation="test.metadata",
+        observation_name="localization_task",
+    )
+
+    assert "test.metadata" in caplog.text
+    assert "localization_task" in caplog.text
+    assert "score_context" in caplog.text
+    assert "metadata down" in caplog.text
+
+
+def test_score_emission_failures_are_logged(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+    def failing_emit(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("score down")
+
+    monkeypatch.setattr(evaluation_emitters, "emit_score_for_handle", failing_emit)
+    caplog.set_level("WARNING")
+
+    class Span:
+        id = "score-span"
+        name = "localization_task"
+
+    evaluation_emitters.safe_emit_score_for_handle(
+        Span(),
+        name="gold_hop",
+        value=1.0,
+        data_type="NUMERIC",
+        operation="test.score",
+    )
+
+    assert "test.score" in caplog.text
+    assert "gold_hop" in caplog.text
+    assert "score down" in caplog.text

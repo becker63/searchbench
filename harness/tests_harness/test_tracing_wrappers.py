@@ -33,6 +33,9 @@ class DummySpan:
     def start_observation(self, **kwargs):
         return self
 
+    def start_as_current_observation(self, **kwargs):
+        return self
+
     def end(self, **kwargs):
         self.ended.append(kwargs)
 

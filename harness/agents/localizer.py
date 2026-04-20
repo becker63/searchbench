@@ -12,6 +12,8 @@ import time
 from collections.abc import Mapping
 from typing import Any, Callable, Literal, cast
 
+from langfuse import LangfuseGeneration, LangfuseSpan
+
 from harness.telemetry.tracing import (
     UsageDetails,
     get_tracing_openai_client,
@@ -50,13 +52,26 @@ def _require_parent(parent: object | None, owner: str = "runner agent") -> objec
     return parent
 
 
-def _safe_update(span: object | None, **kwargs: object) -> None:
-    updater = getattr(span, "update", None)
-    if callable(updater):
-        try:
-            updater(**kwargs)
-        except Exception:
-            pass
+def _span_label(span: LangfuseSpan | LangfuseGeneration) -> str:
+    if span.name:
+        return span.name
+    return span.id
+
+
+def _safe_update(span: LangfuseSpan | LangfuseGeneration | None, **kwargs: object) -> None:
+    if span is None:
+        return
+    try:
+        span.update(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        metadata = kwargs.get("metadata")
+        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else sorted(kwargs)
+        _LOGGER.warning(
+            "Langfuse metadata update failed operation=localizer.update observation=%s keys=%s error=%s",
+            _span_label(span),
+            keys,
+            exc,
+        )
 
 
 def _prediction_from_output(
@@ -1269,7 +1284,7 @@ def run_ic_iteration(
             backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
             tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
             system_prompt = build_ic_system_prompt(tool_specs)
-            backend_obs.update(metadata={"backend": "iterative_context", "repo": repo, "identity": task.identity.task_id(), "phase": "agent_execution", "tool_count": len(tool_specs)})
+            _safe_update(backend_obs, metadata={"backend": "iterative_context", "repo": repo, "identity": task.identity.task_id(), "phase": "agent_execution", "tool_count": len(tool_specs)})
         except Exception as exc:  # noqa: BLE001
             summary = _build_task_run_summary(
                 task=task,
@@ -1281,10 +1296,7 @@ def run_ic_iteration(
                 stage="backend_init",
                 message=str(exc),
             )
-            try:
-                backend_obs.update(metadata={"task_summary": summary.model_dump(mode="json"), "phase": "backend_init", "error": str(exc)})
-            except Exception:
-                pass
+            _safe_update(backend_obs, metadata={"task_summary": summary.model_dump(mode="json"), "phase": "backend_init", "error": str(exc)})
             raise LocalizationEvaluationError(
                 LocalizationFailureCategory.RUNNER,
                 str(exc),
@@ -1303,10 +1315,7 @@ def run_ic_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            try:
-                backend_obs.update(metadata={"error": str(exc), "phase": "agent_execution"})
-            except Exception:
-                pass
+            _safe_update(backend_obs, metadata={"error": str(exc), "phase": "agent_execution"})
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         normalized_node_count = _coerce_node_count(normalized.get("node_count"))
@@ -1334,7 +1343,7 @@ def run_ic_iteration(
                         break
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
         emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count_metric, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
+        _safe_update(backend_obs, metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
 
     final = _runner_error_result(
         task=task,
@@ -1371,10 +1380,7 @@ def run_ic_iteration(
         stage="agent_execution" if final.source == "runner_error" else ("finalization" if not final.prediction.predicted_files else None),
         message=str((final.raw or {}).get("error")) if isinstance(final.raw, Mapping) and (final.raw or {}).get("error") else None,
     )
-    try:
-        backend_obs.update(metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
-    except Exception:
-        pass
+    _safe_update(backend_obs, metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
     return final
 
 
@@ -1421,19 +1427,17 @@ def run_jc_iteration(
                 task.task_id,
                 exc,
             )
-            try:
-                backend_obs.update(
-                    metadata={
-                        "backend": "jcodemunch",
-                        "repo": repo,
-                        "identity": task.identity.task_id(),
-                        "phase": "backend_init",
-                        "error": str(exc),
-                        "task_summary": summary.model_dump(mode="json"),
-                    }
-                )
-            except Exception:
-                pass
+            _safe_update(
+                backend_obs,
+                metadata={
+                    "backend": "jcodemunch",
+                    "repo": repo,
+                    "identity": task.identity.task_id(),
+                    "phase": "backend_init",
+                    "error": str(exc),
+                    "task_summary": summary.model_dump(mode="json"),
+                },
+            )
             raise LocalizationEvaluationError(
                 LocalizationFailureCategory.RUNNER,
                 str(exc),
@@ -1445,18 +1449,16 @@ def run_jc_iteration(
             task.task_id,
             len(tool_specs),
         )
-        try:
-            backend_obs.update(
-                metadata={
-                    "backend": "jcodemunch",
-                    "repo": repo,
-                    "identity": task.identity.task_id(),
-                    "phase": "agent_execution",
-                    "tool_count": len(tool_specs),
-                }
-            )
-        except Exception:
-            pass
+        _safe_update(
+            backend_obs,
+            metadata={
+                "backend": "jcodemunch",
+                "repo": repo,
+                "identity": task.identity.task_id(),
+                "phase": "agent_execution",
+                "tool_count": len(tool_specs),
+            },
+        )
         try:
             raw = run_agent(
                 agent_task,
@@ -1469,10 +1471,7 @@ def run_jc_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            try:
-                backend_obs.update(metadata={"error": str(exc), "phase": "agent_execution"})
-            except Exception:
-                pass
+            _safe_update(backend_obs, metadata={"error": str(exc), "phase": "agent_execution"})
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
@@ -1484,7 +1483,7 @@ def run_jc_iteration(
                     node_count_val = len(nodes)
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
         emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count_metric, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": node_count_val or 0})
+        _safe_update(backend_obs, metadata={"node_count": node_count_val or 0})
 
     final = _runner_error_result(
         task=task,
@@ -1514,10 +1513,7 @@ def run_jc_iteration(
         stage="agent_execution" if final.source == "runner_error" else ("finalization" if not final.prediction.predicted_files else None),
         message=str((final.raw or {}).get("error")) if isinstance(final.raw, Mapping) and (final.raw or {}).get("error") else None,
     )
-    try:
-        backend_obs.update(metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
-    except Exception:
-        pass
+    _safe_update(backend_obs, metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
     return final
 
 

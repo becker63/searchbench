@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/traversal.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.1, 0.5, 5.0, 10.0, 'ExpansionPolicy', 'ScoreFn', 'anchor', 'data', 'get_frontier', 'id', 'pending', 'run_traversal', 'score_node', 'select_next_node', 'state', 'tokens']

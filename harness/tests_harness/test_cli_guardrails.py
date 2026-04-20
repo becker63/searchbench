@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import builtins
+import subprocess
 import sys
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -222,6 +224,20 @@ def test_ic_optimize_help_narrates_evaluator_writer_pipeline_flow():
     assert "correctness" in result.output
     assert "accept" in result.output
     assert "reject" in result.output
+
+
+def test_ic_optimize_help_imports_in_fresh_process():
+    result = subprocess.run(
+        [sys.executable, "-m", "harness.entrypoints.cli", "ic", "optimize", "--help"],
+        cwd=Path(__file__).resolve().parents[2],
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--max-workers" in result.stdout
 
 
 def test_old_commands_are_not_registered():
@@ -657,7 +673,11 @@ def test_ic_optimize_traces_parent_and_task_spans(monkeypatch, tmp_path):
     assert task_start["parent"] is None
     assert run_loop_parents == [task_start["span"]]
     assert task_start["span"] is not coordinator["span"]
-    assert all(call.get("session_id") is None for call in propagated)
+    assert all("metadata" not in call for call in propagated)
+    assert all(
+        call.get("session_id") is None or isinstance(call.get("session_id"), str)
+        for call in propagated
+    )
     task_metadata = task_start["metadata"]
     assert isinstance(task_metadata, dict)
     assert task_metadata["optimize_run_id"]

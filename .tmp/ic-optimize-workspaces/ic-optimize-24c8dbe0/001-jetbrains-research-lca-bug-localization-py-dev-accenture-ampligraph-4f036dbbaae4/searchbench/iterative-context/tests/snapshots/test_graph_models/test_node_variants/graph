@@ -1,0 +1,10 @@
+{
+  "edges": [],
+  "nodes": [
+    {
+      "id": "n1",
+      "kind": "symbol",
+      "state": "pending"
+    }
+  ]
+}

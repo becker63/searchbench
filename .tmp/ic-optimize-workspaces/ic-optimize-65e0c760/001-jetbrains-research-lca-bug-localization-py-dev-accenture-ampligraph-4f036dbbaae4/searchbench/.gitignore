@@ -1,0 +1,10 @@
+cat <<EOF > .gitignore
+__pycache__/
+*.pyc
+.venv/
+.uv/
+dist/
+build/
+.env
+EOF
+codeql-db-python

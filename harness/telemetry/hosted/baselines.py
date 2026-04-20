@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,8 +39,6 @@ from harness.telemetry.tracing import propagate_context, start_observation
 from harness.telemetry.tracing.score_emitter import (
     batch_score_summary_metadata,
     emit_batch_score_summary,
-    emit_score_for_handle,
-    emit_task_score_summary,
 )
 
 
@@ -92,8 +91,13 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
     if callable(updater):
         try:
             updater(metadata=metadata)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "Langfuse metadata update failed operation=baseline.metadata observation=%s keys=%s error=%s",
+                getattr(span, "id", type(span).__name__),
+                sorted(str(key) for key in metadata),
+                exc,
+            )
 
 
 def _aggregate_score_summaries(
@@ -295,13 +299,6 @@ def compute_baseline_for_task(
                 materialization_events=materialization.events
                 if materialization
                 else None,
-            )
-            emit_task_score_summary(
-                trace,
-                score_summary,
-                prefix="baseline",
-                metadata_key="score_summary",
-                emit_fn=emit_score_for_handle,
             )
             return EvaluationRecord(
                 dataset_name=task.identity.dataset_name,

@@ -94,22 +94,27 @@ def test_start_observation_accepts_context_manager(monkeypatch):
     assert obs.end_called == 0
 
 
-def test_start_child_observation_handles_plain_object_parent():
+def test_start_child_observation_uses_langfuse_child_context_manager():
     class PlainChild:
         def __init__(self, session_id: str | None):
             self.id = "child"
+            self.name = "child"
             self.session_id = session_id
-            self.end_called = 0
+            self.exited = 0
 
-        def end(self):
-            self.end_called += 1
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.exited += 1
+            return False
 
     class PlainParent:
         def __init__(self, session_id: str | None):
             self.session_id = session_id
             self.started = 0
 
-        def start_observation(self, **kwargs):
+        def start_as_current_observation(self, **kwargs):
             self.started += 1
             meta = kwargs.get("metadata") or {}
             child_session = meta.get("session_id") or self.session_id
@@ -120,10 +125,10 @@ def test_start_child_observation_handles_plain_object_parent():
     with lf.start_observation(name="child", parent=parent) as child:
         assert isinstance(child, PlainChild)
         assert child.session_id == "parent-session"
-        assert child.end_called == 0
+        assert child.exited == 0
 
     assert parent.started == 1
-    assert child.end_called == 1
+    assert child.exited == 1
 
 
 def test_emit_score_best_effort_when_client_missing(monkeypatch):
@@ -144,7 +149,7 @@ def test_emit_score_handles_missing_api(monkeypatch):
     score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
 
 
-def test_propagate_context_compacts_metadata(monkeypatch):
+def test_propagate_context_drops_invalid_metadata(monkeypatch, caplog):
     captured: dict[str, object] = {}
 
     def fake_propagate_attributes(**kwargs):
@@ -152,25 +157,27 @@ def test_propagate_context_compacts_metadata(monkeypatch):
         return kwargs
 
     monkeypatch.setattr(lf, "propagate_attributes", fake_propagate_attributes)
-    long_selection = {
-        "offset": 0,
-        "limit": 1,
-        "selected_count": 1,
-        "total_available": 10,
-        "preview": ["a" * 300, "b"],
-    }
-    long_projection = "x" * 400
+    caplog.set_level("WARNING")
 
-    lf.propagate_context(metadata={"selection": long_selection, "projection": long_projection})
+    lf.propagate_context(
+        metadata={
+            "source": "api",
+            "task_identity": "task-1",
+            "repo": "owner/repo",
+            "toolong": "x" * 400,
+        }
+    )
 
     meta = captured.get("metadata") or {}
     assert isinstance(meta, dict)
-    # selection/projection should be omitted/compacted and under the 200-char limit.
-    assert meta.get("selection") == "<omitted>"
-    assert meta.get("projection") == "<omitted>"
+    assert meta == {"source": "api"}
+    assert "task_identity" not in meta
+    assert "repo" not in meta
+    assert "toolong" not in meta
+    assert "Dropping" in caplog.text
 
 
-def test_propagate_context_strict_rejects_selection(monkeypatch):
+def test_propagate_context_strict_rejects_invalid_key(monkeypatch):
     monkeypatch.setenv("LANGFUSE_STRICT_DEBUG", "1")
     import importlib
 
@@ -178,4 +185,18 @@ def test_propagate_context_strict_rejects_selection(monkeypatch):
 
     importlib.reload(lf_mod)
     with pytest.raises(ValueError):
-        lf_mod.propagate_context(metadata={"selection": {"preview": ["a" * 300]}})
+        lf_mod.propagate_context(metadata={"task_identity": "task-1"})
+
+
+def test_observation_metadata_preserves_nested_json():
+    metadata = lf.serialize_observation_metadata(
+        {
+            "score_context": {"gold_min_hops": 0, "flags": [True, False]},
+            "count": 1,
+        }
+    )
+
+    assert metadata == {
+        "score_context": {"gold_min_hops": 0, "flags": [True, False]},
+        "count": 1,
+    }

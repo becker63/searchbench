@@ -5,7 +5,7 @@ import os
 from contextlib import contextmanager
 from typing import Any, Mapping, Optional, ContextManager, Iterator
 
-from langfuse import Langfuse, propagate_attributes
+from langfuse import Langfuse, LangfuseGeneration, LangfuseSpan, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
 from pydantic import BaseModel, ConfigDict
 
@@ -17,6 +17,18 @@ _PROPAGATION_MAX_LEN = 200
 _LOGGER = logging.getLogger(__name__)
 _STRICT_DEBUG = bool(os.getenv("LANGFUSE_STRICT_DEBUG"))
 _PK_PREFIX_LEN = 12
+_FORBIDDEN_PROPAGATED_METADATA_KEYS = {
+    "repo",
+    "repopath",
+    "task",
+    "taskidentity",
+    "writersessionid",
+    "optimizerunid",
+    "scorecontext",
+    "tasksummary",
+    "reducersummary",
+    "iterationdiagnostics",
+}
 
 
 class _OtelShutdownNoiseFilter(logging.Filter):
@@ -37,13 +49,10 @@ class ObservationMetadata(BaseModel):
 
     data: Mapping[str, object] | None = None
 
-    def to_langfuse(self) -> dict[str, str] | None:
+    def to_langfuse(self) -> dict[str, object] | None:
         if self.data is None:
             return None
-        coerced: dict[str, str] = {}
-        for key, value in self.data.items():
-            coerced[str(key)] = "" if value is None else str(value)
-        return coerced
+        return serialize_observation_metadata(self.data)
 
 
 class UsageDetails(BaseModel):
@@ -108,30 +117,67 @@ def _coerce_tags(tags: list[str] | None) -> list[str] | None:
     return [tag for tag in tags if isinstance(tag, str) and tag]
 
 
-def _truncate_value(val: str, key: str) -> str:
-    if len(val) <= _PROPAGATION_MAX_LEN:
-        return val
-    if _STRICT_DEBUG:
-        raise ValueError(f"Propagated metadata for key '{key}' exceeds {_PROPAGATION_MAX_LEN} chars in strict mode")
-    _LOGGER.warning("Truncating propagated metadata for key '%s' to %s chars", key, _PROPAGATION_MAX_LEN)
-    return val[:_PROPAGATION_MAX_LEN]
+def _is_valid_propagated_key(key: str) -> bool:
+    return bool(key) and key.isalnum()
 
 
-def _coerce_metadata(metadata: Mapping[str, object] | None) -> dict[str, str] | None:
+def serialize_propagated_metadata(metadata: Mapping[str, object] | None) -> dict[str, str] | None:
+    """Serialize Langfuse propagated metadata.
+
+    Langfuse v4 propagated metadata is for attributes applied across all
+    observations in a context. The docs constrain it to string values of at
+    most 200 characters and alphanumeric metadata keys. Execution diagnostics
+    belong on observation-local metadata instead.
+    """
     if metadata is None:
         return None
-    coerced: dict[str, str] = {}
+    serialized: dict[str, str] = {}
     for key, value in metadata.items():
         key_str = str(key)
-        if key_str in {"selection", "projection"}:
+        normalized_key = "".join(ch for ch in key_str.lower() if ch.isalnum())
+        if normalized_key in _FORBIDDEN_PROPAGATED_METADATA_KEYS:
             if _STRICT_DEBUG:
                 raise ValueError(f"Propagated metadata key '{key_str}' is forbidden in strict mode")
-            coerced[key_str] = "<omitted>"
+            _LOGGER.warning("Dropping execution diagnostic propagated metadata key '%s'", key_str)
+            continue
+        if not _is_valid_propagated_key(key_str):
+            if _STRICT_DEBUG:
+                raise ValueError(f"Propagated metadata key '{key_str}' is invalid in strict mode")
+            _LOGGER.warning("Dropping invalid propagated metadata key '%s'", key_str)
             continue
         text = "" if value is None else str(value)
-        coerced[key_str] = _truncate_value(text, key_str)
-    return coerced
+        if len(text) > _PROPAGATION_MAX_LEN:
+            if _STRICT_DEBUG:
+                raise ValueError(f"Propagated metadata for key '{key_str}' exceeds {_PROPAGATION_MAX_LEN} chars in strict mode")
+            _LOGGER.warning(
+                "Dropping propagated metadata key '%s': value exceeds %s chars",
+                key_str,
+                _PROPAGATION_MAX_LEN,
+            )
+            continue
+        serialized[key_str] = text
+    return serialized or None
 
+
+def _json_safe(value: object, *, limit: int = 4000) -> object:
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v, limit=limit) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item, limit=limit) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item, limit=limit) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str) and len(value) > limit:
+            return f"{value[: limit - 3]}..."
+        return value
+    return str(value)
+
+
+def serialize_observation_metadata(metadata: Mapping[str, object] | None) -> dict[str, object] | None:
+    """Serialize observation-local metadata while preserving JSON structure."""
+    if metadata is None:
+        return None
+    return {str(key): _json_safe(value) for key, value in metadata.items()}
 
 def _build_client() -> Langfuse:
     env = get_langfuse_env()
@@ -204,7 +250,7 @@ def propagate_context(
     coerced_tags = _coerce_tags(tags)
     if coerced_tags:
         kwargs["tags"] = coerced_tags
-    coerced_metadata = _coerce_metadata(metadata)
+    coerced_metadata = serialize_propagated_metadata(metadata)
     if coerced_metadata:
         kwargs["metadata"] = coerced_metadata
     if version:
@@ -221,11 +267,11 @@ def start_root_observation(
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
     usage_details: UsageDetails | None = None,
-) -> Iterator[Any]:
+) -> Iterator[LangfuseSpan | LangfuseGeneration]:
     """
     Start a root observation as the current observation.
     """
-    meta = ObservationMetadata(data=_coerce_metadata(metadata)) if metadata else None
+    meta = ObservationMetadata(data=serialize_observation_metadata(metadata)) if metadata else None
     envelope = ObservationEnvelope(
         name=name,
         as_type=as_type,
@@ -234,9 +280,8 @@ def start_root_observation(
         metadata=meta,
         usage_details=usage_details,
     )
-    client_any: Any = get_langfuse_client()
     try:
-        cm = client_any.start_as_current_observation(**envelope.to_start_kwargs())
+        cm = get_langfuse_client().start_as_current_observation(**envelope.to_start_kwargs())
     except AttributeError as exc:
         raise RuntimeError("Langfuse client missing start_as_current_observation") from exc
     with cm as observation:
@@ -245,7 +290,7 @@ def start_root_observation(
 
 @contextmanager
 def start_child_observation(
-    parent: Any,
+    parent: LangfuseSpan | LangfuseGeneration,
     name: str,
     *,
     as_type: str = "span",
@@ -253,23 +298,13 @@ def start_child_observation(
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
     usage_details: UsageDetails | None = None,
-) -> Iterator[Any]:
+) -> Iterator[LangfuseSpan | LangfuseGeneration]:
     """
     Start a child observation from a parent observation.
     """
-    if parent is None or not hasattr(parent, "start_observation"):
-        raise RuntimeError("Parent observation is required to start a child observation")
-    parent_session = getattr(parent, "session_id", None)
-    parent_meta = getattr(parent, "metadata", {}) if hasattr(parent, "metadata") else {}
-    if isinstance(parent_meta, Mapping) and parent_session is None:
-        parent_session = parent_meta.get("session_id")
     effective_metadata: dict[str, object] = dict(metadata) if metadata else {}
-    if "session_id" in effective_metadata and parent_session and effective_metadata["session_id"] != parent_session:
-        raise RuntimeError("session_id conflict")
-    if "session_id" not in effective_metadata and parent_session:
-        effective_metadata["session_id"] = parent_session
     merged_metadata: Mapping[str, object] | None = effective_metadata if effective_metadata else metadata
-    meta = ObservationMetadata(data=_coerce_metadata(merged_metadata)) if merged_metadata else None
+    meta = ObservationMetadata(data=serialize_observation_metadata(merged_metadata)) if merged_metadata else None
     envelope = ObservationEnvelope(
         name=name,
         as_type=as_type,
@@ -278,30 +313,10 @@ def start_child_observation(
         metadata=meta,
         usage_details=usage_details,
     )
-    # Prefer a managed child if available; otherwise manage lifecycle manually.
     try:
         cm = parent.start_as_current_observation(**envelope.to_start_kwargs())
-    except AttributeError:
-        child = parent.start_observation(**envelope.to_start_kwargs())
-        if hasattr(child, "__enter__") and hasattr(child, "__exit__"):
-            cm = child
-        else:
-
-            @contextmanager
-            def _child_cm():
-                try:
-                    yield child
-                finally:
-                    try:
-                        child.end()
-                    except AttributeError as exc:  # pragma: no cover
-                        raise RuntimeError("Child observation missing end()") from exc
-                    except Exception:
-                        if _STRICT_DEBUG:
-                            raise
-                        _LOGGER.warning("Langfuse child end failed", exc_info=True)
-
-            cm = _child_cm()
+    except AttributeError as exc:
+        raise RuntimeError("Parent observation missing start_as_current_observation") from exc
     with cm as observation:
         yield observation
 
@@ -310,17 +325,17 @@ def start_child_observation(
 def start_observation(
     name: str,
     *,
-    parent: Any | None = None,
+    parent: LangfuseSpan | LangfuseGeneration | None = None,
     as_type: str = "span",
     input: object | None = None,
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
     usage_details: UsageDetails | None = None,
-) -> Iterator[Any]:
+) -> Iterator[LangfuseSpan | LangfuseGeneration]:
     """
     Convenience wrapper to start a root or child observation based on parent presence.
     """
-    if parent is None or not hasattr(parent, "start_observation"):
+    if parent is None:
         with start_root_observation(
             name,
             as_type=as_type,
@@ -384,8 +399,8 @@ def ensure_langfuse_auth() -> None:
             public_prefix = public[:_PK_PREFIX_LEN]
         host_val = env.get("base_url")
         host = host_val if isinstance(host_val, str) and host_val else None
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("Langfuse environment metadata inspection failed: %s", exc)
     try:
         ok = bool(client.auth_check())
     except AttributeError:
@@ -420,4 +435,6 @@ __all__ = [
     "start_child_observation",
     "flush_langfuse",
     "ensure_langfuse_auth",
+    "serialize_observation_metadata",
+    "serialize_propagated_metadata",
 ]

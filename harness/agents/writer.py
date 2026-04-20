@@ -10,6 +10,7 @@ import logging
 import time
 from typing import Any, Mapping, Sequence
 
+from langfuse import LangfuseGeneration, LangfuseSpan
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
@@ -60,13 +61,26 @@ def _require_parent(parent_trace: object | None) -> object:
     return parent_trace
 
 
-def _safe_update(span: object | None, **kwargs: object) -> None:
-    updater = getattr(span, "update", None)
-    if callable(updater):
-        try:
-            updater(**kwargs)
-        except Exception:
-            pass
+def _span_label(span: LangfuseSpan | LangfuseGeneration) -> str:
+    if span.name:
+        return span.name
+    return span.id
+
+
+def _safe_update(span: LangfuseSpan | LangfuseGeneration | None, **kwargs: object) -> None:
+    if span is None:
+        return
+    try:
+        span.update(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        metadata = kwargs.get("metadata")
+        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else sorted(kwargs)
+        _LOGGER.warning(
+            "Langfuse metadata update failed operation=writer.update observation=%s keys=%s error=%s",
+            _span_label(span),
+            keys,
+            exc,
+        )
 
 
 def _ensure_non_empty_messages(messages: Sequence[Mapping[str, object]] | None, caller: str) -> None:
@@ -281,16 +295,10 @@ def generate_policy(
                         attempt,
                         e,
                     )
-                    try:
-                        attempt_obs.update(metadata={"error": str(e)})
-                    except Exception:
-                        pass
+                    _safe_update(attempt_obs, metadata={"error": str(e)})
                     time.sleep(2 * (attempt + 1))
         else:
-            try:
-                writer_obs.update(metadata={"error": "writer_failed"})
-            except Exception:
-                pass
+            _safe_update(writer_obs, metadata={"error": "writer_failed"})
             raise RuntimeError("Writer failed after retries")
 
         try:
@@ -309,10 +317,7 @@ def generate_policy(
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.info("[OPTIMIZE] writer compile_validation=failed error=%s", exc)
-            try:
-                writer_obs.update(metadata={"error": str(exc), "model": model})
-            except Exception:
-                pass
+            _safe_update(writer_obs, metadata={"error": str(exc), "model": model})
             raise
         emit_score_for_handle(
             writer_obs,

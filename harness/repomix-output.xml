@@ -144,6 +144,7 @@ telemetry/
     score_emitter.py
     session_policy.py
   __init__.py
+  evaluation_emitters.py
   observability_models.py
 tests_harness/
   __init__.py
@@ -154,6 +155,7 @@ tests_harness/
   test_cerebras_pricing.py
   test_cli_guardrails.py
   test_datasets.py
+  test_evaluation_telemetry.py
   test_executor_helpers.py
   test_experiments_backend.py
   test_failure_context_budget.py
@@ -364,6 +366,8 @@ import time
 from collections.abc import Mapping
 from typing import Any, Callable, Literal, cast
 
+from langfuse import LangfuseGeneration, LangfuseSpan
+
 from harness.telemetry.tracing import (
     UsageDetails,
     get_tracing_openai_client,
@@ -402,13 +406,26 @@ def _require_parent(parent: object | None, owner: str = "runner agent") -> objec
     return parent
 
 
-def _safe_update(span: object | None, **kwargs: object) -> None:
-    updater = getattr(span, "update", None)
-    if callable(updater):
-        try:
-            updater(**kwargs)
-        except Exception:
-            pass
+def _span_label(span: LangfuseSpan | LangfuseGeneration) -> str:
+    if span.name:
+        return span.name
+    return span.id
+
+
+def _safe_update(span: LangfuseSpan | LangfuseGeneration | None, **kwargs: object) -> None:
+    if span is None:
+        return
+    try:
+        span.update(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        metadata = kwargs.get("metadata")
+        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else sorted(kwargs)
+        _LOGGER.warning(
+            "Langfuse metadata update failed operation=localizer.update observation=%s keys=%s error=%s",
+            _span_label(span),
+            keys,
+            exc,
+        )
 
 
 def _prediction_from_output(
@@ -1621,7 +1638,7 @@ def run_ic_iteration(
             backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
             tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
             system_prompt = build_ic_system_prompt(tool_specs)
-            backend_obs.update(metadata={"backend": "iterative_context", "repo": repo, "identity": task.identity.task_id(), "phase": "agent_execution", "tool_count": len(tool_specs)})
+            _safe_update(backend_obs, metadata={"backend": "iterative_context", "repo": repo, "identity": task.identity.task_id(), "phase": "agent_execution", "tool_count": len(tool_specs)})
         except Exception as exc:  # noqa: BLE001
             summary = _build_task_run_summary(
                 task=task,
@@ -1633,10 +1650,7 @@ def run_ic_iteration(
                 stage="backend_init",
                 message=str(exc),
             )
-            try:
-                backend_obs.update(metadata={"task_summary": summary.model_dump(mode="json"), "phase": "backend_init", "error": str(exc)})
-            except Exception:
-                pass
+            _safe_update(backend_obs, metadata={"task_summary": summary.model_dump(mode="json"), "phase": "backend_init", "error": str(exc)})
             raise LocalizationEvaluationError(
                 LocalizationFailureCategory.RUNNER,
                 str(exc),
@@ -1655,10 +1669,7 @@ def run_ic_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            try:
-                backend_obs.update(metadata={"error": str(exc), "phase": "agent_execution"})
-            except Exception:
-                pass
+            _safe_update(backend_obs, metadata={"error": str(exc), "phase": "agent_execution"})
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         normalized_node_count = _coerce_node_count(normalized.get("node_count"))
@@ -1686,7 +1697,7 @@ def run_ic_iteration(
                         break
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
         emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count_metric, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
+        _safe_update(backend_obs, metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
 
     final = _runner_error_result(
         task=task,
@@ -1723,10 +1734,7 @@ def run_ic_iteration(
         stage="agent_execution" if final.source == "runner_error" else ("finalization" if not final.prediction.predicted_files else None),
         message=str((final.raw or {}).get("error")) if isinstance(final.raw, Mapping) and (final.raw or {}).get("error") else None,
     )
-    try:
-        backend_obs.update(metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
-    except Exception:
-        pass
+    _safe_update(backend_obs, metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
     return final
 
 
@@ -1773,19 +1781,17 @@ def run_jc_iteration(
                 task.task_id,
                 exc,
             )
-            try:
-                backend_obs.update(
-                    metadata={
-                        "backend": "jcodemunch",
-                        "repo": repo,
-                        "identity": task.identity.task_id(),
-                        "phase": "backend_init",
-                        "error": str(exc),
-                        "task_summary": summary.model_dump(mode="json"),
-                    }
-                )
-            except Exception:
-                pass
+            _safe_update(
+                backend_obs,
+                metadata={
+                    "backend": "jcodemunch",
+                    "repo": repo,
+                    "identity": task.identity.task_id(),
+                    "phase": "backend_init",
+                    "error": str(exc),
+                    "task_summary": summary.model_dump(mode="json"),
+                },
+            )
             raise LocalizationEvaluationError(
                 LocalizationFailureCategory.RUNNER,
                 str(exc),
@@ -1797,18 +1803,16 @@ def run_jc_iteration(
             task.task_id,
             len(tool_specs),
         )
-        try:
-            backend_obs.update(
-                metadata={
-                    "backend": "jcodemunch",
-                    "repo": repo,
-                    "identity": task.identity.task_id(),
-                    "phase": "agent_execution",
-                    "tool_count": len(tool_specs),
-                }
-            )
-        except Exception:
-            pass
+        _safe_update(
+            backend_obs,
+            metadata={
+                "backend": "jcodemunch",
+                "repo": repo,
+                "identity": task.identity.task_id(),
+                "phase": "agent_execution",
+                "tool_count": len(tool_specs),
+            },
+        )
         try:
             raw = run_agent(
                 agent_task,
@@ -1821,10 +1825,7 @@ def run_jc_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            try:
-                backend_obs.update(metadata={"error": str(exc), "phase": "agent_execution"})
-            except Exception:
-                pass
+            _safe_update(backend_obs, metadata={"error": str(exc), "phase": "agent_execution"})
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
@@ -1836,7 +1837,7 @@ def run_jc_iteration(
                     node_count_val = len(nodes)
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
         emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count_metric, data_type="NUMERIC")
-        backend_obs.update(metadata={"node_count": node_count_val or 0})
+        _safe_update(backend_obs, metadata={"node_count": node_count_val or 0})
 
     final = _runner_error_result(
         task=task,
@@ -1866,10 +1867,7 @@ def run_jc_iteration(
         stage="agent_execution" if final.source == "runner_error" else ("finalization" if not final.prediction.predicted_files else None),
         message=str((final.raw or {}).get("error")) if isinstance(final.raw, Mapping) and (final.raw or {}).get("error") else None,
     )
-    try:
-        backend_obs.update(metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
-    except Exception:
-        pass
+    _safe_update(backend_obs, metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
     return final
 
 
@@ -1896,6 +1894,7 @@ import logging
 import time
 from typing import Any, Mapping, Sequence
 
+from langfuse import LangfuseGeneration, LangfuseSpan
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
@@ -1946,13 +1945,26 @@ def _require_parent(parent_trace: object | None) -> object:
     return parent_trace
 
 
-def _safe_update(span: object | None, **kwargs: object) -> None:
-    updater = getattr(span, "update", None)
-    if callable(updater):
-        try:
-            updater(**kwargs)
-        except Exception:
-            pass
+def _span_label(span: LangfuseSpan | LangfuseGeneration) -> str:
+    if span.name:
+        return span.name
+    return span.id
+
+
+def _safe_update(span: LangfuseSpan | LangfuseGeneration | None, **kwargs: object) -> None:
+    if span is None:
+        return
+    try:
+        span.update(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        metadata = kwargs.get("metadata")
+        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else sorted(kwargs)
+        _LOGGER.warning(
+            "Langfuse metadata update failed operation=writer.update observation=%s keys=%s error=%s",
+            _span_label(span),
+            keys,
+            exc,
+        )
 
 
 def _ensure_non_empty_messages(messages: Sequence[Mapping[str, object]] | None, caller: str) -> None:
@@ -2167,16 +2179,10 @@ def generate_policy(
                         attempt,
                         e,
                     )
-                    try:
-                        attempt_obs.update(metadata={"error": str(e)})
-                    except Exception:
-                        pass
+                    _safe_update(attempt_obs, metadata={"error": str(e)})
                     time.sleep(2 * (attempt + 1))
         else:
-            try:
-                writer_obs.update(metadata={"error": "writer_failed"})
-            except Exception:
-                pass
+            _safe_update(writer_obs, metadata={"error": "writer_failed"})
             raise RuntimeError("Writer failed after retries")
 
         try:
@@ -2195,10 +2201,7 @@ def generate_policy(
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.info("[OPTIMIZE] writer compile_validation=failed error=%s", exc)
-            try:
-                writer_obs.update(metadata={"error": str(exc), "model": model})
-            except Exception:
-                pass
+            _safe_update(writer_obs, metadata={"error": str(exc), "model": model})
             raise
         emit_score_for_handle(
             writer_obs,
@@ -2822,6 +2825,7 @@ from harness.telemetry.hosted.hf_lca import (
     HFDatasetLoadError,
     sync_hf_localization_dataset_to_langfuse,
 )
+from harness.telemetry.evaluation_emitters import safe_update_observation_metadata
 from harness.telemetry.observability_models import RunSummary, TaskRunSummary
 from harness.telemetry.tracing import (
     ensure_langfuse_auth,
@@ -3678,13 +3682,6 @@ def _run_localization_flow_command(
         with propagate_context(
             trace_name=command_name.replace(" ", "_"),
             session_id=session_cfg.session_id,
-            metadata={
-                "command": command_name,
-                "dataset": project_dataset.name,
-                "dataset_version": project_dataset.version,
-                "selection": selection_info,
-                "projection": projection,
-            },
         ):
             with start_observation(
                 name=f"{backend}_run_dataset",
@@ -3703,16 +3700,16 @@ def _run_localization_flow_command(
                     runner=_runner_for_backend(backend),
                 )
                 if result.run_summary is not None:
-                    try:
-                        dataset_span.update(
-                            metadata={
-                                "run_summary": result.run_summary.model_dump(
-                                    mode="json"
-                                )
-                            }
-                        )
-                    except Exception:
-                        pass
+                    safe_update_observation_metadata(
+                        dataset_span,
+                        {
+                            "run_summary": result.run_summary.model_dump(
+                                mode="json"
+                            )
+                        },
+                        operation="cli.run_dataset.metadata",
+                        observation_name=f"{backend}_run_dataset",
+                    )
         print(f"[RUN] session={session_cfg.session_id} dataset={project_dataset.name}")
         _print_evaluation_summary(backend, result)
 
@@ -3842,7 +3839,7 @@ def _run_ic_optimize_command(
                 }
                 with propagate_context(
                     trace_name="ic_optimize_task",
-                    metadata=task_metadata,
+                    session_id=writer_session_id,
                 ):
                     with start_observation(
                         name="optimize_task",
@@ -3868,17 +3865,17 @@ def _run_ic_optimize_command(
                             getattr(record, "accepted_policy", None) is not None
                             for record in history
                         )
-                        try:
-                            task_span.update(
-                                metadata={
-                                    "status": "success",
-                                    "iterations": len(history),
-                                    "accepted_policy": accepted,
-                                    "duration_seconds": duration,
-                                }
-                            )
-                        except Exception:
-                            pass
+                        safe_update_observation_metadata(
+                            task_span,
+                            {
+                                "status": "success",
+                                "iterations": len(history),
+                                "accepted_policy": accepted,
+                                "duration_seconds": duration,
+                            },
+                            operation="cli.optimize_task.metadata",
+                            observation_name="optimize_task",
+                        )
                 with progress_lock:
                     completed += 1
                     local_started = started
@@ -3923,7 +3920,7 @@ def _run_ic_optimize_command(
                 }
                 with propagate_context(
                     trace_name="ic_optimize_task",
-                    metadata=failure_metadata,
+                    session_id=writer_session_id,
                 ):
                     with start_observation(
                         name="optimize_task",
@@ -3959,18 +3956,7 @@ def _run_ic_optimize_command(
 
         with propagate_context(
             trace_name="ic_optimize",
-            metadata={
-                "command": "ic optimize",
-                "optimize_run_id": optimize_run_id,
-                "dataset": project_dataset.name,
-                "dataset_version": project_dataset.version,
-                "selection": selection_info,
-                "projection": projection,
-                    "execution": "parallel",
-                    "effective_workers": effective_workers,
-                    "iterations": iterations,
-                    "isolation": "per-task-workspace",
-                },
+            session_id=session_cfg.session_id,
         ):
             with start_observation(
                 name="ic_optimize_dataset",
@@ -3994,19 +3980,19 @@ def _run_ic_optimize_command(
                     for future in as_completed(futures):
                         results.append(future.result())
                 applied, applied_task = _apply_best_accepted_policy(results, dataset_span)
-                try:
-                    dataset_span.update(
-                        metadata={
-                            "started": started,
-                            "completed": completed,
-                            "failed": failed,
-                            "remaining": max(0, total - completed - failed),
-                            "policy_applied": applied,
-                            "applied_task": applied_task,
-                        }
-                    )
-                except Exception:
-                    pass
+                safe_update_observation_metadata(
+                    dataset_span,
+                    {
+                        "started": started,
+                        "completed": completed,
+                        "failed": failed,
+                        "remaining": max(0, total - completed - failed),
+                        "policy_applied": applied,
+                        "applied_task": applied_task,
+                    },
+                    operation="cli.optimize_dataset.metadata",
+                    observation_name="ic_optimize_dataset",
+                )
         total_duration = sum(result.duration_seconds for result in results)
         print(
             "[RUN] ic optimize summary selected=%s started=%s completed=%s failed=%s effective_workers=%s policy_applied=%s applied_task=%s total_task_duration=%.2fs"
@@ -4946,21 +4932,21 @@ from harness.scoring.token_usage import (
     TokenUsageRecord,
     aggregate_token_usage_record,
 )
-from harness.telemetry.tracing import start_observation
-from harness.telemetry.tracing.score_emitter import (
-    emit_score_bundle,
-    emit_score_for_handle,
-    score_bundle_metadata,
+from harness.telemetry.evaluation_emitters import (
+    emit_localization_task_telemetry,
+    safe_update_observation_metadata,
 )
+from harness.telemetry.observability_models import EvaluationTelemetryArtifact
+from harness.telemetry.tracing import start_observation
 
 
 def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -> None:
-    updater = getattr(span, "update", None)
-    if callable(updater):
-        try:
-            updater(metadata=metadata)
-        except Exception:
-            pass
+    safe_update_observation_metadata(
+        span,
+        metadata,
+        operation="localization_runtime.metadata",
+        observation_name="localization_task",
+    )
 
 
 def _get_repo_checkout(
@@ -5084,7 +5070,7 @@ def _default_runner(
 
 def _score_task(
     task: LCATask, prediction: LocalizationPrediction, repo_path: Path, token_usage: TokenUsageRecord | None = None
-) -> ScoreBundle:
+) -> EvaluationTelemetryArtifact:
     try:
         anchor_text = "\n".join([task.context.issue_title or "", task.context.issue_body or ""]).strip()
         score_context = build_localization_score_context(
@@ -5104,7 +5090,12 @@ def _score_task(
             evidence=task.evidence,
             repo_path=repo_path,
         )
-        return eval_record.score_bundle
+        score_summary = summarize_task_score(task.task_id, eval_record.score_bundle)
+        return EvaluationTelemetryArtifact.from_scoring(
+            score_bundle=eval_record.score_bundle,
+            score_context=score_context,
+            score_summary=score_summary,
+        )
     except LocalizationEvaluationError:
         raise
     except Exception as exc:
@@ -5115,7 +5106,7 @@ def _score_task(
 
 def _emit_telemetry(
     task: LCATask,
-    score_bundle: ScoreBundle,
+    artifact: EvaluationTelemetryArtifact,
     evidence: LocalizationEvidence | None,
     materialization: RepoMaterializationResult | None,
     dataset_provenance: str | None,
@@ -5123,11 +5114,11 @@ def _emit_telemetry(
     predicted_files: list[str],
     changed_files: list[str],
     score_prefix: str = "localization",
+    task_summary: Mapping[str, object] | None = None,
 ) -> None:
-    task_score_summary = summarize_task_score(task.task_id, score_bundle)
     telemetry = build_localization_telemetry(
         task.identity,
-        score_summary=task_score_summary,
+        score_summary=artifact.score_summary,
         changed_files_count=len(task.gold.normalized_changed_files()),
         dataset_provenance=dataset_provenance,
         repo_language=task.context.repo_language,
@@ -5135,28 +5126,15 @@ def _emit_telemetry(
         evidence=evidence,
         materialization_events=materialization.events if materialization else None,
     )
-    emit_score_bundle(
+    emit_localization_task_telemetry(
         trace,
-        score_bundle,
-        prefix=score_prefix,
-        metadata_key="score_bundle",
-        emit_fn=emit_score_for_handle,
+        artifact,
+        score_prefix=score_prefix,
+        telemetry_payload=telemetry.model_dump(exclude_none=True),
+        predicted_files=predicted_files,
+        changed_files=changed_files,
+        task_summary=task_summary,
     )
-    if trace:
-        try:
-            telemetry_payload = telemetry.model_dump(exclude_none=True)
-            metadata_payload: dict[str, object] = {
-                "telemetry": telemetry_payload,
-                "score_summary": task_score_summary.model_dump(mode="json"),
-                "predicted_files": list(predicted_files),
-                "changed_files": list(changed_files),
-            }
-            metadata_payload.update(
-                score_bundle_metadata(score_bundle, metadata_key="score_bundle")
-            )
-            _safe_update_metadata(trace, metadata_payload)
-        except Exception:
-            pass
 
 
 def run_localization_task(
@@ -5213,7 +5191,8 @@ def run_localization_task(
             runner_result.model_dump(),
             source="runner",
         )
-        score_bundle = _score_task(task, prediction, repo_path, usage)
+        telemetry_artifact = _score_task(task, prediction, repo_path, usage)
+        score_bundle = telemetry_artifact.score_bundle
         if runner_result.observability_summary is not None:
             predicted_set = set(prediction.normalized_predicted_files())
             gold_set = set(task.gold.normalized_changed_files())
@@ -5229,7 +5208,7 @@ def run_localization_task(
             )
         _emit_telemetry(
             task=task,
-            score_bundle=score_bundle,
+            artifact=telemetry_artifact,
             evidence=task.evidence,
             materialization=checkout_result,
             dataset_provenance=dataset_provenance,
@@ -5237,19 +5216,10 @@ def run_localization_task(
             predicted_files=prediction.normalized_predicted_files(),
             changed_files=task.gold.normalized_changed_files(),
             score_prefix=_score_prefix_from_runner_result(runner_result),
+            task_summary=runner_result.observability_summary.model_dump(mode="json")
+            if runner_result.observability_summary is not None
+            else None,
         )
-        if runner_result.observability_summary is not None:
-            try:
-                _safe_update_metadata(
-                    trace,
-                    {
-                        "task_summary": runner_result.observability_summary.model_dump(
-                            mode="json"
-                        )
-                    },
-                )
-            except Exception:
-                pass
         return prediction, score_bundle, task.evidence, checkout_result, usage, runner_result
 </file>
 
@@ -6954,6 +6924,7 @@ from harness.localization.runtime.evaluate import (
 )
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterOptimizationBrief
+from harness.telemetry.evaluation_emitters import safe_update_observation_metadata
 from harness.utils.diff import DiffSummary
 from harness.utils.type_loader import FrontierContext
 from harness.utils.warnings import suppress_third_party_invalid_escape_warnings
@@ -7082,10 +7053,12 @@ def prepare_iteration_tasks(
                 result = index_folder(task.repo)
             repo_id = str(result.get("repo", ""))
             jc_repo_id = repo_id
-            try:
-                index_obs.update(metadata={"repo": repo_id})
-            except Exception:
-                pass
+            safe_update_observation_metadata(
+                index_obs,
+                {"repo": repo_id},
+                operation="prepare_iteration_tasks.metadata",
+                observation_name="prepare_jc_repo",
+            )
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
     return PreparedTasks(
@@ -7591,11 +7564,16 @@ No session creation; reacts to machine events only.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, ContextManager, Protocol
 
 from statemachine import State
 
+from harness.telemetry.evaluation_emitters import safe_update_observation_metadata
+
 from .types import RepairMachineModel
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SpanHandle(Protocol):
@@ -7675,16 +7653,21 @@ class RepairTracingListener:
             metadata["error"] = ctx.error
         span = ctx.repair_observation
         if span:
-            try:
-                span.update(metadata=metadata)
-            except Exception:
-                pass
+            safe_update_observation_metadata(
+                span,
+                metadata,
+                operation="policy_repair_attempt.metadata",
+                observation_name="policy_repair_attempt",
+            )
         cm = ctx.repair_observation_cm
         if cm is not None:
             try:
                 cm.__exit__(None, None, None)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Langfuse observation close failed operation=policy_repair_attempt.close observation=policy_repair_attempt error=%s",
+                    exc,
+                )
         ctx.repair_observation = None
         ctx.repair_observation_cm = None
 </file>
@@ -7711,6 +7694,7 @@ from harness.agents import writer as agent_writer
 from harness.pipeline.types import StepResult
 from harness.prompts import WriterGuidance
 from harness.telemetry import tracing
+from harness.telemetry.evaluation_emitters import safe_update_observation_metadata
 from harness.telemetry.tracing import score_emitter
 from harness.utils import diff as diff_utils
 from harness.utils import env as env_utils
@@ -7883,7 +7867,6 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         }
         with tracing.propagate_context(
             session_id=ctx.writer_session_id,
-            metadata=writer_metadata,
         ):
             with deps.start_observation(
                 name="writer_generation",
@@ -7901,17 +7884,17 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                     parent_trace=writer_span,
                     pipeline_feedback=ctx.last_classified,
                 )
-                try:
-                    writer_span.update(
-                        metadata={
-                            "attempt": ctx.attempts_used,
-                            "code_returned": new_code is not None,
-                            "writer_error": writer_error,
-                            "writer_session_id": ctx.writer_session_id,
-                        }
-                    )
-                except Exception:
-                    pass
+                safe_update_observation_metadata(
+                    writer_span,
+                    {
+                        "attempt": ctx.attempts_used,
+                        "code_returned": new_code is not None,
+                        "writer_error": writer_error,
+                        "writer_session_id": ctx.writer_session_id,
+                    },
+                    operation="writer_generation.metadata",
+                    observation_name="writer_generation",
+                )
 
         if new_code is None:
             _LOGGER.info(
@@ -7961,7 +7944,6 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         }
         with tracing.propagate_context(
             session_id=ctx.writer_session_id,
-            metadata=pipeline_metadata,
         ):
             with deps.start_observation(
                 name="pipeline_check",
@@ -7973,16 +7955,16 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                     ctx.repo_root,
                     repair_obs=pipeline_span,
                 )
-                try:
-                    pipeline_span.update(
-                        metadata={
-                            "pipeline_passed": pipeline_success,
-                            "checks_run": [step.name for step in pipeline_results],
-                            "writer_session_id": ctx.writer_session_id,
-                        }
-                    )
-                except Exception:
-                    pass
+                safe_update_observation_metadata(
+                    pipeline_span,
+                    {
+                        "pipeline_passed": pipeline_success,
+                        "checks_run": [step.name for step in pipeline_results],
+                        "writer_session_id": ctx.writer_session_id,
+                    },
+                    operation="pipeline_check.metadata",
+                    observation_name="pipeline_check",
+                )
         # Enforce canonical step result shape at the boundary.
         ctx.pipeline_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in pipeline_results]
         ctx.pipeline_passed = pipeline_success
@@ -8002,7 +7984,6 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             }
             with tracing.propagate_context(
                 session_id=ctx.writer_session_id,
-                metadata=acceptance_metadata,
             ):
                 with deps.start_observation(
                     name="policy_acceptance",
@@ -8015,15 +7996,15 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                         max_repair_attempts=ctx.max_repair_attempts,
                         repair_obs=acceptance_span,
                     )
-                    try:
-                        acceptance_span.update(
-                            metadata={
-                                **success_meta.model_dump(mode="json"),
-                                "writer_session_id": ctx.writer_session_id,
-                            }
-                        )
-                    except Exception:
-                        pass
+                    safe_update_observation_metadata(
+                        acceptance_span,
+                        {
+                            **success_meta.model_dump(mode="json"),
+                            "writer_session_id": ctx.writer_session_id,
+                        },
+                        operation="policy_acceptance.metadata",
+                        observation_name="policy_acceptance",
+                    )
             ctx.candidate_code = final_policy
             ctx.accepted_policy_source = success_meta.accepted_policy_source
             ctx.accepted_policy_changed_by_pipeline = success_meta.accepted_policy_changed_by_pipeline
@@ -8118,7 +8099,6 @@ machine remains the inner writer/pipeline retry engine.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -8129,7 +8109,10 @@ from harness.localization.models import LCATask
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterFeedbackFinding
 from harness.telemetry import tracing
-from harness.telemetry.tracing.score_emitter import emit_score_for_handle
+from harness.telemetry.evaluation_emitters import (
+    emit_optimize_iteration_telemetry,
+    safe_update_observation_metadata,
+)
 
 from .machine import (
     RepairStateMachine,
@@ -8163,6 +8146,23 @@ if TYPE_CHECKING:
 
 DEFAULT_OPTIMIZATION_ITERATIONS = 5
 _LOGGER = logging.getLogger(__name__)
+
+
+def _score_context_summary_from_metrics(metrics: EvaluationMetrics) -> dict[str, object]:
+    metric_map = metrics.as_map()
+    summary: dict[str, object] = {}
+    for key in (
+        "gold_hop",
+        "issue_hop",
+        "token_efficiency",
+        "gold_min_hops",
+        "issue_min_hops",
+        "previous_total_token_count",
+    ):
+        value = metric_map.get(key)
+        if isinstance(value, (int, float, bool)):
+            summary[key] = value
+    return summary
 
 
 def _baseline_record_model(
@@ -8358,16 +8358,16 @@ class OptimizeTaskLoop:
                 )
             except Exception as exc:  # noqa: BLE001
                 error = str(exc)
-            try:
-                eval_span.update(
-                    metadata={
-                        "status": "ok" if evaluation and evaluation.success else "failed",
-                        "success": evaluation.success if evaluation else False,
-                        "error": error,
-                    }
-                )
-            except Exception:
-                pass
+            safe_update_observation_metadata(
+                eval_span,
+                {
+                    "status": "ok" if evaluation and evaluation.success else "failed",
+                    "success": evaluation.success if evaluation else False,
+                    "error": error,
+                },
+                operation="evaluate_iteration.metadata",
+                observation_name="evaluate_iteration",
+            )
         predicted_files_obj = (
             evaluation.ic_result.as_map().get("predicted_files") if evaluation else []
         )
@@ -8476,16 +8476,16 @@ class OptimizeTaskLoop:
                 repo_root,
             )
             feedback = self._attach_reducer_summary(feedback, reducer_summary)
-            try:
-                feedback_span.update(
-                    metadata={
-                        "tests_chars": len(feedback.tests),
-                        "frontier_context_chars": len(feedback.frontier_context),
-                        "reducer_summary": reducer_summary.model_dump(mode="json"),
-                    }
-                )
-            except Exception:
-                pass
+            safe_update_observation_metadata(
+                feedback_span,
+                {
+                    "tests_chars": len(feedback.tests),
+                    "frontier_context_chars": len(feedback.frontier_context),
+                    "reducer_summary": reducer_summary.model_dump(mode="json"),
+                },
+                operation="build_writer_input.metadata",
+                observation_name="build_writer_input",
+            )
         _LOGGER.info(
             "[OPTIMIZE] build_writer_input complete iteration=%s/%s tests_chars=%s frontier_context_chars=%s reducer_available=true",
             state.iteration + 1,
@@ -8528,17 +8528,17 @@ class OptimizeTaskLoop:
                 writer_input.feedback,
                 writer_span,
             )
-            try:
-                writer_span.update(
-                    metadata={
-                        "pipeline_passed": repair_outcome.success,
-                        "attempts_used": repair_outcome.attempts_used,
-                        "writer_error": repair_outcome.writer_error,
-                        "error": repair_outcome.error,
-                    }
-                )
-            except Exception:
-                pass
+            safe_update_observation_metadata(
+                writer_span,
+                {
+                    "pipeline_passed": repair_outcome.success,
+                    "attempts_used": repair_outcome.attempts_used,
+                    "writer_error": repair_outcome.writer_error,
+                    "error": repair_outcome.error,
+                },
+                operation="writer_iteration.metadata",
+                observation_name="writer_iteration",
+            )
         _LOGGER.info(
             "[OPTIMIZE] writer_iteration complete iteration=%s/%s pipeline_passed=%s attempts=%s",
             state.iteration + 1,
@@ -8694,28 +8694,15 @@ class OptimizeTaskLoop:
         handle: SpanHandle | None,
         record: IterationRecord,
     ) -> None:
-        score_meta = {"iteration": record.iteration}
-        try:
-            comment = json.dumps(score_meta)
-        except Exception:
-            comment = str(score_meta)
-        if record.pipeline_passed is not None:
-            emit_score_for_handle(
-                handle,
-                name="pipeline_passed",
-                value=bool(record.pipeline_passed),
-                data_type="BOOLEAN",
-                comment=comment,
-            )
-        value = record.metrics.get("score")
-        if isinstance(value, (int, float, bool)):
-            emit_score_for_handle(
-                handle,
-                name="metrics.score",
-                value=float(value),
-                data_type="NUMERIC" if not isinstance(value, bool) else "BOOLEAN",
-                comment=comment,
-            )
+        emit_optimize_iteration_telemetry(
+            handle,
+            metrics=record.metrics,
+            iteration=record.iteration,
+            status="recorded",
+            pipeline_passed=record.pipeline_passed,
+            score_context_summary=_score_context_summary_from_metrics(record.metrics),
+            error=record.error or record.writer_error,
+        )
 
     def _advance_iteration(self) -> bool:
         self.context.current_iteration += 1
@@ -8740,10 +8727,12 @@ class OptimizeTaskLoop:
             metadata["error"] = failure_val
         if outcome.duration_seconds is not None:
             metadata["duration_seconds"] = outcome.duration_seconds
-        try:
-            span.update(metadata=metadata)
-        except Exception:
-            pass
+        safe_update_observation_metadata(
+            span,
+            metadata,
+            operation="optimize_iteration.finalize",
+            observation_name="optimize_iteration",
+        )
         self._current_iteration_span = None
 
     def _finalize_run_trace(self, status: str | None) -> None:
@@ -8755,10 +8744,12 @@ class OptimizeTaskLoop:
         }
         if status:
             metadata["status"] = status
-        try:
-            span.update(metadata=metadata)
-        except Exception:
-            pass
+        safe_update_observation_metadata(
+            span,
+            metadata,
+            operation="run_loop.finalize",
+            observation_name="run_loop",
+        )
 
     def _iteration_metadata(self, state: OptimizationIterationState) -> dict[str, object]:
         metadata: dict[str, object] = {
@@ -8845,14 +8836,7 @@ def run_loop(
     ) as run_span:
         with tracing.propagate_context(
             trace_name="run_loop",
-            metadata={
-                "iterations": iterations,
-                "optimize_run_id": optimize_run_id,
-                "writer_session_id": writer_session_id,
-                "task_ordinal": task_ordinal,
-                "task_total": task_total,
-                "session_policy": "writer_loop_only",
-            },
+            session_id=writer_session_id,
         ):
             context = LoopContext(
                 task=task,
@@ -12197,6 +12181,7 @@ __all__ = [
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12234,8 +12219,6 @@ from harness.telemetry.tracing import propagate_context, start_observation
 from harness.telemetry.tracing.score_emitter import (
     batch_score_summary_metadata,
     emit_batch_score_summary,
-    emit_score_for_handle,
-    emit_task_score_summary,
 )
 
 
@@ -12288,8 +12271,13 @@ def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -
     if callable(updater):
         try:
             updater(metadata=metadata)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "Langfuse metadata update failed operation=baseline.metadata observation=%s keys=%s error=%s",
+                getattr(span, "id", type(span).__name__),
+                sorted(str(key) for key in metadata),
+                exc,
+            )
 
 
 def _aggregate_score_summaries(
@@ -12491,13 +12479,6 @@ def compute_baseline_for_task(
                 materialization_events=materialization.events
                 if materialization
                 else None,
-            )
-            emit_task_score_summary(
-                trace,
-                score_summary,
-                prefix="baseline",
-                metadata_key="score_summary",
-                emit_fn=emit_score_for_handle,
             )
             return EvaluationRecord(
                 dataset_name=task.identity.dataset_name,
@@ -13027,12 +13008,6 @@ def run_hosted_localization_baseline(
     with propagate_context(
         trace_name="localization_baseline_dataset",
         session_id=run_session_id,
-        metadata={
-            "dataset": req.dataset,
-            "dataset_version": req.version,
-            "run_kind": "localization_baseline",
-            "dataset_store": "langfuse",
-        },
     ):
         with start_observation(
             name="localization_baseline_dataset",
@@ -13230,8 +13205,13 @@ def _emit_experiment_dataset_aggregates(
     if callable(updater):
         try:
             updater(metadata=metadata)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "Langfuse metadata update failed operation=experiment.metadata observation=%s keys=%s error=%s",
+                getattr(span, "id", type(span).__name__),
+                sorted(str(key) for key in metadata),
+                exc,
+            )
 
 
 def _run_experiment_task(
@@ -13386,12 +13366,6 @@ def run_hosted_localization_experiment(
     with propagate_context(
         trace_name="localization_experiment",
         session_id=run_session_id,
-        metadata={
-            "dataset": req.dataset,
-            "dataset_version": req.version,
-            "run_kind": "localization_experiment",
-            "dataset_store": "langfuse",
-        },
     ):
         with start_observation(
             name="localization_experiment_dataset",
@@ -13978,7 +13952,7 @@ import os
 from contextlib import contextmanager
 from typing import Any, Mapping, Optional, ContextManager, Iterator
 
-from langfuse import Langfuse, propagate_attributes
+from langfuse import Langfuse, LangfuseGeneration, LangfuseSpan, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
 from pydantic import BaseModel, ConfigDict
 
@@ -13990,6 +13964,18 @@ _PROPAGATION_MAX_LEN = 200
 _LOGGER = logging.getLogger(__name__)
 _STRICT_DEBUG = bool(os.getenv("LANGFUSE_STRICT_DEBUG"))
 _PK_PREFIX_LEN = 12
+_FORBIDDEN_PROPAGATED_METADATA_KEYS = {
+    "repo",
+    "repopath",
+    "task",
+    "taskidentity",
+    "writersessionid",
+    "optimizerunid",
+    "scorecontext",
+    "tasksummary",
+    "reducersummary",
+    "iterationdiagnostics",
+}
 
 
 class _OtelShutdownNoiseFilter(logging.Filter):
@@ -14010,13 +13996,10 @@ class ObservationMetadata(BaseModel):
 
     data: Mapping[str, object] | None = None
 
-    def to_langfuse(self) -> dict[str, str] | None:
+    def to_langfuse(self) -> dict[str, object] | None:
         if self.data is None:
             return None
-        coerced: dict[str, str] = {}
-        for key, value in self.data.items():
-            coerced[str(key)] = "" if value is None else str(value)
-        return coerced
+        return serialize_observation_metadata(self.data)
 
 
 class UsageDetails(BaseModel):
@@ -14081,30 +14064,67 @@ def _coerce_tags(tags: list[str] | None) -> list[str] | None:
     return [tag for tag in tags if isinstance(tag, str) and tag]
 
 
-def _truncate_value(val: str, key: str) -> str:
-    if len(val) <= _PROPAGATION_MAX_LEN:
-        return val
-    if _STRICT_DEBUG:
-        raise ValueError(f"Propagated metadata for key '{key}' exceeds {_PROPAGATION_MAX_LEN} chars in strict mode")
-    _LOGGER.warning("Truncating propagated metadata for key '%s' to %s chars", key, _PROPAGATION_MAX_LEN)
-    return val[:_PROPAGATION_MAX_LEN]
+def _is_valid_propagated_key(key: str) -> bool:
+    return bool(key) and key.isalnum()
 
 
-def _coerce_metadata(metadata: Mapping[str, object] | None) -> dict[str, str] | None:
+def serialize_propagated_metadata(metadata: Mapping[str, object] | None) -> dict[str, str] | None:
+    """Serialize Langfuse propagated metadata.
+
+    Langfuse v4 propagated metadata is for attributes applied across all
+    observations in a context. The docs constrain it to string values of at
+    most 200 characters and alphanumeric metadata keys. Execution diagnostics
+    belong on observation-local metadata instead.
+    """
     if metadata is None:
         return None
-    coerced: dict[str, str] = {}
+    serialized: dict[str, str] = {}
     for key, value in metadata.items():
         key_str = str(key)
-        if key_str in {"selection", "projection"}:
+        normalized_key = "".join(ch for ch in key_str.lower() if ch.isalnum())
+        if normalized_key in _FORBIDDEN_PROPAGATED_METADATA_KEYS:
             if _STRICT_DEBUG:
                 raise ValueError(f"Propagated metadata key '{key_str}' is forbidden in strict mode")
-            coerced[key_str] = "<omitted>"
+            _LOGGER.warning("Dropping execution diagnostic propagated metadata key '%s'", key_str)
+            continue
+        if not _is_valid_propagated_key(key_str):
+            if _STRICT_DEBUG:
+                raise ValueError(f"Propagated metadata key '{key_str}' is invalid in strict mode")
+            _LOGGER.warning("Dropping invalid propagated metadata key '%s'", key_str)
             continue
         text = "" if value is None else str(value)
-        coerced[key_str] = _truncate_value(text, key_str)
-    return coerced
+        if len(text) > _PROPAGATION_MAX_LEN:
+            if _STRICT_DEBUG:
+                raise ValueError(f"Propagated metadata for key '{key_str}' exceeds {_PROPAGATION_MAX_LEN} chars in strict mode")
+            _LOGGER.warning(
+                "Dropping propagated metadata key '%s': value exceeds %s chars",
+                key_str,
+                _PROPAGATION_MAX_LEN,
+            )
+            continue
+        serialized[key_str] = text
+    return serialized or None
 
+
+def _json_safe(value: object, *, limit: int = 4000) -> object:
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v, limit=limit) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item, limit=limit) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item, limit=limit) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str) and len(value) > limit:
+            return f"{value[: limit - 3]}..."
+        return value
+    return str(value)
+
+
+def serialize_observation_metadata(metadata: Mapping[str, object] | None) -> dict[str, object] | None:
+    """Serialize observation-local metadata while preserving JSON structure."""
+    if metadata is None:
+        return None
+    return {str(key): _json_safe(value) for key, value in metadata.items()}
 
 def _build_client() -> Langfuse:
     env = get_langfuse_env()
@@ -14177,7 +14197,7 @@ def propagate_context(
     coerced_tags = _coerce_tags(tags)
     if coerced_tags:
         kwargs["tags"] = coerced_tags
-    coerced_metadata = _coerce_metadata(metadata)
+    coerced_metadata = serialize_propagated_metadata(metadata)
     if coerced_metadata:
         kwargs["metadata"] = coerced_metadata
     if version:
@@ -14194,11 +14214,11 @@ def start_root_observation(
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
     usage_details: UsageDetails | None = None,
-) -> Iterator[Any]:
+) -> Iterator[LangfuseSpan | LangfuseGeneration]:
     """
     Start a root observation as the current observation.
     """
-    meta = ObservationMetadata(data=_coerce_metadata(metadata)) if metadata else None
+    meta = ObservationMetadata(data=serialize_observation_metadata(metadata)) if metadata else None
     envelope = ObservationEnvelope(
         name=name,
         as_type=as_type,
@@ -14207,9 +14227,8 @@ def start_root_observation(
         metadata=meta,
         usage_details=usage_details,
     )
-    client_any: Any = get_langfuse_client()
     try:
-        cm = client_any.start_as_current_observation(**envelope.to_start_kwargs())
+        cm = get_langfuse_client().start_as_current_observation(**envelope.to_start_kwargs())
     except AttributeError as exc:
         raise RuntimeError("Langfuse client missing start_as_current_observation") from exc
     with cm as observation:
@@ -14218,7 +14237,7 @@ def start_root_observation(
 
 @contextmanager
 def start_child_observation(
-    parent: Any,
+    parent: LangfuseSpan | LangfuseGeneration,
     name: str,
     *,
     as_type: str = "span",
@@ -14226,23 +14245,13 @@ def start_child_observation(
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
     usage_details: UsageDetails | None = None,
-) -> Iterator[Any]:
+) -> Iterator[LangfuseSpan | LangfuseGeneration]:
     """
     Start a child observation from a parent observation.
     """
-    if parent is None or not hasattr(parent, "start_observation"):
-        raise RuntimeError("Parent observation is required to start a child observation")
-    parent_session = getattr(parent, "session_id", None)
-    parent_meta = getattr(parent, "metadata", {}) if hasattr(parent, "metadata") else {}
-    if isinstance(parent_meta, Mapping) and parent_session is None:
-        parent_session = parent_meta.get("session_id")
     effective_metadata: dict[str, object] = dict(metadata) if metadata else {}
-    if "session_id" in effective_metadata and parent_session and effective_metadata["session_id"] != parent_session:
-        raise RuntimeError("session_id conflict")
-    if "session_id" not in effective_metadata and parent_session:
-        effective_metadata["session_id"] = parent_session
     merged_metadata: Mapping[str, object] | None = effective_metadata if effective_metadata else metadata
-    meta = ObservationMetadata(data=_coerce_metadata(merged_metadata)) if merged_metadata else None
+    meta = ObservationMetadata(data=serialize_observation_metadata(merged_metadata)) if merged_metadata else None
     envelope = ObservationEnvelope(
         name=name,
         as_type=as_type,
@@ -14251,30 +14260,10 @@ def start_child_observation(
         metadata=meta,
         usage_details=usage_details,
     )
-    # Prefer a managed child if available; otherwise manage lifecycle manually.
     try:
         cm = parent.start_as_current_observation(**envelope.to_start_kwargs())
-    except AttributeError:
-        child = parent.start_observation(**envelope.to_start_kwargs())
-        if hasattr(child, "__enter__") and hasattr(child, "__exit__"):
-            cm = child
-        else:
-
-            @contextmanager
-            def _child_cm():
-                try:
-                    yield child
-                finally:
-                    try:
-                        child.end()
-                    except AttributeError as exc:  # pragma: no cover
-                        raise RuntimeError("Child observation missing end()") from exc
-                    except Exception:
-                        if _STRICT_DEBUG:
-                            raise
-                        _LOGGER.warning("Langfuse child end failed", exc_info=True)
-
-            cm = _child_cm()
+    except AttributeError as exc:
+        raise RuntimeError("Parent observation missing start_as_current_observation") from exc
     with cm as observation:
         yield observation
 
@@ -14283,17 +14272,17 @@ def start_child_observation(
 def start_observation(
     name: str,
     *,
-    parent: Any | None = None,
+    parent: LangfuseSpan | LangfuseGeneration | None = None,
     as_type: str = "span",
     input: object | None = None,
     model: str | None = None,
     metadata: Mapping[str, object] | None = None,
     usage_details: UsageDetails | None = None,
-) -> Iterator[Any]:
+) -> Iterator[LangfuseSpan | LangfuseGeneration]:
     """
     Convenience wrapper to start a root or child observation based on parent presence.
     """
-    if parent is None or not hasattr(parent, "start_observation"):
+    if parent is None:
         with start_root_observation(
             name,
             as_type=as_type,
@@ -14357,8 +14346,8 @@ def ensure_langfuse_auth() -> None:
             public_prefix = public[:_PK_PREFIX_LEN]
         host_val = env.get("base_url")
         host = host_val if isinstance(host_val, str) and host_val else None
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("Langfuse environment metadata inspection failed: %s", exc)
     try:
         ok = bool(client.auth_check())
     except AttributeError:
@@ -14393,6 +14382,8 @@ __all__ = [
     "start_child_observation",
     "flush_langfuse",
     "ensure_langfuse_auth",
+    "serialize_observation_metadata",
+    "serialize_propagated_metadata",
 ]
 </file>
 
@@ -14551,15 +14542,14 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Mapping
-from typing import TypeAlias
+from collections.abc import Callable
 
+from langfuse import LangfuseGeneration, LangfuseSpan
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from harness.scoring import BatchScoreSummary, ScoreBundle
+from harness.scoring import BatchScoreSummary
 
 _STRICT_DEBUG = bool(os.getenv("LANGFUSE_STRICT_DEBUG"))
-ScoreEmitFn: TypeAlias = Callable[..., None]
 
 
 class ScorePayload(BaseModel):
@@ -14606,13 +14596,17 @@ def _normalize_score_value(
     return value, resolved_type
 
 
-def _handle_trace_id(handle: object | None) -> str | None:
-    trace_id = getattr(handle, "trace_id", None) if handle is not None else None
+def _handle_trace_id(handle: LangfuseSpan | LangfuseGeneration | None) -> str | None:
+    if handle is None:
+        return None
+    trace_id = handle.trace_id
     return trace_id if isinstance(trace_id, str) and trace_id else None
 
 
-def _handle_observation_id(handle: object | None) -> str | None:
-    observation_id = getattr(handle, "id", None) if handle is not None else None
+def _handle_observation_id(handle: LangfuseSpan | LangfuseGeneration | None) -> str | None:
+    if handle is None:
+        return None
+    observation_id = handle.id
     return observation_id if isinstance(observation_id, str) and observation_id else None
 
 
@@ -14637,14 +14631,14 @@ def emit_score(
         client = get_langfuse_client()
         ensure_langfuse_auth()
     except Exception as exc:  # noqa: BLE001
-        logging.debug("Langfuse score emission skipped: %s", exc)
+        logging.warning("Langfuse score emission skipped score=%s error=%s", name, exc)
         return
     try:
         create_fn = client.create_score
     except AttributeError as exc:
         if _STRICT_DEBUG:
             raise RuntimeError("Langfuse client missing create_score API") from exc
-        logging.debug("Langfuse score emission unavailable: missing create_score API")
+        logging.warning("Langfuse score emission unavailable score=%s error=missing_create_score_api", name)
         return
     try:
         payload = ScorePayload(
@@ -14661,7 +14655,7 @@ def emit_score(
     except Exception as exc:  # noqa: BLE001
         if _STRICT_DEBUG:
             raise
-        logging.debug("Langfuse score payload invalid; skipping score %s: %s", name, exc)
+        logging.warning("Langfuse score payload invalid score=%s error=%s", name, exc)
         return
     cleaned = payload.model_dump(exclude_none=True)
     try:
@@ -14669,12 +14663,12 @@ def emit_score(
     except Exception as exc:  # noqa: BLE001
         if _STRICT_DEBUG:
             raise
-        logging.debug("Langfuse score emission failed for %s: %s", name, exc)
+        logging.warning("Langfuse score emission failed score=%s error=%s", name, exc)
         return
 
 
 def emit_score_for_handle(
-    handle: object | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     *,
     name: str,
     value: float | int | bool | str,
@@ -14690,21 +14684,24 @@ def emit_score_for_handle(
     # SDK docs show score_id only on create_score(), so use the low-level path
     # when callers need idempotency.
     if handle is not None and score_id is None:
-        score_fn = getattr(handle, "score", None)
-        if callable(score_fn):
-            try:
-                score_fn(  # type: ignore[call-arg]
-                    name=name,
-                    value=normalized_value,
-                    data_type=resolved_type,
-                    comment=comment,
-                    config_id=config_id,
-                )
-                return
-            except Exception as exc:  # noqa: BLE001
-                if _STRICT_DEBUG:
-                    raise
-                logging.debug("Langfuse handle.score failed for %s: %s", name, exc)
+        try:
+            handle.score(
+                name=name,
+                value=normalized_value,
+                data_type=resolved_type,
+                comment=comment,
+                config_id=config_id,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            if _STRICT_DEBUG:
+                raise
+            logging.warning(
+                "Langfuse handle.score failed observation=%s score=%s error=%s",
+                _handle_observation_id(handle) or type(handle).__name__,
+                name,
+                exc,
+            )
     # Fall back to explicit identifier-based emission only when the handle
     # exposes the real trace id. Langfuse requires trace_id for trace and
     # observation scores; handle.id is an observation id and must not be reused
@@ -14731,7 +14728,7 @@ def emit_score_for_handle(
 
 
 def emit_trace_score_for_handle(
-    handle: object | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     *,
     name: str,
     value: float | int | bool | str,
@@ -14744,21 +14741,24 @@ def emit_trace_score_for_handle(
     """Emit a trace-level score using the v4 score API."""
     normalized_value, resolved_type = _normalize_score_value(value, data_type)
     if handle is not None and score_id is None:
-        score_trace_fn = getattr(handle, "score_trace", None)
-        if callable(score_trace_fn):
-            try:
-                score_trace_fn(  # type: ignore[call-arg]
-                    name=name,
-                    value=normalized_value,
-                    data_type=resolved_type,
-                    comment=comment,
-                    config_id=config_id,
-                )
-                return
-            except Exception as exc:  # noqa: BLE001
-                if _STRICT_DEBUG:
-                    raise
-                logging.debug("Langfuse handle.score_trace failed for %s: %s", name, exc)
+        try:
+            handle.score_trace(
+                name=name,
+                value=normalized_value,
+                data_type=resolved_type,
+                comment=comment,
+                config_id=config_id,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            if _STRICT_DEBUG:
+                raise
+            logging.warning(
+                "Langfuse handle.score_trace failed observation=%s score=%s error=%s",
+                _handle_observation_id(handle) or type(handle).__name__,
+                name,
+                exc,
+            )
     trace_id = _handle_trace_id(handle)
     if trace_id is None and session_id is None:
         logging.debug(
@@ -14780,11 +14780,11 @@ def emit_trace_score_for_handle(
 
 
 def _emit_numeric_score(
-    handle: object | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     *,
     name: str,
     value: float,
-    emit_fn: ScoreEmitFn | None,
+    emit_fn: Callable[..., None] | None,
 ) -> None:
     emitter = emit_fn or emit_score_for_handle
     emitter(
@@ -14795,97 +14795,20 @@ def _emit_numeric_score(
     )
 
 
-def _safe_update_metadata(handle: object | None, metadata: Mapping[str, object]) -> None:
-    updater = getattr(handle, "update", None)
-    if callable(updater):
-        try:
-            updater(metadata=dict(metadata))
-        except Exception:
-            if _STRICT_DEBUG:
-                raise
-            logging.debug("Langfuse score metadata update skipped", exc_info=True)
-
-
-def score_bundle_metadata(
-    bundle: ScoreBundle,
-    *,
-    metadata_key: str = "score_bundle",
-) -> dict[str, object]:
-    hidden_components: list[str] = []
-    unavailable_components: dict[str, object] = {}
-    for component_name, result in bundle.results.items():
-        stable_name = result.name or component_name
-        if not result.visible_to_agent:
-            hidden_components.append(stable_name)
-            continue
-        if not result.available or not isinstance(result.value, (int, float)):
-            unavailable_components[stable_name] = result.reason or "unavailable"
-    return {
-        metadata_key: bundle.model_dump(mode="json"),
-        f"{metadata_key}_diagnostics": {
-            "hidden_components": hidden_components,
-            "unavailable_components": unavailable_components,
-            "available": bundle.available,
-        },
-    }
-
-
-def emit_score_bundle(
-    handle: object | None,
-    bundle: ScoreBundle,
-    *,
-    prefix: str,
-    metadata_key: str = "score_bundle",
-    emit_fn: ScoreEmitFn | None = None,
-) -> None:
-    """
-    Emit the canonical per-item scoring surface.
-
-    Ownership convention: callers attach score bundles to the evaluated task span,
-    not raw backend spans. Backend spans may still emit auxiliary diagnostics such
-    as node counts, but only the evaluated task span has the gold-aware
-    `ScoreBundle` needed for composed and component scores.
-    """
-    if bundle.composed_score is not None:
-        _emit_numeric_score(
-            handle,
-            name=f"{prefix}.composed_score",
-            value=float(bundle.composed_score),
-            emit_fn=emit_fn,
+def _safe_update_metadata(handle: LangfuseSpan | LangfuseGeneration | None, metadata: dict[str, object]) -> None:
+    if handle is None:
+        return
+    try:
+        handle.update(metadata=dict(metadata))
+    except Exception as exc:  # noqa: BLE001
+        if _STRICT_DEBUG:
+            raise
+        logging.warning(
+            "Langfuse batch score metadata update failed observation=%s keys=%s error=%s",
+            _handle_observation_id(handle) or type(handle).__name__,
+            sorted(str(key) for key in metadata),
+            exc,
         )
-
-    for component_name, result in bundle.results.items():
-        stable_name = result.name or component_name
-        if not result.visible_to_agent:
-            continue
-        if not result.available or not isinstance(result.value, (int, float)):
-            continue
-        _emit_numeric_score(
-            handle,
-            name=f"{prefix}.{stable_name}",
-            value=float(result.value),
-            emit_fn=emit_fn,
-        )
-
-    _safe_update_metadata(handle, score_bundle_metadata(bundle, metadata_key=metadata_key))
-
-
-def emit_task_score_summary(
-    handle: object | None,
-    summary: ScoreBundle,
-    *,
-    prefix: str,
-    metadata_key: str = "score_summary",
-    emit_fn: ScoreEmitFn | None = None,
-) -> None:
-    """Emit a task score summary using the same names as a concrete score bundle."""
-    emit_score_bundle(
-        handle,
-        summary,
-        prefix=prefix,
-        metadata_key=metadata_key,
-        emit_fn=emit_fn,
-    )
 
 
 def batch_score_summary_metadata(
@@ -14918,7 +14841,7 @@ def emit_batch_score_summary(
     *,
     prefix: str,
     metadata_key: str = "score_summary",
-    emit_fn: ScoreEmitFn | None = None,
+    emit_fn: Callable[..., None] | None = None,
 ) -> None:
     """Emit the canonical dataset/root scoring surface for an aggregate summary."""
     score_fn = emit_fn or emit_trace_score_for_handle
@@ -14954,11 +14877,8 @@ __all__ = [
     "batch_score_summary_metadata",
     "emit_batch_score_summary",
     "emit_score",
-    "emit_score_bundle",
     "emit_score_for_handle",
-    "emit_task_score_summary",
     "emit_trace_score_for_handle",
-    "score_bundle_metadata",
 ]
 </file>
 
@@ -15169,6 +15089,198 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module 'harness.telemetry' has no attribute {name!r}")
 </file>
 
+<file path="telemetry/evaluation_emitters.py">
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+from langfuse import LangfuseSpan
+
+from harness.telemetry.observability_models import (
+    EvaluationTelemetryArtifact,
+    OptimizeIterationTelemetryContext,
+    evaluation_metrics_map,
+)
+from harness.telemetry.tracing.score_emitter import emit_score_for_handle
+
+if TYPE_CHECKING:
+    from harness.orchestration.types import EvaluationMetrics
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _observation_name(handle: LangfuseSpan | None) -> str:
+    if handle is None:
+        return "none"
+    if handle.name:
+        return handle.name
+    return handle.id
+
+
+def safe_update_observation_metadata(
+    handle: LangfuseSpan | None,
+    metadata: Mapping[str, object],
+    *,
+    operation: str,
+    observation_name: str | None = None,
+) -> None:
+    if handle is None:
+        return
+    keys = sorted(str(key) for key in metadata)
+    try:
+        handle.update(metadata=dict(metadata))
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning(
+            "Langfuse metadata update failed operation=%s observation=%s keys=%s error=%s",
+            operation,
+            observation_name or _observation_name(handle),
+            keys,
+            exc,
+        )
+
+
+def safe_emit_score_for_handle(
+    handle: LangfuseSpan | None,
+    *,
+    name: str,
+    value: float | int | bool,
+    data_type: str | None = None,
+    comment: str | None = None,
+    operation: str,
+) -> None:
+    try:
+        emit_score_for_handle(
+            handle,
+            name=name,
+            value=value,
+            data_type=data_type,
+            comment=comment,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning(
+            "Langfuse score emission failed operation=%s observation=%s score=%s error=%s",
+            operation,
+            _observation_name(handle),
+            name,
+            exc,
+        )
+
+
+def _score_type(value: float | bool) -> str:
+    return "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
+
+
+def _score_value(value: float | bool) -> float | int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    return float(value)
+
+
+def emit_localization_task_telemetry(
+    handle: LangfuseSpan | None,
+    artifact: EvaluationTelemetryArtifact,
+    *,
+    score_prefix: str,
+    telemetry_payload: Mapping[str, object],
+    predicted_files: list[str],
+    changed_files: list[str],
+    task_summary: Mapping[str, object] | None = None,
+) -> None:
+    """Emit localization evaluation on the `localization_task` observation.
+
+    Langfuse scores are the queryable evaluation objects. Metadata is kept
+    observation-local and compact so backend spans remain diagnostic-only.
+    """
+
+    for metric_name, value in artifact.metric_map.items():
+        safe_emit_score_for_handle(
+            handle,
+            name=f"{score_prefix}.{metric_name}",
+            value=_score_value(value),
+            data_type=_score_type(value),
+            operation="localization_task.score",
+        )
+
+    metadata: dict[str, object] = {
+        "telemetry": dict(telemetry_payload),
+        "score_summary": artifact.score_summary.model_dump(mode="json"),
+        "score_context": artifact.compact_score_context.model_dump(mode="json", exclude_none=True),
+        "predicted_files": list(predicted_files),
+        "changed_files": list(changed_files),
+        "score_metric_names": sorted(artifact.metric_map),
+    }
+    if task_summary is not None:
+        metadata["task_summary"] = dict(task_summary)
+    safe_update_observation_metadata(
+        handle,
+        metadata,
+        operation="localization_task.metadata",
+        observation_name="localization_task",
+    )
+
+
+def emit_optimize_iteration_telemetry(
+    handle: LangfuseSpan | None,
+    *,
+    metrics: EvaluationMetrics,
+    iteration: int,
+    status: str | None = None,
+    pipeline_passed: bool | None = None,
+    score_context_summary: Mapping[str, object] | None = None,
+    error: str | None = None,
+) -> None:
+    metric_map = evaluation_metrics_map(metrics)
+    if pipeline_passed is not None:
+        metric_map["pipeline_passed"] = bool(pipeline_passed)
+    comment = json.dumps({"iteration": iteration})
+    for metric_name, value in metric_map.items():
+        safe_emit_score_for_handle(
+            handle,
+            name=metric_name,
+            value=_score_value(value),
+            data_type=_score_type(value),
+            comment=comment,
+            operation="optimize_iteration.score",
+        )
+    context = OptimizeIterationTelemetryContext(
+        iteration=iteration,
+        iteration_ordinal=iteration + 1,
+        status=status,
+        pipeline_passed=pipeline_passed,
+        score_context_summary=None,
+        error=error,
+    ).model_dump(mode="json", exclude_none=True)
+    metadata: dict[str, object] = {
+        "iteration": iteration,
+        "iteration_ordinal": iteration + 1,
+        "status": status,
+        "pipeline_passed": pipeline_passed,
+        "evaluation_metric_names": sorted(metric_map),
+        "evaluation": context,
+    }
+    if score_context_summary:
+        metadata["score_context_summary"] = dict(score_context_summary)
+    if error:
+        metadata["error"] = error
+    safe_update_observation_metadata(
+        handle,
+        {key: value for key, value in metadata.items() if value is not None},
+        operation="optimize_iteration.metadata",
+        observation_name="optimize_iteration",
+    )
+
+
+__all__ = [
+    "emit_localization_task_telemetry",
+    "emit_optimize_iteration_telemetry",
+    "safe_emit_score_for_handle",
+    "safe_update_observation_metadata",
+]
+</file>
+
 <file path="telemetry/observability_models.py">
 from __future__ import annotations
 
@@ -15176,6 +15288,8 @@ from collections.abc import Iterable, Mapping
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+from harness.scoring import ScoreBundle, ScoreContext
 
 
 def _number(value: object) -> float | None:
@@ -15354,11 +15468,167 @@ class RunSummary(BaseModel):
         )
 
 
+class CompactScoreContext(BaseModel):
+    """Bounded score diagnostics for observation metadata.
+
+    Langfuse scores carry evaluation values. This context is explanatory
+    metadata for the single observation being evaluated, not propagated trace
+    metadata and not a raw `ScoreContext` dump.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    gold_min_hops: int | None = None
+    issue_min_hops: int | None = None
+    previous_total_token_count: float | None = None
+    static_graph_available: bool | None = None
+    token_usage_available: bool | None = None
+    gold_min_hops_available: bool | None = None
+    issue_min_hops_available: bool | None = None
+    predicted_files_count: int = 0
+    gold_files_count: int = 0
+    resolved_prediction_count: int = 0
+    resolved_gold_count: int = 0
+    unresolved_prediction_count: int = 0
+    unresolved_gold_count: int = 0
+    issue_anchor_count: int | None = None
+    gold_anchor_count: int | None = None
+
+    @classmethod
+    def from_score_context(cls, context: ScoreContext) -> "CompactScoreContext":
+        diagnostics = context.diagnostics
+        return cls(
+            gold_min_hops=context.gold_min_hops,
+            issue_min_hops=context.issue_min_hops,
+            previous_total_token_count=context.previous_total_token_count,
+            static_graph_available=_optional_bool(diagnostics.get("static_graph_available")),
+            token_usage_available=_optional_bool(diagnostics.get("token_usage_available")),
+            gold_min_hops_available=_optional_bool(diagnostics.get("gold_min_hops_available")),
+            issue_min_hops_available=_optional_bool(diagnostics.get("issue_min_hops_available")),
+            predicted_files_count=len(context.predicted_files),
+            gold_files_count=len(context.gold_files),
+            resolved_prediction_count=_int_or_count(
+                diagnostics.get("resolved_prediction_count"),
+                context.resolved_prediction_nodes,
+            ),
+            resolved_gold_count=_int_or_count(
+                diagnostics.get("resolved_gold_count"),
+                context.resolved_gold_nodes,
+            ),
+            unresolved_prediction_count=len(context.unresolved_predictions),
+            unresolved_gold_count=len(context.unresolved_gold_files),
+            issue_anchor_count=_optional_int(diagnostics.get("issue_anchor_count")),
+            gold_anchor_count=_optional_int(diagnostics.get("gold_anchor_count")),
+        )
+
+
+class LocalizationTaskTelemetryContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    score_context: CompactScoreContext
+    predicted_files: list[str] = Field(default_factory=list)
+    changed_files: list[str] = Field(default_factory=list)
+
+
+class OptimizeIterationTelemetryContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    iteration: int
+    iteration_ordinal: int
+    status: str | None = None
+    pipeline_passed: bool | None = None
+    score_context_summary: CompactScoreContext | None = None
+    error: str | None = None
+
+
+class EvaluationTelemetryArtifact(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    score_bundle: ScoreBundle
+    score_context: ScoreContext
+    score_summary: ScoreBundle
+    metric_map: dict[str, float | bool] = Field(default_factory=dict)
+    compact_score_context: CompactScoreContext
+
+    @classmethod
+    def from_scoring(
+        cls,
+        *,
+        score_bundle: ScoreBundle,
+        score_context: ScoreContext,
+        score_summary: ScoreBundle | None = None,
+    ) -> "EvaluationTelemetryArtifact":
+        return cls(
+            score_bundle=score_bundle,
+            score_context=score_context,
+            score_summary=score_summary or score_bundle,
+            metric_map=score_bundle_metric_map(score_bundle),
+            compact_score_context=CompactScoreContext.from_score_context(score_context),
+        )
+
+
+def _optional_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, int) else None
+
+
+def _int_or_count(value: object, fallback: Mapping[str, object]) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    return sum(1 for item in fallback.values() if item)
+
+
+def score_bundle_metric_map(bundle: ScoreBundle) -> dict[str, float | bool]:
+    metrics: dict[str, float | bool] = {}
+    if bundle.composed_score is not None:
+        metrics["composed_score"] = float(bundle.composed_score)
+    for component_name, result in bundle.results.items():
+        stable_name = result.name or component_name
+        if not result.visible_to_agent:
+            continue
+        if not result.available or not isinstance(result.value, (int, float)):
+            continue
+        metrics[stable_name] = float(result.value)
+    return metrics
+
+
+def evaluation_metrics_map(metrics: object) -> dict[str, float | bool]:
+    metric_map: dict[str, float | bool] = {}
+    score = getattr(metrics, "score", None)
+    if isinstance(score, bool):
+        metric_map["metrics.score"] = score
+    elif isinstance(score, (int, float)):
+        metric_map["metrics.score"] = float(score)
+    for entry in getattr(metrics, "additional_metrics", []) or []:
+        name = getattr(entry, "name", None)
+        value = getattr(entry, "value", None)
+        if not isinstance(name, str) or not name:
+            continue
+        if isinstance(value, bool):
+            metric_map[name] = value
+        elif isinstance(value, (int, float)):
+            metric_map[name] = float(value)
+    return metric_map
+
+
 __all__ = [
     "BackendRunStats",
+    "CompactScoreContext",
+    "EvaluationTelemetryArtifact",
+    "LocalizationTaskTelemetryContext",
+    "OptimizeIterationTelemetryContext",
     "RunSummary",
     "TaskRunSummary",
     "TokenUsageBreakdown",
+    "evaluation_metrics_map",
+    "score_bundle_metric_map",
 ]
 </file>
 
@@ -15445,6 +15715,10 @@ def _stub_langfuse_client(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
 
         def update(self, **kwargs: Any) -> None:
             return None
+
+        @contextmanager
+        def start_as_current_observation(self, **kwargs: Any) -> Iterator["DummySpan"]:
+            yield DummySpan(session_id=self.session_id)
 
     class DummyClient:
         def __init__(self):
@@ -17267,10 +17541,12 @@ def test_cost_details_for_usage_no_match_returns_none():
 from __future__ import annotations
 
 import builtins
+import subprocess
 import sys
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17488,6 +17764,20 @@ def test_ic_optimize_help_narrates_evaluator_writer_pipeline_flow():
     assert "correctness" in result.output
     assert "accept" in result.output
     assert "reject" in result.output
+
+
+def test_ic_optimize_help_imports_in_fresh_process():
+    result = subprocess.run(
+        [sys.executable, "-m", "harness.entrypoints.cli", "ic", "optimize", "--help"],
+        cwd=Path(__file__).resolve().parents[2],
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--max-workers" in result.stdout
 
 
 def test_old_commands_are_not_registered():
@@ -17923,7 +18213,11 @@ def test_ic_optimize_traces_parent_and_task_spans(monkeypatch, tmp_path):
     assert task_start["parent"] is None
     assert run_loop_parents == [task_start["span"]]
     assert task_start["span"] is not coordinator["span"]
-    assert all(call.get("session_id") is None for call in propagated)
+    assert all("metadata" not in call for call in propagated)
+    assert all(
+        call.get("session_id") is None or isinstance(call.get("session_id"), str)
+        for call in propagated
+    )
     task_metadata = task_start["metadata"]
     assert isinstance(task_metadata, dict)
     assert task_metadata["optimize_run_id"]
@@ -18100,6 +18394,252 @@ def test_langfuse_item_contract_rejects_missing_repo_identity_with_item_id():
     assert "missing required field" in message
     assert "`repo`" in message
     assert "dataset sync schema is incomplete for runtime execution" in message
+</file>
+
+<file path="tests_harness/test_evaluation_telemetry.py">
+from __future__ import annotations
+
+import pytest
+
+from harness.orchestration.types import EvaluationMetrics
+from harness.scoring import ComposeMode, Goal, ScoreBundle, ScoreContext, ScoreResult
+from harness.telemetry import evaluation_emitters
+from harness.telemetry.observability_models import (
+    EvaluationTelemetryArtifact,
+    evaluation_metrics_map,
+)
+
+
+def _bundle() -> ScoreBundle:
+    return ScoreBundle(
+        results={
+            "gold_hop": ScoreResult(
+                name="gold_hop",
+                value=1.0,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            ),
+            "issue_hop": ScoreResult(
+                name="issue_hop",
+                value=0.5,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            ),
+            "token_efficiency": ScoreResult(
+                name="token_efficiency",
+                value=0.25,
+                goal=Goal.MAXIMIZE,
+                available=True,
+                visible_to_agent=True,
+            ),
+        },
+        composed_score=0.75,
+        compose_mode=ComposeMode.WEIGHTED_SUM,
+        compose_weights={"gold_hop": 0.75, "issue_hop": 0.25},
+        available=True,
+    )
+
+
+def _context() -> ScoreContext:
+    return ScoreContext(
+        predicted_files=("a.py", "missing.py"),
+        gold_files=("a.py",),
+        gold_min_hops=0,
+        issue_min_hops=2,
+        previous_total_token_count=123.0,
+        resolved_prediction_nodes={"a.py": ("file:a.py",), "missing.py": ()},
+        resolved_gold_nodes={"a.py": ("file:a.py",)},
+        unresolved_predictions=("missing.py",),
+        unresolved_gold_files=(),
+        diagnostics={
+            "static_graph_available": True,
+            "token_usage_available": True,
+            "gold_min_hops_available": True,
+            "issue_min_hops_available": True,
+            "issue_anchor_count": 3,
+            "gold_anchor_count": 1,
+        },
+    )
+
+
+def test_evaluation_telemetry_artifact_contains_compact_score_context():
+    artifact = EvaluationTelemetryArtifact.from_scoring(
+        score_bundle=_bundle(),
+        score_context=_context(),
+    )
+
+    assert artifact.metric_map == {
+        "composed_score": 0.75,
+        "gold_hop": 1.0,
+        "issue_hop": 0.5,
+        "token_efficiency": 0.25,
+    }
+    compact = artifact.compact_score_context.model_dump(mode="json", exclude_none=True)
+    assert compact["gold_min_hops"] == 0
+    assert compact["issue_min_hops"] == 2
+    assert compact["previous_total_token_count"] == 123.0
+    assert compact["static_graph_available"] is True
+    assert compact["token_usage_available"] is True
+    assert compact["unresolved_prediction_count"] == 1
+
+
+def test_localization_task_emitter_scores_and_metadata(monkeypatch: pytest.MonkeyPatch):
+    scores: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    class Span:
+        id = "localization-task"
+        name = "localization_task"
+
+        def update(self, **kwargs: object) -> None:
+            updates.append(kwargs)
+
+    monkeypatch.setattr(
+        evaluation_emitters,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: scores.append(kwargs),
+    )
+    artifact = EvaluationTelemetryArtifact.from_scoring(
+        score_bundle=_bundle(),
+        score_context=_context(),
+    )
+
+    evaluation_emitters.emit_localization_task_telemetry(
+        Span(),
+        artifact,
+        score_prefix="ic",
+        telemetry_payload={"identity": {"task_id": "task"}},
+        predicted_files=["a.py", "missing.py"],
+        changed_files=["a.py"],
+    )
+
+    assert [score["name"] for score in scores] == [
+        "ic.composed_score",
+        "ic.gold_hop",
+        "ic.issue_hop",
+        "ic.token_efficiency",
+    ]
+    metadata = updates[-1]["metadata"]
+    assert metadata["score_context"]["gold_min_hops"] == 0
+    assert metadata["score_context"]["previous_total_token_count"] == 123.0
+    assert metadata["predicted_files"] == ["a.py", "missing.py"]
+
+
+def test_optimize_iteration_emits_all_numeric_boolean_metrics(monkeypatch: pytest.MonkeyPatch):
+    scores: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    class Span:
+        id = "optimize-iteration"
+        name = "optimize_iteration"
+
+        def update(self, **kwargs: object) -> None:
+            updates.append(kwargs)
+
+    monkeypatch.setattr(
+        evaluation_emitters,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: scores.append(kwargs),
+    )
+    metrics = EvaluationMetrics.model_validate(
+        {
+            "score": 0.4,
+            "additional_metrics": [
+                {"name": "gold_hop", "value": 1.0},
+                {"name": "issue_hop", "value": 0.5},
+                {"name": "token_efficiency", "value": 0.25},
+                {"name": "component_passed", "value": True},
+                {"name": "ignored", "value": None},
+            ],
+        }
+    )
+
+    evaluation_emitters.emit_optimize_iteration_telemetry(
+        Span(),
+        metrics=metrics,
+        iteration=2,
+        status="success",
+        pipeline_passed=False,
+        score_context_summary={"gold_hop": 1.0},
+    )
+
+    emitted_names = [score["name"] for score in scores]
+    assert emitted_names == [
+        "metrics.score",
+        "gold_hop",
+        "issue_hop",
+        "token_efficiency",
+        "component_passed",
+        "pipeline_passed",
+    ]
+    assert {score["name"]: score["data_type"] for score in scores}["component_passed"] == "BOOLEAN"
+    assert updates[-1]["metadata"]["score_context_summary"] == {"gold_hop": 1.0}
+
+
+def test_evaluation_metrics_map_ignores_non_numeric_or_boolean_entries():
+    metrics = EvaluationMetrics.model_validate(
+        {
+            "score": 1.0,
+            "additional_metrics": [
+                {"name": "numeric", "value": 2},
+                {"name": "boolean", "value": False},
+                {"name": "missing", "value": None},
+            ],
+        }
+    )
+
+    assert evaluation_metrics_map(metrics) == {
+        "metrics.score": 1.0,
+        "numeric": 2.0,
+        "boolean": False,
+    }
+
+
+def test_metadata_update_failures_are_logged(caplog: pytest.LogCaptureFixture):
+    class BrokenSpan:
+        id = "broken"
+
+        def update(self, **kwargs: object) -> None:
+            raise RuntimeError("metadata down")
+
+    caplog.set_level("WARNING")
+    evaluation_emitters.safe_update_observation_metadata(
+        BrokenSpan(),
+        {"score_context": {"gold_min_hops": 0}},
+        operation="test.metadata",
+        observation_name="localization_task",
+    )
+
+    assert "test.metadata" in caplog.text
+    assert "localization_task" in caplog.text
+    assert "score_context" in caplog.text
+    assert "metadata down" in caplog.text
+
+
+def test_score_emission_failures_are_logged(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+    def failing_emit(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("score down")
+
+    monkeypatch.setattr(evaluation_emitters, "emit_score_for_handle", failing_emit)
+    caplog.set_level("WARNING")
+
+    class Span:
+        id = "score-span"
+        name = "localization_task"
+
+    evaluation_emitters.safe_emit_score_for_handle(
+        Span(),
+        name="gold_hop",
+        value=1.0,
+        data_type="NUMERIC",
+        operation="test.score",
+    )
+
+    assert "test.score" in caplog.text
+    assert "gold_hop" in caplog.text
+    assert "score down" in caplog.text
 </file>
 
 <file path="tests_harness/test_executor_helpers.py">
@@ -19217,6 +19757,7 @@ from harness.localization.models import (
     canonicalize_paths,
 )
 from harness.scoring import ScoreContext, ScoreEngine, summarize_task_score
+from harness.telemetry.observability_models import EvaluationTelemetryArtifact
 from harness.localization.runtime.records import build_localization_score_eval_record
 from harness.localization.telemetry import build_localization_telemetry
 from harness.localization.runtime.execute import run_localization_task
@@ -19224,6 +19765,32 @@ from harness.localization.errors import LocalizationEvaluationError
 from harness.scoring.helpers import tokens_to_score
 import harness.localization.runtime.execute as executor_module
 import harness.agents.localizer as runner
+
+
+class FakeLangfuseSpan:
+    id = "span"
+    trace_id = "trace"
+    name = "span"
+    metadata: dict[str, object] = {}
+
+    def __init__(self, update_sink: list[dict[str, object]] | None = None) -> None:
+        self.scores: list[dict[str, object]] = []
+        self.updates: list[dict[str, object]] = []
+        self._update_sink = update_sink
+
+    def score(self, **kwargs: object) -> None:
+        self.scores.append(kwargs)
+
+    def score_trace(self, **kwargs: object) -> None:
+        self.scores.append(kwargs)
+
+    def update(self, **kwargs: object) -> None:
+        self.updates.append(kwargs)
+        if self._update_sink is not None:
+            self._update_sink.append(kwargs)
+
+    def end(self, **kwargs: object) -> None:
+        return None
 
 
 def _runner_result(
@@ -19403,7 +19970,7 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
 
     @contextmanager
     def span_cm():
-        yield type("S", (), {"id": "span", "metadata": {}, "end": lambda self, **kw: None})()
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     prediction, score_bundle, _evidence, _mat, _usage, _run_result = run_localization_task(
@@ -19441,15 +20008,13 @@ def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
 
     @contextmanager
     def span_cm():
-        span = type(
-            "S",
-            (),
-            {"id": "span", "metadata": {}, "update": lambda self, **kw: updates.append(kw), "end": lambda self, **kw: None},
-        )()
-        yield span
+        yield FakeLangfuseSpan(update_sink=updates)
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    monkeypatch.setattr(executor_module, "emit_score_for_handle", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "harness.telemetry.evaluation_emitters.emit_score_for_handle",
+        lambda *a, **k: None,
+    )
     prediction, score_bundle, *_ = run_localization_task(
         lca_task,
         runner=lambda task, *_args: _runner_result(task, ["SRC\\foo.py"], source="runner"),
@@ -19498,23 +20063,24 @@ def test_localization_task_emits_backend_prefixed_score_bundle(monkeypatch, tmp_
 
     @contextmanager
     def span_cm():
-        span = type(
-            "S",
-            (),
-            {
-                "id": "span",
-                "metadata": {},
-                "update": lambda self, **kw: None,
-                "end": lambda self, **kw: None,
-            },
-        )()
-        yield span
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    monkeypatch.setattr(executor_module, "_score_task", lambda *a, **k: bundle)
     monkeypatch.setattr(
         executor_module,
-        "emit_score_for_handle",
+        "_score_task",
+        lambda *a, **k: EvaluationTelemetryArtifact.from_scoring(
+            score_bundle=bundle,
+            score_context=ScoreContext(
+                predicted_files=("a.py",),
+                gold_files=("a.py",),
+                gold_min_hops=0,
+                issue_min_hops=0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "harness.telemetry.evaluation_emitters.emit_score_for_handle",
         lambda handle, **kwargs: emitted.append(kwargs),
     )
 
@@ -19555,22 +20121,11 @@ def test_localization_task_scores_runner_usage_as_visible_component(monkeypatch,
 
     @contextmanager
     def span_cm():
-        span = type(
-            "S",
-            (),
-            {
-                "id": "span",
-                "metadata": {},
-                "update": lambda self, **kw: None,
-                "end": lambda self, **kw: None,
-            },
-        )()
-        yield span
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     monkeypatch.setattr(
-        executor_module,
-        "emit_score_for_handle",
+        "harness.telemetry.evaluation_emitters.emit_score_for_handle",
         lambda handle, **kwargs: emitted.append(kwargs),
     )
 
@@ -19616,20 +20171,13 @@ def test_localization_task_scores_full_run_usage_not_finalization_only(monkeypat
 
     @contextmanager
     def span_cm():
-        span = type(
-            "S",
-            (),
-            {
-                "id": "span",
-                "metadata": {},
-                "update": lambda self, **kw: None,
-                "end": lambda self, **kw: None,
-            },
-        )()
-        yield span
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    monkeypatch.setattr(executor_module, "emit_score_for_handle", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "harness.telemetry.evaluation_emitters.emit_score_for_handle",
+        lambda *a, **k: None,
+    )
 
     _prediction, score_bundle, _evidence, _mat, usage, _run_result = run_localization_task(
         lca_task,
@@ -19697,7 +20245,12 @@ def test_localization_langfuse_boundary_node_count_visible_without_malformed_bun
 
     class TaskSpan:
         id = "task-observation"
+        trace_id = "trace"
+        name = "localization_task"
         metadata: dict[str, object] = {}
+
+        def score(self, **kwargs):
+            pass
 
         def update(self, **kwargs):
             pass
@@ -19707,6 +20260,8 @@ def test_localization_langfuse_boundary_node_count_visible_without_malformed_bun
 
     class BackendSpan:
         id = "backend-observation"
+        trace_id = "trace"
+        name = "iterative_context"
 
         def score(self, **kwargs):
             handle_scores.append(kwargs)
@@ -19723,7 +20278,9 @@ def test_localization_langfuse_boundary_node_count_visible_without_malformed_bun
         yield TaskSpan()
 
     def runner_with_visible_node_count(task: LCATask, *_args):
-        executor_module.emit_score_for_handle(
+        from harness.telemetry.tracing.score_emitter import emit_score_for_handle
+
+        emit_score_for_handle(
             BackendSpan(),
             name="ic.node_count",
             value=2.0,
@@ -19732,7 +20289,19 @@ def test_localization_langfuse_boundary_node_count_visible_without_malformed_bun
         return _runner_result(task, ["a.py"], backend="ic")
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    monkeypatch.setattr(executor_module, "_score_task", lambda *a, **k: bundle)
+    monkeypatch.setattr(
+        executor_module,
+        "_score_task",
+        lambda *a, **k: EvaluationTelemetryArtifact.from_scoring(
+            score_bundle=bundle,
+            score_context=ScoreContext(
+                predicted_files=("a.py",),
+                gold_files=("a.py",),
+                gold_min_hops=0,
+                issue_min_hops=0,
+            ),
+        ),
+    )
     monkeypatch.setattr(
         "harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient()
     )
@@ -19768,7 +20337,7 @@ def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
 
     @contextmanager
     def span_cm():
-        yield type("S", (), {"update": lambda self, **kw: None, "end": lambda self, **kw: None, "id": "span"})()
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     repo_dir = tmp_path / "repo"
@@ -19819,11 +20388,7 @@ def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_
 
     @contextmanager
     def span_cm():
-        yield type(
-            "S",
-            (),
-            {"update": lambda self, **kw: None, "end": lambda self, **kw: None, "id": "span"},
-        )()
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     repo_dir = tmp_path / "repo"
@@ -19881,11 +20446,7 @@ def test_run_ic_iteration_recovers_nested_tool_result_candidates(monkeypatch, tm
 
     @contextmanager
     def span_cm():
-        yield type(
-            "S",
-            (),
-            {"update": lambda self, **kw: None, "end": lambda self, **kw: None, "id": "span"},
-        )()
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
 
@@ -19930,11 +20491,7 @@ def test_run_ic_iteration_recovers_when_finalization_request_fails(monkeypatch, 
 
     @contextmanager
     def span_cm():
-        yield type(
-            "S",
-            (),
-            {"update": lambda self, **kw: None, "end": lambda self, **kw: None, "id": "span"},
-        )()
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     repo_dir = tmp_path / "repo"
@@ -20007,16 +20564,7 @@ def test_run_localization_task_empty_finalize_and_empty_fallback_is_typed(
 
     @contextmanager
     def span_cm():
-        yield type(
-            "S",
-            (),
-            {
-                "id": "span",
-                "metadata": {},
-                "update": lambda self, **kw: None,
-                "end": lambda self, **kw: None,
-            },
-        )()
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
@@ -20069,16 +20617,7 @@ def test_run_localization_task_preserves_exploration_failure_without_observation
 
     @contextmanager
     def span_cm():
-        yield type(
-            "S",
-            (),
-            {
-                "id": "span",
-                "metadata": {},
-                "update": lambda self, **kw: None,
-                "end": lambda self, **kw: None,
-            },
-        )()
+        yield FakeLangfuseSpan()
 
     monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
     monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
@@ -21044,22 +21583,27 @@ def test_start_observation_accepts_context_manager(monkeypatch):
     assert obs.end_called == 0
 
 
-def test_start_child_observation_handles_plain_object_parent():
+def test_start_child_observation_uses_langfuse_child_context_manager():
     class PlainChild:
         def __init__(self, session_id: str | None):
             self.id = "child"
+            self.name = "child"
             self.session_id = session_id
-            self.end_called = 0
+            self.exited = 0
 
-        def end(self):
-            self.end_called += 1
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.exited += 1
+            return False
 
     class PlainParent:
         def __init__(self, session_id: str | None):
             self.session_id = session_id
             self.started = 0
 
-        def start_observation(self, **kwargs):
+        def start_as_current_observation(self, **kwargs):
             self.started += 1
             meta = kwargs.get("metadata") or {}
             child_session = meta.get("session_id") or self.session_id
@@ -21070,10 +21614,10 @@ def test_start_child_observation_handles_plain_object_parent():
     with lf.start_observation(name="child", parent=parent) as child:
         assert isinstance(child, PlainChild)
         assert child.session_id == "parent-session"
-        assert child.end_called == 0
+        assert child.exited == 0
 
     assert parent.started == 1
-    assert child.end_called == 1
+    assert child.exited == 1
 
 
 def test_emit_score_best_effort_when_client_missing(monkeypatch):
@@ -21094,7 +21638,7 @@ def test_emit_score_handles_missing_api(monkeypatch):
     score_emitter.emit_score(name="metric", value=1.0, trace_id="t1")
 
 
-def test_propagate_context_compacts_metadata(monkeypatch):
+def test_propagate_context_drops_invalid_metadata(monkeypatch, caplog):
     captured: dict[str, object] = {}
 
     def fake_propagate_attributes(**kwargs):
@@ -21102,25 +21646,27 @@ def test_propagate_context_compacts_metadata(monkeypatch):
         return kwargs
 
     monkeypatch.setattr(lf, "propagate_attributes", fake_propagate_attributes)
-    long_selection = {
-        "offset": 0,
-        "limit": 1,
-        "selected_count": 1,
-        "total_available": 10,
-        "preview": ["a" * 300, "b"],
-    }
-    long_projection = "x" * 400
+    caplog.set_level("WARNING")
 
-    lf.propagate_context(metadata={"selection": long_selection, "projection": long_projection})
+    lf.propagate_context(
+        metadata={
+            "source": "api",
+            "task_identity": "task-1",
+            "repo": "owner/repo",
+            "toolong": "x" * 400,
+        }
+    )
 
     meta = captured.get("metadata") or {}
     assert isinstance(meta, dict)
-    # selection/projection should be omitted/compacted and under the 200-char limit.
-    assert meta.get("selection") == "<omitted>"
-    assert meta.get("projection") == "<omitted>"
+    assert meta == {"source": "api"}
+    assert "task_identity" not in meta
+    assert "repo" not in meta
+    assert "toolong" not in meta
+    assert "Dropping" in caplog.text
 
 
-def test_propagate_context_strict_rejects_selection(monkeypatch):
+def test_propagate_context_strict_rejects_invalid_key(monkeypatch):
     monkeypatch.setenv("LANGFUSE_STRICT_DEBUG", "1")
     import importlib
 
@@ -21128,7 +21674,21 @@ def test_propagate_context_strict_rejects_selection(monkeypatch):
 
     importlib.reload(lf_mod)
     with pytest.raises(ValueError):
-        lf_mod.propagate_context(metadata={"selection": {"preview": ["a" * 300]}})
+        lf_mod.propagate_context(metadata={"task_identity": "task-1"})
+
+
+def test_observation_metadata_preserves_nested_json():
+    metadata = lf.serialize_observation_metadata(
+        {
+            "score_context": {"gold_min_hops": 0, "flags": [True, False]},
+            "count": 1,
+        }
+    )
+
+    assert metadata == {
+        "score_context": {"gold_min_hops": 0, "flags": [True, False]},
+        "count": 1,
+    }
 </file>
 
 <file path="tests_harness/test_orchestration_dependencies.py">
@@ -22401,107 +22961,6 @@ def test_emit_trace_score_for_handle_prefers_score_trace():
     ]
 
 
-def test_emit_score_bundle_emits_composed_and_visible_components():
-    emitted: list[dict[str, object]] = []
-    updates: list[dict[str, object]] = []
-
-    class Dummy:
-        id = "obs"
-
-        def score(self, **kwargs):
-            emitted.append(kwargs)
-
-        def update(self, **kwargs):
-            updates.append(kwargs)
-
-    bundle = ScoreBundle(
-        results={
-            "gold_hop": ScoreResult(
-                name="gold_hop",
-                value=0.75,
-                goal=Goal.MAXIMIZE,
-                available=True,
-                visible_to_agent=True,
-            ),
-            "hidden_quality": ScoreResult(
-                name="hidden_quality",
-                value=0.25,
-                goal=Goal.MAXIMIZE,
-                available=True,
-                visible_to_agent=False,
-            ),
-            "token_efficiency": ScoreResult(
-                name="token_efficiency",
-                value=None,
-                goal=Goal.MAXIMIZE,
-                available=False,
-                visible_to_agent=True,
-                reason="no token usage",
-            ),
-        },
-        composed_score=0.8,
-        compose_mode=ComposeMode.WEIGHTED_SUM,
-        compose_weights={"gold_hop": 1.0},
-        available=True,
-    )
-
-    score_emitter.emit_score_bundle(
-        Dummy(),
-        bundle,
-        prefix="ic",
-    )
-
-    assert [item["name"] for item in emitted] == ["ic.composed_score", "ic.gold_hop"]
-    assert "score_id" not in emitted[0]
-    assert updates
-    metadata = updates[-1]["metadata"]
-    diagnostics = metadata["score_bundle_diagnostics"]
-    assert diagnostics["hidden_components"] == ["hidden_quality"]
-    assert diagnostics["unavailable_components"] == {"token_efficiency": "no token usage"}
-
-
-def test_emit_score_bundle_uses_handle_score_without_forcing_create_score(monkeypatch):
-    emitted: list[dict[str, object]] = []
-
-    class DummyHandle:
-        id = "obs"
-        trace_id = "trace"
-
-        def score(self, **kwargs):
-            emitted.append(kwargs)
-
-    class DummyClient:
-        def auth_check(self):
-            return True
-
-        def create_score(self, **kwargs):
-            raise AssertionError("bundle scores should use handle.score by default")
-
-    monkeypatch.setattr(
-        "harness.telemetry.tracing.get_langfuse_client", lambda: DummyClient()
-    )
-    bundle = ScoreBundle(
-        results={
-            "gold_hop": ScoreResult(
-                name="gold_hop",
-                value=0.75,
-                goal=Goal.MAXIMIZE,
-                available=True,
-                visible_to_agent=True,
-            )
-        },
-        composed_score=0.8,
-        compose_mode=ComposeMode.WEIGHTED_SUM,
-        compose_weights={"gold_hop": 1.0},
-        available=True,
-    )
-
-    score_emitter.emit_score_bundle(DummyHandle(), bundle, prefix="ic")
-
-    assert [item["name"] for item in emitted] == ["ic.composed_score", "ic.gold_hop"]
-    assert all("score_id" not in item for item in emitted)
-
-
 def test_emit_batch_score_summary_emits_visible_component_averages():
     emitted: list[dict[str, object]] = []
 
@@ -23213,6 +23672,9 @@ class DummySpan:
         return False
 
     def start_observation(self, **kwargs):
+        return self
+
+    def start_as_current_observation(self, **kwargs):
         return self
 
     def end(self, **kwargs):

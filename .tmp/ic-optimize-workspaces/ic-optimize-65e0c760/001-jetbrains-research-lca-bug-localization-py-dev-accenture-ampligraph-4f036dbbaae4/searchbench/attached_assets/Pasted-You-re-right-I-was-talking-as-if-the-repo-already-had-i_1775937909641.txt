@@ -1,0 +1,165 @@
+You’re right — I was talking as if the repo already had inner nesting, but the current snapshot is still mostly one layer deep inside each subsystem. The current tree is flat within localization/, telemetry/, and entrypoints/, so a small amount of second-level nesting would make sense now.
+
+I’d aim for this kind of move:
+	•	localization/runtime/ for agent_runtime.py, execute.py, evaluate.py, records.py
+	•	localization/materialization/ for materialize.py, hf_materialize.py
+	•	telemetry/hosted/ for baselines.py, experiments.py, datasets.py, hf_lca.py
+	•	telemetry/langfuse/ for langfuse.py, score_emitter.py, session_policy.py, cerebras_pricing.py
+	•	entrypoints/models/ for requests.py
+
+That keeps the current top-level subsystem split, but adds one more useful layer where the file count and conceptual split are real.  ￼
+
+:::writing{variant=“chat_message” id=“42856”}
+I want a conservative nested-folder migration for this Python repo.
+
+The current top-level structure is good, but the internals are still too flat. I want you to introduce one additional level of meaningful nesting inside a few subsystems so the tree better reflects the real ownership boundaries.
+
+This is a structure/legibility migration, not a business-logic rewrite.
+
+Goal
+
+Keep the current major package layout:
+	•	agents/
+	•	backends/
+	•	docs/
+	•	entrypoints/
+	•	localization/
+	•	orchestration/
+	•	pipeline/
+	•	policy/
+	•	prompts/
+	•	telemetry/
+	•	utils/
+
+But add a small amount of second-level nesting where it improves clarity.
+
+Hard constraints
+	•	Do not change business logic.
+	•	Do not change scoring semantics.
+	•	Do not change tracing ownership.
+	•	Do not touch backend behavior.
+	•	Do not invent deeper trees than necessary.
+	•	Prefer moving files and rewriting imports over rewriting implementations.
+	•	Keep tests green.
+
+What I want changed
+
+1. Add nested folders inside localization/
+
+Create this shape:
+	•	localization/runtime/
+	•	move agent_runtime.py
+	•	move execute.py
+	•	move evaluate.py
+	•	move records.py
+	•	localization/materialization/
+	•	move materialize.py
+	•	move hf_materialize.py
+
+Keep these at localization/ root unless there is a very strong reason not to:
+	•	models.py
+	•	errors.py
+	•	scoring.py
+	•	telemetry.py
+	•	token_usage.py
+	•	__init__.py
+
+Reason:
+	•	runtime/ is the execution path
+	•	materialization/ is a clear sub-capability
+	•	models/scoring/errors remain foundational and easy to find at package root
+
+2. Add nested folders inside telemetry/
+
+Create this shape:
+	•	telemetry/hosted/
+	•	move baselines.py
+	•	move experiments.py
+	•	move datasets.py
+	•	move hf_lca.py
+	•	telemetry/langfuse/
+	•	move langfuse.py
+	•	move score_emitter.py
+	•	move session_policy.py
+	•	move cerebras_pricing.py
+
+Keep these at telemetry/ root unless needed:
+	•	policy_reducer.py
+	•	__init__.py
+
+Reason:
+	•	one cluster is hosted dataset/baseline/experiment workflow support
+	•	another cluster is Langfuse/session/cost/tracing support
+
+3. Add a small nested folder inside entrypoints/
+
+Create:
+	•	entrypoints/models/
+	•	move requests.py
+
+Keep:
+	•	entrypoints/cli.py
+	•	entrypoints/__init__.py
+
+Reason:
+	•	CLI entrypoint should stay obvious
+	•	request/config models should not sit beside the main executable file unless they are the same concern
+
+Non-goals
+
+Do not:
+	•	create micro-nesting beyond this
+	•	add third-level trees
+	•	move orchestration/, pipeline/, policy/, or agents/ into more nested structures unless absolutely necessary
+	•	touch backends/
+	•	rename concepts just for style
+	•	perform feature work
+
+Execution plan
+
+Phase 1
+
+Inspect the current tree and produce a move map:
+	•	old path -> new path
+	•	imports that must change
+	•	any likely cycle risks
+
+Phase 2
+
+Perform the file moves and update imports.
+
+Phase 3
+
+Update package __init__.py exports so the public import surface stays clean and unsurprising.
+
+Phase 4
+
+Update docs/comments that mention moved paths.
+
+Phase 5
+
+Run targeted tests and repair only migration-caused failures.
+
+Test focus
+
+Run the most relevant tests for:
+	•	localization
+	•	telemetry / tracing wrappers
+	•	entrypoints / CLI guardrails
+	•	orchestration if imports changed indirectly
+
+Deliverables
+
+At the end, provide:
+	1.	exact file move summary
+	2.	import surface changes
+	3.	docs/comments updated
+	4.	tests run and status
+	5.	confirmation that no unnecessary deeper nesting was introduced
+
+Stay conservative.
+
+This migration should make the tree easier to guess, not more elaborate.
+:::
+
+If you want, I can also write a stronger opinionated version that tells Replit exactly which imports to preserve as compatibility shims for one pass.

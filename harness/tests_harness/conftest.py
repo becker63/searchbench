@@ -77,6 +77,10 @@ def _stub_langfuse_client(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
         def update(self, **kwargs: Any) -> None:
             return None
 
+        @contextmanager
+        def start_as_current_observation(self, **kwargs: Any) -> Iterator["DummySpan"]:
+            yield DummySpan(session_id=self.session_id)
+
     class DummyClient:
         def __init__(self):
             self.scores: list[dict[str, object]] = []

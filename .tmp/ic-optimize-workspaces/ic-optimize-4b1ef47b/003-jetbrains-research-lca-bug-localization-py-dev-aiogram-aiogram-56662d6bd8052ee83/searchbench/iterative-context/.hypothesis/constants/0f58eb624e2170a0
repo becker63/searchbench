@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/normalize.py
+# hypothesis_version: 6.151.9
+
+['call', 'calls', 'file', 'function', 'import', 'imports', 'module', 'symbol', 'type', 'unknown']
