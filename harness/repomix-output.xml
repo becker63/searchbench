@@ -7379,6 +7379,7 @@ from harness.orchestration.types import (
 )
 from harness.orchestration.runtime_context import optimization_policy_path
 from harness.prompts import WriterScoreSummary, build_writer_score_summary_from_bundle
+from harness.telemetry.observability_models import score_bundle_component_states
 
 if TYPE_CHECKING:
     from harness.telemetry.hosted.baselines import EvaluationRecord
@@ -7412,6 +7413,7 @@ def _failure_evaluation_result(error: str) -> EvaluationResult:
             composed_score=-10.0,
             optimization_goal="maximize",
         ),
+        score_components={},
     )
 
 
@@ -7468,6 +7470,7 @@ def evaluate_policy_on_item(
         policy_code=_read_policy(),
         control_score=eval_result.machine_score,
         score_summary=build_writer_score_summary_from_bundle(score_bundle),
+        score_components=score_bundle_component_states(score_bundle),
     )
 </file>
 
@@ -7734,10 +7737,9 @@ import logging
 from pathlib import Path
 from typing import Any, cast
 
+import jcodemunch_mcp.tools.index_folder as index_folder_tool
 from statemachine import State, StateChart
 from statemachine.event import BoundEvent
-
-import jcodemunch_mcp.tools.index_folder as index_folder_tool
 
 from harness import pipeline as pipeline_module
 from harness.agents import writer as agent_writer
@@ -7749,14 +7751,14 @@ from harness.telemetry.tracing import score_emitter
 from harness.utils import diff as diff_utils
 from harness.utils import env as env_utils
 from harness.utils import repo_root as repo_root_utils
-from harness.utils import test_loader
-from harness.utils import type_loader
+from harness.utils import test_loader, type_loader
+
 from . import dependencies as dependency_wiring
 from . import evaluation as policy_evaluation
 from . import feedback as feedback_wiring
 from . import writer as policy_writer
-from .runtime_context import optimization_repo_root
 from .listeners import RepairTracingListener
+from .runtime_context import optimization_repo_root
 from .types import (
     LoopDependencies,
     RepairContext,
@@ -7765,7 +7767,7 @@ from .types import (
 )
 
 _BOUND_EVENT = cast(Any, BoundEvent)
-_MAX_POLICY_REPAIRS = 3
+_MAX_POLICY_REPAIRS = 8
 _LOGGER = logging.getLogger(__name__)
 
 # The installed python-statemachine release still reads ``BoundEvent.key``
@@ -7840,7 +7842,8 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             pipeline_results=self.context.pipeline_results,
             success=self.context.pipeline_passed,
             attempts_used=final_attempts,
-            pipeline_feedback=self.context.pipeline_feedback or self.context.last_classified,
+            pipeline_feedback=self.context.pipeline_feedback
+            or self.context.last_classified,
             writer_error=self.context.writer_error,
             error=self.context.error,
             failed_step=self.context.failed_step,
@@ -7897,9 +7900,13 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             guidance.append(
                 "Repair mode: produce the smallest change that makes harness/policy.py pass ruff, basedpyright, and pytest."
             )
-            guidance.append("Add missing parameter annotations and return type -> float before optimizing frontier_priority.")
+            guidance.append(
+                "Add missing parameter annotations and return type -> float before optimizing frontier_priority."
+            )
         if ctx.last_classified and ctx.last_classified.type_errors:
-            guidance.append("Fix all type errors and ensure parameters are annotated; avoid unknown types.")
+            guidance.append(
+                "Fix all type errors and ensure parameters are annotated; avoid unknown types."
+            )
         optimization_brief = ctx.feedback.optimization_brief.model_copy(
             update={"guidance": WriterGuidance(mode=mode, instructions=guidance)}
         )
@@ -7980,7 +7987,9 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         ctx = self.context
         deps = self.deps
         pipeline = ctx.pipeline or deps.default_pipeline()
-        check_names = [getattr(step, "name", "unknown") for step in getattr(pipeline, "steps", [])]
+        check_names = [
+            getattr(step, "name", "unknown") for step in getattr(pipeline, "steps", [])
+        ]
         _LOGGER.info(
             "[OPTIMIZE] pipeline_check start attempt=%s checks=%s repo_root=%s writer_session_id=%s",
             ctx.attempts_used,
@@ -8017,7 +8026,10 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                     observation_name="pipeline_check",
                 )
         # Enforce canonical step result shape at the boundary.
-        ctx.pipeline_results = [step if isinstance(step, StepResult) else StepResult.from_external(step) for step in pipeline_results]
+        ctx.pipeline_results = [
+            step if isinstance(step, StepResult) else StepResult.from_external(step)
+            for step in pipeline_results
+        ]
         ctx.pipeline_passed = pipeline_success
         ctx.attempts_used += 1
         _LOGGER.info(
@@ -8058,7 +8070,9 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                     )
             ctx.candidate_code = final_policy
             ctx.accepted_policy_source = success_meta.accepted_policy_source
-            ctx.accepted_policy_changed_by_pipeline = success_meta.accepted_policy_changed_by_pipeline
+            ctx.accepted_policy_changed_by_pipeline = (
+                success_meta.accepted_policy_changed_by_pipeline
+            )
             ctx.repair_attempts_reported = success_meta.repair_attempts
             ctx.max_policy_repairs_reported = success_meta.max_policy_repairs
             self.raise_("pipeline_passed")  # type: ignore[call-arg]
@@ -8096,7 +8110,9 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             self.raise_("pipeline_exhausted")  # type: ignore[call-arg]
 
     # Helpers -------------------------------------------------------------
-    def _format_failure(self, pipeline_results: list[StepResult], writer_error: str | None, attempt: int) -> str:
+    def _format_failure(
+        self, pipeline_results: list[StepResult], writer_error: str | None, attempt: int
+    ) -> str:
         return self.deps.format_pipeline_failure_context(
             pipeline_results,
             self.context.last_classified,
@@ -8647,6 +8663,7 @@ class OptimizeTaskLoop:
         record = IterationRecord(
             iteration=iteration,
             metrics=evaluation.metrics,
+            score_components=evaluation.score_components,
             pipeline_passed=repair_outcome.success if repair_outcome else None,
             pipeline_feedback=pipeline_feedback,
             repair_attempts=repair_attempts_val
@@ -8692,6 +8709,7 @@ class OptimizeTaskLoop:
         return IterationRecord(
             iteration=state.iteration,
             metrics=metrics,
+            score_components=evaluation.score_components if evaluation else {},
             pipeline_passed=None,
             error=evaluation_phase.error or "evaluation_failed",
         )
@@ -8749,6 +8767,7 @@ class OptimizeTaskLoop:
         emit_optimize_iteration_telemetry(
             handle,
             metrics=record.metrics,
+            score_component_states=record.score_components,
             iteration=record.iteration,
             status="recorded",
             pipeline_passed=record.pipeline_passed,
@@ -9002,6 +9021,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterOptimizationBrief, WriterScoreSummary
+from harness.telemetry.observability_models import ScoreComponentTelemetryState
 from harness.telemetry.tracing import UsageDetails
 from harness.utils.type_loader import FrontierContext
 from harness.localization.models import LCATask
@@ -9278,6 +9298,9 @@ class EvaluationResult(BaseModel):
     error: str | None = None
     control_score: float | None = None
     score_summary: WriterScoreSummary | None = None
+    score_components: dict[str, ScoreComponentTelemetryState] = Field(
+        default_factory=dict
+    )
 
 
 class FeedbackPackage(BaseModel):
@@ -9337,6 +9360,9 @@ class IterationRecord(BaseModel):
     writer_error: str | None = None
     repair_attempts: int | None = None
     max_policy_repairs: int | None = None
+    score_components: dict[str, ScoreComponentTelemetryState] = Field(
+        default_factory=dict
+    )
 
 
 class OptimizationIterationState(BaseModel):
@@ -15158,8 +15184,10 @@ from langfuse import LangfuseGeneration, LangfuseSpan
 
 from harness.telemetry.observability_models import (
     EvaluationTelemetryArtifact,
+    LOCALIZATION_CANONICAL_COMPONENTS,
     OptimizeIterationTelemetryContext,
-    evaluation_metrics_map,
+    ScoreComponentTelemetryState,
+    optimize_component_states,
 )
 from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 
@@ -15234,6 +15262,54 @@ def _score_value(value: float | bool) -> float | int:
     return float(value)
 
 
+def _metadata_value(value: float | bool | None) -> float | bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _emit_component_state_scores(
+    handle: LangfuseSpan | LangfuseGeneration | None,
+    *,
+    score_name: str,
+    state: ScoreComponentTelemetryState,
+    operation: str,
+    comment: str | None = None,
+) -> None:
+    if state.available and state.value is not None:
+        safe_emit_score_for_handle(
+            handle,
+            name=score_name,
+            value=_score_value(state.value),
+            data_type=_score_type(state.value),
+            comment=comment,
+            operation=operation,
+        )
+    safe_emit_score_for_handle(
+        handle,
+        name=f"{score_name}_available",
+        value=1 if state.available else 0,
+        data_type="BOOLEAN",
+        comment=comment,
+        operation=f"{operation}.availability",
+    )
+
+
+def _component_state_metadata(
+    component_states: Mapping[str, ScoreComponentTelemetryState],
+) -> dict[str, dict[str, object | None]]:
+    return {
+        name: {
+            "available": state.available,
+            "value": _metadata_value(state.value),
+            "reason": state.reason,
+        }
+        for name, state in component_states.items()
+    }
+
+
 def emit_localization_task_telemetry(
     handle: LangfuseSpan | LangfuseGeneration | None,
     artifact: EvaluationTelemetryArtifact,
@@ -15250,22 +15326,42 @@ def emit_localization_task_telemetry(
     observation-local and compact so backend spans remain diagnostic-only.
     """
 
+    emitted_score_names: list[str] = []
+    for component_name in LOCALIZATION_CANONICAL_COMPONENTS:
+        state = artifact.canonical_component_states[component_name]
+        score_name = f"{score_prefix}.{component_name}"
+        _emit_component_state_scores(
+            handle,
+            score_name=score_name,
+            state=state,
+            operation="localization_task.score",
+        )
+        emitted_score_names.append(f"{score_name}_available")
+        if state.available and state.value is not None:
+            emitted_score_names.append(score_name)
     for metric_name, value in artifact.metric_map.items():
+        if metric_name in LOCALIZATION_CANONICAL_COMPONENTS:
+            continue
+        score_name = f"{score_prefix}.{metric_name}"
         safe_emit_score_for_handle(
             handle,
-            name=f"{score_prefix}.{metric_name}",
+            name=score_name,
             value=_score_value(value),
             data_type=_score_type(value),
             operation="localization_task.score",
         )
+        emitted_score_names.append(score_name)
 
     metadata: dict[str, object] = {
         "telemetry": dict(telemetry_payload),
         "score_summary": artifact.score_summary.model_dump(mode="json"),
         "score_context": artifact.compact_score_context.model_dump(mode="json", exclude_none=True),
+        "score_components": _component_state_metadata(
+            artifact.canonical_component_states
+        ),
         "predicted_files": list(predicted_files),
         "changed_files": list(changed_files),
-        "score_metric_names": sorted(artifact.metric_map),
+        "score_metric_names": sorted(emitted_score_names),
     }
     if task_summary is not None:
         metadata["task_summary"] = dict(task_summary)
@@ -15281,25 +15377,31 @@ def emit_optimize_iteration_telemetry(
     handle: LangfuseSpan | LangfuseGeneration | None,
     *,
     metrics: EvaluationMetrics,
+    score_component_states: Mapping[str, ScoreComponentTelemetryState] | None = None,
     iteration: int,
     status: str | None = None,
     pipeline_passed: bool | None = None,
     score_context_summary: Mapping[str, object] | None = None,
     error: str | None = None,
 ) -> None:
-    metric_map = evaluation_metrics_map(metrics)
-    if pipeline_passed is not None:
-        metric_map["pipeline_passed"] = bool(pipeline_passed)
+    component_states = optimize_component_states(
+        metrics,
+        score_component_states=score_component_states,
+        pipeline_passed=pipeline_passed,
+    )
     comment = json.dumps({"iteration": iteration})
-    for metric_name, value in metric_map.items():
-        safe_emit_score_for_handle(
+    emitted_score_names: list[str] = []
+    for metric_name, state in component_states.items():
+        _emit_component_state_scores(
             handle,
-            name=metric_name,
-            value=_score_value(value),
-            data_type=_score_type(value),
+            score_name=metric_name,
+            state=state,
             comment=comment,
             operation="optimize_iteration.score",
         )
+        emitted_score_names.append(f"{metric_name}_available")
+        if state.available and state.value is not None:
+            emitted_score_names.append(metric_name)
     context = OptimizeIterationTelemetryContext(
         iteration=iteration,
         iteration_ordinal=iteration + 1,
@@ -15313,8 +15415,9 @@ def emit_optimize_iteration_telemetry(
         "iteration_ordinal": iteration + 1,
         "status": status,
         "pipeline_passed": pipeline_passed,
-        "evaluation_metric_names": sorted(metric_map),
+        "evaluation_metric_names": sorted(emitted_score_names),
         "evaluation": context,
+        "score_components": _component_state_metadata(component_states),
     }
     if score_context_summary:
         metadata["score_context_summary"] = dict(score_context_summary)
@@ -15345,6 +15448,21 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from harness.scoring import ScoreBundle, ScoreContext
+
+LOCALIZATION_CANONICAL_COMPONENTS = (
+    "composed_score",
+    "gold_hop",
+    "issue_hop",
+    "token_efficiency",
+)
+
+OPTIMIZE_CANONICAL_COMPONENTS = (
+    "metrics.score",
+    "gold_hop",
+    "issue_hop",
+    "token_efficiency",
+    "pipeline_passed",
+)
 
 
 def _number(value: object) -> float | None:
@@ -15577,6 +15695,16 @@ class CompactScoreContext(BaseModel):
         )
 
 
+class ScoreComponentTelemetryState(BaseModel):
+    """Stable telemetry state for one evaluation component."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool
+    value: float | bool | None = None
+    reason: str | None = None
+
+
 class LocalizationTaskTelemetryContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -15603,6 +15731,9 @@ class EvaluationTelemetryArtifact(BaseModel):
     score_context: ScoreContext
     score_summary: ScoreBundle
     metric_map: dict[str, float | bool] = Field(default_factory=dict)
+    canonical_component_states: dict[str, ScoreComponentTelemetryState] = Field(
+        default_factory=dict
+    )
     compact_score_context: CompactScoreContext
 
     @classmethod
@@ -15618,6 +15749,7 @@ class EvaluationTelemetryArtifact(BaseModel):
             score_context=score_context,
             score_summary=score_summary or score_bundle,
             metric_map=score_bundle_metric_map(score_bundle),
+            canonical_component_states=score_bundle_component_states(score_bundle),
             compact_score_context=CompactScoreContext.from_score_context(score_context),
         )
 
@@ -15646,12 +15778,57 @@ def score_bundle_metric_map(bundle: ScoreBundle) -> dict[str, float | bool]:
         metrics["composed_score"] = float(bundle.composed_score)
     for component_name, result in bundle.results.items():
         stable_name = result.name or component_name
-        if not result.visible_to_agent:
-            continue
         if not result.available or not isinstance(result.value, (int, float)):
             continue
         metrics[stable_name] = float(result.value)
     return metrics
+
+
+def _component_value(value: object) -> float | bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _bundle_component_state(
+    bundle: ScoreBundle,
+    component_name: str,
+) -> ScoreComponentTelemetryState:
+    if component_name == "composed_score":
+        if bundle.composed_score is None:
+            return ScoreComponentTelemetryState(
+                available=False,
+                value=None,
+                reason="composed score unavailable",
+            )
+        return ScoreComponentTelemetryState(
+            available=True,
+            value=float(bundle.composed_score),
+            reason=None,
+        )
+    result = bundle.results.get(component_name)
+    if result is None:
+        return ScoreComponentTelemetryState(
+            available=False,
+            value=None,
+            reason="score component missing from bundle",
+        )
+    return ScoreComponentTelemetryState(
+        available=bool(result.available),
+        value=_component_value(result.value),
+        reason=result.reason,
+    )
+
+
+def score_bundle_component_states(
+    bundle: ScoreBundle,
+) -> dict[str, ScoreComponentTelemetryState]:
+    return {
+        component_name: _bundle_component_state(bundle, component_name)
+        for component_name in LOCALIZATION_CANONICAL_COMPONENTS
+    }
 
 
 def evaluation_metrics_map(metrics: object) -> dict[str, float | bool]:
@@ -15673,16 +15850,74 @@ def evaluation_metrics_map(metrics: object) -> dict[str, float | bool]:
     return metric_map
 
 
+def optimize_component_states(
+    metrics: object,
+    *,
+    score_component_states: Mapping[str, ScoreComponentTelemetryState] | None = None,
+    pipeline_passed: bool | None = None,
+) -> dict[str, ScoreComponentTelemetryState]:
+    metric_map = evaluation_metrics_map(metrics)
+    states: dict[str, ScoreComponentTelemetryState] = {}
+    composed_state = (
+        score_component_states.get("composed_score")
+        if score_component_states is not None
+        else None
+    )
+    if composed_state is not None:
+        states["metrics.score"] = composed_state
+    else:
+        metric_score = metric_map.get("metrics.score")
+        states["metrics.score"] = ScoreComponentTelemetryState(
+            available=metric_score is not None,
+            value=metric_score,
+            reason=None if metric_score is not None else "metrics.score unavailable",
+        )
+    for component_name in ("gold_hop", "issue_hop", "token_efficiency"):
+        component_state = (
+            score_component_states.get(component_name)
+            if score_component_states is not None
+            else None
+        )
+        if component_state is not None:
+            states[component_name] = component_state
+            continue
+        metric_value = metric_map.get(component_name)
+        states[component_name] = ScoreComponentTelemetryState(
+            available=metric_value is not None,
+            value=metric_value,
+            reason=None if metric_value is not None else f"{component_name} unavailable",
+        )
+    states["pipeline_passed"] = ScoreComponentTelemetryState(
+        available=pipeline_passed is not None,
+        value=pipeline_passed,
+        reason=None if pipeline_passed is not None else "pipeline result unavailable",
+    )
+    for metric_name, value in metric_map.items():
+        if metric_name in OPTIMIZE_CANONICAL_COMPONENTS:
+            continue
+        states[metric_name] = ScoreComponentTelemetryState(
+            available=True,
+            value=value,
+            reason=None,
+        )
+    return states
+
+
 __all__ = [
     "BackendRunStats",
     "CompactScoreContext",
     "EvaluationTelemetryArtifact",
     "LocalizationTaskTelemetryContext",
+    "LOCALIZATION_CANONICAL_COMPONENTS",
+    "OPTIMIZE_CANONICAL_COMPONENTS",
     "OptimizeIterationTelemetryContext",
     "RunSummary",
+    "ScoreComponentTelemetryState",
     "TaskRunSummary",
     "TokenUsageBreakdown",
     "evaluation_metrics_map",
+    "optimize_component_states",
+    "score_bundle_component_states",
     "score_bundle_metric_map",
 ]
 </file>
@@ -18457,7 +18692,14 @@ from __future__ import annotations
 import pytest
 
 from harness.orchestration.types import EvaluationMetrics
-from harness.scoring import ComposeMode, Goal, ScoreBundle, ScoreContext, ScoreResult
+from harness.scoring import (
+    ComposeMode,
+    Goal,
+    ScoreBundle,
+    ScoreContext,
+    ScoreEngine,
+    ScoreResult,
+)
 from harness.telemetry import evaluation_emitters
 from harness.telemetry.observability_models import (
     EvaluationTelemetryArtifact,
@@ -18519,6 +18761,30 @@ def _context() -> ScoreContext:
     )
 
 
+def _unavailable_context(
+    *,
+    static_graph_available: bool = True,
+    resolved_prediction_count: int = 1,
+    resolved_gold_count: int = 1,
+    issue_anchor_count: int = 1,
+    token_usage_available: bool = True,
+) -> ScoreContext:
+    return ScoreContext(
+        predicted_files=("a.py",),
+        gold_files=("b.py",),
+        gold_min_hops=None,
+        issue_min_hops=None,
+        previous_total_token_count=None,
+        diagnostics={
+            "static_graph_available": static_graph_available,
+            "resolved_prediction_count": resolved_prediction_count,
+            "resolved_gold_count": resolved_gold_count,
+            "issue_anchor_count": issue_anchor_count,
+            "token_usage_available": token_usage_available,
+        },
+    )
+
+
 def test_evaluation_telemetry_artifact_contains_compact_score_context():
     artifact = EvaluationTelemetryArtifact.from_scoring(
         score_bundle=_bundle(),
@@ -18538,6 +18804,34 @@ def test_evaluation_telemetry_artifact_contains_compact_score_context():
     assert compact["static_graph_available"] is True
     assert compact["token_usage_available"] is True
     assert compact["unresolved_prediction_count"] == 1
+
+
+def test_evaluation_telemetry_artifact_preserves_unavailable_component_state():
+    bundle = ScoreEngine().evaluate(
+        _unavailable_context(
+            static_graph_available=True,
+            resolved_prediction_count=0,
+            resolved_gold_count=1,
+            issue_anchor_count=1,
+            token_usage_available=False,
+        )
+    )
+    artifact = EvaluationTelemetryArtifact.from_scoring(
+        score_bundle=bundle,
+        score_context=_unavailable_context(
+            static_graph_available=True,
+            resolved_prediction_count=0,
+            resolved_gold_count=1,
+            issue_anchor_count=1,
+            token_usage_available=False,
+        ),
+    )
+
+    assert "gold_hop" not in artifact.metric_map
+    assert artifact.canonical_component_states["gold_hop"].available is False
+    assert artifact.canonical_component_states["gold_hop"].reason == "prediction nodes unresolved"
+    assert artifact.canonical_component_states["issue_hop"].reason == "prediction nodes unresolved"
+    assert artifact.canonical_component_states["token_efficiency"].reason == "previous_total_token_count unavailable"
 
 
 def test_localization_task_emitter_scores_and_metadata(monkeypatch: pytest.MonkeyPatch):
@@ -18572,14 +18866,87 @@ def test_localization_task_emitter_scores_and_metadata(monkeypatch: pytest.Monke
 
     assert [score["name"] for score in scores] == [
         "ic.composed_score",
+        "ic.composed_score_available",
         "ic.gold_hop",
+        "ic.gold_hop_available",
         "ic.issue_hop",
+        "ic.issue_hop_available",
         "ic.token_efficiency",
+        "ic.token_efficiency_available",
     ]
     metadata = updates[-1]["metadata"]
     assert metadata["score_context"]["gold_min_hops"] == 0
     assert metadata["score_context"]["previous_total_token_count"] == 123.0
     assert metadata["predicted_files"] == ["a.py", "missing.py"]
+    assert metadata["score_components"]["gold_hop"] == {
+        "available": True,
+        "value": 1.0,
+        "reason": None,
+    }
+
+
+def test_localization_task_emits_availability_and_metadata_for_unavailable_scores(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    scores: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    class Span:
+        id = "localization-task"
+        name = "localization_task"
+
+        def update(self, **kwargs: object) -> None:
+            updates.append(kwargs)
+
+    monkeypatch.setattr(
+        evaluation_emitters,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: scores.append(kwargs),
+    )
+    unavailable_context = _unavailable_context(
+        static_graph_available=False,
+        resolved_prediction_count=0,
+        resolved_gold_count=0,
+        issue_anchor_count=0,
+        token_usage_available=False,
+    )
+    artifact = EvaluationTelemetryArtifact.from_scoring(
+        score_bundle=ScoreEngine().evaluate(unavailable_context),
+        score_context=unavailable_context,
+    )
+
+    evaluation_emitters.emit_localization_task_telemetry(
+        Span(),
+        artifact,
+        score_prefix="ic",
+        telemetry_payload={"identity": {"task_id": "task"}},
+        predicted_files=["a.py"],
+        changed_files=["b.py"],
+    )
+
+    score_names = [score["name"] for score in scores]
+    assert "ic.gold_hop" not in score_names
+    assert "ic.issue_hop" not in score_names
+    assert "ic.token_efficiency" not in score_names
+    assert "ic.gold_hop_available" in score_names
+    assert "ic.issue_hop_available" in score_names
+    assert "ic.token_efficiency_available" in score_names
+    metadata = updates[-1]["metadata"]["score_components"]
+    assert metadata["gold_hop"] == {
+        "available": False,
+        "value": None,
+        "reason": "static_graph unavailable",
+    }
+    assert metadata["issue_hop"] == {
+        "available": False,
+        "value": None,
+        "reason": "static_graph unavailable",
+    }
+    assert metadata["token_efficiency"] == {
+        "available": False,
+        "value": None,
+        "reason": "previous_total_token_count unavailable",
+    }
 
 
 def test_optimize_iteration_emits_all_numeric_boolean_metrics(monkeypatch: pytest.MonkeyPatch):
@@ -18598,6 +18965,10 @@ def test_optimize_iteration_emits_all_numeric_boolean_metrics(monkeypatch: pytes
         "emit_score_for_handle",
         lambda handle, **kwargs: scores.append(kwargs),
     )
+    artifact = EvaluationTelemetryArtifact.from_scoring(
+        score_bundle=_bundle(),
+        score_context=_context(),
+    )
     metrics = EvaluationMetrics.model_validate(
         {
             "score": 0.4,
@@ -18614,6 +18985,7 @@ def test_optimize_iteration_emits_all_numeric_boolean_metrics(monkeypatch: pytes
     evaluation_emitters.emit_optimize_iteration_telemetry(
         Span(),
         metrics=metrics,
+        score_component_states=artifact.canonical_component_states,
         iteration=2,
         status="success",
         pipeline_passed=False,
@@ -18623,14 +18995,89 @@ def test_optimize_iteration_emits_all_numeric_boolean_metrics(monkeypatch: pytes
     emitted_names = [score["name"] for score in scores]
     assert emitted_names == [
         "metrics.score",
+        "metrics.score_available",
         "gold_hop",
+        "gold_hop_available",
         "issue_hop",
+        "issue_hop_available",
         "token_efficiency",
-        "component_passed",
+        "token_efficiency_available",
         "pipeline_passed",
+        "pipeline_passed_available",
+        "component_passed",
+        "component_passed_available",
     ]
     assert {score["name"]: score["data_type"] for score in scores}["component_passed"] == "BOOLEAN"
     assert updates[-1]["metadata"]["score_context_summary"] == {"gold_hop": 1.0}
+    assert updates[-1]["metadata"]["score_components"]["gold_hop"]["available"] is True
+
+
+def test_optimize_iteration_surfaces_unavailable_canonical_component_state(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    scores: list[dict[str, object]] = []
+    updates: list[dict[str, object]] = []
+
+    class Span:
+        id = "optimize-iteration"
+        name = "optimize_iteration"
+
+        def update(self, **kwargs: object) -> None:
+            updates.append(kwargs)
+
+    monkeypatch.setattr(
+        evaluation_emitters,
+        "emit_score_for_handle",
+        lambda handle, **kwargs: scores.append(kwargs),
+    )
+    unavailable_context = _unavailable_context(
+        static_graph_available=True,
+        resolved_prediction_count=1,
+        resolved_gold_count=1,
+        issue_anchor_count=0,
+        token_usage_available=False,
+    )
+    artifact = EvaluationTelemetryArtifact.from_scoring(
+        score_bundle=ScoreEngine().evaluate(unavailable_context),
+        score_context=unavailable_context,
+    )
+    metrics = EvaluationMetrics.model_validate(
+        {
+            "score": 0.4,
+            "additional_metrics": [
+                {"name": "component_passed", "value": True},
+            ],
+        }
+    )
+
+    evaluation_emitters.emit_optimize_iteration_telemetry(
+        Span(),
+        metrics=metrics,
+        score_component_states=artifact.canonical_component_states,
+        iteration=1,
+        status="failed",
+        pipeline_passed=None,
+        score_context_summary={},
+        error="pipeline unavailable",
+    )
+
+    score_names = [score["name"] for score in scores]
+    assert "gold_hop_available" in score_names
+    assert "issue_hop_available" in score_names
+    assert "token_efficiency_available" in score_names
+    assert "pipeline_passed_available" in score_names
+    assert "issue_hop" not in score_names
+    metadata = updates[-1]["metadata"]["score_components"]
+    assert metadata["issue_hop"] == {
+        "available": False,
+        "value": None,
+        "reason": "issue anchors unresolved",
+    }
+    assert metadata["pipeline_passed"] == {
+        "available": False,
+        "value": None,
+        "reason": "pipeline result unavailable",
+    }
 
 
 def test_evaluation_metrics_map_ignores_non_numeric_or_boolean_entries():
@@ -18650,6 +19097,31 @@ def test_evaluation_metrics_map_ignores_non_numeric_or_boolean_entries():
         "numeric": 2.0,
         "boolean": False,
     }
+
+
+def test_unavailable_and_omitted_components_are_distinguishable():
+    artifact = EvaluationTelemetryArtifact.from_scoring(
+        score_bundle=ScoreEngine().evaluate(
+            _unavailable_context(
+                static_graph_available=True,
+                resolved_prediction_count=0,
+                resolved_gold_count=1,
+                issue_anchor_count=1,
+                token_usage_available=False,
+            )
+        ),
+        score_context=_unavailable_context(
+            static_graph_available=True,
+            resolved_prediction_count=0,
+            resolved_gold_count=1,
+            issue_anchor_count=1,
+            token_usage_available=False,
+        ),
+    )
+
+    assert "gold_hop" not in artifact.metric_map
+    assert artifact.canonical_component_states["gold_hop"].available is False
+    assert "non_canonical_metric" not in artifact.canonical_component_states
 
 
 def test_metadata_update_failures_are_logged(caplog: pytest.LogCaptureFixture):
@@ -25786,8 +26258,8 @@ Langfuse Python v4 is observation-centric in this codebase:
 - propagated attributes are restricted to documented correlation fields
 
 Canonical evaluation observations:
-- `localization_task` is the localization evaluation surface. It emits all component scores from the evaluation telemetry artifact and stores compact `score_context` metadata.
-- `optimize_iteration` is the optimizer evaluation surface. It emits `metrics.score`, `pipeline_passed`, and every numeric/boolean additional metric, plus compact iteration score-context metadata.
+- `localization_task` is the localization evaluation surface. It emits numeric canonical component scores when available, always emits canonical `<component>_available` boolean scores, and stores compact canonical `score_components` metadata with `available`, `value`, and `reason`.
+- `optimize_iteration` is the optimizer evaluation surface. It emits `metrics.score`, `pipeline_passed`, canonical component availability scores, and every numeric/boolean additional metric in scope, plus compact iteration score-context metadata and canonical `score_components` metadata.
 
 Backend spans remain diagnostic-only:
 - `iterative_context` and `jcodemunch` record backend diagnostics such as node counts and task summaries.

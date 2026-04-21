@@ -1,0 +1,33 @@
+{
+  "edges": [
+    {
+      "kind": "calls",
+      "source": "A",
+      "target": "A_child"
+    },
+    {
+      "kind": "calls",
+      "source": "A_child",
+      "target": "A_child_child"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "A",
+      "kind": "symbol",
+      "state": "resolved",
+      "tokens": 1
+    },
+    {
+      "id": "A_child",
+      "kind": "symbol",
+      "state": "resolved",
+      "tokens": 1
+    },
+    {
+      "id": "A_child_child",
+      "kind": "symbol",
+      "state": "pending"
+    }
+  ]
+}
