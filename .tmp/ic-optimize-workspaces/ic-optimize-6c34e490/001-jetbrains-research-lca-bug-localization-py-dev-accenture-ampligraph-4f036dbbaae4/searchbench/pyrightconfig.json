@@ -1,5 +1,0 @@
-{
-  "include": ["harness"],
-  "exclude": ["harness/tests_harness"],
-  "reportMissingParameterType": "none"
-}
