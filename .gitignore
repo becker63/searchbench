@@ -2,6 +2,7 @@ cat <<EOF > .gitignore
 __pycache__/
 *.pyc
 .venv/
+.tmp
 .uv/
 dist/
 build/
