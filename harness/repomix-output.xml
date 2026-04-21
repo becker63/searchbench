@@ -400,26 +400,51 @@ _AGGRESSIVE_USER_CHARS = 1500
 _LOGGER = logging.getLogger(__name__)
 
 
-def _require_parent(parent: object | None, owner: str = "runner agent") -> object:
+def _require_parent(
+    parent: LangfuseSpan | LangfuseGeneration | None,
+    owner: str = "runner agent",
+) -> LangfuseSpan | LangfuseGeneration:
     if parent is None:
         raise RuntimeError(f"Parent span required for {owner} tracing")
     return parent
 
 
 def _span_label(span: LangfuseSpan | LangfuseGeneration) -> str:
-    if span.name:
-        return span.name
     return span.id
 
 
-def _safe_update(span: LangfuseSpan | LangfuseGeneration | None, **kwargs: object) -> None:
+def _langfuse_usage_details(
+    usage_details: Mapping[str, object] | None,
+) -> dict[str, int] | None:
+    if not isinstance(usage_details, Mapping):
+        return None
+    numeric: dict[str, int] = {}
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input",
+        "input_cached_tokens",
+        "output",
+        "total",
+    ):
+        value = usage_details.get(key)
+        if isinstance(value, (int, float)):
+            numeric[key] = int(value)
+    return numeric or None
+
+
+def _safe_update(
+    span: LangfuseSpan | LangfuseGeneration | None,
+    *,
+    metadata: Mapping[str, object] | None = None,
+) -> None:
     if span is None:
         return
     try:
-        span.update(**kwargs)
+        span.update(metadata=dict(metadata) if metadata is not None else None)
     except Exception as exc:  # noqa: BLE001
-        metadata = kwargs.get("metadata")
-        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else sorted(kwargs)
+        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else ["metadata"]
         _LOGGER.warning(
             "Langfuse metadata update failed operation=localizer.update observation=%s keys=%s error=%s",
             _span_label(span),
@@ -631,7 +656,7 @@ def _collect_tool_results(
     observations: list[dict[str, object]],
     dispatch_tool_call: Callable[[str, dict[str, Any]], object],
     budget_limit: int,
-    parent_trace: object | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
 ) -> list[dict[str, object]]:
     parent_span = _require_parent(parent_trace, owner="toolcall")
     total_chars = sum(_message_content_length(obs) for obs in observations)
@@ -767,7 +792,7 @@ def run_agent(
     tool_specs: list[ChatCompletionToolParam],
     dispatch_tool_call: Callable[[str, dict[str, Any]], object],
     system_prompt: str,
-    parent_trace: object | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
     backend_name: str | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner=backend_name or "runner agent")
@@ -843,7 +868,7 @@ def run_agent(
             usage_details = _collect_usage_details(completion)
             if usage_details:
                 _accumulate_usage_details(aggregate_usage_details, usage_details)
-                obs.update(usage_details=usage_details)
+                obs.update(usage_details=_langfuse_usage_details(usage_details))
             else:
                 raise RuntimeError("Agent response missing usage details")
             message_obj = getattr(choice, "message", None)
@@ -931,7 +956,7 @@ def run_agent_with_retry(
     tool_specs: list[ChatCompletionToolParam],
     dispatch_tool_call: Callable[[str, dict[str, Any]], object],
     system_prompt: str,
-    parent_trace: object | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
     backend_name: str | None = None,
 ):
     parent_span = _require_parent(parent_trace, owner=backend_name or "runner agent")
@@ -1471,7 +1496,7 @@ def _format_finalization_messages(agent_task: dict[str, object], observations: l
 def _finalize_localization(
     task: LCATask,
     observations: list[dict[str, object]],
-    parent_trace: object | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
 ) -> LocalizationRunResult:
     client, model = _make_client()
     agent_task = serialize_lca_task_for_prompt(task)
@@ -1494,7 +1519,7 @@ def _finalize_localization(
         )
         usage_details = _collect_usage_details(completion)
         if usage_details:
-            obs.update(usage_details=usage_details)
+            obs.update(usage_details=_langfuse_usage_details(usage_details))
         choice = completion.choices[0]
         message_obj = getattr(choice, "message", None)
         content = getattr(message_obj, "content", None) if message_obj is not None else None
@@ -1561,7 +1586,7 @@ def _finalize_or_recover(
     observations: list[dict[str, object]],
     normalized: Mapping[str, object],
     node_count: int | None,
-    parent_span: object,
+    parent_span: LangfuseSpan | LangfuseGeneration,
 ) -> LocalizationRunResult:
     try:
         final = _finalize_localization(task, observations, parent_trace=parent_span)
@@ -1620,7 +1645,7 @@ def run_ic_iteration(
     task: LCATask,
     score_fn: Callable[..., float] | None = None,
     steps: int = 5,
-    parent_trace: object | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
 ):
     started_at = time.perf_counter()
     parent_span = _require_parent(parent_trace, owner="iterative_context")
@@ -1741,7 +1766,7 @@ def run_ic_iteration(
 def run_jc_iteration(
     task: LCATask,
     steps: int = 5,
-    parent_trace: object | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
 ):
     started_at = time.perf_counter()
     parent_span = _require_parent(parent_trace, owner="jcodemunch")
@@ -1922,7 +1947,8 @@ class WriterRequest(BaseModel):
     frontier_context: str
     frontier_context_details: FrontierContext
     optimization_brief: WriterOptimizationBrief
-    parent_trace: object | None = None
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None
+    writer_session_id: str | None = None
     failure_context: str | None = None
     repair_attempt: int = 0
 
@@ -1939,26 +1965,56 @@ def _get_client():
     return _client, get_writer_model()
 
 
-def _require_parent(parent_trace: object | None) -> object:
+def _require_parent(
+    parent_trace: LangfuseSpan | LangfuseGeneration | None,
+) -> LangfuseSpan | LangfuseGeneration:
     if parent_trace is None:
         raise RuntimeError("Parent span required for writer tracing")
     return parent_trace
 
 
 def _span_label(span: LangfuseSpan | LangfuseGeneration) -> str:
-    if span.name:
-        return span.name
     return span.id
 
 
-def _safe_update(span: LangfuseSpan | LangfuseGeneration | None, **kwargs: object) -> None:
+def _langfuse_usage_details(
+    usage_details: Mapping[str, object] | None,
+) -> dict[str, int] | None:
+    if not isinstance(usage_details, Mapping):
+        return None
+    numeric: dict[str, int] = {}
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input",
+        "input_cached_tokens",
+        "output",
+        "total",
+    ):
+        value = usage_details.get(key)
+        if isinstance(value, (int, float)):
+            numeric[key] = int(value)
+    return numeric or None
+
+
+def _safe_update(
+    span: LangfuseSpan | LangfuseGeneration | None,
+    *,
+    metadata: Mapping[str, object] | None = None,
+    usage_details: Mapping[str, object] | None = None,
+    cost_details: Mapping[str, float] | None = None,
+) -> None:
     if span is None:
         return
     try:
-        span.update(**kwargs)
+        span.update(
+            metadata=dict(metadata) if metadata is not None else None,
+            usage_details=_langfuse_usage_details(usage_details),
+            cost_details=dict(cost_details) if cost_details is not None else None,
+        )
     except Exception as exc:  # noqa: BLE001
-        metadata = kwargs.get("metadata")
-        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else sorted(kwargs)
+        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else ["metadata"]
         _LOGGER.warning(
             "Langfuse metadata update failed operation=writer.update observation=%s keys=%s error=%s",
             _span_label(span),
@@ -2035,7 +2091,8 @@ def generate_policy(
     frontier_context_details: FrontierContext,
     optimization_brief: WriterOptimizationBrief,
     feedback: dict[str, Any] | None = None,
-    parent_trace: object | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
+    writer_session_id: str | None = None,
     failure_context: str | None = None,
     repair_attempt: int = 0,
 ) -> str:
@@ -2052,6 +2109,7 @@ def generate_policy(
             frontier_context_details=frontier_context_details,
             optimization_brief=optimization_brief,
             parent_trace=parent_trace,
+            writer_session_id=writer_session_id,
             failure_context=failure_context,
             repair_attempt=repair_attempt,
         )
@@ -2062,11 +2120,6 @@ def generate_policy(
     client, model = _get_client()
     if client is None or not hasattr(client, "chat"):
         raise RuntimeError("Writer client is not available")
-    writer_session_id = getattr(parent_span, "session_id", None)
-    parent_metadata = getattr(parent_span, "metadata", None)
-    if writer_session_id is None and isinstance(parent_metadata, Mapping):
-        raw_session = parent_metadata.get("writer_session_id") or parent_metadata.get("session_id")
-        writer_session_id = raw_session if isinstance(raw_session, str) else None
     model_budget = get_model_budget(model)
     failure_context_budget = compute_prompt_char_budget(model, repair_attempt=repair_attempt)
     failure_context = failure_context or ""
@@ -6916,6 +6969,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
+from langfuse import LangfuseGeneration, LangfuseSpan
+
 from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
@@ -6936,7 +6991,6 @@ from .types import (
     FailedRepairDetails,
     LoopDependencies,
     PreparedTasks,
-    SpanHandle,
     StartObservation,
     SupportsPipelineRun,
     format_failure_context_payload,
@@ -6966,7 +7020,7 @@ class EvaluateLocalizationBatch(Protocol):
         *,
         dataset_provenance: str | None = None,
         worktree_manager: WorktreeManager | None = None,
-        parent_trace: object | None = None,
+        parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
         runner: LocalizationRunner | None = None,
     ) -> LocalizationEvaluationResult: ...
 
@@ -6980,7 +7034,8 @@ class PolicyGenerator(Protocol):
         frontier_context_details: FrontierContext,
         optimization_brief: WriterOptimizationBrief,
         feedback: dict[str, object] | None = None,
-        parent_trace: object | None = None,
+        parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
+        writer_session_id: str | None = None,
         failure_context: str | None = None,
         repair_attempt: int = 0,
     ) -> str: ...
@@ -7036,7 +7091,7 @@ class RuntimeCollaborators:
 
 def prepare_iteration_tasks(
     task: LCATask,
-    parent_trace: SpanHandle | None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None,
     *,
     start_observation: StartObservation,
     index_folder: IndexFolder,
@@ -7098,7 +7153,7 @@ def first_failed_step(steps: list[StepResult]) -> StepResult | None:
 def run_policy_pipeline(
     pipeline: SupportsPipelineRun,
     repo_root: Path,
-    repair_obs: SpanHandle | None = None,
+    repair_obs: LangfuseSpan | LangfuseGeneration | None = None,
     allow_no_parent: bool = False,
     *,
     emit_score: EmitScore,
@@ -7117,12 +7172,9 @@ def run_policy_pipeline(
         step if isinstance(step, StepResult) else StepResult.from_external(step)
         for step in raw_results
     ]
-    trace_id = getattr(repair_obs, "trace_id", None) if repair_obs is not None else None
-    observation_id = getattr(repair_obs, "id", None) if repair_obs is not None else None
-    session_id_val = (
-        getattr(repair_obs, "session_id", None) if repair_obs is not None else None
-    )
-    if not any([trace_id, observation_id, session_id_val]):
+    trace_id = repair_obs.trace_id if repair_obs is not None else None
+    observation_id = repair_obs.id if repair_obs is not None else None
+    if not any([trace_id, observation_id]):
         return step_results, all(step_succeeded(result) for result in step_results)
 
     for step in step_results:
@@ -7137,7 +7189,6 @@ def run_policy_pipeline(
             data_type="NUMERIC",
             trace_id=trace_id,
             observation_id=observation_id,
-            session_id=session_id_val,
             score_id=score_id,
         )
         pass_score_id = (
@@ -7151,7 +7202,6 @@ def run_policy_pipeline(
             data_type="BOOLEAN",
             trace_id=trace_id,
             observation_id=observation_id,
-            session_id=session_id_val,
             score_id=pass_score_id,
         )
     return step_results, all(step_succeeded(result) for result in step_results)
@@ -7162,7 +7212,7 @@ def finalize_successful_policy(
     new_code: str,
     attempts_used: int,
     max_repair_attempts: int,
-    repair_obs: object | None = None,
+    repair_obs: LangfuseSpan | LangfuseGeneration | None = None,
     read_policy: ReadPolicy,
 ) -> tuple[str, AcceptedPolicyMeta]:
     del repair_obs
@@ -7232,7 +7282,10 @@ def build_loop_dependencies(
     build_iteration_feedback: BuildIterationFeedback,
     attempt_policy_generation: AttemptPolicyGeneration,
 ) -> LoopDependencies:
-    def prepare_tasks(task: LCATask, parent_trace: SpanHandle | None) -> PreparedTasks:
+    def prepare_tasks(
+        task: LCATask,
+        parent_trace: LangfuseSpan | LangfuseGeneration | None,
+    ) -> PreparedTasks:
         return prepare_iteration_tasks(
             task,
             parent_trace,
@@ -7243,7 +7296,7 @@ def build_loop_dependencies(
     def run_pipeline(
         pipeline: SupportsPipelineRun,
         repo_root: Path,
-        repair_obs: SpanHandle | None = None,
+        repair_obs: LangfuseSpan | LangfuseGeneration | None = None,
         allow_no_parent: bool = False,
     ) -> tuple[list[StepResult], bool]:
         return run_policy_pipeline(
@@ -7259,7 +7312,7 @@ def build_loop_dependencies(
         new_code: str,
         attempts_used: int,
         max_repair_attempts: int,
-        repair_obs: object | None = None,
+        repair_obs: LangfuseSpan | LangfuseGeneration | None = None,
     ) -> tuple[str, AcceptedPolicyMeta]:
         return finalize_successful_policy(
             new_code=new_code,
@@ -7310,6 +7363,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from langfuse import LangfuseGeneration, LangfuseSpan
 
 from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
@@ -7363,7 +7418,7 @@ def _failure_evaluation_result(error: str) -> EvaluationResult:
 def evaluate_policy_on_item(
     task: LCATask,
     baseline_record: "EvaluationRecord | None",
-    iteration_span: object | None = None,
+    iteration_span: LangfuseSpan | LangfuseGeneration | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
     del baseline_record, iteration_index
@@ -7567,6 +7622,7 @@ from __future__ import annotations
 import logging
 from typing import Any, ContextManager, Protocol
 
+from langfuse import LangfuseGeneration, LangfuseSpan
 from statemachine import State
 
 from harness.telemetry.evaluation_emitters import safe_update_observation_metadata
@@ -7574,12 +7630,6 @@ from harness.telemetry.evaluation_emitters import safe_update_observation_metada
 from .types import RepairMachineModel
 
 _LOGGER = logging.getLogger(__name__)
-
-
-class SpanHandle(Protocol):
-    def end(self, **kwargs: object) -> None: ...
-
-    def update(self, **kwargs: object) -> None: ...
 
 
 class _EventTarget(Protocol):
@@ -7623,7 +7673,7 @@ class RepairTracingListener:
                 metadata["ordinal"] = ctx.task_ordinal
             if ctx.task_total is not None:
                 metadata["total"] = ctx.task_total
-            cm: ContextManager[SpanHandle] = repair_model.deps.start_observation(
+            cm: ContextManager[LangfuseSpan | LangfuseGeneration] = repair_model.deps.start_observation(
                 name=f"policy_repair_attempt_{ctx.attempts_used}",
                 parent=ctx.parent_trace,
                 metadata=metadata,
@@ -7882,6 +7932,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                     failure_context_str=ctx.failure_context,
                     repair_attempt=ctx.attempts_used,
                     parent_trace=writer_span,
+                    writer_session_id=ctx.writer_session_id,
                     pipeline_feedback=ctx.last_classified,
                 )
                 safe_update_observation_metadata(
@@ -8105,6 +8156,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from langfuse import LangfuseGeneration, LangfuseSpan
+
 from harness.localization.models import LCATask
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterFeedbackFinding
@@ -8136,7 +8189,6 @@ from .types import (
     RepairMachineModel,
     RepairOutcome,
     RunMetadata,
-    SpanHandle,
     WriterInputContext,
 )
 
@@ -8190,7 +8242,7 @@ class OptimizeTaskLoop:
         self.context = context
         self.deps = deps
         self.max_policy_repairs = max_policy_repairs
-        self._current_iteration_span: SpanHandle | None = None
+        self._current_iteration_span: LangfuseSpan | LangfuseGeneration | None = None
 
     def run(self) -> list[IterationRecord]:
         status = "running"
@@ -8327,7 +8379,7 @@ class OptimizeTaskLoop:
         self,
         state: OptimizationIterationState,
         prepared_tasks: PreparedTasks,
-        iteration_span: SpanHandle,
+        iteration_span: LangfuseSpan | LangfuseGeneration,
     ) -> EvaluationPhaseResult:
         iteration_tasks = prepared_tasks.build_iteration_tasks()
         metadata = {
@@ -8395,7 +8447,7 @@ class OptimizeTaskLoop:
         self,
         state: OptimizationIterationState,
         evaluation_phase: EvaluationPhaseResult,
-        iteration_span: SpanHandle,
+        iteration_span: LangfuseSpan | LangfuseGeneration,
     ) -> ReducerSummary:
         _LOGGER.info(
             "[OPTIMIZE] reduce_iteration start iteration=%s/%s task=%s",
@@ -8451,7 +8503,7 @@ class OptimizeTaskLoop:
         state: OptimizationIterationState,
         evaluation: EvaluationResult,
         reducer_summary: ReducerSummary,
-        iteration_span: SpanHandle,
+        iteration_span: LangfuseSpan | LangfuseGeneration,
     ) -> WriterInputContext:
         repo_root = self.deps.find_repo_root()
         _LOGGER.info(
@@ -8503,7 +8555,7 @@ class OptimizeTaskLoop:
     def _writer_iteration(
         self,
         writer_input: WriterInputContext,
-        iteration_span: SpanHandle,
+        iteration_span: LangfuseSpan | LangfuseGeneration,
     ) -> RepairOutcome:
         state = writer_input.state
         _LOGGER.info(
@@ -8553,7 +8605,7 @@ class OptimizeTaskLoop:
         repo_root: Path,
         evaluation: EvaluationResult,
         feedback: FeedbackPackage,
-        iteration_span: SpanHandle | None,
+        iteration_span: LangfuseSpan | LangfuseGeneration | None,
     ) -> RepairOutcome:
         repair_ctx = RepairContext(
             repo_root=repo_root,
@@ -8691,7 +8743,7 @@ class OptimizeTaskLoop:
 
     def _record_iteration_scores(
         self,
-        handle: SpanHandle | None,
+        handle: LangfuseSpan | LangfuseGeneration | None,
         record: IterationRecord,
     ) -> None:
         emit_optimize_iteration_telemetry(
@@ -8710,7 +8762,7 @@ class OptimizeTaskLoop:
 
     def _finalize_iteration_span(
         self,
-        span: SpanHandle,
+        span: LangfuseSpan | LangfuseGeneration,
         outcome: IterationOutcome,
     ) -> None:
         metadata: dict[str, object] = {
@@ -8807,7 +8859,7 @@ class OptimizeTaskLoop:
 def run_loop(
     task: LCATask,
     iterations: int = DEFAULT_OPTIMIZATION_ITERATIONS,
-    parent_trace: SpanHandle | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
     baseline_record: "EvaluationRecord | Mapping[str, object] | None" = None,
     session_id: str | None = None,
     optimize_run_id: str | None = None,
@@ -8869,7 +8921,7 @@ def run_loop(
 def _fallback_history_from_context(
     context: LoopContext,
     deps: LoopDependencies,
-    parent_trace: SpanHandle | None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None,
 ) -> list[IterationRecord]:
     repo_root = deps.find_repo_root()
     pipeline = deps.default_pipeline()
@@ -8945,6 +8997,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, ContextManager, Mapping, Protocol, Sequence, runtime_checkable
 
+from langfuse import LangfuseGeneration, LangfuseSpan
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness.pipeline.types import PipelineClassification, StepResult
@@ -8964,18 +9017,11 @@ FeedbackMap = Mapping[str, str | float | int | bool | None]
 
 
 @runtime_checkable
-class SpanHandle(Protocol):
-    def end(self, **kwargs: object) -> None: ...
-
-    def update(self, **kwargs: object) -> None: ...
-
-
-@runtime_checkable
 class SupportsPipelineRun(Protocol):
     def run(
         self,
         repo_root: Path,
-        observation: SpanHandle | None = None,
+        observation: LangfuseSpan | LangfuseGeneration | None = None,
         allow_no_parent: bool = False,
     ) -> list[StepResult]: ...
 
@@ -8986,13 +9032,13 @@ class StartObservation(Protocol):
         self,
         name: str,
         *,
-        parent: object | None = None,
+        parent: LangfuseSpan | LangfuseGeneration | None = None,
         as_type: str = "span",
         input: object | None = None,
         model: str | None = None,
         metadata: Mapping[str, object] | None = None,
         usage_details: UsageDetails | None = None,
-    ) -> ContextManager[SpanHandle]: ...
+    ) -> ContextManager[LangfuseSpan | LangfuseGeneration]: ...
 
 
 @runtime_checkable
@@ -9007,7 +9053,8 @@ class AttemptPolicyGeneration(Protocol):
         optimization_brief: WriterOptimizationBrief,
         failure_context_str: str | None,
         repair_attempt: int,
-        parent_trace: object | None = None,
+        parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
+        writer_session_id: str | None = None,
         pipeline_feedback: PipelineClassification | None = None,
     ) -> tuple[str | None, str | None]: ...
 
@@ -9018,7 +9065,7 @@ class EvaluatePolicyOnItem(Protocol):
         self,
         task: LCATask,
         baseline_record: "EvaluationRecord | None",
-        iteration_span: SpanHandle | None,
+        iteration_span: LangfuseSpan | LangfuseGeneration | None,
         iteration_index: int | None,
     ) -> "EvaluationResult": ...
 
@@ -9040,7 +9087,7 @@ class RunPolicyPipeline(Protocol):
         self,
         pipeline: SupportsPipelineRun,
         repo_root: Path,
-        repair_obs: SpanHandle | None = None,
+        repair_obs: LangfuseSpan | LangfuseGeneration | None = None,
         allow_no_parent: bool = False,
     ) -> tuple[list[StepResult], bool]: ...
 
@@ -9053,7 +9100,7 @@ class FinalizeSuccessfulPolicy(Protocol):
         new_code: str,
         attempts_used: int,
         max_repair_attempts: int,
-        repair_obs: object | None = None,
+        repair_obs: LangfuseSpan | LangfuseGeneration | None = None,
     ) -> tuple[str, "AcceptedPolicyMeta"]: ...
 
 
@@ -9386,10 +9433,10 @@ class LoopContext(BaseModel):
     writer_session_id: str | None = None
     task_ordinal: int | None = None
     task_total: int | None = None
-    parent_trace: SpanHandle | None = None
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None
     run_metadata: RunMetadata | None = None
     baseline_record: "EvaluationRecord | None" = None
-    run_trace: SpanHandle | None
+    run_trace: LangfuseSpan | LangfuseGeneration | None
     history: list[IterationRecord] = Field(default_factory=list)
     prepared_tasks: PreparedTasks | None = None
     prev_score: float | None = None
@@ -9403,7 +9450,9 @@ class LoopDependencies(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    prepare_iteration_tasks: Callable[[LCATask, SpanHandle | None], PreparedTasks]
+    prepare_iteration_tasks: Callable[
+        [LCATask, LangfuseSpan | LangfuseGeneration | None], PreparedTasks
+    ]
     evaluate_policy_on_item: EvaluatePolicyOnItem
     build_iteration_feedback: BuildIterationFeedback
     attempt_policy_generation: AttemptPolicyGeneration
@@ -9427,7 +9476,7 @@ class RepairContext(BaseModel):
     evaluation: EvaluationResult
     feedback: FeedbackPackage
     max_repair_attempts: int
-    parent_trace: SpanHandle | None
+    parent_trace: LangfuseSpan | LangfuseGeneration | None
     writer_model: str | None
     optimize_run_id: str | None = None
     writer_session_id: str | None = None
@@ -9442,7 +9491,7 @@ class RepairContext(BaseModel):
     pipeline_passed: bool = False
     candidate_code: str | None = None
     pipeline: SupportsPipelineRun | None = None
-    repair_observation: SpanHandle | None = None
+    repair_observation: LangfuseSpan | LangfuseGeneration | None = None
     writer_error: str | None = None
     pipeline_feedback: PipelineClassification | None = None
     failed_step: str | None = None
@@ -9453,7 +9502,7 @@ class RepairContext(BaseModel):
     repair_attempts_reported: int | None = None
     max_policy_repairs_reported: int | None = None
     error: str | None = None
-    repair_observation_cm: ContextManager[SpanHandle] | None = None
+    repair_observation_cm: ContextManager[LangfuseSpan | LangfuseGeneration] | None = None
 
 
 class AcceptedPolicyMeta(BaseModel):
@@ -9558,6 +9607,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from langfuse import LangfuseGeneration, LangfuseSpan
+
 from harness.agents.writer import generate_policy
 from harness.orchestration.runtime_context import optimization_policy_path
 from harness.pipeline.types import PipelineClassification
@@ -9595,7 +9646,8 @@ def attempt_policy_generation(
     optimization_brief: WriterOptimizationBrief,
     failure_context_str: str | None,
     repair_attempt: int,
-    parent_trace: object | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
+    writer_session_id: str | None = None,
     pipeline_feedback: PipelineClassification | None = None,
 ) -> tuple[str | None, str | None]:
     try:
@@ -9610,6 +9662,7 @@ def attempt_policy_generation(
             optimization_brief=optimization_brief,
             feedback=feedback,
             parent_trace=parent_trace,
+            writer_session_id=writer_session_id,
             failure_context=failure_context_str,
             repair_attempt=repair_attempt,
         )
@@ -12188,6 +12241,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Callable, Mapping, Sequence
 
+from langfuse import LangfuseGeneration, LangfuseSpan
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.localization.errors import (
@@ -12266,18 +12320,22 @@ class EvaluationBundle(BaseModel):
     failure: LocalizationEvaluationFailure | None = None
 
 
-def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -> None:
-    updater = getattr(span, "update", None)
-    if callable(updater):
-        try:
-            updater(metadata=metadata)
-        except Exception as exc:  # noqa: BLE001
-            logging.getLogger(__name__).warning(
-                "Langfuse metadata update failed operation=baseline.metadata observation=%s keys=%s error=%s",
-                getattr(span, "id", type(span).__name__),
-                sorted(str(key) for key in metadata),
-                exc,
-            )
+def _safe_update_metadata(
+    span: LangfuseSpan | LangfuseGeneration | None,
+    metadata: Mapping[str, object],
+) -> None:
+    if span is None:
+        return
+    keys = sorted(str(key) for key in metadata)
+    try:
+        span.update(metadata=dict(metadata))
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "Langfuse metadata update failed operation=baseline.metadata observation=%s keys=%s error=%s",
+            span.id,
+            keys,
+            exc,
+        )
 
 
 def _aggregate_score_summaries(
@@ -12326,7 +12384,7 @@ def _aggregate_score_summaries(
 
 
 def emit_baseline_dataset_aggregates(
-    span: object | None,
+    span: LangfuseSpan | LangfuseGeneration | None,
     records: Sequence[EvaluationRecord],
     extra_metadata: Mapping[str, object] | None = None,
 ) -> None:
@@ -12426,7 +12484,7 @@ def compute_baseline_for_task(
     task: LCATask,
     session_id: str | None = None,
     dataset_version: str | None = None,
-    parent_trace: object | None = None,
+    parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
     runner: Callable[
         [LCATask, str, object | None], LocalizationRunResult
     ]
@@ -12494,7 +12552,7 @@ def compute_baseline_for_task(
                 repo_owner=task.identity.repo_owner,
                 repo_name=task.identity.repo_name,
                 base_sha=task.identity.base_sha,
-                trace_id=getattr(trace, "id", None),
+                trace_id=trace.trace_id,
                 experiment_run_id=None,
                 evidence=evidence,
                 token_usage=task_result.token_usage,
@@ -12820,6 +12878,7 @@ import logging
 from concurrent.futures import FIRST_COMPLETED
 from typing import Mapping, Sequence
 
+from langfuse import LangfuseGeneration, LangfuseSpan
 from pydantic import BaseModel, Field
 
 from harness.entrypoints.models.requests import (
@@ -13075,7 +13134,7 @@ def run_hosted_localization_baseline(
 def _baseline_worker(
     index: int,
     task: LCATask,
-    parent_trace: object,
+    parent_trace: LangfuseSpan | LangfuseGeneration,
     worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
@@ -13113,7 +13172,7 @@ def _baseline_worker(
 def _run_baseline_parallel(
     tasks: list[LCATask],
     effective_workers: int,
-    parent_trace: object,
+    parent_trace: LangfuseSpan | LangfuseGeneration,
     worktree_manager: WorktreeManager | None,
     dataset_version: str | None,
     session_id: str | None,
@@ -13179,7 +13238,7 @@ def _run_baseline_parallel(
 
 
 def _emit_experiment_dataset_aggregates(
-    span: object | None,
+    span: LangfuseSpan | LangfuseGeneration | None,
     results: Sequence[LocalizationRunItemResult],
     extra_metadata: Mapping[str, object] | None = None,
 ) -> None:
@@ -13201,22 +13260,20 @@ def _emit_experiment_dataset_aggregates(
     metadata.update(batch_score_summary_metadata(summary, metadata_key="score_summary"))
     if extra_metadata:
         metadata.update(dict(extra_metadata))
-    updater = getattr(span, "update", None)
-    if callable(updater):
-        try:
-            updater(metadata=metadata)
-        except Exception as exc:  # noqa: BLE001
-            logging.getLogger(__name__).warning(
-                "Langfuse metadata update failed operation=experiment.metadata observation=%s keys=%s error=%s",
-                getattr(span, "id", type(span).__name__),
-                sorted(str(key) for key in metadata),
-                exc,
-            )
+    try:
+        span.update(metadata=dict(metadata))
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "Langfuse metadata update failed operation=experiment.metadata observation=%s keys=%s error=%s",
+            span.id,
+            sorted(str(key) for key in metadata),
+            exc,
+        )
 
 
 def _run_experiment_task(
     task: LCATask,
-    parent_trace: object,
+    parent_trace: LangfuseSpan | LangfuseGeneration,
     worktree_manager: WorktreeManager | None,
     session_id: str | None,
 ) -> LocalizationRunItemResult:
@@ -13250,7 +13307,7 @@ def _run_experiment_task(
             task=task,
             score_summary=score_summary,
             prediction=prediction_filenames(task_result.prediction),
-            trace_id=getattr(parent_trace, "id", None),
+            trace_id=parent_trace.trace_id,
             materialization=task_result.materialization,
             token_usage=task_result.token_usage,
         )
@@ -13273,7 +13330,7 @@ def _run_experiment_task(
 def _run_experiment_parallel(
     tasks: list[LCATask],
     effective_workers: int,
-    parent_trace: object,
+    parent_trace: LangfuseSpan | LangfuseGeneration,
     worktree_manager: WorktreeManager | None,
     session_id: str | None,
 ) -> tuple[list[LocalizationRunItemResult], LocalizationEvaluationFailure | None]:
@@ -15097,7 +15154,7 @@ import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from langfuse import LangfuseSpan
+from langfuse import LangfuseGeneration, LangfuseSpan
 
 from harness.telemetry.observability_models import (
     EvaluationTelemetryArtifact,
@@ -15112,16 +15169,14 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
-def _observation_name(handle: LangfuseSpan | None) -> str:
+def _observation_name(handle: LangfuseSpan | LangfuseGeneration | None) -> str:
     if handle is None:
         return "none"
-    if handle.name:
-        return handle.name
     return handle.id
 
 
 def safe_update_observation_metadata(
-    handle: LangfuseSpan | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     metadata: Mapping[str, object],
     *,
     operation: str,
@@ -15143,7 +15198,7 @@ def safe_update_observation_metadata(
 
 
 def safe_emit_score_for_handle(
-    handle: LangfuseSpan | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     *,
     name: str,
     value: float | int | bool,
@@ -15180,7 +15235,7 @@ def _score_value(value: float | bool) -> float | int:
 
 
 def emit_localization_task_telemetry(
-    handle: LangfuseSpan | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     artifact: EvaluationTelemetryArtifact,
     *,
     score_prefix: str,
@@ -15223,7 +15278,7 @@ def emit_localization_task_telemetry(
 
 
 def emit_optimize_iteration_telemetry(
-    handle: LangfuseSpan | None,
+    handle: LangfuseSpan | LangfuseGeneration | None,
     *,
     metrics: EvaluationMetrics,
     iteration: int,
@@ -25725,18 +25780,30 @@ todo.md
 
 ## Tracing & Scoring
 
-Orchestration-scoped tracing is owned by the state machines and their listeners:
-- `orchestration/machine.py`: `OptimizationStateMachine` and `RepairStateMachine` drive the optimization and repair loops.
-- `orchestration/dependencies.py`: typed dependency wiring for concrete collaborators used by the machines.
-- `orchestration/evaluation.py`: policy-on-item evaluation against the shared localization backend.
-- `orchestration/writer.py`: repair writer support, candidate cleanup, and policy file writes.
-- `orchestration/listeners.py`: `OptimizationTracingListener` owns iteration spans (open/close, score recording). `RepairTracingListener` owns the full repair attempt span lifecycle — opens spans on transition into `generating_candidate` (via `on_transition`, which fires before the machine's `on_enter` callback) and closes them on `retrying` / `candidate_valid` / `repair_exhausted`. Iteration scoring records the composed score bundle output.
+Langfuse Python v4 is observation-centric in this codebase:
+- scores are first-class evaluation objects attached to observations
+- observation metadata stores compact structured execution detail
+- propagated attributes are restricted to documented correlation fields
 
-Leaf-operation observability remains with:
-- `runner.py`: model calls and MCP tool invocations traced via Langfuse spans.
-- `writer.py`: policy generations/retries traced; emits `writer.policy_generated` and `writer.policy_compiled`.
-- `pipeline` steps emit exit-code/pass flags per step.
-- `localization/scoring.py` remains the source of score-context construction; Langfuse stores composed score and named component results.
+Canonical evaluation observations:
+- `localization_task` is the localization evaluation surface. It emits all component scores from the evaluation telemetry artifact and stores compact `score_context` metadata.
+- `optimize_iteration` is the optimizer evaluation surface. It emits `metrics.score`, `pipeline_passed`, and every numeric/boolean additional metric, plus compact iteration score-context metadata.
+
+Backend spans remain diagnostic-only:
+- `iterative_context` and `jcodemunch` record backend diagnostics such as node counts and task summaries.
+- They do not duplicate localization hop, token, or component evaluation scores.
+
+Orchestration-scoped tracing is owned by the state machines and listeners:
+- `orchestration/machine.py`: optimizer and repair control flow.
+- `orchestration/dependencies.py`: concrete collaborator wiring for tracing-aware dependencies.
+- `orchestration/evaluation.py`: policy-on-item evaluation against the shared localization runtime.
+- `orchestration/writer.py`: repair writer support and policy file writes.
+- `orchestration/listeners.py`: repair attempt span lifecycle.
+
+Metadata channel rules:
+- Use `propagate_context()` only for correlation context such as `trace_name`, `session_id`, `user_id`, `tags`, and similarly small documented attributes.
+- Put execution diagnostics, score context, reducer summaries, repo paths, and task summaries on observation-local metadata.
+- Observation metadata may be structured JSON. Propagated metadata must respect Langfuse's propagation limits.
 
 ## CLI
 - Localization baseline (hosted Langfuse dataset): `python run.py baseline --dataset DATASET_NAME [--version v1] --max-items 25`

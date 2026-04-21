@@ -1,0 +1,161 @@
+[
+  {
+    "event": null,
+    "graph": {
+      "edges": [],
+      "nodes": [
+        {
+          "id": "n1",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n2",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n5",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "nodes": [
+        "n5"
+      ],
+      "type": "addNodes"
+    },
+    "graph": {
+      "edges": [],
+      "nodes": [
+        {
+          "id": "n1",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n2",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n5",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "n1",
+          "target": "n2"
+        }
+      ],
+      "type": "addEdges"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "n1",
+          "target": "n2"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "n1",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n2",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n5",
+          "kind": "symbol",
+          "state": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "id": "n5",
+      "patch": {
+        "state": "resolved",
+        "tokens": 3
+      },
+      "type": "updateNode"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "n1",
+          "target": "n2"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "n1",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n2",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n5",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 3
+        }
+      ]
+    }
+  },
+  {
+    "event": {
+      "step": 1,
+      "type": "iteration"
+    },
+    "graph": {
+      "edges": [
+        {
+          "kind": "calls",
+          "source": "n1",
+          "target": "n2"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "n1",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n2",
+          "kind": "symbol",
+          "state": "pending"
+        },
+        {
+          "id": "n5",
+          "kind": "symbol",
+          "state": "resolved",
+          "tokens": 3
+        }
+      ]
+    }
+  }
+]

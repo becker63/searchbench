@@ -1,0 +1,4 @@
+# file: /home/becker/projects/iterative-context/src/iterative_context/test_helpers/snapshot_graph.py
+# hypothesis_version: 6.151.9
+
+['GraphSnapshot', 'addEdges', 'addNodes', 'data', 'edge', 'edges', 'event', 'events', 'evidence', 'file', 'graph', 'id', 'iteration', 'kind', 'node', 'nodes', 'normalize_edge', 'normalize_event', 'normalize_graph', 'normalize_node', 'patch', 'primary', 'render_steps', 'snippet', 'source', 'startLine', 'state', 'step', 'target', 'to_event_dict', 'tokens', 'type', 'updateNode']
