@@ -11,11 +11,12 @@ from typing import Any, ContextManager, Protocol
 from langfuse import LangfuseGeneration, LangfuseSpan
 from statemachine import State
 
-from harness.telemetry.evaluation_emitters import safe_update_observation_metadata
+from harness.log import get_logger
+from harness.telemetry.tracing import get_langfuse_client, serialize_observation_metadata
 
 from .types import RepairMachineModel
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 
 class _EventTarget(Protocol):
@@ -59,11 +60,18 @@ class RepairTracingListener:
                 metadata["ordinal"] = ctx.task_ordinal
             if ctx.task_total is not None:
                 metadata["total"] = ctx.task_total
-            cm: ContextManager[LangfuseSpan | LangfuseGeneration] = repair_model.deps.start_observation(
-                name=f"policy_repair_attempt_{ctx.attempts_used}",
-                parent=ctx.parent_trace,
-                metadata=metadata,
-            )
+            if ctx.parent_trace is None:
+                cm = get_langfuse_client().start_as_current_observation(
+                    name=f"policy_repair_attempt_{ctx.attempts_used}",
+                    as_type="span",
+                    metadata=serialize_observation_metadata(metadata),
+                )
+            else:
+                cm = ctx.parent_trace.start_as_current_observation(
+                    name=f"policy_repair_attempt_{ctx.attempts_used}",
+                    as_type="span",
+                    metadata=serialize_observation_metadata(metadata),
+                )
             ctx.repair_observation = cm.__enter__()
             ctx.repair_observation_cm = cm
 
@@ -89,20 +97,26 @@ class RepairTracingListener:
             metadata["error"] = ctx.error
         span = ctx.repair_observation
         if span:
-            safe_update_observation_metadata(
-                span,
-                metadata,
-                operation="policy_repair_attempt.metadata",
-                observation_name="policy_repair_attempt",
-            )
+            try:
+                span.update(metadata=serialize_observation_metadata(metadata))
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="policy_repair_attempt.metadata",
+                    observation="policy_repair_attempt",
+                    keys=sorted(metadata.keys()),
+                    error=str(exc),
+                )
         cm = ctx.repair_observation_cm
         if cm is not None:
             try:
                 cm.__exit__(None, None, None)
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning(
-                    "Langfuse observation close failed operation=policy_repair_attempt.close observation=policy_repair_attempt error=%s",
-                    exc,
+                    "langfuse_observation_close_failed",
+                    operation="policy_repair_attempt.close",
+                    observation="policy_repair_attempt",
+                    error=str(exc),
                 )
         ctx.repair_observation = None
         ctx.repair_observation_cm = None

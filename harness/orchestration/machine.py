@@ -5,21 +5,20 @@ Holds state transitions and callbacks; no CLI or entrypoint concerns.
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import jcodemunch_mcp.tools.index_folder as index_folder_tool
+from langfuse import propagate_attributes
 from statemachine import State, StateChart
 from statemachine.event import BoundEvent
 
 from harness import pipeline as pipeline_module
 from harness.agents import writer as agent_writer
+from harness.log import bind_logger, get_logger, short_task_label, tail_text
 from harness.pipeline.types import StepResult
 from harness.prompts import WriterGuidance
-from harness.telemetry import tracing
-from harness.telemetry.evaluation_emitters import safe_update_observation_metadata
-from harness.telemetry.tracing import score_emitter
+from harness.telemetry.tracing import serialize_observation_metadata
 from harness.utils import diff as diff_utils
 from harness.utils import env as env_utils
 from harness.utils import repo_root as repo_root_utils
@@ -38,15 +37,14 @@ from .types import (
     RepairOutcome,
 )
 
-_BOUND_EVENT = cast(Any, BoundEvent)
 _MAX_POLICY_REPAIRS = 8
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 # The installed python-statemachine release still reads ``BoundEvent.key``
 # internally while dispatching callbacks. Keep the patch isolated here; harness
 # callbacks and listeners use state hooks and EventData instead.
 if not hasattr(BoundEvent, "key"):  # pragma: no cover - depends on library release
-    setattr(_BOUND_EVENT, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
+    setattr(BoundEvent, "key", property(lambda self: self.name))  # type: ignore[attr-defined]
 
 
 class RepairStateMachine(StateChart[RepairMachineModel]):
@@ -140,6 +138,62 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
     def _attempts_remaining(self) -> bool:
         return self.context.attempts_used < self.context.max_repair_attempts
 
+    def _repair_logger(self):
+        ctx = self.context
+        iteration_ordinal = ctx.iteration + 1 if ctx.iteration is not None else None
+        return bind_logger(
+            _LOGGER,
+            optimize_run_id=ctx.optimize_run_id,
+            writer_session_id=ctx.writer_session_id,
+            task=short_task_label(
+                ctx.task_identity or "task",
+                ordinal=ctx.task_ordinal,
+                total=ctx.task_total,
+            ),
+            task_identity=ctx.task_identity,
+            iteration=ctx.iteration,
+            iteration_ordinal=iteration_ordinal,
+            iterations=ctx.iterations,
+        )
+
+    def _attempt_logger(self):
+        return bind_logger(
+            self._repair_logger(),
+            attempt=self.context.attempts_used,
+            max_attempts=self.context.max_repair_attempts,
+        )
+
+    def _pipeline_classification_label(self) -> str | None:
+        classified = self.context.last_classified
+        if classified is None:
+            return None
+        labels: list[str] = []
+        if classified.type_errors:
+            labels.append("type_errors")
+        if classified.lint_errors:
+            labels.append("lint_errors")
+        if classified.test_failures:
+            labels.append("test_failures")
+        if not labels and classified.passed:
+            labels.append("passed_only")
+        return "+".join(labels) if labels else None
+
+    def _log_pipeline_failures(self) -> None:
+        failure_logger = self._attempt_logger()
+        classification = self._pipeline_classification_label()
+        for step in self.context.pipeline_results:
+            if step.exit_code == 0:
+                continue
+            failure_logger.warning(
+                "pipeline_step_failed",
+                step_name=step.name,
+                command=" ".join(step.command) if step.command else None,
+                exit_code=step.exit_code,
+                classification=classification,
+                stderr_tail=tail_text(step.stderr),
+                stdout_tail=tail_text(step.stdout),
+            )
+
     def _writer_correlation_metadata(self, *, phase: str) -> dict[str, object]:
         ctx = self.context
         metadata: dict[str, object] = {
@@ -165,6 +219,7 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
     def _run_writer(self) -> None:
         ctx = self.context
         deps = self.deps
+        attempt_logger = self._attempt_logger()
         guidance = list(ctx.feedback.optimization_brief.guidance.instructions)
         mode = ctx.feedback.optimization_brief.guidance.mode
         if ctx.attempts_used > 0:
@@ -183,24 +238,24 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             update={"guidance": WriterGuidance(mode=mode, instructions=guidance)}
         )
 
-        _LOGGER.info(
-            "[OPTIMIZE] writer_generation start attempt=%s model=%s failure_context_chars=%s",
-            ctx.attempts_used,
-            ctx.writer_model or "unknown",
-            len(ctx.failure_context or ""),
+        attempt_logger.info(
+            "writer_generation_started",
+            writer_model=ctx.writer_model or "unknown",
+            failure_context_chars=len(ctx.failure_context or ""),
         )
         writer_metadata = {
             **self._writer_correlation_metadata(phase="writer_generation"),
             "writer_model": ctx.writer_model,
             "failure_context_chars": len(ctx.failure_context or ""),
         }
-        with tracing.propagate_context(
-            session_id=ctx.writer_session_id,
-        ):
-            with deps.start_observation(
+        repair_span = ctx.repair_observation
+        if repair_span is None:
+            raise RuntimeError("policy repair span missing before writer_generation")
+        with propagate_attributes(session_id=ctx.writer_session_id):
+            with repair_span.start_as_current_observation(
                 name="writer_generation",
-                parent=ctx.repair_observation,
-                metadata=writer_metadata,
+                as_type="span",
+                metadata=serialize_observation_metadata(writer_metadata),
             ) as writer_span:
                 new_code, writer_error = deps.attempt_policy_generation(
                     initial_policy=ctx.evaluation.policy_code,
@@ -214,23 +269,31 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                     writer_session_id=ctx.writer_session_id,
                     pipeline_feedback=ctx.last_classified,
                 )
-                safe_update_observation_metadata(
-                    writer_span,
-                    {
-                        "attempt": ctx.attempts_used,
-                        "code_returned": new_code is not None,
-                        "writer_error": writer_error,
-                        "writer_session_id": ctx.writer_session_id,
-                    },
-                    operation="writer_generation.metadata",
-                    observation_name="writer_generation",
-                )
+                try:
+                    writer_span.update(
+                        metadata=serialize_observation_metadata(
+                            {
+                                "attempt": ctx.attempts_used,
+                                "code_returned": new_code is not None,
+                                "writer_error": writer_error,
+                                "writer_session_id": ctx.writer_session_id,
+                            }
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    attempt_logger.warning(
+                        "langfuse_metadata_update_failed",
+                        operation="writer_generation.metadata",
+                        observation="writer_generation",
+                        keys=["attempt", "code_returned", "writer_error", "writer_session_id"],
+                        error=str(exc),
+                    )
 
         if new_code is None:
-            _LOGGER.info(
-                "[OPTIMIZE] writer_generation complete attempt=%s code_returned=false error=%s",
-                ctx.attempts_used,
-                writer_error,
+            attempt_logger.warning(
+                "writer_generation_completed",
+                code_returned=False,
+                writer_error=writer_error,
             )
             ctx.writer_error = writer_error
             ctx.error = writer_error or "writer_failed"
@@ -239,18 +302,41 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                 [], writer_error, ctx.attempts_used
             )
             if self._attempts_remaining():
+                attempt_logger.warning(
+                    "policy_candidate_rejected",
+                    stage="writer_generation",
+                    rejection_reason=ctx.error,
+                )
+                bind_logger(
+                    self._repair_logger(),
+                    attempt=ctx.attempts_used,
+                    max_attempts=ctx.max_repair_attempts,
+                ).info(
+                    "policy_candidate_retrying",
+                    previous_attempt=ctx.attempts_used - 1,
+                    rejection_reason=ctx.error,
+                )
                 self.raise_("writer_retryable_failure")  # type: ignore[call-arg]
             else:
+                attempt_logger.warning(
+                    "policy_candidate_rejected",
+                    stage="writer_generation",
+                    rejection_reason=ctx.error,
+                )
+                attempt_logger.warning(
+                    "policy_candidate_exhausted",
+                    rejection_reason=ctx.error,
+                )
                 self.raise_("writer_exhausted")  # type: ignore[call-arg]
             return
 
         deps.write_policy(new_code)
         ctx.candidate_code = new_code
-        _LOGGER.info(
-            "[OPTIMIZE] writer_generation complete attempt=%s code_returned=true code_chars=%s writer_session_id=%s",
-            ctx.attempts_used,
-            len(new_code),
-            ctx.writer_session_id or "none",
+        attempt_logger.info(
+            "writer_generation_completed",
+            code_returned=True,
+            code_chars=len(new_code),
+            writer_session_id=ctx.writer_session_id,
         )
         self.raise_("writer_generated")  # type: ignore[call-arg]
         self._run_pipeline()
@@ -259,44 +345,53 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         ctx = self.context
         deps = self.deps
         pipeline = ctx.pipeline or deps.default_pipeline()
+        attempt_logger = self._attempt_logger()
         check_names = [
             getattr(step, "name", "unknown") for step in getattr(pipeline, "steps", [])
         ]
-        _LOGGER.info(
-            "[OPTIMIZE] pipeline_check start attempt=%s checks=%s repo_root=%s writer_session_id=%s",
-            ctx.attempts_used,
-            ",".join(check_names) if check_names else "unknown",
-            ctx.repo_root,
-            ctx.writer_session_id or "none",
+        attempt_logger.info(
+            "pipeline_check_started",
+            checks=check_names,
+            repo_root=str(ctx.repo_root),
+            writer_session_id=ctx.writer_session_id,
         )
         pipeline_metadata = {
             **self._writer_correlation_metadata(phase="pipeline_check"),
             "checks": check_names,
             "repo_root": str(ctx.repo_root),
         }
-        with tracing.propagate_context(
-            session_id=ctx.writer_session_id,
-        ):
-            with deps.start_observation(
+        repair_span = ctx.repair_observation
+        if repair_span is None:
+            raise RuntimeError("policy repair span missing before pipeline_check")
+        with propagate_attributes(session_id=ctx.writer_session_id):
+            with repair_span.start_as_current_observation(
                 name="pipeline_check",
-                parent=ctx.repair_observation,
-                metadata=pipeline_metadata,
+                as_type="span",
+                metadata=serialize_observation_metadata(pipeline_metadata),
             ) as pipeline_span:
                 pipeline_results, pipeline_success = deps.run_policy_pipeline(
                     pipeline,
                     ctx.repo_root,
                     repair_obs=pipeline_span,
                 )
-                safe_update_observation_metadata(
-                    pipeline_span,
-                    {
-                        "pipeline_passed": pipeline_success,
-                        "checks_run": [step.name for step in pipeline_results],
-                        "writer_session_id": ctx.writer_session_id,
-                    },
-                    operation="pipeline_check.metadata",
-                    observation_name="pipeline_check",
-                )
+                try:
+                    pipeline_span.update(
+                        metadata=serialize_observation_metadata(
+                            {
+                                "pipeline_passed": pipeline_success,
+                                "checks_run": [step.name for step in pipeline_results],
+                                "writer_session_id": ctx.writer_session_id,
+                            }
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    attempt_logger.warning(
+                        "langfuse_metadata_update_failed",
+                        operation="pipeline_check.metadata",
+                        observation="pipeline_check",
+                        keys=["checks_run", "pipeline_passed", "writer_session_id"],
+                        error=str(exc),
+                    )
         # Enforce canonical step result shape at the boundary.
         ctx.pipeline_results = [
             step if isinstance(step, StepResult) else StepResult.from_external(step)
@@ -304,11 +399,10 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         ]
         ctx.pipeline_passed = pipeline_success
         ctx.attempts_used += 1
-        _LOGGER.info(
-            "[OPTIMIZE] pipeline_check result attempt=%s passed=%s checks_run=%s",
-            ctx.attempts_used - 1,
-            pipeline_success,
-            ",".join(step.name for step in ctx.pipeline_results),
+        attempt_logger.info(
+            "pipeline_check_result",
+            passed=pipeline_success,
+            checks_run=[step.name for step in ctx.pipeline_results],
         )
 
         if pipeline_success:
@@ -317,13 +411,14 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                 "attempts_used": ctx.attempts_used,
                 "status": "accepted",
             }
-            with tracing.propagate_context(
-                session_id=ctx.writer_session_id,
-            ):
-                with deps.start_observation(
+            repair_span = ctx.repair_observation
+            if repair_span is None:
+                raise RuntimeError("policy repair span missing before policy_acceptance")
+            with propagate_attributes(session_id=ctx.writer_session_id):
+                with repair_span.start_as_current_observation(
                     name="policy_acceptance",
-                    parent=ctx.repair_observation,
-                    metadata=acceptance_metadata,
+                    as_type="span",
+                    metadata=serialize_observation_metadata(acceptance_metadata),
                 ) as acceptance_span:
                     final_policy, success_meta = deps.finalize_successful_policy(
                         new_code=ctx.candidate_code or deps.read_policy(),
@@ -331,15 +426,28 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
                         max_repair_attempts=ctx.max_repair_attempts,
                         repair_obs=acceptance_span,
                     )
-                    safe_update_observation_metadata(
-                        acceptance_span,
-                        {
-                            **success_meta.model_dump(mode="json"),
-                            "writer_session_id": ctx.writer_session_id,
-                        },
-                        operation="policy_acceptance.metadata",
-                        observation_name="policy_acceptance",
-                    )
+                    try:
+                        acceptance_span.update(
+                            metadata=serialize_observation_metadata(
+                                {
+                                    **success_meta.model_dump(mode="json"),
+                                    "writer_session_id": ctx.writer_session_id,
+                                }
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        attempt_logger.warning(
+                            "langfuse_metadata_update_failed",
+                            operation="policy_acceptance.metadata",
+                            observation="policy_acceptance",
+                            keys=sorted(
+                                [
+                                    *success_meta.model_dump(mode="json").keys(),
+                                    "writer_session_id",
+                                ]
+                            ),
+                            error=str(exc),
+                        )
             ctx.candidate_code = final_policy
             ctx.accepted_policy_source = success_meta.accepted_policy_source
             ctx.accepted_policy_changed_by_pipeline = (
@@ -347,6 +455,15 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
             )
             ctx.repair_attempts_reported = success_meta.repair_attempts
             ctx.max_policy_repairs_reported = success_meta.max_policy_repairs
+            bind_logger(
+                self._repair_logger(),
+                attempt=ctx.attempts_used - 1,
+                max_attempts=ctx.max_repair_attempts,
+            ).info(
+                "policy_candidate_accepted",
+                accepted_policy_source=ctx.accepted_policy_source,
+                changed_by_pipeline=ctx.accepted_policy_changed_by_pipeline,
+            )
             self.raise_("pipeline_passed")  # type: ignore[call-arg]
             return
 
@@ -366,18 +483,41 @@ class RepairStateMachine(StateChart[RepairMachineModel]):
         ctx.failed_exit_code = failure_details.failed_exit_code
         ctx.failed_summary = failure_details.failed_summary
         ctx.error = failure_details.error
+        self._log_pipeline_failures()
         if self._attempts_remaining():
-            _LOGGER.info(
-                "[OPTIMIZE] pipeline_check rejected attempt=%s retrying=true failed_step=%s",
-                ctx.attempts_used - 1,
-                ctx.failed_step or "unknown",
+            attempt_logger.warning(
+                "policy_candidate_rejected",
+                stage="pipeline_check",
+                failed_step=ctx.failed_step,
+                exit_code=ctx.failed_exit_code,
+                rejection_reason=ctx.error,
+                classification=self._pipeline_classification_label(),
+            )
+            bind_logger(
+                self._repair_logger(),
+                attempt=ctx.attempts_used,
+                max_attempts=ctx.max_repair_attempts,
+            ).info(
+                "policy_candidate_retrying",
+                previous_attempt=ctx.attempts_used - 1,
+                failed_step=ctx.failed_step,
+                rejection_reason=ctx.error,
             )
             self.raise_("pipeline_retryable_failure")  # type: ignore[call-arg]
         else:
-            _LOGGER.info(
-                "[OPTIMIZE] pipeline_check rejected attempt=%s retrying=false failed_step=%s",
-                ctx.attempts_used - 1,
-                ctx.failed_step or "unknown",
+            attempt_logger.warning(
+                "policy_candidate_rejected",
+                stage="pipeline_check",
+                failed_step=ctx.failed_step,
+                exit_code=ctx.failed_exit_code,
+                rejection_reason=ctx.error,
+                classification=self._pipeline_classification_label(),
+            )
+            attempt_logger.warning(
+                "policy_candidate_exhausted",
+                failed_step=ctx.failed_step,
+                exit_code=ctx.failed_exit_code,
+                rejection_reason=ctx.error,
             )
             self.raise_("pipeline_exhausted")  # type: ignore[call-arg]
 
@@ -409,12 +549,10 @@ def _runtime_collaborators() -> dependency_wiring.RuntimeCollaborators:
         format_diff=diff_utils.format_diff,
         interpret_diff=diff_utils.interpret_diff,
         generate_policy=agent_writer.generate_policy,
-        emit_score=score_emitter.emit_score,
         classify_results=pipeline_module.classify_results,
         read_policy=policy_evaluation._read_policy,
         write_policy=policy_writer._write_policy,
         get_writer_model=env_utils.get_writer_model,
-        start_observation=tracing.start_observation,
         find_repo_root=find_runtime_repo_root,
         default_pipeline=pipeline_module.default_pipeline,
     )

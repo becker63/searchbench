@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import hashlib
 import json
 import time
@@ -9,11 +8,12 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from harness.log import bind_logger, get_logger
 from harness.localization.models import LCATask, normalize_lca_task
 from harness.telemetry.hosted.datasets import langfuse_dataset_item_from_task
 from harness.telemetry.tracing import get_langfuse_client
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 SYNC_PROGRESS_INTERVAL = 250
 
 
@@ -116,12 +116,15 @@ def fetch_hf_localization_dataset(
     Networked access is opt-in; if the dependency is missing or auth fails, a categorized HFDatasetLoadError is raised.
     """
     started_at = time.perf_counter()
-    logger.info(
-        "Loading HF dataset name=%s config=%s split=%s revision=%s",
-        name,
-        dataset_config,
-        dataset_split,
-        revision,
+    load_logger = bind_logger(
+        logger,
+        dataset=name,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        revision=revision,
+    )
+    load_logger.info(
+        "hf_dataset_load_started",
     )
     datasets = _require_dependency()
     try:
@@ -157,12 +160,10 @@ def fetch_hf_localization_dataset(
             tasks.append(normalize_lca_task(row, defaults=defaults))
         except Exception as exc:
             raise HFDatasetLoadError(f"HF row normalization failed: {exc}", category="schema") from exc
-    logger.info(
-        "Loaded %d HF LCA rows (config=%s split=%s) in %s",
-        len(tasks),
-        dataset_config,
-        dataset_split,
-        _elapsed(started_at),
+    load_logger.info(
+        "hf_dataset_load_completed",
+        task_count=len(tasks),
+        elapsed=_elapsed(started_at),
     )
     return tasks
 
@@ -249,20 +250,17 @@ def _get_dataset(client: object, dataset_name: str) -> object:
 
 def _ensure_langfuse_dataset(client: object, dataset_name: str) -> object:
     started_at = time.perf_counter()
-    logger.info("Resolving target Langfuse dataset name=%s", dataset_name)
+    dataset_logger = bind_logger(logger, dataset=dataset_name)
+    dataset_logger.info("langfuse_dataset_resolve_started")
     try:
         dataset = _get_dataset(client, dataset_name)
-        logger.info(
-            "Resolved target Langfuse dataset name=%s in %s",
-            dataset_name,
-            _elapsed(started_at),
+        dataset_logger.info(
+            "langfuse_dataset_resolve_completed",
+            elapsed=_elapsed(started_at),
         )
         return dataset
     except Exception as get_exc:  # noqa: BLE001
-        logger.info(
-            "Target Langfuse dataset name=%s was not fetched; attempting create",
-            dataset_name,
-        )
+        dataset_logger.info("langfuse_dataset_create_attempt_started")
         create_dataset = _require_client_method(client, "create_dataset")
         try:
             create_dataset(
@@ -275,10 +273,9 @@ def _ensure_langfuse_dataset(client: object, dataset_name: str) -> object:
                 category="langfuse-client",
             ) from get_exc
         dataset = _get_dataset(client, dataset_name)
-        logger.info(
-            "Created and resolved target Langfuse dataset name=%s in %s",
-            dataset_name,
-            _elapsed(started_at),
+        dataset_logger.info(
+            "langfuse_dataset_create_completed",
+            elapsed=_elapsed(started_at),
         )
         return dataset
 
@@ -301,7 +298,8 @@ def _fetch_existing_langfuse_items(
     dataset_name: str,
 ) -> list[object]:
     started_at = time.perf_counter()
-    logger.info("Fetching existing Langfuse dataset items dataset=%s", dataset_name)
+    dataset_logger = bind_logger(logger, dataset=dataset_name)
+    dataset_logger.info("langfuse_dataset_items_fetch_started")
     dataset = _ensure_langfuse_dataset(client, dataset_name)
     items = _get_field(dataset, "items")
     if items is None:
@@ -315,10 +313,10 @@ def _fetch_existing_langfuse_items(
             category="langfuse-client",
         )
     existing_items = list(items)
-    logger.info(
-        "Finished fetching %d existing Langfuse dataset items in %s",
-        len(existing_items),
-        _elapsed(started_at),
+    dataset_logger.info(
+        "langfuse_dataset_items_fetch_completed",
+        item_count=len(existing_items),
+        elapsed=_elapsed(started_at),
     )
     return existing_items
 
@@ -326,7 +324,10 @@ def _fetch_existing_langfuse_items(
 def _index_existing_item_identities(items: Sequence[object]) -> set[str]:
     started_at = time.perf_counter()
     total = len(items)
-    logger.info("Building existing item identity index items=%d", total)
+    logger.info(
+        "langfuse_item_identity_index_started",
+        item_count=total,
+    )
     identities: set[str] = set()
     for index, item in enumerate(items, start=1):
         identity = _stable_identity_from_item(item)
@@ -334,16 +335,16 @@ def _index_existing_item_identities(items: Sequence[object]) -> set[str]:
             identities.add(identity)
         if index % SYNC_PROGRESS_INTERVAL == 0 or index == total:
             logger.info(
-                "Indexed %d / %d existing Langfuse items unique_identities=%d",
-                index,
-                total,
-                len(identities),
+                "langfuse_item_identity_index_progress",
+                processed=index,
+                total=total,
+                unique_identities=len(identities),
             )
     logger.info(
-        "Finished existing item identity index unique_identities=%d source_items=%d in %s",
-        len(identities),
-        total,
-        _elapsed(started_at),
+        "langfuse_item_identity_index_completed",
+        unique_identities=len(identities),
+        source_items=total,
+        elapsed=_elapsed(started_at),
     )
     return identities
 
@@ -378,13 +379,16 @@ def sync_hf_localization_dataset_to_langfuse(
     """
 
     sync_started_at = time.perf_counter()
-    logger.info(
-        "Starting sync-hf hf_dataset=%s config=%s split=%s revision=%s target_dataset=%s",
-        hf_dataset,
-        dataset_config,
-        dataset_split,
-        revision,
-        langfuse_dataset,
+    sync_logger = bind_logger(
+        logger,
+        hf_dataset=hf_dataset,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        revision=revision,
+        target_dataset=langfuse_dataset,
+    )
+    sync_logger.info(
+        "sync_hf_started",
     )
     tasks = fetch_hf_localization_dataset(
         hf_dataset,
@@ -393,7 +397,10 @@ def sync_hf_localization_dataset_to_langfuse(
         revision=revision,
         token=token,
     )
-    logger.info("Building Langfuse dataset item payloads source_items=%d", len(tasks))
+    sync_logger.info(
+        "langfuse_dataset_payload_build_started",
+        source_items=len(tasks),
+    )
     items = build_langfuse_items_from_hf_tasks(
         tasks,
         dataset_name=hf_dataset,
@@ -410,10 +417,10 @@ def sync_hf_localization_dataset_to_langfuse(
     original_existing_count = len(existing_identities)
 
     compare_started_at = time.perf_counter()
-    logger.info(
-        "Beginning comparison against HF items source_items=%d existing_identities=%d",
-        len(items),
-        original_existing_count,
+    sync_logger.info(
+        "langfuse_dataset_comparison_started",
+        source_items=len(items),
+        existing_identities=original_existing_count,
     )
     missing_items: list[dict[str, object]] = []
     skipped_items = 0
@@ -426,25 +433,28 @@ def sync_hf_localization_dataset_to_langfuse(
             missing_items.append(item)
         if index % SYNC_PROGRESS_INTERVAL == 0 or index == total_items:
             logger.info(
-                "Compared %d / %d HF items missing=%d skipped=%d",
-                index,
-                total_items,
-                len(missing_items),
-                skipped_items,
+                "langfuse_dataset_comparison_progress",
+                processed=index,
+                total=total_items,
+                missing=len(missing_items),
+                skipped=skipped_items,
             )
-    logger.info(
-        "Finished comparison source_items=%d missing=%d skipped=%d in %s",
-        total_items,
-        len(missing_items),
-        skipped_items,
-        _elapsed(compare_started_at),
+    sync_logger.info(
+        "langfuse_dataset_comparison_completed",
+        source_items=total_items,
+        missing=len(missing_items),
+        skipped=skipped_items,
+        elapsed=_elapsed(compare_started_at),
     )
 
     created_items = 0
     failed_items = 0
     create_started_at = time.perf_counter()
     missing_total = len(missing_items)
-    logger.info("Creating missing Langfuse dataset items missing=%d", missing_total)
+    sync_logger.info(
+        "langfuse_dataset_create_missing_started",
+        missing=missing_total,
+    )
     for index, item in enumerate(missing_items, start=1):
         stable_identity = str(item["id"])
         # Langfuse Python exposes create/list helpers, not a reliable item upsert
@@ -458,12 +468,12 @@ def sync_hf_localization_dataset_to_langfuse(
             )
         except Exception as exc:
             failed_items += 1
-            logger.exception(
-                "Failed creating Langfuse dataset item index=%d id=%s created=%d failed=%d",
-                index,
-                stable_identity,
-                created_items,
-                failed_items,
+            sync_logger.exception(
+                "langfuse_dataset_item_create_failed",
+                index=index,
+                item_id=stable_identity,
+                created=created_items,
+                failed=failed_items,
             )
             raise HFDatasetLoadError(
                 f"Failed creating Langfuse dataset item id={stable_identity}: {exc}",
@@ -472,26 +482,26 @@ def sync_hf_localization_dataset_to_langfuse(
         existing_identities.add(stable_identity)
         created_items += 1
         if index % SYNC_PROGRESS_INTERVAL == 0 or index == missing_total:
-            logger.info(
-                "Created %d / %d missing Langfuse dataset items failed=%d",
-                index,
-                missing_total,
-                failed_items,
+            sync_logger.info(
+                "langfuse_dataset_create_missing_progress",
+                created=index,
+                total=missing_total,
+                failed=failed_items,
             )
-    logger.info(
-        "Finished creating missing Langfuse dataset items created=%d failed=%d in %s",
-        created_items,
-        failed_items,
-        _elapsed(create_started_at),
+    sync_logger.info(
+        "langfuse_dataset_create_missing_completed",
+        created=created_items,
+        failed=failed_items,
+        elapsed=_elapsed(create_started_at),
     )
-    logger.info(
-        "Sync complete source_items=%d existing=%d skipped=%d created=%d failed=%d total_elapsed=%s",
-        len(items),
-        original_existing_count,
-        skipped_items,
-        created_items,
-        failed_items,
-        _elapsed(sync_started_at),
+    sync_logger.info(
+        "sync_hf_completed",
+        source_items=len(items),
+        existing=original_existing_count,
+        skipped=skipped_items,
+        created=created_items,
+        failed=failed_items,
+        total_elapsed=_elapsed(sync_started_at),
     )
     return HFDatasetSyncResult(
         items=items,

@@ -174,7 +174,7 @@ def test_propagate_context_drops_invalid_metadata(monkeypatch, caplog):
     assert "task_identity" not in meta
     assert "repo" not in meta
     assert "toolong" not in meta
-    assert "Dropping" in caplog.text
+    assert "propagated_metadata_key_dropped" in caplog.text
 
 
 def test_propagate_context_strict_rejects_invalid_key(monkeypatch):

@@ -8,10 +8,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List
 
-from harness.telemetry.tracing import start_observation
-from harness.telemetry.tracing.score_emitter import emit_score_for_handle
+from langfuse import LangfuseGeneration, LangfuseSpan
+from langfuse.api.commons.types import ScoreDataType
+
+from harness.log import bind_logger, get_logger, tail_text
+from harness.telemetry.tracing import serialize_observation_metadata
 from .steps import BasedPyrightStep, PytestStep, RuffFixStep
 from .types import PipelineClassification, Step, StepResult
+
+_LOGGER = get_logger(__name__)
 
 
 class Pipeline:
@@ -19,50 +24,100 @@ class Pipeline:
         self.steps: List[Step] = list(steps)
         self.fail_fast: bool = fail_fast
 
-    def run(self, repo_root: Path, observation: object | None = None, allow_no_parent: bool = False) -> List[StepResult]:
+    def run(
+        self,
+        repo_root: Path,
+        observation: LangfuseSpan | LangfuseGeneration | None = None,
+        allow_no_parent: bool = False,
+    ) -> List[StepResult]:
         results: List[StepResult] = []
         if observation is None and not allow_no_parent:
             raise RuntimeError("Parent span required for pipeline tracing; provide observation or set allow_no_parent=True to disable tracing")
+        logger = bind_logger(
+            _LOGGER,
+            repo_root=str(repo_root),
+            fail_fast=self.fail_fast,
+        )
         for step in self.steps:
-            with start_observation(
-                name=step.name,
-                parent=observation,
-                metadata={"cwd": str(repo_root)},
-            ) as step_obs:
+            step_logger = bind_logger(logger, step_name=step.name)
+            step_logger.info("pipeline_step_started")
+            if observation is None:
                 result = step.run(repo_root)
-                # Normalize to canonical StepResult to avoid drifting shapes.
                 result = result if isinstance(result, StepResult) else StepResult.from_external(result)
-                # Enforce success semantics based solely on exit status.
                 result.success = result.exit_code == 0
                 results.append(result)
-                emit_score_for_handle(
-                    step_obs,
-                    name="exit_code",
-                    value=result.exit_code,
-                    data_type="NUMERIC",
-                    comment=f"step={step.name}",
-                )
-                emit_score_for_handle(
-                    step_obs,
-                    name="pipeline_pass",
-                    value=result.success,
-                    data_type="BOOLEAN",
-                    comment=f"step={step.name}",
-                )
                 terminated = self.fail_fast and result.exit_code != 0
-                step_obs.update(
-                    metadata={
-                        "step": step.name,
-                        "success": result.success,
-                        "exit_code": result.exit_code,
-                        "stdout_excerpt": (result.stdout or "")[:400],
-                        "stderr_excerpt": (result.stderr or "")[:400],
-                        "fail_fast": self.fail_fast,
-                        "terminated_pipeline": terminated,
-                    }
+            else:
+                with observation.start_as_current_observation(
+                    name=step.name,
+                    as_type="span",
+                    metadata=serialize_observation_metadata({"cwd": str(repo_root)}),
+                ) as step_obs:
+                    result = step.run(repo_root)
+                    result = result if isinstance(result, StepResult) else StepResult.from_external(result)
+                    result.success = result.exit_code == 0
+                    results.append(result)
+                    terminated = self.fail_fast and result.exit_code != 0
+                    try:
+                        step_obs.score(
+                            name="exit_code",
+                            value=result.exit_code,
+                            data_type=ScoreDataType.NUMERIC,
+                            comment=f"step={step.name}",
+                        )
+                        step_obs.score(
+                            name="pipeline_pass",
+                            value=1 if result.success else 0,
+                            data_type=ScoreDataType.BOOLEAN,
+                            comment=f"step={step.name}",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        step_logger.warning(
+                            "langfuse_score_emission_failed",
+                            score="exit_code|pipeline_pass",
+                            error=str(exc),
+                        )
+                    try:
+                        step_obs.update(
+                            metadata=serialize_observation_metadata(
+                                {
+                                    "step": step.name,
+                                    "success": result.success,
+                                    "exit_code": result.exit_code,
+                                    "stdout_excerpt": (result.stdout or "")[:400],
+                                    "stderr_excerpt": (result.stderr or "")[:400],
+                                    "fail_fast": self.fail_fast,
+                                    "terminated_pipeline": terminated,
+                                }
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        step_logger.warning(
+                            "langfuse_metadata_update_failed",
+                            error=str(exc),
+                        )
+            command = " ".join(result.command) if result.command else None
+            if result.success:
+                step_logger.info(
+                    "pipeline_step_completed",
+                    exit_code=result.exit_code,
+                    command=command,
                 )
-                if terminated:
-                    break
+            else:
+                step_logger.warning(
+                    "pipeline_step_failed",
+                    exit_code=result.exit_code,
+                    command=command,
+                    stderr_tail=tail_text(result.stderr),
+                    stdout_tail=tail_text(result.stdout),
+                )
+            if terminated:
+                logger.warning(
+                    "pipeline_check_terminated",
+                    step_name=step.name,
+                    exit_code=result.exit_code,
+                )
+                break
         return results
 
 

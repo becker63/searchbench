@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import logging
 import os
 from collections.abc import Callable
+from typing import Any, cast
 
 from langfuse import LangfuseGeneration, LangfuseSpan
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from harness.log import get_logger
 from harness.scoring import BatchScoreSummary
 
 _STRICT_DEBUG = bool(os.getenv("LANGFUSE_STRICT_DEBUG"))
+_LOGGER = get_logger(__name__)
 
 
 class ScorePayload(BaseModel):
@@ -56,17 +58,17 @@ def _normalize_score_value(
     return value, resolved_type
 
 
-def _handle_trace_id(handle: LangfuseSpan | LangfuseGeneration | None) -> str | None:
+def _handle_trace_id(handle: object | None) -> str | None:
     if handle is None:
         return None
-    trace_id = handle.trace_id
+    trace_id = getattr(handle, "trace_id", None)
     return trace_id if isinstance(trace_id, str) and trace_id else None
 
 
-def _handle_observation_id(handle: LangfuseSpan | LangfuseGeneration | None) -> str | None:
+def _handle_observation_id(handle: object | None) -> str | None:
     if handle is None:
         return None
-    observation_id = handle.id
+    observation_id = getattr(handle, "id", None)
     return observation_id if isinstance(observation_id, str) and observation_id else None
 
 
@@ -91,14 +93,22 @@ def emit_score(
         client = get_langfuse_client()
         ensure_langfuse_auth()
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Langfuse score emission skipped score=%s error=%s", name, exc)
+        _LOGGER.warning(
+            "langfuse_score_emission_skipped",
+            score_name=name,
+            error=str(exc),
+        )
         return
     try:
         create_fn = client.create_score
     except AttributeError as exc:
         if _STRICT_DEBUG:
             raise RuntimeError("Langfuse client missing create_score API") from exc
-        logging.warning("Langfuse score emission unavailable score=%s error=missing_create_score_api", name)
+        _LOGGER.warning(
+            "langfuse_score_emission_unavailable",
+            score_name=name,
+            error="missing_create_score_api",
+        )
         return
     try:
         payload = ScorePayload(
@@ -115,7 +125,11 @@ def emit_score(
     except Exception as exc:  # noqa: BLE001
         if _STRICT_DEBUG:
             raise
-        logging.warning("Langfuse score payload invalid score=%s error=%s", name, exc)
+        _LOGGER.warning(
+            "langfuse_score_payload_invalid",
+            score_name=name,
+            error=str(exc),
+        )
         return
     cleaned = payload.model_dump(exclude_none=True)
     try:
@@ -123,12 +137,16 @@ def emit_score(
     except Exception as exc:  # noqa: BLE001
         if _STRICT_DEBUG:
             raise
-        logging.warning("Langfuse score emission failed score=%s error=%s", name, exc)
+        _LOGGER.warning(
+            "langfuse_score_emission_failed",
+            score_name=name,
+            error=str(exc),
+        )
         return
 
 
 def emit_score_for_handle(
-    handle: LangfuseSpan | LangfuseGeneration | None,
+    handle: object | None,
     *,
     name: str,
     value: float | int | bool | str,
@@ -145,7 +163,7 @@ def emit_score_for_handle(
     # when callers need idempotency.
     if handle is not None and score_id is None:
         try:
-            handle.score(
+            cast(Any, handle).score(
                 name=name,
                 value=normalized_value,
                 data_type=resolved_type,
@@ -156,11 +174,11 @@ def emit_score_for_handle(
         except Exception as exc:  # noqa: BLE001
             if _STRICT_DEBUG:
                 raise
-            logging.warning(
-                "Langfuse handle.score failed observation=%s score=%s error=%s",
-                _handle_observation_id(handle) or type(handle).__name__,
-                name,
-                exc,
+            _LOGGER.warning(
+                "langfuse_handle_score_failed",
+                observation=_handle_observation_id(handle) or type(handle).__name__,
+                score_name=name,
+                error=str(exc),
             )
     # Fall back to explicit identifier-based emission only when the handle
     # exposes the real trace id. Langfuse requires trace_id for trace and
@@ -168,9 +186,10 @@ def emit_score_for_handle(
     # as a fabricated trace id.
     trace_id = _handle_trace_id(handle)
     if trace_id is None and session_id is None:
-        logging.debug(
-            "Langfuse score emission skipped for %s: missing trace_id on handle",
-            name,
+        _LOGGER.debug(
+            "langfuse_score_emission_skipped",
+            score_name=name,
+            reason="missing_trace_id_on_handle",
         )
         return
     observation_id = _handle_observation_id(handle)
@@ -188,7 +207,7 @@ def emit_score_for_handle(
 
 
 def emit_trace_score_for_handle(
-    handle: LangfuseSpan | LangfuseGeneration | None,
+    handle: object | None,
     *,
     name: str,
     value: float | int | bool | str,
@@ -202,7 +221,7 @@ def emit_trace_score_for_handle(
     normalized_value, resolved_type = _normalize_score_value(value, data_type)
     if handle is not None and score_id is None:
         try:
-            handle.score_trace(
+            cast(Any, handle).score_trace(
                 name=name,
                 value=normalized_value,
                 data_type=resolved_type,
@@ -213,17 +232,18 @@ def emit_trace_score_for_handle(
         except Exception as exc:  # noqa: BLE001
             if _STRICT_DEBUG:
                 raise
-            logging.warning(
-                "Langfuse handle.score_trace failed observation=%s score=%s error=%s",
-                _handle_observation_id(handle) or type(handle).__name__,
-                name,
-                exc,
+            _LOGGER.warning(
+                "langfuse_handle_score_trace_failed",
+                observation=_handle_observation_id(handle) or type(handle).__name__,
+                score_name=name,
+                error=str(exc),
             )
     trace_id = _handle_trace_id(handle)
     if trace_id is None and session_id is None:
-        logging.debug(
-            "Langfuse trace score emission skipped for %s: missing trace_id on handle",
-            name,
+        _LOGGER.debug(
+            "langfuse_trace_score_emission_skipped",
+            score_name=name,
+            reason="missing_trace_id_on_handle",
         )
         return
     emit_score(
@@ -240,7 +260,7 @@ def emit_trace_score_for_handle(
 
 
 def _emit_numeric_score(
-    handle: LangfuseSpan | LangfuseGeneration | None,
+    handle: object | None,
     *,
     name: str,
     value: float,
@@ -255,19 +275,19 @@ def _emit_numeric_score(
     )
 
 
-def _safe_update_metadata(handle: LangfuseSpan | LangfuseGeneration | None, metadata: dict[str, object]) -> None:
+def _safe_update_metadata(handle: object | None, metadata: dict[str, object]) -> None:
     if handle is None:
         return
     try:
-        handle.update(metadata=dict(metadata))
+        cast(Any, handle).update(metadata=dict(metadata))
     except Exception as exc:  # noqa: BLE001
         if _STRICT_DEBUG:
             raise
-        logging.warning(
-            "Langfuse batch score metadata update failed observation=%s keys=%s error=%s",
-            _handle_observation_id(handle) or type(handle).__name__,
-            sorted(str(key) for key in metadata),
-            exc,
+        _LOGGER.warning(
+            "langfuse_batch_score_metadata_update_failed",
+            observation=_handle_observation_id(handle) or type(handle).__name__,
+            keys=sorted(str(key) for key in metadata),
+            error=str(exc),
         )
 
 

@@ -1,16 +1,83 @@
 You are optimizing a traversal/frontier priority function for a graph search system.
 Respond ONLY with JSON matching the provided schema.
-The 'code' field must contain pure Python defining a typed frontier priority function with signature:
-def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float.
-- node: GraphNode (Pending/Pruned/Anchor/Resolved) from graph_models.py
-- graph: Graph (networkx DiGraph with GraphNode data)
-- step: int traversal step index
+
+The "code" field must contain a complete standalone Python module that defines:
+def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float
+
+Required module header:
+from __future__ import annotations
+from iterative_context.graph_models import Graph, GraphNode
+from iterative_context.types import SelectionCallable
 
 STRICT RULES:
-- You MUST NOT use import statements
-- You MUST NOT reference external modules
-- You MUST NOT access the filesystem
-- Only use built-in Python operations
-- Do NOT wrap the code in Markdown
-- Use the provided GraphNode/Graph shapes; annotate parameters with GraphNode, Graph, step (int). Quoted annotations are allowed to avoid imports.
+- The returned code MUST be a complete standalone module, not just a bare function.
+- You MUST include the required imports exactly once unless an equivalent import set is already present.
+- You MUST define frontier_priority with this exact signature:
+  def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float
+- The code MUST be valid under Ruff and BasedPyright.
+- You MUST NOT import any third-party libraries other than the iterative_context types above.
+- You MUST NOT access the filesystem.
+- Only use built-in Python operations plus the imported iterative_context types.
+- Do NOT wrap the code in Markdown.
+- Keep the policy deterministic and local to traversal selection.
+- The returned code MUST be a complete standalone module including the imports required for GraphNode and Graph
+- Always include the required module header before frontier_priority
+- Do NOT use getattr on GraphNode fields.
+- Access stable fields directly, e.g. node.id and node.state.
+- For variant-specific fields like tokens, use explicit state narrowing:
+  if node.state == "anchor": ...
+  elif node.state == "resolved": ...
+
 Any violation will cause immediate failure.
+
+The module header should look like this
+```py
+from __future__ import annotations
+from iterative_context.graph_models import Graph, GraphNode
+
+def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:
+```
+
+heres a complete example of what we would like
+
+```py
+from __future__ import annotations
+
+from iterative_context.graph_models import Graph, GraphNode
+
+
+def _degree(node: GraphNode, graph: Graph) -> int:
+    return int(graph.in_degree(node.id) + graph.out_degree(node.id))
+
+
+def _bounded_tokens(node: GraphNode, cap: float = 150.0) -> float:
+    if node.state == "anchor":
+        tokens_val = node.tokens
+        if isinstance(tokens_val, (int, float)):
+            return min(float(tokens_val), cap)
+        return 0.0
+
+    if node.state == "resolved":
+        return min(float(node.tokens), cap)
+
+    return 0.0
+
+
+def frontier_priority(node: GraphNode, graph: Graph, step: int) -> float:
+    total = 0.0
+
+    if node.state == "anchor":
+        total += 12.0
+    elif node.state == "pending":
+        total += 5.0
+    elif node.state == "resolved":
+        total += 2.0
+    elif node.state == "pruned":
+        total -= 100.0
+
+    total += min(float(_degree(node, graph)), 30.0) * 0.4
+    total += _bounded_tokens(node, cap=150.0) * 0.07
+    total += min(float(step), 5.0) * 0.15
+
+    return float(total)
+```

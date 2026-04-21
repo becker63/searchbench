@@ -6,21 +6,24 @@ machine remains the inner writer/pipeline retry engine.
 
 from __future__ import annotations
 
-import logging
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from langfuse import LangfuseGeneration, LangfuseSpan
+from langfuse import LangfuseGeneration, LangfuseSpan, propagate_attributes
 
+from harness.log import bind_logger, get_logger, short_task_label
 from harness.localization.models import LCATask
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterFeedbackFinding
-from harness.telemetry import tracing
+from harness.telemetry.tracing import (
+    flush_langfuse,
+    get_langfuse_client,
+    serialize_observation_metadata,
+)
 from harness.telemetry.evaluation_emitters import (
     emit_optimize_iteration_telemetry,
-    safe_update_observation_metadata,
 )
 
 from .machine import (
@@ -53,7 +56,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_OPTIMIZATION_ITERATIONS = 5
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 
 def _score_context_summary_from_metrics(metrics: EvaluationMetrics) -> dict[str, object]:
@@ -99,15 +102,36 @@ class OptimizeTaskLoop:
         self.deps = deps
         self.max_policy_repairs = max_policy_repairs
         self._current_iteration_span: LangfuseSpan | LangfuseGeneration | None = None
+        self._logger = bind_logger(
+            _LOGGER,
+            optimize_run_id=context.optimize_run_id,
+            writer_session_id=context.writer_session_id,
+            task=short_task_label(
+                context.task,
+                ordinal=context.task_ordinal,
+                total=context.task_total,
+            ),
+            task_identity=context.task.task_id,
+            repo=context.task.repo,
+        )
+
+    def _iteration_logger(
+        self,
+        state: OptimizationIterationState,
+    ):
+        return bind_logger(
+            self._logger,
+            iteration=state.iteration,
+            iteration_ordinal=state.iteration + 1,
+            iterations=state.iterations,
+        )
 
     def run(self) -> list[IterationRecord]:
         status = "running"
         try:
-            _LOGGER.info(
-                "[OPTIMIZE] run_loop start task=%s iterations=%s repo=%s",
-                self.context.task.task_id,
-                self.context.iterations,
-                self.context.task.repo,
+            self._logger.info(
+                "run_loop_started",
+                iterations=self.context.iterations,
             )
             prepared_tasks = self._prepare_context()
             while self.context.current_iteration < self.context.iterations:
@@ -123,18 +147,15 @@ class OptimizeTaskLoop:
             return self.context.history
         finally:
             self._finalize_run_trace(status=status)
-            _LOGGER.info(
-                "[OPTIMIZE] run_loop complete task=%s status=%s iterations_completed=%s",
-                self.context.task.task_id,
-                status,
-                len(self.context.history),
+            self._logger.info(
+                "run_loop_completed",
+                status=status,
+                iterations_completed=len(self.context.history),
             )
 
     def _prepare_context(self) -> PreparedTasks:
-        _LOGGER.info(
-            "[OPTIMIZE] backend_init start task=%s repo=%s",
-            self.context.task.task_id,
-            self.context.task.repo,
+        self._logger.info(
+            "backend_init_started",
         )
         try:
             prepared = self.deps.prepare_iteration_tasks(
@@ -147,10 +168,9 @@ class OptimizeTaskLoop:
                 jc_repo_id=None,
             )
         self.context.prepared_tasks = prepared
-        _LOGGER.info(
-            "[OPTIMIZE] backend_init complete task=%s resolved_repo=%s",
-            self.context.task.task_id,
-            prepared.resolved_repo_path,
+        self._logger.info(
+            "backend_init_completed",
+            resolved_repo_path=prepared.resolved_repo_path,
         )
         return prepared
 
@@ -166,16 +186,15 @@ class OptimizeTaskLoop:
             task_total=self.context.task_total,
         )
         metadata = self._iteration_metadata(state)
-        _LOGGER.info(
-            "[OPTIMIZE] optimize_iteration start iteration=%s/%s task=%s",
-            state.iteration + 1,
-            state.iterations,
-            state.task_identity,
-        )
-        with self.deps.start_observation(
+        iteration_logger = self._iteration_logger(state)
+        iteration_logger.info("optimize_iteration_started")
+        run_span = self.context.run_trace
+        if run_span is None:
+            raise RuntimeError("run_loop span missing for optimize_iteration")
+        with run_span.start_as_current_observation(
             name="optimize_iteration",
-            parent=self.context.run_trace,
-            metadata=metadata,
+            as_type="span",
+            metadata=serialize_observation_metadata(metadata),
         ) as iteration_span:
             self._current_iteration_span = iteration_span
             eval_result = self._evaluate_iteration(state, prepared_tasks, iteration_span)
@@ -221,13 +240,12 @@ class OptimizeTaskLoop:
                 continue_next=self._advance_iteration(),
             )
             self._finalize_iteration_span(iteration_span, outcome)
-            _LOGGER.info(
-                "[OPTIMIZE] optimize_iteration complete iteration=%s/%s status=%s pipeline_passed=%s continue=%s",
-                state.iteration + 1,
-                state.iterations,
-                outcome.status,
-                record.pipeline_passed,
-                outcome.continue_next,
+            iteration_logger.info(
+                "optimize_iteration_completed",
+                status=outcome.status,
+                pipeline_passed=record.pipeline_passed,
+                continue_next=outcome.continue_next,
+                rejection_reason=record.error or record.writer_error,
             )
             return outcome
 
@@ -244,18 +262,14 @@ class OptimizeTaskLoop:
             "task": iteration_tasks.task.identity.task_id(),
             "session_policy": "metadata_only",
         }
-        _LOGGER.info(
-            "[OPTIMIZE] evaluate_iteration start iteration=%s/%s task=%s",
-            state.iteration + 1,
-            state.iterations,
-            iteration_tasks.task.identity.task_id(),
-        )
+        iteration_logger = self._iteration_logger(state)
+        iteration_logger.info("evaluate_iteration_started")
         evaluation: EvaluationResult | None = None
         error: str | None = None
-        with self.deps.start_observation(
+        with iteration_span.start_as_current_observation(
             name="evaluate_iteration",
-            parent=iteration_span,
-            metadata=metadata,
+            as_type="span",
+            metadata=serialize_observation_metadata(metadata),
         ) as eval_span:
             try:
                 evaluation = self.deps.evaluate_policy_on_item(
@@ -266,29 +280,36 @@ class OptimizeTaskLoop:
                 )
             except Exception as exc:  # noqa: BLE001
                 error = str(exc)
-            safe_update_observation_metadata(
-                eval_span,
-                {
-                    "status": "ok" if evaluation and evaluation.success else "failed",
-                    "success": evaluation.success if evaluation else False,
-                    "error": error,
-                },
-                operation="evaluate_iteration.metadata",
-                observation_name="evaluate_iteration",
-            )
+            try:
+                eval_span.update(
+                    metadata=serialize_observation_metadata(
+                        {
+                            "status": "ok" if evaluation and evaluation.success else "failed",
+                            "success": evaluation.success if evaluation else False,
+                            "error": error,
+                        }
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                iteration_logger.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="evaluate_iteration.metadata",
+                    observation="evaluate_iteration",
+                    keys=["error", "status", "success"],
+                    error=str(exc),
+                )
         predicted_files_obj = (
             evaluation.ic_result.as_map().get("predicted_files") if evaluation else []
         )
         predicted_files_count = (
             len(predicted_files_obj) if isinstance(predicted_files_obj, list) else 0
         )
-        _LOGGER.info(
-            "[OPTIMIZE] evaluate_iteration complete iteration=%s/%s success=%s score=%s predicted_files=%s",
-            state.iteration + 1,
-            state.iterations,
-            evaluation.success if evaluation else False,
-            evaluation.metrics.score if evaluation else None,
-            predicted_files_count,
+        iteration_logger.info(
+            "evaluate_iteration_completed",
+            success=evaluation.success if evaluation else False,
+            score=evaluation.metrics.score if evaluation else None,
+            predicted_files_count=predicted_files_count,
+            error=error or (evaluation.error if evaluation else None),
         )
         return EvaluationPhaseResult(
             state=state,
@@ -305,12 +326,8 @@ class OptimizeTaskLoop:
         evaluation_phase: EvaluationPhaseResult,
         iteration_span: LangfuseSpan | LangfuseGeneration,
     ) -> ReducerSummary:
-        _LOGGER.info(
-            "[OPTIMIZE] reduce_iteration start iteration=%s/%s task=%s",
-            state.iteration + 1,
-            state.iterations,
-            state.task_identity,
-        )
+        iteration_logger = self._iteration_logger(state)
+        iteration_logger.info("reduce_iteration_started")
         evaluation = evaluation_phase.evaluation
         current_score = self._score_from_evaluation(evaluation)
         previous_score = self.context.prev_score
@@ -331,26 +348,26 @@ class OptimizeTaskLoop:
             pipeline_feedback_available=self.context.prev_classified is not None,
             comparison_summary=evaluation.comparison_summary if evaluation else None,
         )
-        with self.deps.start_observation(
+        with iteration_span.start_as_current_observation(
             name="reduce_iteration",
-            parent=iteration_span,
-            metadata={
-                **self._iteration_metadata(state),
-                "phase": "reduce_iteration",
-                "current_score": summary.current_score,
-                "previous_score": summary.previous_score,
-                "score_delta": summary.score_delta,
-                "evaluation_success": summary.evaluation_success,
-            },
+            as_type="span",
+            metadata=serialize_observation_metadata(
+                {
+                    **self._iteration_metadata(state),
+                    "phase": "reduce_iteration",
+                    "current_score": summary.current_score,
+                    "previous_score": summary.previous_score,
+                    "score_delta": summary.score_delta,
+                    "evaluation_success": summary.evaluation_success,
+                }
+            ),
         ):
             pass
-        _LOGGER.info(
-            "[OPTIMIZE] reduce_iteration complete iteration=%s/%s current_score=%s previous_score=%s delta=%s",
-            state.iteration + 1,
-            state.iterations,
-            summary.current_score,
-            summary.previous_score,
-            summary.score_delta,
+        iteration_logger.info(
+            "reduce_iteration_completed",
+            current_score=summary.current_score,
+            previous_score=summary.previous_score,
+            score_delta=summary.score_delta,
         )
         return summary
 
@@ -362,20 +379,21 @@ class OptimizeTaskLoop:
         iteration_span: LangfuseSpan | LangfuseGeneration,
     ) -> WriterInputContext:
         repo_root = self.deps.find_repo_root()
-        _LOGGER.info(
-            "[OPTIMIZE] build_writer_input start iteration=%s/%s prev_score=%s",
-            state.iteration + 1,
-            state.iterations,
-            self.context.prev_score,
+        iteration_logger = self._iteration_logger(state)
+        iteration_logger.info(
+            "build_writer_input_started",
+            previous_score=self.context.prev_score,
         )
-        with self.deps.start_observation(
+        with iteration_span.start_as_current_observation(
             name="build_writer_input",
-            parent=iteration_span,
-            metadata={
-                **self._iteration_metadata(state),
-                "phase": "build_writer_input",
-                "previous_score": self.context.prev_score,
-            },
+            as_type="span",
+            metadata=serialize_observation_metadata(
+                {
+                    **self._iteration_metadata(state),
+                    "phase": "build_writer_input",
+                    "previous_score": self.context.prev_score,
+                }
+            ),
         ) as feedback_span:
             feedback = self.deps.build_iteration_feedback(
                 evaluation,
@@ -384,22 +402,29 @@ class OptimizeTaskLoop:
                 repo_root,
             )
             feedback = self._attach_reducer_summary(feedback, reducer_summary)
-            safe_update_observation_metadata(
-                feedback_span,
-                {
-                    "tests_chars": len(feedback.tests),
-                    "frontier_context_chars": len(feedback.frontier_context),
-                    "reducer_summary": reducer_summary.model_dump(mode="json"),
-                },
-                operation="build_writer_input.metadata",
-                observation_name="build_writer_input",
-            )
-        _LOGGER.info(
-            "[OPTIMIZE] build_writer_input complete iteration=%s/%s tests_chars=%s frontier_context_chars=%s reducer_available=true",
-            state.iteration + 1,
-            state.iterations,
-            len(feedback.tests),
-            len(feedback.frontier_context),
+            try:
+                feedback_span.update(
+                    metadata=serialize_observation_metadata(
+                        {
+                            "tests_chars": len(feedback.tests),
+                            "frontier_context_chars": len(feedback.frontier_context),
+                            "reducer_summary": reducer_summary.model_dump(mode="json"),
+                        }
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                iteration_logger.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="build_writer_input.metadata",
+                    observation="build_writer_input",
+                    keys=["frontier_context_chars", "reducer_summary", "tests_chars"],
+                    error=str(exc),
+                )
+        iteration_logger.info(
+            "build_writer_input_completed",
+            tests_chars=len(feedback.tests),
+            frontier_context_chars=len(feedback.frontier_context),
+            reducer_available=True,
         )
         return WriterInputContext(
             state=state,
@@ -414,21 +439,22 @@ class OptimizeTaskLoop:
         iteration_span: LangfuseSpan | LangfuseGeneration,
     ) -> RepairOutcome:
         state = writer_input.state
-        _LOGGER.info(
-            "[OPTIMIZE] writer_iteration start iteration=%s/%s task=%s writer_session_id=%s",
-            state.iteration + 1,
-            state.iterations,
-            state.task_identity,
-            state.writer_session_id or "none",
+        bind_logger(
+            self._iteration_logger(state),
+            writer_session_id=state.writer_session_id,
+        ).info(
+            "writer_iteration_started",
         )
-        with self.deps.start_observation(
+        with iteration_span.start_as_current_observation(
             name="writer_iteration",
-            parent=iteration_span,
-            metadata={
-                **self._iteration_metadata(state),
-                "phase": "writer_iteration",
-                "writer_session_id": state.writer_session_id,
-            },
+            as_type="span",
+            metadata=serialize_observation_metadata(
+                {
+                    **self._iteration_metadata(state),
+                    "phase": "writer_iteration",
+                    "writer_session_id": state.writer_session_id,
+                }
+            ),
         ) as writer_span:
             repair_outcome = self._run_repair_phase(
                 self.deps.find_repo_root(),
@@ -436,23 +462,29 @@ class OptimizeTaskLoop:
                 writer_input.feedback,
                 writer_span,
             )
-            safe_update_observation_metadata(
-                writer_span,
-                {
-                    "pipeline_passed": repair_outcome.success,
-                    "attempts_used": repair_outcome.attempts_used,
-                    "writer_error": repair_outcome.writer_error,
-                    "error": repair_outcome.error,
-                },
-                operation="writer_iteration.metadata",
-                observation_name="writer_iteration",
-            )
-        _LOGGER.info(
-            "[OPTIMIZE] writer_iteration complete iteration=%s/%s pipeline_passed=%s attempts=%s",
-            state.iteration + 1,
-            state.iterations,
-            repair_outcome.success,
-            repair_outcome.attempts_used,
+            try:
+                writer_span.update(
+                    metadata=serialize_observation_metadata(
+                        {
+                            "pipeline_passed": repair_outcome.success,
+                            "attempts_used": repair_outcome.attempts_used,
+                            "writer_error": repair_outcome.writer_error,
+                            "error": repair_outcome.error,
+                        }
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._iteration_logger(state).warning(
+                    "langfuse_metadata_update_failed",
+                    operation="writer_iteration.metadata",
+                    observation="writer_iteration",
+                    keys=["attempts_used", "error", "pipeline_passed", "writer_error"],
+                    error=str(exc),
+                )
+        self._iteration_logger(state).info(
+            "writer_iteration_completed",
+            pipeline_passed=repair_outcome.success,
+            attempts_used=repair_outcome.attempts_used,
         )
         return repair_outcome
 
@@ -473,6 +505,8 @@ class OptimizeTaskLoop:
             optimize_run_id=self.context.optimize_run_id,
             writer_session_id=self.context.writer_session_id,
             task_identity=self.context.task.task_id,
+            iteration=self.context.current_iteration,
+            iterations=self.context.iterations,
             task_ordinal=self.context.task_ordinal,
             task_total=self.context.task_total,
             pipeline=self.deps.default_pipeline(),
@@ -638,12 +672,16 @@ class OptimizeTaskLoop:
             metadata["error"] = failure_val
         if outcome.duration_seconds is not None:
             metadata["duration_seconds"] = outcome.duration_seconds
-        safe_update_observation_metadata(
-            span,
-            metadata,
-            operation="optimize_iteration.finalize",
-            observation_name="optimize_iteration",
-        )
+        try:
+            span.update(metadata=serialize_observation_metadata(metadata))
+        except Exception as exc:  # noqa: BLE001
+            self._iteration_logger(outcome.state).warning(
+                "langfuse_metadata_update_failed",
+                operation="optimize_iteration.finalize",
+                observation="optimize_iteration",
+                keys=sorted(metadata.keys()),
+                error=str(exc),
+            )
         self._current_iteration_span = None
 
     def _finalize_run_trace(self, status: str | None) -> None:
@@ -655,12 +693,16 @@ class OptimizeTaskLoop:
         }
         if status:
             metadata["status"] = status
-        safe_update_observation_metadata(
-            span,
-            metadata,
-            operation="run_loop.finalize",
-            observation_name="run_loop",
-        )
+        try:
+            span.update(metadata=serialize_observation_metadata(metadata))
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning(
+                "langfuse_metadata_update_failed",
+                operation="run_loop.finalize",
+                observation="run_loop",
+                keys=sorted(metadata.keys()),
+                error=str(exc),
+            )
 
     def _iteration_metadata(self, state: OptimizationIterationState) -> dict[str, object]:
         metadata: dict[str, object] = {
@@ -739,13 +781,22 @@ def run_loop(
     context: LoopContext | None = None
     deps: LoopDependencies | None = None
     history: list[IterationRecord] = []
-    with tracing.start_observation(
-        name="run_loop",
-        parent=parent_trace,
-        input=task.model_dump(),
-        metadata=root_meta.model_dump(),
-    ) as run_span:
-        with tracing.propagate_context(
+    if parent_trace is None:
+        run_loop_cm = get_langfuse_client().start_as_current_observation(
+            name="run_loop",
+            as_type="span",
+            input=task.model_dump(),
+            metadata=serialize_observation_metadata(root_meta.model_dump()),
+        )
+    else:
+        run_loop_cm = parent_trace.start_as_current_observation(
+            name="run_loop",
+            as_type="span",
+            input=task.model_dump(),
+            metadata=serialize_observation_metadata(root_meta.model_dump()),
+        )
+    with run_loop_cm as run_span:
+        with propagate_attributes(
             trace_name="run_loop",
             session_id=writer_session_id,
         ):
@@ -771,7 +822,7 @@ def run_loop(
                 ).run()
             finally:
                 if flush_tracing:
-                    tracing.flush_langfuse()
+                    flush_langfuse()
     if not history and context is not None and deps is not None:
         history = _fallback_history_from_context(context, deps, parent_trace)
     return history

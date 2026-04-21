@@ -7,19 +7,19 @@ context-budget management, finalization, and retry logic.
 from __future__ import annotations
 
 import json
-import logging
 import time
 from collections.abc import Mapping
 from typing import Any, Callable, Literal, cast
 
 from langfuse import LangfuseGeneration, LangfuseSpan
+from langfuse.api.commons.types import ScoreDataType
 
+from harness.log import bind_logger, get_logger, short_task_label
 from harness.telemetry.tracing import (
     UsageDetails,
     get_tracing_openai_client,
-    start_observation,
+    serialize_observation_metadata,
 )
-from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 from harness.telemetry.observability_models import TaskRunSummary, TokenUsageBreakdown
 from harness.prompts import build_ic_system_prompt, build_jc_system_prompt
 from harness.backends.ic import IterativeContextBackend
@@ -43,7 +43,7 @@ _AGGRESSIVE_TOOL_CONTENT_CHARS = 1200
 _AGGRESSIVE_SYSTEM_CHARS = 1500
 _AGGRESSIVE_USER_CHARS = 1500
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 
 def _require_parent(
@@ -55,8 +55,9 @@ def _require_parent(
     return parent
 
 
-def _span_label(span: LangfuseSpan | LangfuseGeneration) -> str:
-    return span.id
+def _span_label(span: object) -> str:
+    span_id = getattr(span, "id", None)
+    return span_id if isinstance(span_id, str) and span_id else type(span).__name__
 
 
 def _langfuse_usage_details(
@@ -78,25 +79,6 @@ def _langfuse_usage_details(
         if isinstance(value, (int, float)):
             numeric[key] = int(value)
     return numeric or None
-
-
-def _safe_update(
-    span: LangfuseSpan | LangfuseGeneration | None,
-    *,
-    metadata: Mapping[str, object] | None = None,
-) -> None:
-    if span is None:
-        return
-    try:
-        span.update(metadata=dict(metadata) if metadata is not None else None)
-    except Exception as exc:  # noqa: BLE001
-        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else ["metadata"]
-        _LOGGER.warning(
-            "Langfuse metadata update failed operation=localizer.update observation=%s keys=%s error=%s",
-            _span_label(span),
-            keys,
-            exc,
-        )
 
 
 def _prediction_from_output(
@@ -269,7 +251,12 @@ def resolve_runner_model(model_override: str | None = None) -> str:
     resolved = model_override or env_model or get_runner_model()
     if not resolved:
         resolved = "gpt-oss-120b"
-    _LOGGER.info("Localization runner model resolved: %s (override=%s, env=%s)", resolved, bool(model_override), env_model)
+    _LOGGER.info(
+        "runner_model_resolved",
+        model=resolved,
+        override=bool(model_override),
+        env_model=env_model,
+    )
     return resolved
 
 
@@ -330,7 +317,11 @@ def _collect_tool_results(
                         arg_map = loaded_args
                 except Exception:
                     pass
-            with start_observation(name=f"toolcall.{name}", parent=parent_span, metadata={"tool": name}) as tool_obs:
+            with parent_span.start_as_current_observation(
+                name=f"toolcall.{name}",
+                as_type="span",
+                metadata=serialize_observation_metadata({"tool": name}),
+            ) as tool_obs:
                 try:
                     result = dispatch_tool_call(name, arg_map)
                     failed = False
@@ -347,10 +338,25 @@ def _collect_tool_results(
                         "tool_status": "failure" if failed else "success",
                     }
                 )
-                tool_obs.update(
-                    output=_truncate_for_metadata(result),
-                    metadata={"tool": name, "phase": "tool_execution", "status": "failure" if failed else "success"},
-                )
+                try:
+                    tool_obs.update(
+                        output=_truncate_for_metadata(result),
+                        metadata=serialize_observation_metadata(
+                            {
+                                "tool": name,
+                                "phase": "tool_execution",
+                                "status": "failure" if failed else "success",
+                            }
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.warning(
+                        "langfuse_metadata_update_failed",
+                        operation="toolcall.update",
+                        observation=_span_label(tool_obs),
+                        keys=["phase", "status", "tool"],
+                        error=str(exc),
+                    )
     return new_results
 
 
@@ -443,7 +449,16 @@ def run_agent(
 ):
     parent_span = _require_parent(parent_trace, owner=backend_name or "runner agent")
     client, model = _make_client()
-    _safe_update(parent_span, metadata={"runner_model": model})
+    try:
+        parent_span.update(metadata=serialize_observation_metadata({"runner_model": model}))
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning(
+            "langfuse_metadata_update_failed",
+            operation="runner_parent.update",
+            observation=_span_label(parent_span),
+            keys=["runner_model"],
+            error=str(exc),
+        )
     messages = _build_model_messages(agent_task, tool_specs, system_prompt)
     tool_choice = "required" if tool_specs else None
     tools_payload: list[ChatCompletionToolParam] | None = tool_specs or None
@@ -451,20 +466,27 @@ def run_agent(
     aggregate_usage_details: dict[str, object] = {}
     step_count = 0
     generation_count = 0
+    run_logger = bind_logger(
+        _LOGGER,
+        backend=backend_name or "localizer",
+    )
 
     for step in range(steps):
         step_count += 1
-        _LOGGER.info(
-            "[RUN] %s agent_step=%s/%s model=%s",
-            backend_name or "localizer",
-            step + 1,
-            steps,
-            model,
+        step_logger = bind_logger(
+            run_logger,
+            step=step,
+            step_ordinal=step + 1,
+            steps=steps,
+            model=model,
         )
-        with start_observation(
+        step_logger.info("agent_step_started")
+        with parent_span.start_as_current_observation(
             name="agent_step",
-            parent=parent_span,
-            metadata={"step": step, "model": model, "backend": backend_name or "unknown"},
+            as_type="span",
+            metadata=serialize_observation_metadata(
+                {"step": step, "model": model, "backend": backend_name or "unknown"}
+            ),
         ) as obs:
             tool_results = _collect_tool_results(
                 observations,
@@ -541,11 +563,9 @@ def run_agent(
                     name_obj = getattr(function_obj, "name", None)
                     if isinstance(name_obj, str):
                         tool_names.append(name_obj)
-                _LOGGER.info(
-                    "[RUN] %s agent_step=%s tool_calls=%s",
-                    backend_name or "localizer",
-                    step + 1,
-                    ",".join(tool_names) if tool_names else "unknown",
+                step_logger.info(
+                    "agent_step_tool_calls",
+                    tool_calls=tool_names or ["unknown"],
                 )
                 assistant_observation = {
                     "role": "assistant",
@@ -581,11 +601,9 @@ def run_agent(
                 )
                 predicted = response_json.get("predicted_files")
                 predicted_count = len(predicted) if isinstance(predicted, list) else 0
-                _LOGGER.info(
-                    "[RUN] %s agent_step=%s complete predicted_files=%s",
-                    backend_name or "localizer",
-                    step + 1,
-                    predicted_count,
+                step_logger.info(
+                    "agent_step_completed",
+                    predicted_files_count=predicted_count,
                 )
                 break
     result: dict[str, object] = {"observations": observations}
@@ -1151,10 +1169,13 @@ def _finalize_localization(
     prepared_observations = _clean_observations_for_finalization(observations, repo_root)
     messages = _format_finalization_messages(agent_task, prepared_observations)
     schema = _localization_result_schema()
-    with start_observation(
+    parent_span = _require_parent(parent_trace, owner="runner agent")
+    with parent_span.start_as_current_observation(
         name="localization_finalize",
-        parent=_require_parent(parent_trace, owner="runner agent"),
-        metadata={"phase": "finalization", "runner_model": model},
+        as_type="span",
+        metadata=serialize_observation_metadata(
+            {"phase": "finalization", "runner_model": model}
+        ),
     ) as obs:
         completion = client.chat.completions.create(
             messages=messages,
@@ -1300,16 +1321,42 @@ def run_ic_iteration(
     repo = task.repo
     agent_task = serialize_lca_task_for_prompt(task)
 
-    with start_observation(
-            name="iterative_context",
-            parent=parent_span,
-            metadata={"backend": "iterative_context", "repo": repo, "identity": task.identity.task_id(), "phase": "backend_init"},
+    with parent_span.start_as_current_observation(
+        name="iterative_context",
+        as_type="span",
+        metadata=serialize_observation_metadata(
+            {
+                "backend": "iterative_context",
+                "repo": repo,
+                "identity": task.identity.task_id(),
+                "phase": "backend_init",
+            }
+        ),
     ) as backend_obs:
         try:
             backend = IterativeContextBackend(repo=repo, score_fn=score_fn)
             tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
             system_prompt = build_ic_system_prompt(tool_specs)
-            _safe_update(backend_obs, metadata={"backend": "iterative_context", "repo": repo, "identity": task.identity.task_id(), "phase": "agent_execution", "tool_count": len(tool_specs)})
+            try:
+                backend_obs.update(
+                    metadata=serialize_observation_metadata(
+                        {
+                            "backend": "iterative_context",
+                            "repo": repo,
+                            "identity": task.identity.task_id(),
+                            "phase": "agent_execution",
+                            "tool_count": len(tool_specs),
+                        }
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="iterative_context.update",
+                    observation=_span_label(backend_obs),
+                    keys=["backend", "identity", "phase", "repo", "tool_count"],
+                    error=str(exc),
+                )
         except Exception as exc:  # noqa: BLE001
             summary = _build_task_run_summary(
                 task=task,
@@ -1321,7 +1368,24 @@ def run_ic_iteration(
                 stage="backend_init",
                 message=str(exc),
             )
-            _safe_update(backend_obs, metadata={"task_summary": summary.model_dump(mode="json"), "phase": "backend_init", "error": str(exc)})
+            try:
+                backend_obs.update(
+                    metadata=serialize_observation_metadata(
+                        {
+                            "task_summary": summary.model_dump(mode="json"),
+                            "phase": "backend_init",
+                            "error": str(exc),
+                        }
+                    )
+                )
+            except Exception as update_exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="iterative_context.update",
+                    observation=_span_label(backend_obs),
+                    keys=["error", "phase", "task_summary"],
+                    error=str(update_exc),
+                )
             raise LocalizationEvaluationError(
                 LocalizationFailureCategory.RUNNER,
                 str(exc),
@@ -1340,7 +1404,20 @@ def run_ic_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            _safe_update(backend_obs, metadata={"error": str(exc), "phase": "agent_execution"})
+            try:
+                backend_obs.update(
+                    metadata=serialize_observation_metadata(
+                        {"error": str(exc), "phase": "agent_execution"}
+                    )
+                )
+            except Exception as update_exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="iterative_context.update",
+                    observation=_span_label(backend_obs),
+                    keys=["error", "phase"],
+                    error=str(update_exc),
+                )
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         normalized_node_count = _coerce_node_count(normalized.get("node_count"))
@@ -1367,8 +1444,34 @@ def run_ic_iteration(
                         node_count_val = len(nodes)
                         break
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
-        emit_score_for_handle(backend_obs, name="ic.node_count", value=node_count_metric, data_type="NUMERIC")
-        _safe_update(backend_obs, metadata={"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")})
+        try:
+            backend_obs.score(
+                name="ic.node_count",
+                value=node_count_metric,
+                data_type=ScoreDataType.NUMERIC,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "langfuse_score_emission_failed",
+                operation="iterative_context.score",
+                observation=_span_label(backend_obs),
+                score="ic.node_count",
+                error=str(exc),
+            )
+        try:
+            backend_obs.update(
+                metadata=serialize_observation_metadata(
+                    {"node_count": node_count_val or 0, "full_graph": normalized.get("full_graph")}
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "langfuse_metadata_update_failed",
+                operation="iterative_context.update",
+                observation=_span_label(backend_obs),
+                keys=["full_graph", "node_count"],
+                error=str(exc),
+            )
 
     final = _runner_error_result(
         task=task,
@@ -1405,7 +1508,24 @@ def run_ic_iteration(
         stage="agent_execution" if final.source == "runner_error" else ("finalization" if not final.prediction.predicted_files else None),
         message=str((final.raw or {}).get("error")) if isinstance(final.raw, Mapping) and (final.raw or {}).get("error") else None,
     )
-    _safe_update(backend_obs, metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
+    try:
+        backend_obs.update(
+            metadata=serialize_observation_metadata(
+                {
+                    "task_summary": final.observability_summary.model_dump(mode="json")
+                    if final.observability_summary
+                    else None
+                }
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning(
+            "langfuse_metadata_update_failed",
+            operation="iterative_context.update",
+            observation=_span_label(backend_obs),
+            keys=["task_summary"],
+            error=str(exc),
+        )
     return final
 
 
@@ -1420,18 +1540,27 @@ def run_jc_iteration(
         raise ValueError("LCATask.repo is required for jcodemunch execution")
     repo = task.repo
     agent_task = serialize_lca_task_for_prompt(task)
+    backend_logger = bind_logger(
+        _LOGGER,
+        backend="jcodemunch",
+        task=short_task_label(task),
+        task_identity=task.task_id,
+        repo=repo,
+    )
 
-    with start_observation(
-            name="jcodemunch",
-            parent=parent_span,
-            metadata={
+    with parent_span.start_as_current_observation(
+        name="jcodemunch",
+        as_type="span",
+        metadata=serialize_observation_metadata(
+            {
                 "backend": "jcodemunch",
                 "repo": repo,
                 "identity": task.identity.task_id(),
                 "phase": "backend_init",
-            },
+            }
+        ),
     ) as backend_obs:
-        _LOGGER.info("[RUN] initializing jc backend for task %s", task.task_id)
+        backend_logger.info("backend_init_started")
         try:
             backend = JCodeMunchBackend(repo=repo)
             tool_specs: list[ChatCompletionToolParam] = backend.tool_specs
@@ -1447,43 +1576,61 @@ def run_jc_iteration(
                 stage="backend_init",
                 message=str(exc),
             )
-            _LOGGER.error(
-                "[RUN] jc backend initialization failed for task %s: %s",
-                task.task_id,
-                exc,
+            backend_logger.error(
+                "backend_init_failed",
+                error=str(exc),
             )
-            _safe_update(
-                backend_obs,
-                metadata={
-                    "backend": "jcodemunch",
-                    "repo": repo,
-                    "identity": task.identity.task_id(),
-                    "phase": "backend_init",
-                    "error": str(exc),
-                    "task_summary": summary.model_dump(mode="json"),
-                },
-            )
+            try:
+                backend_obs.update(
+                    metadata=serialize_observation_metadata(
+                        {
+                            "backend": "jcodemunch",
+                            "repo": repo,
+                            "identity": task.identity.task_id(),
+                            "phase": "backend_init",
+                            "error": str(exc),
+                            "task_summary": summary.model_dump(mode="json"),
+                        }
+                    )
+                )
+            except Exception as update_exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="jcodemunch.update",
+                    observation=_span_label(backend_obs),
+                    keys=["backend", "error", "identity", "phase", "repo", "task_summary"],
+                    error=str(update_exc),
+                )
             raise LocalizationEvaluationError(
                 LocalizationFailureCategory.RUNNER,
                 str(exc),
                 task_id=task.task_id,
                 observability_summary=summary,
             ) from exc
-        _LOGGER.info(
-            "[RUN] initialized jc backend for task %s tools=%d",
-            task.task_id,
-            len(tool_specs),
+        backend_logger.info(
+            "backend_init_completed",
+            tool_count=len(tool_specs),
         )
-        _safe_update(
-            backend_obs,
-            metadata={
-                "backend": "jcodemunch",
-                "repo": repo,
-                "identity": task.identity.task_id(),
-                "phase": "agent_execution",
-                "tool_count": len(tool_specs),
-            },
-        )
+        try:
+            backend_obs.update(
+                metadata=serialize_observation_metadata(
+                    {
+                        "backend": "jcodemunch",
+                        "repo": repo,
+                        "identity": task.identity.task_id(),
+                        "phase": "agent_execution",
+                        "tool_count": len(tool_specs),
+                    }
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "langfuse_metadata_update_failed",
+                operation="jcodemunch.update",
+                observation=_span_label(backend_obs),
+                keys=["backend", "identity", "phase", "repo", "tool_count"],
+                error=str(exc),
+            )
         try:
             raw = run_agent(
                 agent_task,
@@ -1496,7 +1643,20 @@ def run_jc_iteration(
             )
         except Exception as exc:  # noqa: BLE001
             raw = cast(dict[str, object], {"observations": [], "error": str(exc)})
-            _safe_update(backend_obs, metadata={"error": str(exc), "phase": "agent_execution"})
+            try:
+                backend_obs.update(
+                    metadata=serialize_observation_metadata(
+                        {"error": str(exc), "phase": "agent_execution"}
+                    )
+                )
+            except Exception as update_exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="jcodemunch.update",
+                    observation=_span_label(backend_obs),
+                    keys=["error", "phase"],
+                    error=str(update_exc),
+                )
         normalized = _normalize_agent_result(raw)
         observations = _coerce_observations(normalized.get("observations"))
         node_count_val = _coerce_node_count(normalized.get("node_count"))
@@ -1507,8 +1667,32 @@ def run_jc_iteration(
                 if isinstance(nodes, list):
                     node_count_val = len(nodes)
         node_count_metric = float(node_count_val) if node_count_val is not None else 0.0
-        emit_score_for_handle(backend_obs, name="jc.node_count", value=node_count_metric, data_type="NUMERIC")
-        _safe_update(backend_obs, metadata={"node_count": node_count_val or 0})
+        try:
+            backend_obs.score(
+                name="jc.node_count",
+                value=node_count_metric,
+                data_type=ScoreDataType.NUMERIC,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "langfuse_score_emission_failed",
+                operation="jcodemunch.score",
+                observation=_span_label(backend_obs),
+                score="jc.node_count",
+                error=str(exc),
+            )
+        try:
+            backend_obs.update(
+                metadata=serialize_observation_metadata({"node_count": node_count_val or 0})
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "langfuse_metadata_update_failed",
+                operation="jcodemunch.update",
+                observation=_span_label(backend_obs),
+                keys=["node_count"],
+                error=str(exc),
+            )
 
     final = _runner_error_result(
         task=task,
@@ -1538,7 +1722,24 @@ def run_jc_iteration(
         stage="agent_execution" if final.source == "runner_error" else ("finalization" if not final.prediction.predicted_files else None),
         message=str((final.raw or {}).get("error")) if isinstance(final.raw, Mapping) and (final.raw or {}).get("error") else None,
     )
-    _safe_update(backend_obs, metadata={"task_summary": final.observability_summary.model_dump(mode="json") if final.observability_summary else None})
+    try:
+        backend_obs.update(
+            metadata=serialize_observation_metadata(
+                {
+                    "task_summary": final.observability_summary.model_dump(mode="json")
+                    if final.observability_summary
+                    else None
+                }
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning(
+            "langfuse_metadata_update_failed",
+            operation="jcodemunch.update",
+            observation=_span_label(backend_obs),
+            keys=["task_summary"],
+            error=str(exc),
+        )
     return final
 
 

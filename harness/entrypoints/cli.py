@@ -26,6 +26,7 @@ except ImportError:
     termios = None  # type: ignore
 
 import typer
+from langfuse import LangfuseGeneration, LangfuseSpan, propagate_attributes
 from pydantic import BaseModel, ConfigDict
 
 from harness.agents.localizer import run_ic_iteration, run_jc_iteration
@@ -35,6 +36,8 @@ from harness.entrypoints.flows import (
     JC_RUN_NARRATIVE,
     flow_help,
 )
+from harness.log import get_logger
+from harness.logging_config import configure_logging
 from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
@@ -52,13 +55,12 @@ from harness.telemetry.hosted.hf_lca import (
     HFDatasetLoadError,
     sync_hf_localization_dataset_to_langfuse,
 )
-from harness.telemetry.evaluation_emitters import safe_update_observation_metadata
 from harness.telemetry.observability_models import RunSummary, TaskRunSummary
 from harness.telemetry.tracing import (
     ensure_langfuse_auth,
     flush_langfuse,
-    propagate_context,
-    start_observation,
+    get_langfuse_client,
+    serialize_observation_metadata,
 )
 from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
 from harness.telemetry.tracing.session_policy import (
@@ -145,6 +147,8 @@ jc_app = typer.Typer(help="JCodeMunch flows", no_args_is_help=True)
 ic_app = typer.Typer(help="Iterative Context flows", no_args_is_help=True)
 app.add_typer(jc_app, name="jc")
 app.add_typer(ic_app, name="ic")
+
+_LOGGER = get_logger(__name__)
 
 MaxItemsOption = Annotated[
     int | None,
@@ -829,15 +833,24 @@ def _accepted_policy_candidates(
 
 def _apply_best_accepted_policy(
     results: Sequence[OptimizeTaskResult],
-    parent_span: object | None,
+    parent_span: LangfuseSpan | LangfuseGeneration | None,
 ) -> tuple[bool, str | None]:
     candidates = _accepted_policy_candidates(results)
     if not candidates:
-        with start_observation(
-            name="policy_acceptance",
-            parent=parent_span,
-            metadata={"status": "no_accepted_policy"},
-        ):
+        observation_cm = (
+            get_langfuse_client().start_as_current_observation(
+                name="policy_acceptance",
+                as_type="span",
+                metadata=serialize_observation_metadata({"status": "no_accepted_policy"}),
+            )
+            if parent_span is None
+            else parent_span.start_as_current_observation(
+                name="policy_acceptance",
+                as_type="span",
+                metadata=serialize_observation_metadata({"status": "no_accepted_policy"}),
+            )
+        )
+        with observation_cm:
             pass
         return False, None
     score, result, accepted = max(candidates, key=lambda item: item[0])
@@ -849,11 +862,20 @@ def _apply_best_accepted_policy(
         "score": score,
         "workspace_root": str(result.workspace_root) if result.workspace_root else None,
     }
-    with start_observation(
-        name="policy_acceptance",
-        parent=parent_span,
-        metadata=metadata,
-    ):
+    observation_cm = (
+        get_langfuse_client().start_as_current_observation(
+            name="policy_acceptance",
+            as_type="span",
+            metadata=serialize_observation_metadata(metadata),
+        )
+        if parent_span is None
+        else parent_span.start_as_current_observation(
+            name="policy_acceptance",
+            as_type="span",
+            metadata=serialize_observation_metadata(metadata),
+        )
+    )
+    with observation_cm:
         pass
     return True, result.task.task_id
 
@@ -906,18 +928,21 @@ def _run_localization_flow_command(
         )
         if should_exit:
             return
-        with propagate_context(
+        with propagate_attributes(
             trace_name=command_name.replace(" ", "_"),
             session_id=session_cfg.session_id,
         ):
-            with start_observation(
+            with get_langfuse_client().start_as_current_observation(
                 name=f"{backend}_run_dataset",
-                metadata={
-                    "command": command_name,
-                    "dataset": project_dataset.name,
-                    "dataset_version": project_dataset.version,
-                    "selected_count": selection_info.get("selected_count"),
-                },
+                as_type="span",
+                metadata=serialize_observation_metadata(
+                    {
+                        "command": command_name,
+                        "dataset": project_dataset.name,
+                        "dataset_version": project_dataset.version,
+                        "selected_count": selection_info.get("selected_count"),
+                    }
+                ),
             ) as dataset_span:
                 result = evaluate_localization_batch(
                     selected_tasks,
@@ -927,16 +952,24 @@ def _run_localization_flow_command(
                     runner=_runner_for_backend(backend),
                 )
                 if result.run_summary is not None:
-                    safe_update_observation_metadata(
-                        dataset_span,
-                        {
-                            "run_summary": result.run_summary.model_dump(
-                                mode="json"
+                    try:
+                        dataset_span.update(
+                            metadata=serialize_observation_metadata(
+                                {
+                                    "run_summary": result.run_summary.model_dump(
+                                        mode="json"
+                                    )
+                                }
                             )
-                        },
-                        operation="cli.run_dataset.metadata",
-                        observation_name=f"{backend}_run_dataset",
-                    )
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _LOGGER.warning(
+                            "langfuse_metadata_update_failed",
+                            operation="cli.run_dataset.metadata",
+                            observation=f"{backend}_run_dataset",
+                            keys=["run_summary"],
+                            error=str(exc),
+                        )
         print(f"[RUN] session={session_cfg.session_id} dataset={project_dataset.name}")
         _print_evaluation_summary(backend, result)
 
@@ -1064,13 +1097,14 @@ def _run_ic_optimize_command(
                     "writer_session_id": writer_session_id,
                     "session_policy": "writer_loop_only",
                 }
-                with propagate_context(
+                with propagate_attributes(
                     trace_name="ic_optimize_task",
                     session_id=writer_session_id,
                 ):
-                    with start_observation(
+                    with get_langfuse_client().start_as_current_observation(
                         name="optimize_task",
-                        metadata=task_metadata,
+                        as_type="span",
+                        metadata=serialize_observation_metadata(task_metadata),
                     ) as task_span:
                         log(
                             "[TASK] ic optimize phase=evaluate_policy task=%s/%s identity=%s optimize_run_id=%s writer_session_id=%s"
@@ -1092,17 +1126,30 @@ def _run_ic_optimize_command(
                             getattr(record, "accepted_policy", None) is not None
                             for record in history
                         )
-                        safe_update_observation_metadata(
-                            task_span,
-                            {
-                                "status": "success",
-                                "iterations": len(history),
-                                "accepted_policy": accepted,
-                                "duration_seconds": duration,
-                            },
-                            operation="cli.optimize_task.metadata",
-                            observation_name="optimize_task",
-                        )
+                        try:
+                            task_span.update(
+                                metadata=serialize_observation_metadata(
+                                    {
+                                        "status": "success",
+                                        "iterations": len(history),
+                                        "accepted_policy": accepted,
+                                        "duration_seconds": duration,
+                                    }
+                                )
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            _LOGGER.warning(
+                                "langfuse_metadata_update_failed",
+                                operation="cli.optimize_task.metadata",
+                                observation="optimize_task",
+                                keys=[
+                                    "accepted_policy",
+                                    "duration_seconds",
+                                    "iterations",
+                                    "status",
+                                ],
+                                error=str(exc),
+                            )
                 with progress_lock:
                     completed += 1
                     local_started = started
@@ -1145,13 +1192,14 @@ def _run_ic_optimize_command(
                     "writer_session_id": writer_session_id,
                     "session_policy": "writer_loop_only",
                 }
-                with propagate_context(
+                with propagate_attributes(
                     trace_name="ic_optimize_task",
                     session_id=writer_session_id,
                 ):
-                    with start_observation(
+                    with get_langfuse_client().start_as_current_observation(
                         name="optimize_task",
-                        metadata=failure_metadata,
+                        as_type="span",
+                        metadata=serialize_observation_metadata(failure_metadata),
                     ):
                         pass
                 with progress_lock:
@@ -1181,23 +1229,26 @@ def _run_ic_optimize_command(
                     error=str(exc),
                 )
 
-        with propagate_context(
+        with propagate_attributes(
             trace_name="ic_optimize",
             session_id=session_cfg.session_id,
         ):
-            with start_observation(
+            with get_langfuse_client().start_as_current_observation(
                 name="ic_optimize_dataset",
-                metadata={
-                    "command": "ic optimize",
-                    "optimize_run_id": optimize_run_id,
-                    "dataset": project_dataset.name,
-                    "dataset_version": project_dataset.version,
-                    "selected_count": total,
-                    "execution": "parallel",
-                    "effective_workers": effective_workers,
-                    "iterations": iterations,
-                    "workspace_base": str(workspace_base),
-                },
+                as_type="span",
+                metadata=serialize_observation_metadata(
+                    {
+                        "command": "ic optimize",
+                        "optimize_run_id": optimize_run_id,
+                        "dataset": project_dataset.name,
+                        "dataset_version": project_dataset.version,
+                        "selected_count": total,
+                        "execution": "parallel",
+                        "effective_workers": effective_workers,
+                        "iterations": iterations,
+                        "workspace_base": str(workspace_base),
+                    }
+                ),
             ) as dataset_span:
                 with ThreadPoolExecutor(max_workers=effective_workers) as executor:
                     futures = [
@@ -1207,19 +1258,34 @@ def _run_ic_optimize_command(
                     for future in as_completed(futures):
                         results.append(future.result())
                 applied, applied_task = _apply_best_accepted_policy(results, dataset_span)
-                safe_update_observation_metadata(
-                    dataset_span,
-                    {
-                        "started": started,
-                        "completed": completed,
-                        "failed": failed,
-                        "remaining": max(0, total - completed - failed),
-                        "policy_applied": applied,
-                        "applied_task": applied_task,
-                    },
-                    operation="cli.optimize_dataset.metadata",
-                    observation_name="ic_optimize_dataset",
-                )
+                try:
+                    dataset_span.update(
+                        metadata=serialize_observation_metadata(
+                            {
+                                "started": started,
+                                "completed": completed,
+                                "failed": failed,
+                                "remaining": max(0, total - completed - failed),
+                                "policy_applied": applied,
+                                "applied_task": applied_task,
+                            }
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.warning(
+                        "langfuse_metadata_update_failed",
+                        operation="cli.optimize_dataset.metadata",
+                        observation="ic_optimize_dataset",
+                        keys=[
+                            "applied_task",
+                            "completed",
+                            "failed",
+                            "policy_applied",
+                            "remaining",
+                            "started",
+                        ],
+                        error=str(exc),
+                    )
         total_duration = sum(result.duration_seconds for result in results)
         print(
             "[RUN] ic optimize summary selected=%s started=%s completed=%s failed=%s effective_workers=%s policy_applied=%s applied_task=%s total_task_duration=%.2fs"
@@ -1393,7 +1459,7 @@ def sync_hf(
 
 def main(argv: list[str] | None = None) -> None:
     os.environ.setdefault("LANGFUSE_STRICT_DEBUG", "1")
-    logging.basicConfig(level=logging.INFO)
+    configure_logging(level=logging.INFO)
     args = argv if argv is not None else sys.argv[1:]
     _reject_removed_flags(args)
     app(args=args, standalone_mode=False)

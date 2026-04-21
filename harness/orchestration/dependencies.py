@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from langfuse import LangfuseGeneration, LangfuseSpan
+from langfuse.api.commons.types import ScoreDataType
 
+from harness.log import get_logger
 from harness.localization.materialization.worktree import WorktreeManager
 from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
@@ -15,7 +17,7 @@ from harness.localization.runtime.evaluate import (
 )
 from harness.pipeline.types import PipelineClassification, StepResult
 from harness.prompts import WriterOptimizationBrief
-from harness.telemetry.evaluation_emitters import safe_update_observation_metadata
+from harness.telemetry.tracing import get_langfuse_client, serialize_observation_metadata
 from harness.utils.diff import DiffSummary
 from harness.utils.type_loader import FrontierContext
 from harness.utils.warnings import suppress_third_party_invalid_escape_warnings
@@ -27,7 +29,6 @@ from .types import (
     FailedRepairDetails,
     LoopDependencies,
     PreparedTasks,
-    StartObservation,
     SupportsPipelineRun,
     format_failure_context_payload,
 )
@@ -47,6 +48,8 @@ BuildFrontierContext = Callable[[Path], FrontierContext]
 FormatFrontierContext = Callable[[FrontierContext], str]
 FormatDiff = Callable[[DiffSummary], str]
 InterpretDiff = Callable[[DiffSummary], str]
+
+_LOGGER = get_logger(__name__)
 
 
 class EvaluateLocalizationBatch(Protocol):
@@ -77,22 +80,6 @@ class PolicyGenerator(Protocol):
     ) -> str: ...
 
 
-class EmitScore(Protocol):
-    def __call__(
-        self,
-        *,
-        name: str,
-        value: float | int | bool | str,
-        data_type: str | None = None,
-        trace_id: str | None = None,
-        observation_id: str | None = None,
-        session_id: str | None = None,
-        config_id: str | None = None,
-        comment: str | None = None,
-        score_id: str | None = None,
-    ) -> None: ...
-
-
 class ComputeRawDiff(Protocol):
     def __call__(
         self,
@@ -115,12 +102,10 @@ class RuntimeCollaborators:
     format_diff: FormatDiff
     interpret_diff: InterpretDiff
     generate_policy: PolicyGenerator
-    emit_score: EmitScore
     classify_results: ClassifyResults
     read_policy: ReadPolicy
     write_policy: WritePolicy
     get_writer_model: GetWriterModel
-    start_observation: StartObservation
     find_repo_root: FindRepoRoot
     default_pipeline: PipelineFactory
 
@@ -129,27 +114,41 @@ def prepare_iteration_tasks(
     task: LCATask,
     parent_trace: LangfuseSpan | LangfuseGeneration | None,
     *,
-    start_observation: StartObservation,
     index_folder: IndexFolder,
 ) -> PreparedTasks:
     resolved_repo_path = task.repo
     jc_repo_id: str | None = None
     if isinstance(task.repo, str):
-        with start_observation(
-            name="index_repo",
-            parent=parent_trace,
-            metadata={"repo": task.repo},
-        ) as index_obs:
+        observation_cm = (
+            get_langfuse_client().start_as_current_observation(
+                name="index_repo",
+                as_type="span",
+                metadata=serialize_observation_metadata({"repo": task.repo}),
+            )
+            if parent_trace is None
+            else parent_trace.start_as_current_observation(
+                name="index_repo",
+                as_type="span",
+                metadata=serialize_observation_metadata({"repo": task.repo}),
+            )
+        )
+        with observation_cm as index_obs:
             with suppress_third_party_invalid_escape_warnings(task.repo):
                 result = index_folder(task.repo)
             repo_id = str(result.get("repo", ""))
             jc_repo_id = repo_id
-            safe_update_observation_metadata(
-                index_obs,
-                {"repo": repo_id},
-                operation="prepare_iteration_tasks.metadata",
-                observation_name="prepare_jc_repo",
-            )
+            try:
+                index_obs.update(
+                    metadata=serialize_observation_metadata({"repo": repo_id})
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="prepare_iteration_tasks.metadata",
+                    observation="prepare_jc_repo",
+                    keys=["repo"],
+                    error=str(exc),
+                )
     if resolved_repo_path is None:
         raise RuntimeError("Task missing repo")
     return PreparedTasks(
@@ -191,8 +190,6 @@ def run_policy_pipeline(
     repo_root: Path,
     repair_obs: LangfuseSpan | LangfuseGeneration | None = None,
     allow_no_parent: bool = False,
-    *,
-    emit_score: EmitScore,
 ) -> tuple[list[StepResult], bool]:
     try:
         raw_results = list(
@@ -208,38 +205,38 @@ def run_policy_pipeline(
         step if isinstance(step, StepResult) else StepResult.from_external(step)
         for step in raw_results
     ]
-    trace_id = repair_obs.trace_id if repair_obs is not None else None
-    observation_id = repair_obs.id if repair_obs is not None else None
-    if not any([trace_id, observation_id]):
+    if repair_obs is None:
         return step_results, all(step_succeeded(result) for result in step_results)
 
     for step in step_results:
-        score_id = (
-            f"{observation_id or trace_id}-pipeline.{step.name}.exit_code"
-            if (observation_id or trace_id)
-            else None
-        )
-        emit_score(
-            name=f"pipeline.{step.name}.exit_code",
-            value=step.exit_code,
-            data_type="NUMERIC",
-            trace_id=trace_id,
-            observation_id=observation_id,
-            score_id=score_id,
-        )
-        pass_score_id = (
-            f"{observation_id or trace_id}-pipeline.{step.name}.passed"
-            if (observation_id or trace_id)
-            else None
-        )
-        emit_score(
-            name=f"pipeline.{step.name}.passed",
-            value=int(step.success),
-            data_type="BOOLEAN",
-            trace_id=trace_id,
-            observation_id=observation_id,
-            score_id=pass_score_id,
-        )
+        try:
+            repair_obs.score(
+                name=f"pipeline.{step.name}.exit_code",
+                value=step.exit_code,
+                data_type=ScoreDataType.NUMERIC,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "langfuse_score_emission_failed",
+                operation="run_policy_pipeline.score",
+                observation="pipeline_check",
+                score_name=f"pipeline.{step.name}.exit_code",
+                error=str(exc),
+            )
+        try:
+            repair_obs.score(
+                name=f"pipeline.{step.name}.passed",
+                value=step.success,
+                data_type=ScoreDataType.BOOLEAN,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "langfuse_score_emission_failed",
+                operation="run_policy_pipeline.score",
+                observation="pipeline_check",
+                score_name=f"pipeline.{step.name}.passed",
+                error=str(exc),
+            )
     return step_results, all(step_succeeded(result) for result in step_results)
 
 
@@ -325,7 +322,6 @@ def build_loop_dependencies(
         return prepare_iteration_tasks(
             task,
             parent_trace,
-            start_observation=collaborators.start_observation,
             index_folder=collaborators.index_folder,
         )
 
@@ -340,7 +336,6 @@ def build_loop_dependencies(
             repo_root,
             repair_obs=repair_obs,
             allow_no_parent=allow_no_parent,
-            emit_score=collaborators.emit_score,
         )
 
     def finalize_success(
@@ -388,7 +383,6 @@ def build_loop_dependencies(
         read_policy=collaborators.read_policy,
         write_policy=collaborators.write_policy,
         get_writer_model=collaborators.get_writer_model,
-        start_observation=collaborators.start_observation,
         find_repo_root=collaborators.find_repo_root,
         default_pipeline=collaborators.default_pipeline,
     )

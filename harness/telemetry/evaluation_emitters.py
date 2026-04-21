@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from langfuse import LangfuseGeneration, LangfuseSpan
+from langfuse.api.commons.types import ScoreDataType
 
+from harness.log import get_logger
 from harness.telemetry.observability_models import (
     EvaluationTelemetryArtifact,
     LOCALIZATION_CANONICAL_COMPONENTS,
@@ -14,22 +15,22 @@ from harness.telemetry.observability_models import (
     ScoreComponentTelemetryState,
     optimize_component_states,
 )
-from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 
 if TYPE_CHECKING:
     from harness.orchestration.types import EvaluationMetrics
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
+ObservationHandle = LangfuseSpan | LangfuseGeneration
 
 
-def _observation_name(handle: LangfuseSpan | LangfuseGeneration | None) -> str:
+def _observation_name(handle: ObservationHandle | None) -> str:
     if handle is None:
         return "none"
     return handle.id
 
 
-def safe_update_observation_metadata(
-    handle: LangfuseSpan | LangfuseGeneration | None,
+def _update_observation_metadata(
+    handle: ObservationHandle | None,
     metadata: Mapping[str, object],
     *,
     operation: str,
@@ -50,23 +51,32 @@ def safe_update_observation_metadata(
         )
 
 
-def safe_emit_score_for_handle(
-    handle: LangfuseSpan | LangfuseGeneration | None,
+def _emit_score_for_handle(
+    handle: ObservationHandle | None,
     *,
     name: str,
     value: float | int | bool,
-    data_type: str | None = None,
+    data_type: Literal[ScoreDataType.NUMERIC, ScoreDataType.BOOLEAN],
     comment: str | None = None,
     operation: str,
 ) -> None:
+    if handle is None:
+        return
     try:
-        emit_score_for_handle(
-            handle,
-            name=name,
-            value=value,
-            data_type=data_type,
-            comment=comment,
-        )
+        if data_type == ScoreDataType.BOOLEAN:
+            handle.score(
+                name=name,
+                value=bool(value),
+                data_type=ScoreDataType.BOOLEAN,
+                comment=comment,
+            )
+        else:
+            handle.score(
+                name=name,
+                value=float(value),
+                data_type=ScoreDataType.NUMERIC,
+                comment=comment,
+            )
     except Exception as exc:  # noqa: BLE001
         _LOGGER.warning(
             "Langfuse score emission failed operation=%s observation=%s score=%s error=%s",
@@ -77,13 +87,15 @@ def safe_emit_score_for_handle(
         )
 
 
-def _score_type(value: float | bool) -> str:
-    return "BOOLEAN" if isinstance(value, bool) else "NUMERIC"
+def _score_type(
+    value: float | bool,
+) -> Literal[ScoreDataType.NUMERIC, ScoreDataType.BOOLEAN]:
+    return ScoreDataType.BOOLEAN if isinstance(value, bool) else ScoreDataType.NUMERIC
 
 
-def _score_value(value: float | bool) -> float | int:
+def _score_value(value: float | bool) -> float | bool:
     if isinstance(value, bool):
-        return 1 if value else 0
+        return value
     return float(value)
 
 
@@ -96,7 +108,7 @@ def _metadata_value(value: float | bool | None) -> float | bool | None:
 
 
 def _emit_component_state_scores(
-    handle: LangfuseSpan | LangfuseGeneration | None,
+    handle: ObservationHandle | None,
     *,
     score_name: str,
     state: ScoreComponentTelemetryState,
@@ -104,7 +116,7 @@ def _emit_component_state_scores(
     comment: str | None = None,
 ) -> None:
     if state.available and state.value is not None:
-        safe_emit_score_for_handle(
+        _emit_score_for_handle(
             handle,
             name=score_name,
             value=_score_value(state.value),
@@ -112,11 +124,11 @@ def _emit_component_state_scores(
             comment=comment,
             operation=operation,
         )
-    safe_emit_score_for_handle(
+    _emit_score_for_handle(
         handle,
         name=f"{score_name}_available",
-        value=1 if state.available else 0,
-        data_type="BOOLEAN",
+        value=state.available,
+        data_type=ScoreDataType.BOOLEAN,
         comment=comment,
         operation=f"{operation}.availability",
     )
@@ -136,7 +148,7 @@ def _component_state_metadata(
 
 
 def emit_localization_task_telemetry(
-    handle: LangfuseSpan | LangfuseGeneration | None,
+    handle: ObservationHandle | None,
     artifact: EvaluationTelemetryArtifact,
     *,
     score_prefix: str,
@@ -168,7 +180,7 @@ def emit_localization_task_telemetry(
         if metric_name in LOCALIZATION_CANONICAL_COMPONENTS:
             continue
         score_name = f"{score_prefix}.{metric_name}"
-        safe_emit_score_for_handle(
+        _emit_score_for_handle(
             handle,
             name=score_name,
             value=_score_value(value),
@@ -190,7 +202,7 @@ def emit_localization_task_telemetry(
     }
     if task_summary is not None:
         metadata["task_summary"] = dict(task_summary)
-    safe_update_observation_metadata(
+    _update_observation_metadata(
         handle,
         metadata,
         operation="localization_task.metadata",
@@ -199,7 +211,7 @@ def emit_localization_task_telemetry(
 
 
 def emit_optimize_iteration_telemetry(
-    handle: LangfuseSpan | LangfuseGeneration | None,
+    handle: ObservationHandle | None,
     *,
     metrics: EvaluationMetrics,
     score_component_states: Mapping[str, ScoreComponentTelemetryState] | None = None,
@@ -248,7 +260,7 @@ def emit_optimize_iteration_telemetry(
         metadata["score_context_summary"] = dict(score_context_summary)
     if error:
         metadata["error"] = error
-    safe_update_observation_metadata(
+    _update_observation_metadata(
         handle,
         {key: value for key, value in metadata.items() if value is not None},
         operation="optimize_iteration.metadata",
@@ -259,6 +271,4 @@ def emit_optimize_iteration_telemetry(
 __all__ = [
     "emit_localization_task_telemetry",
     "emit_optimize_iteration_telemetry",
-    "safe_emit_score_for_handle",
-    "safe_update_observation_metadata",
 ]

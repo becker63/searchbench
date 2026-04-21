@@ -6,25 +6,28 @@ No CLI or orchestration logic; only generation and validation.
 from __future__ import annotations
 
 import json
-import logging
 import time
 from typing import Any, Mapping, Sequence
 
 from langfuse import LangfuseGeneration, LangfuseSpan
+from langfuse.api.commons.types import ScoreDataType
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from harness.log import bind_logger, get_logger
 from .common import usage_from_response  # pyright: ignore[reportPrivateUsage]
 from harness.prompts import (
     WriterOptimizationBrief,
     build_writer_prompt,
 )
-from harness.telemetry.tracing import get_tracing_openai_client, start_observation
-from harness.telemetry.tracing.score_emitter import emit_score_for_handle
+from harness.telemetry.tracing import (
+    get_tracing_openai_client,
+    serialize_observation_metadata,
+)
 from harness.utils.env import get_cerebras_api_key, get_writer_model
 from harness.utils.model_budgets import compute_prompt_char_budget, get_model_budget
 from harness.utils.type_loader import FrontierContext, format_frontier_context
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 
 class WriterRequest(BaseModel):
@@ -38,7 +41,7 @@ class WriterRequest(BaseModel):
     frontier_context: str
     frontier_context_details: FrontierContext
     optimization_brief: WriterOptimizationBrief
-    parent_trace: LangfuseSpan | LangfuseGeneration | None = None
+    parent_trace: Any | None = None
     writer_session_id: str | None = None
     failure_context: str | None = None
     repair_attempt: int = 0
@@ -64,8 +67,9 @@ def _require_parent(
     return parent_trace
 
 
-def _span_label(span: LangfuseSpan | LangfuseGeneration) -> str:
-    return span.id
+def _span_label(span: object) -> str:
+    span_id = getattr(span, "id", None)
+    return span_id if isinstance(span_id, str) and span_id else type(span).__name__
 
 
 def _langfuse_usage_details(
@@ -87,31 +91,6 @@ def _langfuse_usage_details(
         if isinstance(value, (int, float)):
             numeric[key] = int(value)
     return numeric or None
-
-
-def _safe_update(
-    span: LangfuseSpan | LangfuseGeneration | None,
-    *,
-    metadata: Mapping[str, object] | None = None,
-    usage_details: Mapping[str, object] | None = None,
-    cost_details: Mapping[str, float] | None = None,
-) -> None:
-    if span is None:
-        return
-    try:
-        span.update(
-            metadata=dict(metadata) if metadata is not None else None,
-            usage_details=_langfuse_usage_details(usage_details),
-            cost_details=dict(cost_details) if cost_details is not None else None,
-        )
-    except Exception as exc:  # noqa: BLE001
-        keys = sorted(str(key) for key in metadata) if isinstance(metadata, Mapping) else ["metadata"]
-        _LOGGER.warning(
-            "Langfuse metadata update failed operation=writer.update observation=%s keys=%s error=%s",
-            _span_label(span),
-            keys,
-            exc,
-        )
 
 
 def _ensure_non_empty_messages(messages: Sequence[Mapping[str, object]] | None, caller: str) -> None:
@@ -225,44 +204,69 @@ def generate_policy(
         frontier_context_details=frontier_context_details,
         optimization_brief=optimization_brief,
     )
-    with start_observation(
+    logger = bind_logger(
+        _LOGGER,
+        writer_session_id=writer_session_id,
+        repair_attempt=repair_attempt,
+        model=model,
+    )
+    with parent_span.start_as_current_observation(
         name="policy_writer",
-        parent=parent_span,
-        metadata={
-            "model": model,
-            "writer_session_id": writer_session_id,
-            "session_id": writer_session_id,
-        }
-        if writer_session_id
-        else {"model": model},
+        as_type="span",
+        metadata=serialize_observation_metadata(
+            {
+                "model": model,
+                "writer_session_id": writer_session_id,
+                "session_id": writer_session_id,
+            }
+            if writer_session_id
+            else {"model": model}
+        ),
     ) as writer_obs:
         response = None
-        _LOGGER.info(
-            "[OPTIMIZE] writer model=%s completion_budget=%s failure_context_budget=%s prompt_chars=%s writer_session_id=%s",
-            model,
-            completion_tokens,
-            failure_context_budget,
-            len(rendered_prompt.system) + len(rendered_prompt.user),
-            writer_session_id or "none",
+        logger.info(
+            "policy_writer_started",
+            completion_tokens=completion_tokens,
+            failure_context_budget=failure_context_budget,
+            prompt_chars=len(rendered_prompt.system) + len(rendered_prompt.user),
         )
-        emit_score_for_handle(writer_obs, name="writer.policy_generated", value=False, data_type="BOOLEAN")
-        emit_score_for_handle(writer_obs, name="writer.policy_compiled", value=False, data_type="BOOLEAN")
+        try:
+            writer_obs.score(
+                name="writer.policy_generated",
+                value=0,
+                data_type=ScoreDataType.BOOLEAN,
+            )
+            writer_obs.score(
+                name="writer.policy_compiled",
+                value=0,
+                data_type=ScoreDataType.BOOLEAN,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "langfuse_score_emission_failed",
+                operation="policy_writer.score",
+                observation=_span_label(writer_obs),
+                score="writer.policy_generated|writer.policy_compiled",
+                error=str(exc),
+            )
         for attempt in range(3):
             start_time = time.perf_counter()
-            _LOGGER.info("[OPTIMIZE] writer attempt=%s start model=%s", attempt, model)
-            with start_observation(
+            attempt_logger = bind_logger(logger, writer_attempt=attempt)
+            attempt_logger.info("writer_attempt_started")
+            with writer_obs.start_as_current_observation(
                 name=f"writer_attempt_{attempt}",
-                parent=writer_obs,
                 as_type="generation",
                 model=model,
-                metadata={
-                    "attempt": attempt,
-                    "model": model,
-                    "writer_session_id": writer_session_id,
-                    "session_id": writer_session_id,
-                }
-                if writer_session_id
-                else {"attempt": attempt, "model": model},
+                metadata=serialize_observation_metadata(
+                    {
+                        "attempt": attempt,
+                        "model": model,
+                        "writer_session_id": writer_session_id,
+                        "session_id": writer_session_id,
+                    }
+                    if writer_session_id
+                    else {"attempt": attempt, "model": model}
+                ),
             ) as attempt_obs:
                 try:
                     messages = [
@@ -304,55 +308,137 @@ def generate_policy(
                     from harness.telemetry.tracing.cerebras_pricing import cost_details_for_usage
 
                     cost_details = cost_details_for_usage(model, usage_details) if usage_details else None
-                    _safe_update(
-                        attempt_obs,
-                        metadata={"model": model, "attempt": attempt, "latency_ms": latency_ms},
-                        usage_details=usage_details,
-                        cost_details=cost_details,
-                    )
-                    _LOGGER.info(
-                        "[OPTIMIZE] writer attempt=%s complete model=%s latency_ms=%.0f",
-                        attempt,
-                        model,
-                        latency_ms,
+                    try:
+                        attempt_obs.update(
+                            metadata=serialize_observation_metadata(
+                                {"model": model, "attempt": attempt, "latency_ms": latency_ms}
+                            ),
+                            usage_details=_langfuse_usage_details(usage_details),
+                            cost_details=dict(cost_details) if cost_details is not None else None,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _LOGGER.warning(
+                            "langfuse_metadata_update_failed",
+                            operation="writer_attempt.update",
+                            observation=_span_label(attempt_obs),
+                            keys=["attempt", "latency_ms", "model"],
+                            error=str(exc),
+                        )
+                    attempt_logger.info(
+                        "writer_attempt_completed",
+                        latency_ms=latency_ms,
                     )
                     break
                 except Exception as e:  # noqa: BLE001
-                    _LOGGER.info(
-                        "[OPTIMIZE] writer attempt=%s failed error=%s",
-                        attempt,
-                        e,
+                    attempt_logger.warning(
+                        "writer_attempt_failed",
+                        error=str(e),
                     )
-                    _safe_update(attempt_obs, metadata={"error": str(e)})
+                    try:
+                        attempt_obs.update(
+                            metadata=serialize_observation_metadata({"error": str(e)})
+                        )
+                    except Exception as update_exc:  # noqa: BLE001
+                        _LOGGER.warning(
+                            "langfuse_metadata_update_failed",
+                            operation="writer_attempt.update",
+                            observation=_span_label(attempt_obs),
+                            keys=["error"],
+                            error=str(update_exc),
+                        )
                     time.sleep(2 * (attempt + 1))
         else:
-            _safe_update(writer_obs, metadata={"error": "writer_failed"})
+            logger.warning("writer_attempt_exhausted", retries=3)
+            try:
+                writer_obs.update(
+                    metadata=serialize_observation_metadata({"error": "writer_failed"})
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="policy_writer.update",
+                    observation=_span_label(writer_obs),
+                    keys=["error"],
+                    error=str(exc),
+                )
             raise RuntimeError("Writer failed after retries")
 
         try:
             raw_code = _extract_policy_code(response)
             code = _ensure_valid_policy_code(raw_code)
-            _LOGGER.info(
-                "[OPTIMIZE] writer returned code_chars=%s compile_validation=passed",
-                len(code),
+            logger.info(
+                "writer_compile_validation_passed",
+                code_chars=len(code),
             )
-            emit_score_for_handle(
-                writer_obs,
-                name="writer.policy_compiled",
-                value=True,
-                data_type="BOOLEAN",
+            try:
+                writer_obs.score(
+                    name="writer.policy_compiled",
+                    value=1,
+                    data_type=ScoreDataType.BOOLEAN,
+                    comment=json.dumps({"model": model}),
+                )
+            except Exception as score_exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_score_emission_failed",
+                    operation="policy_writer.score",
+                    observation=_span_label(writer_obs),
+                    score="writer.policy_compiled",
+                    error=str(score_exc),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "writer_compile_validation_failed",
+                error=str(exc),
+            )
+            try:
+                writer_obs.update(
+                    metadata=serialize_observation_metadata({"error": str(exc), "model": model})
+                )
+            except Exception as update_exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "langfuse_metadata_update_failed",
+                    operation="policy_writer.update",
+                    observation=_span_label(writer_obs),
+                    keys=["error", "model"],
+                    error=str(update_exc),
+                )
+            raise
+        try:
+            writer_obs.score(
+                name="writer.policy_generated",
+                value=1,
+                data_type=ScoreDataType.BOOLEAN,
                 comment=json.dumps({"model": model}),
             )
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.info("[OPTIMIZE] writer compile_validation=failed error=%s", exc)
-            _safe_update(writer_obs, metadata={"error": str(exc), "model": model})
-            raise
-        emit_score_for_handle(
-            writer_obs,
-            name="writer.policy_generated",
-            value=True,
-            data_type="BOOLEAN",
-            comment=json.dumps({"model": model}),
+            _LOGGER.warning(
+                "langfuse_score_emission_failed",
+                operation="policy_writer.score",
+                observation=_span_label(writer_obs),
+                score="writer.policy_generated",
+                error=str(exc),
+            )
+        try:
+            writer_obs.update(
+                metadata=serialize_observation_metadata(
+                    {
+                        "model": model,
+                        "length": len(code),
+                        "feedback_keys": list((feedback or {}).keys()),
+                    }
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "langfuse_metadata_update_failed",
+                operation="policy_writer.update",
+                observation=_span_label(writer_obs),
+                keys=["feedback_keys", "length", "model"],
+                error=str(exc),
+            )
+        logger.info(
+            "policy_writer_completed",
+            code_chars=len(code),
+            feedback_keys=sorted((feedback or {}).keys()),
         )
-        _safe_update(writer_obs, metadata={"model": model, "length": len(code), "feedback_keys": list((feedback or {}).keys())})
         return code

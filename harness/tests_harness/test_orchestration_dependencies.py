@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from langfuse import LangfuseSpan
+
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
 from harness.localization.runtime.evaluate import LocalizationEvaluationResult
 from harness.orchestration.dependencies import RuntimeCollaborators, build_loop_dependencies
@@ -22,15 +24,27 @@ from harness.utils.diff import DiffSummary
 from harness.utils.type_loader import FrontierContext
 
 
-class RecordingSpan:
+class RecordingSpan(LangfuseSpan):
     def __init__(self) -> None:
+        self.id = "span"
+        self.trace_id = "trace"
         self.updates: list[dict[str, object]] = []
+        self.scores: list[dict[str, object]] = []
 
     def end(self, **kwargs: object) -> None:
         self.updates.append(dict(kwargs))
 
     def update(self, **kwargs: object) -> None:
         self.updates.append(dict(kwargs))
+
+    def score(self, **kwargs: object) -> None:
+        self.scores.append(dict(kwargs))
+
+    def __enter__(self) -> "RecordingSpan":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
 
 
 class EmptyPipeline:
@@ -81,26 +95,12 @@ def _feedback() -> FeedbackPackage:
     )
 
 
-def test_build_loop_dependencies_wires_explicit_collaborators(tmp_path: Path) -> None:
+def test_build_loop_dependencies_wires_explicit_collaborators(
+    monkeypatch, tmp_path: Path
+) -> None:
     spans: list[RecordingSpan] = []
     indexed: list[str] = []
-    emitted_scores: list[str] = []
     pipeline = EmptyPipeline()
-
-    @contextmanager
-    def start_observation(
-        name: str,
-        *,
-        parent: object | None = None,
-        as_type: str = "span",
-        input: object | None = None,
-        model: str | None = None,
-        metadata: dict[str, object] | None = None,
-        usage_details: object | None = None,
-    ) -> Iterator[RecordingSpan]:
-        span = RecordingSpan()
-        spans.append(span)
-        yield span
 
     def generate_policy(
         current_policy: str,
@@ -115,6 +115,18 @@ def test_build_loop_dependencies_wires_explicit_collaborators(tmp_path: Path) ->
     ) -> str:
         return current_policy
 
+    class DummyClient:
+        @contextmanager
+        def start_as_current_observation(self, **kwargs: object) -> Iterator[RecordingSpan]:
+            span = RecordingSpan()
+            spans.append(span)
+            yield span
+
+    monkeypatch.setattr(
+        "harness.orchestration.dependencies.get_langfuse_client",
+        lambda: DummyClient(),
+    )
+
     collaborators = RuntimeCollaborators(
         index_folder=lambda repo: indexed.append(repo) or {"repo": "indexed-repo"},
         evaluate_localization_batch=lambda tasks, **kwargs: LocalizationEvaluationResult(),
@@ -126,12 +138,10 @@ def test_build_loop_dependencies_wires_explicit_collaborators(tmp_path: Path) ->
         format_diff=lambda diff: "diff",
         interpret_diff=lambda diff: "guidance",
         generate_policy=generate_policy,
-        emit_score=lambda **kwargs: emitted_scores.append(str(kwargs["name"])),
         classify_results=lambda results: PipelineClassification(passed=[step.name for step in results]),
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        start_observation=start_observation,
         find_repo_root=lambda: tmp_path,
         default_pipeline=lambda: pipeline,
     )
@@ -154,7 +164,6 @@ def test_build_loop_dependencies_wires_explicit_collaborators(tmp_path: Path) ->
     assert deps.default_pipeline() is pipeline
     assert deps.classify_results([StepResult(name="step", success=True, exit_code=0, stdout="", stderr="")]).passed == ["step"]
     assert deps.run_policy_pipeline(pipeline, tmp_path) == ([], True)
-    assert emitted_scores == []
     assert deps.finalize_successful_policy(
         new_code="candidate",
         attempts_used=2,

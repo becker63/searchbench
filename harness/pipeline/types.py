@@ -18,6 +18,7 @@ class StepResult(BaseModel):
     stdout: str
     stderr: str
     exit_code: int
+    command: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_external(cls, step: object) -> "StepResult":
@@ -27,7 +28,7 @@ class StepResult(BaseModel):
         if isinstance(step, dict):
             return cls.model_validate(step)
         data: dict[str, Any] = {}
-        allowed_fields = {"name", "success", "stdout", "stderr", "exit_code"}
+        allowed_fields = {"name", "success", "stdout", "stderr", "exit_code", "command"}
         extras: set[str] = set()
         for field in allowed_fields:
             if hasattr(step, field):
@@ -52,34 +53,33 @@ class PipelineClassification(BaseModel):
     test_failures: str = ""
     passed: list[str] = Field(default_factory=list)
 
+
 class Step(Protocol):
     name: str
 
-    def run(self, repo_root: Path) -> StepResult:
-        ...
+    def run(self, repo_root: Path) -> StepResult: ...
 
 
 class ExecutionBackend:
     def run(self, cmd: list[str], cwd: Path, name: str | None = None) -> StepResult:
         import subprocess
+
         from ..utils.repo_root import find_repo_root
 
         allowed_prefixes = {
             ("uv", "run", "ruff", "check", "--fix"),
             ("uv", "run", "basedpyright"),
             ("uv", "run", "pytest", "iterative-context"),
-            ("uv", "run", "pytest", "iterative-context", "-q", "--disable-warnings", "--maxfail=1"),
+            (
+                "uv",
+                "run",
+                "pytest",
+                "iterative-context",
+                "-q",
+                "--disable-warnings",
+                "--maxfail=1",
+            ),
         }
-
-        repo_root = find_repo_root()
-        if cwd != repo_root:
-            return StepResult(
-                name=" ".join(cmd),
-                success=False,
-                stdout="",
-                stderr="Execution not allowed outside repo root",
-                exit_code=1,
-            )
 
         def _is_allowed(command: list[str]) -> bool:
             for prefix in allowed_prefixes:
@@ -94,6 +94,7 @@ class ExecutionBackend:
                 stdout="",
                 stderr="Command not permitted",
                 exit_code=1,
+                command=list(cmd),
             )
 
         completed = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -103,6 +104,7 @@ class ExecutionBackend:
             stdout=completed.stdout,
             stderr=completed.stderr,
             exit_code=completed.returncode,
+            command=list(cmd),
         )
         if name:
             result.name = name

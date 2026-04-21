@@ -334,7 +334,7 @@ def test_hf_sync_missing_upsert_api_no_longer_fails(monkeypatch):
     assert len(created) == 1
 
 
-def test_hf_sync_emits_stage_progress_and_summary_logs(monkeypatch, caplog):
+def test_hf_sync_emits_stage_progress_and_summary_logs(monkeypatch, caplog, capsys):
     rows = [
         {
             "repo_owner": "square",
@@ -375,16 +375,16 @@ def test_hf_sync_emits_stage_progress_and_summary_logs(monkeypatch, caplog):
         dataset_split="dev",
     )
 
-    messages = [record.getMessage() for record in caplog.records]
+    rendered = capsys.readouterr().out
     assert result.source_items == 260
     assert result.created_items == 260
-    assert any("Starting sync-hf" in message for message in messages)
-    assert any("Loading HF dataset" in message for message in messages)
-    assert any("Fetching existing Langfuse dataset items" in message for message in messages)
-    assert any("Finished fetching 0 existing Langfuse dataset items" in message for message in messages)
-    assert any("Building existing item identity index" in message for message in messages)
-    assert any("Beginning comparison against HF items" in message for message in messages)
-    assert any("Compared 250 / 260 HF items" in message for message in messages)
-    assert any("Creating missing Langfuse dataset items missing=260" in message for message in messages)
-    assert any("Created 250 / 260 missing Langfuse dataset items" in message for message in messages)
-    assert any("Sync complete source_items=260 existing=0 skipped=0 created=260 failed=0" in message for message in messages)
+    assert "sync_hf_started" in rendered
+    assert "hf_dataset_load_started" in rendered
+    assert "langfuse_dataset_items_fetch_started" in rendered
+    assert "langfuse_dataset_items_fetch_completed" in rendered
+    assert "langfuse_item_identity_index_started" in rendered
+    assert "langfuse_dataset_comparison_started" in rendered
+    assert "langfuse_dataset_comparison_progress" in rendered
+    assert "langfuse_dataset_create_missing_started" in rendered
+    assert "langfuse_dataset_create_missing_progress" in rendered
+    assert "sync_hf_completed" in rendered

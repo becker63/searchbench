@@ -35,6 +35,9 @@ def _install_dummy_langfuse(monkeypatch):
         def update(self, **kwargs):
             return None
 
+        def start_as_current_observation(self, **kwargs):
+            return _CM()
+
     class DummyClient:
         def start_as_current_observation(self, **kwargs):
             return _CM()

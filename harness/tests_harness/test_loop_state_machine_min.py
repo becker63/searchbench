@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, List
 
 import pytest
+from langfuse import LangfuseSpan
 from statemachine.event import BoundEvent
 
+from harness.log import short_task_label
 from harness.localization.models import LCAContext, LCAGold, LCATask, LCATaskIdentity
+from harness.logging_config import configure_logging
 from harness.orchestration import feedback as feedback_module
 from harness.orchestration.machine import RepairStateMachine
 from harness.orchestration.optimize_loop import DEFAULT_OPTIMIZATION_ITERATIONS, OptimizeTaskLoop
@@ -35,11 +40,23 @@ from harness.pipeline.types import PipelineClassification, StepResult
 from harness.utils.type_loader import FrontierContext
 
 
-class RecordingSpan:
-    def __init__(self, name: str | None = None, metadata: dict[str, object] | None = None) -> None:
+class RecordingSpan(LangfuseSpan):
+    def __init__(
+        self,
+        name: str | None = None,
+        metadata: dict[str, object] | None = None,
+        *,
+        registry: list["RecordingSpan"] | None = None,
+        events: list[tuple[str, object]] | None = None,
+    ) -> None:
+        self.id = name or "span"
+        self.trace_id = f"trace-{self.id}"
         self.name = name
         self.metadata = metadata or {}
         self.ended: list[dict[str, Any]] = []
+        self.scores: list[dict[str, Any]] = []
+        self.registry = registry
+        self.events = events
 
     def end(self, **kwargs: Any) -> None:
         self.ended.append(dict(kwargs))
@@ -51,11 +68,28 @@ class RecordingSpan:
         else:
             self.ended.append(dict(kwargs))
 
+    def score(self, **kwargs: Any) -> None:
+        self.scores.append(dict(kwargs))
+
     def __enter__(self) -> "RecordingSpan":
         return self
 
     def __exit__(self, *args: Any) -> None:
         pass
+
+    @contextmanager
+    def start_as_current_observation(self, **kwargs: Any) -> Iterator["RecordingSpan"]:
+        span = RecordingSpan(
+            name=kwargs.get("name") if isinstance(kwargs.get("name"), str) else None,
+            metadata=kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else None,
+            registry=self.registry,
+            events=self.events,
+        )
+        if self.registry is not None:
+            self.registry.append(span)
+        if self.events is not None:
+            self.events.append(("span_open", span))
+        yield span
 
 
 class EmptyPipeline:
@@ -142,7 +176,10 @@ def test_build_iteration_feedback_produces_typed_writer_brief(monkeypatch: pytes
 
 
 def _repair_deps(
-    writer_ok_sequence: List[bool], pipeline_ok_sequence: List[bool]
+    writer_ok_sequence: List[bool],
+    pipeline_ok_sequence: List[bool],
+    *,
+    pipeline_classification: PipelineClassification | None = None,
 ) -> tuple[LoopDependencies, list[RecordingSpan], list[object], list[tuple[str, object]]]:
     writer_seq = list(writer_ok_sequence)
     pipeline_seq = list(pipeline_ok_sequence)
@@ -150,6 +187,7 @@ def _repair_deps(
     seen_parent: list[object] = []
     events: list[tuple[str, object]] = []
     written: list[str] = []
+    classification = pipeline_classification or PipelineClassification()
 
     def attempt_policy_generation(**kwargs: Any) -> tuple[str | None, str | None]:
         parent_trace = kwargs.get("parent_trace")
@@ -162,7 +200,14 @@ def _repair_deps(
 
     def run_policy_pipeline(*args: Any, **kwargs: Any) -> tuple[list[StepResult], bool]:
         ok = pipeline_seq.pop(0) if pipeline_seq else False
-        result = StepResult(name="step", success=ok, exit_code=0 if ok else 1, stdout="", stderr="")
+        result = StepResult(
+            name="basedpyright",
+            success=ok,
+            exit_code=0 if ok else 1,
+            stdout="" if ok else "stdout tail",
+            stderr="" if ok else "stderr tail",
+            command=["uv", "run", "basedpyright"],
+        )
         return [result], ok
 
     def finalize_successful_policy(**kwargs: Any) -> tuple[str, AcceptedPolicyMeta]:
@@ -186,16 +231,6 @@ def _repair_deps(
             error="pipeline_failed",
         )
 
-    @contextmanager
-    def start_observation(**kwargs: Any) -> Iterator[RecordingSpan]:
-        span = RecordingSpan(
-            name=kwargs.get("name") if isinstance(kwargs.get("name"), str) else None,
-            metadata=kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else None,
-        )
-        spans.append(span)
-        events.append(("span_open", span))
-        yield span
-
     deps = LoopDependencies(
         prepare_iteration_tasks=lambda task, trace=None: PreparedTasks(
             task=task,
@@ -208,12 +243,11 @@ def _repair_deps(
         run_policy_pipeline=run_policy_pipeline,
         finalize_successful_policy=finalize_successful_policy,
         finalize_failed_repair=finalize_failed_repair,
-        classify_results=lambda results: PipelineClassification(),
+        classify_results=lambda results: classification,
         format_pipeline_failure_context=lambda *a, **k: "failure",
         read_policy=lambda: "policy",
         write_policy=lambda code: written.append(code),
         get_writer_model=lambda: "model",
-        start_observation=start_observation,
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: EmptyPipeline(),
     )
@@ -224,6 +258,14 @@ def _repair_spans(spans: list[RecordingSpan]) -> list[RecordingSpan]:
     return [span for span in spans if (span.name or "").startswith("policy_repair_attempt_")]
 
 
+def _json_events(stderr: str) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in stderr.splitlines()
+        if line.strip().startswith("{")
+    ]
+
+
 def test_repair_exhausts_after_failures() -> None:
     deps, spans, seen_parent, events = _repair_deps(writer_ok_sequence=[False, False], pipeline_ok_sequence=[])
     ctx = RepairContext(
@@ -231,7 +273,7 @@ def test_repair_exhausts_after_failures() -> None:
         evaluation=_make_eval(),
         feedback=_make_feedback(),
         max_repair_attempts=2,
-        parent_trace=None,
+        parent_trace=RecordingSpan(registry=spans, events=events),
         writer_model="model",
     )
     model = RepairMachineModel(context=ctx, deps=deps)
@@ -253,6 +295,68 @@ def test_repair_exhausts_after_failures() -> None:
     assert any(event[0] == "writer" for event in events[1:])
 
 
+def test_repair_rejection_logs_structured_failure_details(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging(
+        level=logging.INFO,
+        renderer="json",
+        force=True,
+        cache_logger_on_first_use=False,
+    )
+    deps, _, _, _ = _repair_deps(
+        writer_ok_sequence=[True, True],
+        pipeline_ok_sequence=[False, False],
+        pipeline_classification=PipelineClassification(type_errors="bad types"),
+    )
+    task = _task()
+    ctx = RepairContext(
+        repo_root=Path("."),
+        evaluation=_make_eval(),
+        feedback=_make_feedback(),
+        max_repair_attempts=2,
+        parent_trace=RecordingSpan(),
+        writer_model="model",
+        optimize_run_id="run-1",
+        writer_session_id="writer-1",
+        task_identity=task.task_id,
+        iteration=2,
+        iterations=5,
+        task_ordinal=1,
+        task_total=4,
+    )
+    model = RepairMachineModel(context=ctx, deps=deps)
+
+    outcome = RepairStateMachine(model).run()
+
+    assert outcome.success is False
+    events = _json_events(capsys.readouterr().err)
+    event_names = [str(event["event"]) for event in events]
+    assert "writer_generation_started" in event_names
+    assert "writer_generation_completed" in event_names
+    assert "pipeline_check_started" in event_names
+    assert "pipeline_check_result" in event_names
+    assert "pipeline_step_failed" in event_names
+    assert "policy_candidate_rejected" in event_names
+    assert "policy_candidate_retrying" in event_names
+    assert "policy_candidate_exhausted" in event_names
+
+    pipeline_failure = next(
+        event for event in events if event.get("event") == "pipeline_step_failed"
+    )
+    assert pipeline_failure["optimize_run_id"] == "run-1"
+    assert pipeline_failure["writer_session_id"] == "writer-1"
+    assert pipeline_failure["iteration"] == 2
+    assert pipeline_failure["task"] == short_task_label(task.task_id, ordinal=1, total=4)
+    assert pipeline_failure["attempt"] == 1
+    assert pipeline_failure["step_name"] == "basedpyright"
+    assert pipeline_failure["command"] == "uv run basedpyright"
+    assert pipeline_failure["exit_code"] == 1
+    assert pipeline_failure["classification"] == "type_errors"
+    assert pipeline_failure["stderr_tail"] == "stderr tail"
+    assert pipeline_failure["stdout_tail"] == "stdout tail"
+
+
 def test_repair_succeeds_on_second_attempt() -> None:
     deps, spans, seen_parent, events = _repair_deps(writer_ok_sequence=[False, True], pipeline_ok_sequence=[True])
     ctx = RepairContext(
@@ -260,7 +364,7 @@ def test_repair_succeeds_on_second_attempt() -> None:
         evaluation=_make_eval(),
         feedback=_make_feedback(),
         max_repair_attempts=3,
-        parent_trace=None,
+        parent_trace=RecordingSpan(registry=spans, events=events),
         writer_model="model",
     )
     model = RepairMachineModel(context=ctx, deps=deps)
@@ -291,7 +395,7 @@ def test_repair_writer_loop_uses_writer_session_only(monkeypatch: pytest.MonkeyP
         propagated.append(dict(kwargs))
         yield
 
-    monkeypatch.setattr(machine_module.tracing, "propagate_context", propagate_cm)
+    monkeypatch.setattr(machine_module, "propagate_attributes", propagate_cm)
     deps, spans, _seen_parent, _events = _repair_deps(
         writer_ok_sequence=[True],
         pipeline_ok_sequence=[True],
@@ -301,7 +405,7 @@ def test_repair_writer_loop_uses_writer_session_only(monkeypatch: pytest.MonkeyP
         evaluation=_make_eval(),
         feedback=_make_feedback(),
         max_repair_attempts=1,
-        parent_trace=None,
+        parent_trace=RecordingSpan(registry=spans, events=_events),
         writer_model="model",
         optimize_run_id="opt-run-1",
         writer_session_id="writer:opt-run-1:1:abc",
@@ -332,7 +436,7 @@ def test_pipeline_failure_propagates_failure_details() -> None:
         evaluation=_make_eval(),
         feedback=_make_feedback(),
         max_repair_attempts=1,
-        parent_trace=None,
+        parent_trace=RecordingSpan(registry=spans, events=events),
         writer_model="model",
     )
     model = RepairMachineModel(context=ctx, deps=deps)
@@ -362,7 +466,7 @@ def test_repair_listener_uses_event_data_without_direct_event_key_inspection() -
         evaluation=_make_eval(),
         feedback=_make_feedback(),
         max_repair_attempts=1,
-        parent_trace=None,
+        parent_trace=RecordingSpan(registry=spans, events=events),
         writer_model="model",
     )
     model = RepairMachineModel(context=ctx, deps=deps)
@@ -384,7 +488,7 @@ def test_failed_candidate_not_marked_accepted() -> None:
         evaluation=_make_eval(),
         feedback=_make_feedback(),
         max_repair_attempts=2,
-        parent_trace=None,
+        parent_trace=RecordingSpan(registry=spans, events=events),
         writer_model="model",
     )
     model = RepairMachineModel(context=ctx, deps=deps)
@@ -469,7 +573,6 @@ def _opt_deps(events: list[str] | None = None) -> LoopDependencies:
         read_policy=lambda: "policy",
         write_policy=lambda code: None,
         get_writer_model=lambda: "model",
-        start_observation=lambda **k: span,  # RecordingSpan is a context manager
         find_repo_root=lambda: Path("."),
         default_pipeline=lambda: EmptyPipeline(),
     )
@@ -478,14 +581,24 @@ def _opt_deps(events: list[str] | None = None) -> LoopDependencies:
 
 def test_optimize_task_loop_completes_and_records_history() -> None:
     events: list[str] = []
-    ctx = LoopContext(
+    ctx = LoopContext.model_construct(
         task=_task(),
         iterations=1,
         session_id=None,
+        optimize_run_id=None,
+        writer_session_id=None,
+        task_ordinal=None,
+        task_total=None,
+        parent_trace=None,
+        run_metadata=None,
         baseline_record=None,
         run_trace=RecordingSpan(),
         history=[],
         prepared_tasks=None,
+        prev_score=None,
+        prev_classified=None,
+        last_classified=None,
+        current_iteration=0,
     )
     deps = _opt_deps(events)
 

@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Any, cast
 
 import pytest
+from langfuse import LangfuseSpan
 from mcp.types import TextContent, Tool
 
 from harness.agents import localizer as runner
@@ -29,6 +30,34 @@ from harness.localization.models import (
 )
 from harness.prompts import build_jc_system_prompt
 from harness.utils.openai_schema import ChatCompletionToolParam, validate_tools
+
+
+class FakeObservation(LangfuseSpan):
+    def __init__(
+        self,
+        *,
+        starts: list[dict[str, Any]] | None = None,
+        updates: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.id = "span"
+        self._starts = starts
+        self._updates = updates
+
+    def update(self, **kwargs: Any) -> None:
+        if self._updates is not None:
+            self._updates.append(dict(kwargs))
+
+    def score(self, name: str, value: float, data_type=None, comment=None) -> None:
+        del name, value, data_type, comment
+
+    def end(self, **kwargs: Any) -> None:
+        del kwargs
+
+    @contextmanager
+    def start_as_current_observation(self, **kwargs: Any):
+        if self._starts is not None:
+            self._starts.append(dict(kwargs))
+        yield FakeObservation(starts=self._starts, updates=self._updates)
 
 
 def _runner_task(repo: str) -> LCATask:
@@ -504,21 +533,9 @@ def test_run_agent_returns_usage_details_for_scoring(monkeypatch):
     class DummyClient:
         chat = type("Chat", (), {"completions": DummyCompletions()})()
 
-    @contextmanager
-    def span_cm():
-        yield type(
-            "S",
-            (),
-            {
-                "id": "span",
-                "update": lambda self, **kwargs: updates.append(kwargs),
-                "end": lambda self, **kwargs: None,
-            },
-        )()
-
     monkeypatch.setattr(runner, "_make_client", lambda model_override=None: (DummyClient(), "dummy-model"))
     monkeypatch.setattr(runner, "get_cerebras_api_key", lambda: "key")
-    monkeypatch.setattr(runner, "start_observation", lambda *args, **kwargs: span_cm())
+    monkeypatch.setattr(runner, "_require_parent", lambda parent_trace, owner="runner agent": FakeObservation(updates=updates))
 
     result = runner.run_agent(
         {"identity": {}, "repo": "repo", "context": {}},
@@ -575,21 +592,9 @@ def test_run_agent_counts_retry_generation_attempts(monkeypatch):
     class DummyClient:
         chat = type("Chat", (), {"completions": completions})()
 
-    @contextmanager
-    def span_cm():
-        yield type(
-            "S",
-            (),
-            {
-                "id": "span",
-                "update": lambda self, **kwargs: None,
-                "end": lambda self, **kwargs: None,
-            },
-        )()
-
     monkeypatch.setattr(runner, "_make_client", lambda model_override=None: (DummyClient(), "dummy-model"))
     monkeypatch.setattr(runner, "get_cerebras_api_key", lambda: "key")
-    monkeypatch.setattr(runner, "start_observation", lambda *args, **kwargs: span_cm())
+    monkeypatch.setattr(runner, "_require_parent", lambda parent_trace, owner="runner agent": FakeObservation())
 
     result = runner.run_agent(
         {"identity": {}, "repo": "repo", "context": {}},
@@ -606,21 +611,9 @@ def test_run_agent_counts_retry_generation_attempts(monkeypatch):
 
 
 def test_failed_tool_dispatch_counts_as_attempted_failed_call(monkeypatch):
-    @contextmanager
-    def span_cm():
-        yield type(
-            "S",
-            (),
-            {
-                "id": "span",
-                "update": lambda self, **kwargs: None,
-                "end": lambda self, **kwargs: None,
-            },
-        )()
-
     monkeypatch.setattr(runner, "_make_client", lambda model_override=None: _dummy_client("search_files", {"query": "foo"}))
     monkeypatch.setattr(runner, "get_cerebras_api_key", lambda: "key")
-    monkeypatch.setattr(runner, "start_observation", lambda *args, **kwargs: span_cm())
+    monkeypatch.setattr(runner, "_require_parent", lambda parent_trace, owner="runner agent": FakeObservation())
 
     def failing_dispatch(name: str, args: dict[str, Any]) -> object:
         raise RuntimeError("tool boom")
@@ -675,23 +668,7 @@ def test_run_ic_iteration_preserves_full_graph_and_score_source(monkeypatch, tmp
     monkeypatch.setattr("harness.backends.ic.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.backends.ic.IterativeContextToolRuntime", FakeRuntime)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("resolve_path", {"identity": "task"}))
-    @contextmanager
-    def span_cm():
-        class Span:
-            id = "span"
-
-            def score(self, name: str, value: float, metadata=None):
-                pass
-
-            def update(self, **kwargs):
-                pass
-
-            def end(self, **kwargs):
-                pass
-
-        yield Span()
-
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(runner, "_require_parent", lambda parent_trace, owner="runner agent": FakeObservation())
     def fake_finalize(task, obs, parent_trace=None):
         # Expect a separate no-tools finalize call; simulate schema result.
         assert isinstance(task, LCATask)
@@ -743,23 +720,7 @@ def test_run_jc_iteration_uses_call_tool(monkeypatch, tmp_path):
     monkeypatch.setattr("harness.backends.jc.list_tools", fake_list_tools)
     monkeypatch.setattr("harness.backends.jc.call_tool", fake_call_tool)
     monkeypatch.setattr(runner, "_make_client", lambda: _dummy_client("search_files", {"query": "foo"}))
-    @contextmanager
-    def span_cm():
-        class Span:
-            id = "span"
-
-            def score(self, name: str, value: float, metadata=None):
-                pass
-
-            def update(self, **kwargs):
-                pass
-
-            def end(self, **kwargs):
-                pass
-
-        yield Span()
-
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(runner, "_require_parent", lambda parent_trace, owner="runner agent": FakeObservation())
     def fake_finalize(task, obs, parent_trace=None):
         assert isinstance(task, LCATask)
         assert isinstance(obs, list)
@@ -798,25 +759,11 @@ def test_run_jc_iteration_traces_backend_init_failure(monkeypatch, tmp_path, cap
 
     monkeypatch.setattr("harness.backends.jc.list_tools", fake_list_tools)
 
-    @contextmanager
-    def span_cm(*args, **kwargs):
-        starts.append(dict(kwargs))
-
-        class Span:
-            id = "span"
-
-            def score(self, name: str, value: float, metadata=None):
-                pass
-
-            def update(self, **kwargs):
-                updates.append(dict(kwargs))
-
-            def end(self, **kwargs):
-                pass
-
-        yield Span()
-
-    monkeypatch.setattr(runner, "start_observation", span_cm)
+    monkeypatch.setattr(
+        runner,
+        "_require_parent",
+        lambda parent_trace, owner="runner agent": FakeObservation(starts=starts, updates=updates),
+    )
     caplog.set_level(logging.INFO, logger="harness.agents.localizer")
 
     task = _runner_task(str(tmp_path))
@@ -834,8 +781,8 @@ def test_run_jc_iteration_traces_backend_init_failure(monkeypatch, tmp_path, cap
     assert failure_metadata["repo"] == str(tmp_path)
     assert failure_metadata["task_summary"]["stage"] == "backend_init"
     messages = [record.getMessage() for record in caplog.records]
-    assert any("[RUN] initializing jc backend" in message for message in messages)
-    assert any("jc backend initialization failed" in message for message in messages)
+    assert any("backend_init_started" in message for message in messages)
+    assert any("backend_init_failed" in message for message in messages)
 
 
 def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
@@ -873,27 +820,11 @@ def test_run_ic_iteration_uses_backend_tool_specs(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "_finalize_localization", fake_finalize)
 
-    @contextmanager
-    def span_cm():
-        class Span:
-            id = "span"
-
-            def score(self, name: str, value: float, metadata=None):
-                pass
-
-            def update(self, **kwargs):
-                pass
-
-            def end(self, **kwargs):
-                pass
-
-        yield Span()
-
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     monkeypatch.setattr(runner, "IterativeContextBackend", FakeBackend)
     monkeypatch.setattr(runner, "run_agent", fake_run_agent)
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(runner, "_require_parent", lambda parent_trace, owner="runner agent": FakeObservation())
 
     result = runner.run_ic_iteration(
         _runner_task(str(repo_dir)),
@@ -956,17 +887,7 @@ def test_finalization_uses_json_schema(monkeypatch, tmp_path):
         "IterativeContextBackend",
         lambda repo, score_fn: type("B", (), {"tool_specs": [{"type": "function", "function": {"name": "t", "parameters": {"type": "object", "properties": {}}}}], "dispatch": lambda self, name, args: {"ok": True}})(),
     )
-    @contextmanager
-    def span_cm():
-        class Span:
-            id = "span"
-
-            def update(self, **kwargs): ...
-            def end(self, **kwargs): ...
-
-        yield Span()
-
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(runner, "_require_parent", lambda parent_trace, owner="runner agent": FakeObservation())
 
     result = runner.run_ic_iteration(_runner_task(str(tmp_path)), score_fn=None, steps=1, parent_trace=object())
     assert result.prediction.predicted_files == ["src/app.py"]
@@ -1075,17 +996,7 @@ def test_finalization_json_schema_uses_provider_supported_subset(monkeypatch, tm
         )(),
     )
 
-    @contextmanager
-    def span_cm():
-        class Span:
-            id = "span"
-
-            def update(self, **kwargs): ...
-            def end(self, **kwargs): ...
-
-        yield Span()
-
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    monkeypatch.setattr(runner, "_require_parent", lambda parent_trace, owner="runner agent": FakeObservation())
 
     result = runner.run_ic_iteration(
         _runner_task(str(tmp_path)),

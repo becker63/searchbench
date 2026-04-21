@@ -1,15 +1,14 @@
 from __future__ import annotations
-
-import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from harness.localization.models import LCAGold, LCATask, normalize_lca_task
+from harness.log import bind_logger, get_logger
 from harness.telemetry.tracing import get_langfuse_client
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class LocalizationDatasetLoadError(RuntimeError):
@@ -217,12 +216,10 @@ def fetch_localization_dataset(
         except LocalizationDatasetLoadError:
             rejected += 1
             raise
-    logger.info(
-        "Converted %d Langfuse dataset items into localization tasks dataset=%s version=%s rejected=%d",
-        len(tasks),
-        name,
-        version,
-        rejected,
+    bind_logger(logger, dataset=name, version=version).info(
+        "langfuse_dataset_converted",
+        task_count=len(tasks),
+        rejected=rejected,
     )
     return tasks
 

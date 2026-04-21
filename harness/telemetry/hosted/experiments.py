@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import concurrent.futures
-import logging
 from concurrent.futures import FIRST_COMPLETED
 from typing import Mapping, Sequence
 
-from langfuse import LangfuseGeneration, LangfuseSpan
+from langfuse import LangfuseGeneration, LangfuseSpan, propagate_attributes
 from pydantic import BaseModel, Field
 
 from harness.entrypoints.models.requests import (
@@ -24,6 +23,7 @@ from harness.localization.runtime.evaluate import (
     evaluate_localization_batch,
     prediction_filenames,
 )
+from harness.log import bind_logger, get_logger
 from harness.scoring import summarize_score_summaries, summarize_task_score
 from harness.scoring.batch import TaskScoreSummary
 from harness.scoring.token_usage import TokenUsageRecord
@@ -44,8 +44,8 @@ from harness.scoring.reducers import (
 )
 from harness.telemetry.tracing import (
     flush_langfuse,
-    propagate_context,
-    start_observation,
+    get_langfuse_client,
+    serialize_observation_metadata,
 )
 from harness.telemetry.tracing.score_emitter import (
     batch_score_summary_metadata,
@@ -54,7 +54,7 @@ from harness.telemetry.tracing.score_emitter import (
 from harness.telemetry.tracing.session_policy import resolve_session_id
 from harness.utils.env import get_runner_model
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 
 class LocalizationRunItemResult(BaseModel):
@@ -155,7 +155,16 @@ def run_hosted_localization_baseline(
 ) -> EvaluationBundle:
     run_session_id = resolve_session_id(req.session, run_id=req.dataset)
     resolved_model = get_runner_model()
-    _LOGGER.info("Localization baseline runner model resolved to %s", resolved_model)
+    logger = bind_logger(
+        _LOGGER,
+        dataset=req.dataset,
+        dataset_version=req.version,
+        session_id=run_session_id,
+    )
+    logger.info(
+        "localization_baseline_runner_model_resolved",
+        runner_model=resolved_model,
+    )
     cached_bundle = load_persisted_baseline_bundle(
         dataset_name=req.dataset,
         dataset_version=req.version,
@@ -191,20 +200,23 @@ def run_hosted_localization_baseline(
         records = list(cached_bundle.records)
         failure = cached_bundle.failure
         selection_meta = {"selected_count": len(records)}
-    with propagate_context(
+    with propagate_attributes(
         trace_name="localization_baseline_dataset",
         session_id=run_session_id,
     ):
-        with start_observation(
+        with get_langfuse_client().start_as_current_observation(
             name="localization_baseline_dataset",
-            metadata={
-                "dataset": req.dataset,
-                "dataset_version": req.version,
-                "run_kind": "localization_baseline",
-                "dataset_store": "langfuse",
-                "selection": selection_meta,
-                "runner_model": resolved_model,
-            },
+            as_type="span",
+            metadata=serialize_observation_metadata(
+                {
+                    "dataset": req.dataset,
+                    "dataset_version": req.version,
+                    "run_kind": "localization_baseline",
+                    "dataset_store": "langfuse",
+                    "selection": selection_meta,
+                    "runner_model": resolved_model,
+                }
+            ),
         ) as dataset_span:
             parent_trace = dataset_span
             if cached_bundle is None:
@@ -390,11 +402,12 @@ def _emit_experiment_dataset_aggregates(
     try:
         span.update(metadata=dict(metadata))
     except Exception as exc:  # noqa: BLE001
-        logging.getLogger(__name__).warning(
-            "Langfuse metadata update failed operation=experiment.metadata observation=%s keys=%s error=%s",
-            span.id,
-            sorted(str(key) for key in metadata),
-            exc,
+        _LOGGER.warning(
+            "langfuse_metadata_update_failed",
+            operation="experiment.metadata",
+            observation=span.id,
+            keys=sorted(str(key) for key in metadata),
+            error=str(exc),
         )
 
 
@@ -412,7 +425,7 @@ def _run_experiment_task(
             "missing parent trace",
         )
     try:
-        with propagate_context(session_id=session_id):
+        with propagate_attributes(session_id=session_id):
             eval_result = evaluate_localization_batch(
                 tasks=[task],
                 dataset_provenance="langfuse",
@@ -547,20 +560,23 @@ def run_hosted_localization_experiment(
     }
     projection_meta: dict[str, object] = {"provided": bool(req.projection)}
     run_session_id = resolve_session_id(req.session, run_id=req.dataset)
-    with propagate_context(
+    with propagate_attributes(
         trace_name="localization_experiment",
         session_id=run_session_id,
     ):
-        with start_observation(
+        with get_langfuse_client().start_as_current_observation(
             name="localization_experiment_dataset",
-            metadata={
-                "dataset": req.dataset,
-                "dataset_version": req.version,
-                "run_kind": "localization_experiment",
-                "dataset_store": "langfuse",
-                "selection": selection_meta,
-                "projection": projection_meta,
-            },
+            as_type="span",
+            metadata=serialize_observation_metadata(
+                {
+                    "dataset": req.dataset,
+                    "dataset_version": req.version,
+                    "run_kind": "localization_experiment",
+                    "dataset_store": "langfuse",
+                    "selection": selection_meta,
+                    "projection": projection_meta,
+                }
+            ),
         ) as dataset_span:
             parent_trace = dataset_span
             if effective_workers == 1:

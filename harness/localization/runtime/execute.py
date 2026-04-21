@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Mapping, Tuple
 
+from langfuse import LangfuseGeneration, LangfuseSpan
+
 from harness.localization.errors import (
     LocalizationEvaluationError,
     LocalizationFailureCategory,
@@ -26,21 +28,11 @@ from harness.scoring.token_usage import (
     TokenUsageRecord,
     aggregate_token_usage_record,
 )
-from harness.telemetry.evaluation_emitters import (
-    emit_localization_task_telemetry,
-    safe_update_observation_metadata,
-)
+from harness.telemetry.evaluation_emitters import emit_localization_task_telemetry
 from harness.telemetry.observability_models import EvaluationTelemetryArtifact
-from harness.telemetry.tracing import start_observation
+from harness.telemetry.tracing import get_langfuse_client, serialize_observation_metadata
 
-
-def _safe_update_metadata(span: object | None, metadata: Mapping[str, object]) -> None:
-    safe_update_observation_metadata(
-        span,
-        metadata,
-        operation="localization_runtime.metadata",
-        observation_name="localization_task",
-    )
+ObservationHandle = LangfuseSpan | LangfuseGeneration
 
 
 def _get_repo_checkout(
@@ -85,9 +77,9 @@ def _resolve_repo_path(
 def _run_runner(
     task: LCATask,
     repo_path: Path,
-    trace: object | None,
+    trace: ObservationHandle | None,
     runner: Callable[
-        [LCATask, str, object | None], LocalizationRunResult
+        [LCATask, str, ObservationHandle | None], LocalizationRunResult
     ]
     | None,
 ) -> LocalizationRunResult:
@@ -126,7 +118,7 @@ def _score_prefix_from_runner_result(runner_result: LocalizationRunResult | None
 
 
 def _default_runner(
-    lca_task: LCATask, repo_path: str, parent: object | None
+    lca_task: LCATask, repo_path: str, parent: ObservationHandle | None
 ) -> LocalizationRunResult:
     from harness.agents.localizer import run_ic_iteration as run_ic_iteration_fn
     result = run_ic_iteration_fn(lca_task.with_repo(repo_path), score_fn=None, steps=5, parent_trace=parent)
@@ -204,7 +196,7 @@ def _emit_telemetry(
     evidence: LocalizationEvidence | None,
     materialization: RepoMaterializationResult | None,
     dataset_provenance: str | None,
-    trace: object | None,
+    trace: ObservationHandle,
     predicted_files: list[str],
     changed_files: list[str],
     score_prefix: str = "localization",
@@ -235,9 +227,9 @@ def run_localization_task(
     task: LCATask,
     dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
-    parent_trace: object | None = None,
+    parent_trace: ObservationHandle | None = None,
     runner: Callable[
-        [LCATask, str, object | None], LocalizationRunResult
+        [LCATask, str, ObservationHandle | None], LocalizationRunResult
     ]
     | None = None,
 ) -> Tuple[
@@ -257,10 +249,8 @@ def run_localization_task(
     Returns prediction, score bundle, optional evidence, checkout details, and token usage.
     """
 
-    with start_observation(
-        name="localization_task",
-        parent=parent_trace,
-        metadata={
+    metadata = serialize_observation_metadata(
+        {
             "identity": task.task_id,
             "dataset": task.identity.dataset_name,
             "dataset_config": task.identity.dataset_config,
@@ -268,8 +258,22 @@ def run_localization_task(
             "repo_owner": task.identity.repo_owner,
             "repo_name": task.identity.repo_name,
             "base_sha": task.identity.base_sha,
-        },
-    ) as trace:
+        }
+    )
+    observation_cm = (
+        get_langfuse_client().start_as_current_observation(
+            name="localization_task",
+            as_type="span",
+            metadata=metadata,
+        )
+        if parent_trace is None
+        else parent_trace.start_as_current_observation(
+            name="localization_task",
+            as_type="span",
+            metadata=metadata,
+        )
+    )
+    with observation_cm as trace:
         try:
             checkout_result = _get_repo_checkout(task, worktree_manager)
         except Exception as exc:

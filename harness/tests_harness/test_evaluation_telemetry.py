@@ -156,11 +156,8 @@ def test_localization_task_emitter_scores_and_metadata(monkeypatch: pytest.Monke
         def update(self, **kwargs: object) -> None:
             updates.append(kwargs)
 
-    monkeypatch.setattr(
-        evaluation_emitters,
-        "emit_score_for_handle",
-        lambda handle, **kwargs: scores.append(kwargs),
-    )
+        def score(self, **kwargs: object) -> None:
+            scores.append(dict(kwargs))
     artifact = EvaluationTelemetryArtifact.from_scoring(
         score_bundle=_bundle(),
         score_context=_context(),
@@ -209,11 +206,8 @@ def test_localization_task_emits_availability_and_metadata_for_unavailable_score
         def update(self, **kwargs: object) -> None:
             updates.append(kwargs)
 
-    monkeypatch.setattr(
-        evaluation_emitters,
-        "emit_score_for_handle",
-        lambda handle, **kwargs: scores.append(kwargs),
-    )
+        def score(self, **kwargs: object) -> None:
+            scores.append(dict(kwargs))
     unavailable_context = _unavailable_context(
         static_graph_available=False,
         resolved_prediction_count=0,
@@ -271,11 +265,8 @@ def test_optimize_iteration_emits_all_numeric_boolean_metrics(monkeypatch: pytes
         def update(self, **kwargs: object) -> None:
             updates.append(kwargs)
 
-    monkeypatch.setattr(
-        evaluation_emitters,
-        "emit_score_for_handle",
-        lambda handle, **kwargs: scores.append(kwargs),
-    )
+        def score(self, **kwargs: object) -> None:
+            scores.append(dict(kwargs))
     artifact = EvaluationTelemetryArtifact.from_scoring(
         score_bundle=_bundle(),
         score_context=_context(),
@@ -318,7 +309,10 @@ def test_optimize_iteration_emits_all_numeric_boolean_metrics(monkeypatch: pytes
         "component_passed",
         "component_passed_available",
     ]
-    assert {score["name"]: score["data_type"] for score in scores}["component_passed"] == "BOOLEAN"
+    assert (
+        {score["name"]: score["data_type"] for score in scores}["component_passed"]
+        == evaluation_emitters.ScoreDataType.BOOLEAN
+    )
     assert updates[-1]["metadata"]["score_context_summary"] == {"gold_hop": 1.0}
     assert updates[-1]["metadata"]["score_components"]["gold_hop"]["available"] is True
 
@@ -336,11 +330,8 @@ def test_optimize_iteration_surfaces_unavailable_canonical_component_state(
         def update(self, **kwargs: object) -> None:
             updates.append(kwargs)
 
-    monkeypatch.setattr(
-        evaluation_emitters,
-        "emit_score_for_handle",
-        lambda handle, **kwargs: scores.append(kwargs),
-    )
+        def score(self, **kwargs: object) -> None:
+            scores.append(dict(kwargs))
     unavailable_context = _unavailable_context(
         static_graph_available=True,
         resolved_prediction_count=1,
@@ -443,7 +434,7 @@ def test_metadata_update_failures_are_logged(caplog: pytest.LogCaptureFixture):
             raise RuntimeError("metadata down")
 
     caplog.set_level("WARNING")
-    evaluation_emitters.safe_update_observation_metadata(
+    evaluation_emitters._update_observation_metadata(
         BrokenSpan(),
         {"score_context": {"gold_min_hops": 0}},
         operation="test.metadata",
@@ -457,21 +448,20 @@ def test_metadata_update_failures_are_logged(caplog: pytest.LogCaptureFixture):
 
 
 def test_score_emission_failures_are_logged(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
-    def failing_emit(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("score down")
-
-    monkeypatch.setattr(evaluation_emitters, "emit_score_for_handle", failing_emit)
     caplog.set_level("WARNING")
 
     class Span:
         id = "score-span"
         name = "localization_task"
 
-    evaluation_emitters.safe_emit_score_for_handle(
+        def score(self, **kwargs: object) -> None:
+            raise RuntimeError("score down")
+
+    evaluation_emitters._emit_score_for_handle(
         Span(),
         name="gold_hop",
         value=1.0,
-        data_type="NUMERIC",
+        data_type=evaluation_emitters.ScoreDataType.NUMERIC,
         operation="test.score",
     )
 

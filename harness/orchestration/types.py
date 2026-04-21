@@ -34,21 +34,6 @@ class SupportsPipelineRun(Protocol):
 
 
 @runtime_checkable
-class StartObservation(Protocol):
-    def __call__(
-        self,
-        name: str,
-        *,
-        parent: LangfuseSpan | LangfuseGeneration | None = None,
-        as_type: str = "span",
-        input: object | None = None,
-        model: str | None = None,
-        metadata: Mapping[str, object] | None = None,
-        usage_details: UsageDetails | None = None,
-    ) -> ContextManager[LangfuseSpan | LangfuseGeneration]: ...
-
-
-@runtime_checkable
 class AttemptPolicyGeneration(Protocol):
     def __call__(
         self,
@@ -477,7 +462,6 @@ class LoopDependencies(BaseModel):
     read_policy: Callable[[], str]
     write_policy: Callable[[str], None]
     get_writer_model: Callable[[], str | None]
-    start_observation: StartObservation
     find_repo_root: Callable[[], Path]
     default_pipeline: Callable[[], SupportsPipelineRun]
 
@@ -494,6 +478,8 @@ class RepairContext(BaseModel):
     optimize_run_id: str | None = None
     writer_session_id: str | None = None
     task_identity: str | None = None
+    iteration: int | None = None
+    iterations: int | None = None
     task_ordinal: int | None = None
     task_total: int | None = None
     failure_context: str | None = None

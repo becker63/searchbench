@@ -3,18 +3,19 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
-from typing import Any, Mapping, Optional, ContextManager, Iterator
+from typing import Any, Mapping, Optional, ContextManager, Iterator, cast
 
 from langfuse import Langfuse, LangfuseGeneration, LangfuseSpan, propagate_attributes
 from langfuse.openai import OpenAI as LangfuseOpenAI  # pyright: ignore[reportPrivateImportUsage]
 from pydantic import BaseModel, ConfigDict
 
+from harness.log import get_logger
 from harness.utils.env import get_langfuse_env
 
 _client: Optional[Langfuse] = None
 
 _PROPAGATION_MAX_LEN = 200
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 _STRICT_DEBUG = bool(os.getenv("LANGFUSE_STRICT_DEBUG"))
 _PK_PREFIX_LEN = 12
 _FORBIDDEN_PROPAGATED_METADATA_KEYS = {
@@ -138,21 +139,30 @@ def serialize_propagated_metadata(metadata: Mapping[str, object] | None) -> dict
         if normalized_key in _FORBIDDEN_PROPAGATED_METADATA_KEYS:
             if _STRICT_DEBUG:
                 raise ValueError(f"Propagated metadata key '{key_str}' is forbidden in strict mode")
-            _LOGGER.warning("Dropping execution diagnostic propagated metadata key '%s'", key_str)
+            _LOGGER.warning(
+                "propagated_metadata_key_dropped",
+                key=key_str,
+                reason="execution_diagnostic_forbidden",
+            )
             continue
         if not _is_valid_propagated_key(key_str):
             if _STRICT_DEBUG:
                 raise ValueError(f"Propagated metadata key '{key_str}' is invalid in strict mode")
-            _LOGGER.warning("Dropping invalid propagated metadata key '%s'", key_str)
+            _LOGGER.warning(
+                "propagated_metadata_key_dropped",
+                key=key_str,
+                reason="invalid_key",
+            )
             continue
         text = "" if value is None else str(value)
         if len(text) > _PROPAGATION_MAX_LEN:
             if _STRICT_DEBUG:
                 raise ValueError(f"Propagated metadata for key '{key_str}' exceeds {_PROPAGATION_MAX_LEN} chars in strict mode")
             _LOGGER.warning(
-                "Dropping propagated metadata key '%s': value exceeds %s chars",
-                key_str,
-                _PROPAGATION_MAX_LEN,
+                "propagated_metadata_key_dropped",
+                key=key_str,
+                reason="value_too_long",
+                max_chars=_PROPAGATION_MAX_LEN,
             )
             continue
         serialized[key_str] = text
@@ -220,7 +230,11 @@ def get_tracing_openai_client(base_url: str, api_key: str) -> Any:
     try:
         return LangfuseOpenAI(base_url=base_url, api_key=api_key)
     except Exception as exc:  # pragma: no cover - fallback path
-        _LOGGER.warning("Langfuse OpenAI client unavailable, falling back to plain OpenAI: %s", exc)
+        _LOGGER.warning(
+            "langfuse_openai_client_unavailable",
+            fallback="plain_openai",
+            error=str(exc),
+        )
         try:
             from openai import OpenAI
         except Exception:
@@ -281,7 +295,9 @@ def start_root_observation(
         usage_details=usage_details,
     )
     try:
-        cm = get_langfuse_client().start_as_current_observation(**envelope.to_start_kwargs())
+        cm = cast(Any, get_langfuse_client()).start_as_current_observation(
+            **envelope.to_start_kwargs()
+        )
     except AttributeError as exc:
         raise RuntimeError("Langfuse client missing start_as_current_observation") from exc
     with cm as observation:
@@ -314,7 +330,7 @@ def start_child_observation(
         usage_details=usage_details,
     )
     try:
-        cm = parent.start_as_current_observation(**envelope.to_start_kwargs())
+        cm = cast(Any, parent).start_as_current_observation(**envelope.to_start_kwargs())
     except AttributeError as exc:
         raise RuntimeError("Parent observation missing start_as_current_observation") from exc
     with cm as observation:
@@ -366,22 +382,22 @@ def flush_langfuse() -> None:
         msg = "Langfuse client missing flush()"
         if _STRICT_DEBUG:
             raise RuntimeError(msg)
-        _LOGGER.warning(msg)
+        _LOGGER.warning("langfuse_flush_unavailable", error=msg)
     except Exception as exc:  # pragma: no cover - best effort
         if _STRICT_DEBUG:
             raise
-        _LOGGER.warning("Langfuse flush failed: %s", exc)
+        _LOGGER.warning("langfuse_flush_failed", error=str(exc))
     try:
         client.shutdown()
     except AttributeError:
         msg = "Langfuse client missing shutdown()"
         if _STRICT_DEBUG:
             raise RuntimeError(msg)
-        _LOGGER.warning(msg)
+        _LOGGER.warning("langfuse_shutdown_unavailable", error=msg)
     except Exception as exc:  # pragma: no cover - best effort
         if _STRICT_DEBUG:
             raise
-        _LOGGER.warning("Langfuse shutdown failed: %s", exc)
+        _LOGGER.warning("langfuse_shutdown_failed", error=str(exc))
 
 
 def ensure_langfuse_auth() -> None:
@@ -400,20 +416,23 @@ def ensure_langfuse_auth() -> None:
         host_val = env.get("base_url")
         host = host_val if isinstance(host_val, str) and host_val else None
     except Exception as exc:  # noqa: BLE001
-        _LOGGER.warning("Langfuse environment metadata inspection failed: %s", exc)
+        _LOGGER.warning(
+            "langfuse_environment_inspection_failed",
+            error=str(exc),
+        )
     try:
         ok = bool(client.auth_check())
     except AttributeError:
         msg = "Langfuse client does not expose auth_check; cannot verify credentials"
         if _STRICT_DEBUG:
             raise RuntimeError(msg)
-        _LOGGER.warning(msg)
+        _LOGGER.warning("langfuse_auth_check_unavailable", error=msg)
         return
     except Exception as exc:  # pragma: no cover
         detail = f"Langfuse auth_check raised: {exc}"
         if _STRICT_DEBUG:
             raise RuntimeError(detail) from exc
-        _LOGGER.warning(detail)
+        _LOGGER.warning("langfuse_auth_check_failed", error=detail)
         return
     if not ok:
         detail = (
@@ -422,7 +441,12 @@ def ensure_langfuse_auth() -> None:
         )
         if _STRICT_DEBUG:
             raise RuntimeError(detail)
-        _LOGGER.warning(detail)
+        _LOGGER.warning(
+            "langfuse_auth_check_failed",
+            error=detail,
+            host=host or "unset",
+            pk_prefix=public_prefix or "unset",
+        )
 
 
 __all__ = [

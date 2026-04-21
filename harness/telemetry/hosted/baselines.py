@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +8,7 @@ from statistics import mean
 from typing import Callable, Mapping, Sequence
 
 from langfuse import LangfuseGeneration, LangfuseSpan
+from langfuse import propagate_attributes
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from harness.localization.errors import (
@@ -28,6 +28,7 @@ from harness.localization.runtime.evaluate import (
     LocalizationEvaluationFailure,
     evaluate_localization_batch,
 )
+from harness.log import get_logger
 from harness.scoring import (
     AggregateComponentScore,
     BatchScoreSummary,
@@ -36,11 +37,16 @@ from harness.scoring import (
 from harness.scoring.batch import TaskScoreSummary
 from harness.localization.telemetry import build_localization_telemetry
 from harness.scoring.token_usage import TokenUsageRecord
-from harness.telemetry.tracing import propagate_context, start_observation
+from harness.telemetry.tracing import (
+    get_langfuse_client,
+    serialize_observation_metadata,
+)
 from harness.telemetry.tracing.score_emitter import (
     batch_score_summary_metadata,
     emit_batch_score_summary,
 )
+
+_LOGGER = get_logger(__name__)
 
 
 class EvaluationRecord(BaseModel):
@@ -97,11 +103,12 @@ def _safe_update_metadata(
     try:
         span.update(metadata=dict(metadata))
     except Exception as exc:  # noqa: BLE001
-        logging.getLogger(__name__).warning(
-            "Langfuse metadata update failed operation=baseline.metadata observation=%s keys=%s error=%s",
-            span.id,
-            keys,
-            exc,
+        _LOGGER.warning(
+            "langfuse_metadata_update_failed",
+            operation="baseline.metadata",
+            observation=span.id,
+            keys=keys,
+            error=str(exc),
         )
 
 
@@ -253,24 +260,43 @@ def compute_baseline_for_task(
     dataset_version: str | None = None,
     parent_trace: LangfuseSpan | LangfuseGeneration | None = None,
     runner: Callable[
-        [LCATask, str, object | None], LocalizationRunResult
+        [LCATask, str, LangfuseSpan | LangfuseGeneration | None], LocalizationRunResult
     ]
     | None = None,
     dataset_provenance: str | None = None,
     worktree_manager: WorktreeManager | None = None,
 ) -> EvaluationRecord:
-    with propagate_context(session_id=session_id):
-        with start_observation(
-            name="localization_baseline_item",
-            parent=parent_trace,
-            metadata={
-                "dataset": task.identity.dataset_name,
-                "dataset_config": task.identity.dataset_config,
-                "dataset_split": task.identity.dataset_split,
-                "dataset_version": dataset_version,
-                "identity": task.task_id,
-            },
-        ) as trace:
+    with propagate_attributes(session_id=session_id):
+        observation_cm = (
+            get_langfuse_client().start_as_current_observation(
+                name="localization_baseline_item",
+                as_type="span",
+                metadata=serialize_observation_metadata(
+                    {
+                        "dataset": task.identity.dataset_name,
+                        "dataset_config": task.identity.dataset_config,
+                        "dataset_split": task.identity.dataset_split,
+                        "dataset_version": dataset_version,
+                        "identity": task.task_id,
+                    }
+                ),
+            )
+            if parent_trace is None
+            else parent_trace.start_as_current_observation(
+                name="localization_baseline_item",
+                as_type="span",
+                metadata=serialize_observation_metadata(
+                    {
+                        "dataset": task.identity.dataset_name,
+                        "dataset_config": task.identity.dataset_config,
+                        "dataset_split": task.identity.dataset_split,
+                        "dataset_version": dataset_version,
+                        "identity": task.task_id,
+                    }
+                ),
+            )
+        )
+        with observation_cm as trace:
             eval_result = evaluate_localization_batch(
                 tasks=[task],
                 dataset_provenance=dataset_provenance,

@@ -1,4 +1,5 @@
 import pytest
+from contextlib import contextmanager
 from pathlib import Path
 
 from harness.localization.models import (
@@ -52,6 +53,25 @@ class FakeLangfuseSpan:
 
     def end(self, **kwargs: object) -> None:
         return None
+
+    def __enter__(self) -> "FakeLangfuseSpan":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
+
+    @contextmanager
+    def start_as_current_observation(self, **kwargs: object):
+        yield FakeLangfuseSpan(update_sink=self._update_sink)
+
+
+def _patch_executor_observation(monkeypatch: pytest.MonkeyPatch, span_factory) -> None:
+    class DummyClient:
+        @contextmanager
+        def start_as_current_observation(self, **kwargs: object):
+            yield span_factory()
+
+    monkeypatch.setattr(executor_module, "get_langfuse_client", lambda: DummyClient())
 
 
 def _runner_result(
@@ -227,13 +247,7 @@ def test_localization_task_uses_runner_predictions(monkeypatch, tmp_path):
         }
     )
 
-    from contextlib import contextmanager
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    _patch_executor_observation(monkeypatch, FakeLangfuseSpan)
     prediction, score_bundle, _evidence, _mat, _usage, _run_result = run_localization_task(
         lca_task,
         runner=lambda task, *_args: _runner_result(task, ["predicted.py"], source="runner"),
@@ -263,17 +277,13 @@ def test_localization_execute_attaches_metadata(monkeypatch, tmp_path):
         }
     )
 
-    from contextlib import contextmanager
-
     updates: list[dict[str, object]] = []
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan(update_sink=updates)
-
-    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    _patch_executor_observation(
+        monkeypatch,
+        lambda: FakeLangfuseSpan(update_sink=updates),
+    )
     monkeypatch.setattr(
-        "harness.telemetry.evaluation_emitters.emit_score_for_handle",
+        "harness.telemetry.evaluation_emitters._emit_score_for_handle",
         lambda *a, **k: None,
     )
     prediction, score_bundle, *_ = run_localization_task(
@@ -318,15 +328,8 @@ def test_localization_task_emits_backend_prefixed_score_bundle(monkeypatch, tmp_
         )
     )
 
-    from contextlib import contextmanager
-
     emitted: list[dict[str, object]] = []
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    _patch_executor_observation(monkeypatch, FakeLangfuseSpan)
     monkeypatch.setattr(
         executor_module,
         "_score_task",
@@ -341,7 +344,7 @@ def test_localization_task_emits_backend_prefixed_score_bundle(monkeypatch, tmp_
         ),
     )
     monkeypatch.setattr(
-        "harness.telemetry.evaluation_emitters.emit_score_for_handle",
+        "harness.telemetry.evaluation_emitters._emit_score_for_handle",
         lambda handle, **kwargs: emitted.append(kwargs),
     )
 
@@ -376,17 +379,10 @@ def test_localization_task_scores_runner_usage_as_visible_component(monkeypatch,
         }
     )
 
-    from contextlib import contextmanager
-
     emitted: list[dict[str, object]] = []
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    _patch_executor_observation(monkeypatch, FakeLangfuseSpan)
     monkeypatch.setattr(
-        "harness.telemetry.evaluation_emitters.emit_score_for_handle",
+        "harness.telemetry.evaluation_emitters._emit_score_for_handle",
         lambda handle, **kwargs: emitted.append(kwargs),
     )
 
@@ -428,15 +424,9 @@ def test_localization_task_scores_full_run_usage_not_finalization_only(monkeypat
         }
     )
 
-    from contextlib import contextmanager
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    _patch_executor_observation(monkeypatch, FakeLangfuseSpan)
     monkeypatch.setattr(
-        "harness.telemetry.evaluation_emitters.emit_score_for_handle",
+        "harness.telemetry.evaluation_emitters._emit_score_for_handle",
         lambda *a, **k: None,
     )
 
@@ -534,10 +524,6 @@ def test_localization_langfuse_boundary_node_count_visible_without_malformed_bun
         def create_score(self, **kwargs):
             create_score_calls.append(kwargs)
 
-    @contextmanager
-    def span_cm():
-        yield TaskSpan()
-
     def runner_with_visible_node_count(task: LCATask, *_args):
         from harness.telemetry.tracing.score_emitter import emit_score_for_handle
 
@@ -549,7 +535,7 @@ def test_localization_langfuse_boundary_node_count_visible_without_malformed_bun
         )
         return _runner_result(task, ["a.py"], backend="ic")
 
-    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
+    _patch_executor_observation(monkeypatch, TaskSpan)
     monkeypatch.setattr(
         executor_module,
         "_score_task",
@@ -594,20 +580,13 @@ def test_run_ic_iteration_strips_gold(monkeypatch, tmp_path):
         "IterativeContextBackend",
         lambda repo, score_fn: type("B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}})(),
     )
-    from contextlib import contextmanager
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     result = runner.run_ic_iteration(
         _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
-        parent_trace=object(),
+        parent_trace=FakeLangfuseSpan(),
     )
     assert captured
     assert "changed_files" not in captured[0]
@@ -645,13 +624,6 @@ def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_
             "B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}}
         )(),
     )
-    from contextlib import contextmanager
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
 
@@ -659,7 +631,7 @@ def test_run_ic_iteration_recovers_when_finalize_returns_empty(monkeypatch, tmp_
         _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
-        parent_trace=object(),
+        parent_trace=FakeLangfuseSpan(),
     )
 
     assert result.prediction.predicted_files == ["src/recovered.py"]
@@ -703,19 +675,11 @@ def test_run_ic_iteration_recovers_nested_tool_result_candidates(monkeypatch, tm
             "B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}}
         )(),
     )
-    from contextlib import contextmanager
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
-
     result = runner.run_ic_iteration(
         _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
-        parent_trace=object(),
+        parent_trace=FakeLangfuseSpan(),
     )
 
     assert result.prediction.predicted_files == ["src/nested.py", "pkg/other.py"]
@@ -748,13 +712,6 @@ def test_run_ic_iteration_recovers_when_finalization_request_fails(monkeypatch, 
             "B", (), {"tool_specs": [], "dispatch": lambda self, name, args: {}}
         )(),
     )
-    from contextlib import contextmanager
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
 
@@ -762,7 +719,7 @@ def test_run_ic_iteration_recovers_when_finalization_request_fails(monkeypatch, 
         _runner_task(str(repo_dir)),
         score_fn=None,
         steps=1,
-        parent_trace=object(),
+        parent_trace=FakeLangfuseSpan(),
     )
 
     assert result.prediction.predicted_files == ["src/from_tool.py"]
@@ -821,14 +778,7 @@ def test_run_localization_task_empty_finalize_and_empty_fallback_is_typed(
         }
     )
 
-    from contextlib import contextmanager
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    _patch_executor_observation(monkeypatch, FakeLangfuseSpan)
     monkeypatch.setattr(runner, "run_agent", lambda *a, **k: {"observations": []})
     monkeypatch.setattr(
         runner,
@@ -874,14 +824,7 @@ def test_run_localization_task_preserves_exploration_failure_without_observation
         }
     )
 
-    from contextlib import contextmanager
-
-    @contextmanager
-    def span_cm():
-        yield FakeLangfuseSpan()
-
-    monkeypatch.setattr(executor_module, "start_observation", lambda *a, **k: span_cm())
-    monkeypatch.setattr(runner, "start_observation", lambda *a, **k: span_cm())
+    _patch_executor_observation(monkeypatch, FakeLangfuseSpan)
 
     def raise_exploration_error(*_args, **_kwargs):
         raise RuntimeError("queue_exceeded")

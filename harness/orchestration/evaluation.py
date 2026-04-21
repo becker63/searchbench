@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from langfuse import LangfuseGeneration, LangfuseSpan
 
+from harness.log import bind_logger, get_logger, short_task_label
 from harness.localization.models import LCATask
 from harness.localization.runtime.evaluate import (
     evaluate_localization_batch,
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 
 
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy" / "current.py"
+_LOGGER = get_logger(__name__)
 
 
 def _read_policy(path: Path = _POLICY_PATH) -> str:
@@ -62,7 +64,15 @@ def evaluate_policy_on_item(
     iteration_span: LangfuseSpan | LangfuseGeneration | None = None,
     iteration_index: int | None = None,
 ) -> EvaluationResult:
-    del baseline_record, iteration_index
+    del baseline_record
+    logger = bind_logger(
+        _LOGGER,
+        task=short_task_label(task),
+        task_identity=task.task_id,
+        iteration=iteration_index,
+        repo=task.repo,
+    )
+    logger.info("policy_evaluation_started")
     eval_result = evaluate_localization_batch(
         tasks=[task],
         dataset_provenance=None,
@@ -75,8 +85,18 @@ def evaluate_policy_on_item(
             "value",
             eval_result.failure.category,
         )
+        logger.warning(
+            "policy_evaluation_failed",
+            failure_category=category,
+            failure_message=eval_result.failure.message,
+        )
         return _failure_evaluation_result(f"{category}: {eval_result.failure.message}")
     if not eval_result.items:
+        logger.warning(
+            "policy_evaluation_failed",
+            failure_category="evaluation_failed",
+            failure_message="no_results",
+        )
         return _failure_evaluation_result("evaluation_failed: no_results")
 
     task_result = eval_result.items[0]
@@ -97,6 +117,13 @@ def evaluate_policy_on_item(
             "iteration_regression": False,
             "additional_metrics": additional_metrics,
         }
+    )
+    logger.info(
+        "policy_evaluation_completed",
+        score=score_value,
+        control_score=eval_result.machine_score,
+        predicted_files_count=len(prediction_filenames(task_result.prediction)),
+        component_metric_names=sorted(entry["name"] for entry in additional_metrics),
     )
     return EvaluationResult(
         metrics=eval_metrics,

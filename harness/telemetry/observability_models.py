@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
-from harness.scoring import ScoreBundle, ScoreContext
+if TYPE_CHECKING:
+    from harness.scoring.bundle import ScoreBundle
+    from harness.scoring.models import ScoreContext
+else:
+    ScoreBundle = Any
+    ScoreContext = Any
 
 LOCALIZATION_CANONICAL_COMPONENTS = (
     "composed_score",
